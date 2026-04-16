@@ -1,0 +1,16 @@
+# 配置文件（敏感信息）
+config.php
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+Thumbs.db
+.DS_Store
+
+# 上传文件
+uploads/
