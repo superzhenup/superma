@@ -1,0 +1,40 @@
+# 系统文件
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+desktop.ini
+
+# 配置文件（含数据库密码等敏感信息）
+config.php
+install.lock
+
+# 日志文件
+*.log
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.sublime-*
+
+# 上传文件
+uploads/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.bak
+
+# 进度文件（写作时的临时进度记录）
+novel_write_progress/
+
+# Composer（如有）
+vendor/
+
+# Node.js（如有前端构建）
+node_modules/
+
+# 环境变量
+.env
+.env.local
