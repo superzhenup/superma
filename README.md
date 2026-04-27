@@ -1,23 +1,20 @@
 # ✦ Super-Ma AI 智能小说创作辅助系统（平台）
 ## UI预览
 <img width="1921" height="906" alt="局部截取_20260427_204024" src="https://github.com/user-attachments/assets/5951459d-bada-4d90-b443-1ad7127c53e1" />
-
-**部分功能预览**
+<p> <p>
 <img width="1895" height="904" alt="局部截取_20260427_204121" src="https://github.com/user-attachments/assets/97c06eaf-12d1-4a89-a985-39d76f98e234" />
-
+<p> <p>
 <img width="1919" height="910" alt="局部截取_20260427_204252" src="https://github.com/user-attachments/assets/31c1d69a-350b-4586-988a-0eaf2e946524" />
 
 
+## 功能简介
 
-**Super Ma v1.3**
+<p> 🤖独创 | 首次将Agents融入到AI小说智能辅助系统：系统内置 WritingStrategyAgent（写作策略）、QualityMonitorAgent（质量监控）、OptimizationAgent（系统优化）三大智能 Agent，三位一体协同决策，动态调整字数容差、爽点密度、节奏策略与质量严格度，让AI持续赋能写作。<p>
+<p> 📊内置 | 深度定制：基于1500+本白金级网文深度学习，量化网文数据，构建小说创作专属知识图谱。章节生成完成后，系统自动解析并提取核心创作要素——角色档案卡、伏笔埋线追踪、世界观设定集，沉淀为可复用、可检索的结构化创作资产，助力长期连载的一致性与深度。<p>
+<p> 🧠创新 | 持久记忆：Pyramid MemoryEngine 记忆引擎 （L1全局设定 / L2弧段摘要 / L3近章大纲 / L4前章尾文），配合 Embedding 语义向量检索，越写越聪明，有效防止长篇创作中的情节失忆与人物漂移（灵感来源：TencentDB AI-Memory ）。<p>
+<p> 🖥️支持 | 可视化写作：支持SSE（流式写作）、CLI（异步后台写作）、Automatic offline（挂机全自动连续写作）三大写作模式，动态字数控制系统精确把控章节篇幅，模型 Fallback 机制保障写作连续性。<p>
 
-Super-Ma 是一个基于 PHP + MySQL 的 AI 智能小说创作辅助平台，支持自动生成章节大纲、流式写作、多模型配置，创新引入多 Agents(智能体) 三位一体协同机制，并兼容接入 OpenAI 协议主流 API AI 模型，助力创作者轻松构建长篇小说。
-
-|🤖独创 首次将Agents融入到AI小说智能辅助系统：系统内置 WritingStrategyAgent（写作策略）、QualityMonitorAgent（质量监控）、OptimizationAgent（系统优化）三大智能 Agent，三位一体协同决策，动态调整字数容差、爽点密度、节奏策略与质量严格度，让AI持续赋能写作。
-|📊内置 深度定制：基于1500+本白金级网文深度学习，量化网文数据，构建小说创作专属知识图谱。章节生成完成后，系统自动解析并提取核心创作要素——角色档案卡、伏笔埋线追踪、世界观设定集，沉淀为可复用、可检索的结构化创作资产，助力长期连载的一致性与深度。
-|🧠创新 持久记忆：Pyramid MemoryEngine 记忆引擎 （L1全局设定 / L2弧段摘要 / L3近章大纲 / L4前章尾文），配合 Embedding 语义向量检索，越写越聪明，有效防止长篇创作中的情节失忆与人物漂移（灵感来源：TencentDB AI-Memory ）。
-|🖥️支持 可视化写作：支持SSE（流式写作）、CLI（异步后台写作）、Automatic offline（挂机全自动连续写作）三大写作模式，动态字数控制系统精确把控章节篇幅，模型 Fallback 机制保障写作连续性。
----
+<p>---<p>
 
 ## 目录
 
@@ -26,7 +23,7 @@ Super-Ma 是一个基于 PHP + MySQL 的 AI 智能小说创作辅助平台，支
 - [快速安装](#快速安装)
 - [使用指南](#使用指南)
 - [记忆引擎 v6](#记忆引擎-v6)
-- [Agents 决策系统](#Agents-三位一体决策系统)
+- [Agents决策系统](#Agents决策系统)
 - [支持的 AI 模型](#支持的-ai-模型)
 - [常见问题](#常见问题)
 - [技术栈](#技术栈)
@@ -213,7 +210,7 @@ http://你的域名/install.php
 
 ---
 
-## Agent 决策系统
+## Agents决策系统
 
 系统内置三个智能 Agent，协同优化写作过程：
 
