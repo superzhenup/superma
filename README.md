@@ -142,9 +142,8 @@ http://你的域名/install.php
 
 **便宜服务器（服务器部署更稳定）：**
 
-|------|---------|
-| 腾讯云 99元良心云 | `https://curl.qcloud.com/CK0gNnTC` |
-| 腾讯云 一流大牌云 | `https://www.aliyun.com/minisite/goods?userCode=null` |
+<p>  腾讯云 99元良心云 | `https://curl.qcloud.com/CK0gNnTC` <p> 
+<p>  腾讯云 一流大牌云 | `https://www.aliyun.com/minisite/goods?userCode=null` <p> 
 
 
 ### 配置写作参数
