@@ -130,6 +130,11 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `suspense`        VARCHAR(10)  NOT NULL DEFAULT '无' COMMENT '悬念：有/无',
                     `quality_score`   DECIMAL(3,1) DEFAULT NULL COMMENT '质量评分(0-100)',
                     `gate_results`    JSON         DEFAULT NULL COMMENT '五关检测结果',
+                    `tokens_used`     INT          NOT NULL DEFAULT 0 COMMENT 'AI生成本章消耗的token总数',
+                    `duration_ms`     INT          NOT NULL DEFAULT 0 COMMENT '本章生成耗时(毫秒)',
+                    `emotion_density` JSON         DEFAULT NULL COMMENT '情绪词频统计(各类别次/万字)',
+                    `emotion_score`   DECIMAL(4,1) DEFAULT NULL COMMENT '情绪密度评分(0-100)',
+                    `actual_cool_point_types` JSON DEFAULT NULL COMMENT '实际检测到的爽点类型(关键词匹配)',
                     `synopsis_id`     INT UNSIGNED DEFAULT NULL COMMENT '章节简介ID',
                     `content`         LONGTEXT COMMENT '章节正文',
                     `words`           INT  NOT NULL DEFAULT 0,
@@ -480,9 +485,8 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `updated_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='系统设置表'",
 
-                // 初始化 system_settings：迁移版本标记 + embedding 模型 ID + 写作参数默认值
+                // 初始化 system_settings：embedding 模型 ID + 写作参数默认值
                 "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES
-                  ('schema_version_migrated', '24'),
                   ('global_embedding_model_id', ''),
                   ('ws_chapter_words',              '2000'),
                   ('ws_chapter_word_tolerance',     '150'),
