@@ -20,6 +20,7 @@ try {
     $actDivision = $input['act_division'] ?? null;
     $majorTurningPoints = $input['major_turning_points'] ?? null;
     $characterArcsStr = trim($input['character_arcs'] ?? '');
+    $characterEndpoints = trim($input['character_endpoints'] ?? '');
     $worldEvolution = trim($input['world_evolution'] ?? '');
     $recurringMotifs = $input['recurring_motifs'] ?? null;
 
@@ -49,6 +50,7 @@ try {
                 'act_division' => $actDivision ? json_encode($actDivision, JSON_UNESCAPED_UNICODE) : null,
                 'major_turning_points' => $majorTurningPoints ? json_encode($majorTurningPoints, JSON_UNESCAPED_UNICODE) : null,
                 'character_arcs' => $characterArcs,
+                'character_endpoints' => $characterEndpoints ?: null,
                 'world_evolution' => $worldEvolution,
                 'recurring_motifs' => $recurringMotifs ? json_encode($recurringMotifs, JSON_UNESCAPED_UNICODE) : null
             ],
@@ -63,6 +65,7 @@ try {
             'act_division' => $actDivision ? json_encode($actDivision, JSON_UNESCAPED_UNICODE) : null,
             'major_turning_points' => $majorTurningPoints ? json_encode($majorTurningPoints, JSON_UNESCAPED_UNICODE) : null,
             'character_arcs' => $characterArcs,
+            'character_endpoints' => $characterEndpoints ?: null,
             'world_evolution' => $worldEvolution,
             'recurring_motifs' => $recurringMotifs ? json_encode($recurringMotifs, JSON_UNESCAPED_UNICODE) : null
         ]);

@@ -154,7 +154,41 @@ function sseMsgWrite(array $payload): void {
     ]);
 }
 
+// ---- 思考过程缓冲（异步模式专用） ----
+$thinkingBuffer = '';
+$thinkingFlushInterval = 2; // 秒
+$lastThinkingFlush = microtime(true);
+
+function sseThinkingWrite(string $chunk): void {
+    global $thinkingBuffer, $lastThinkingFlush, $thinkingFlushInterval;
+    $thinkingBuffer .= $chunk;
+    // 每隔一段时间将思考过程写入进度文件
+    if (microtime(true) - $lastThinkingFlush >= $thinkingFlushInterval) {
+        flushThinkingBuffer();
+    }
+}
+
+function flushThinkingBuffer(): void {
+    global $thinkingBuffer, $lastThinkingFlush, $asyncProgressFile;
+    if ($thinkingBuffer === '' || !$asyncProgressFile || !file_exists($asyncProgressFile)) return;
+    $fp = fopen($asyncProgressFile, 'r+');
+    if (!$fp) return;
+    flock($fp, LOCK_EX);
+    $data = stream_get_contents($fp);
+    $progress = json_decode($data, true) ?: [];
+    $progress['thinking_content'] = ($progress['thinking_content'] ?? '') . $thinkingBuffer;
+    $progress['updated_at'] = time();
+    fseek($fp, 0);
+    ftruncate($fp, 0);
+    fwrite($fp, json_encode($progress, JSON_UNESCAPED_UNICODE));
+    flock($fp, LOCK_UN);
+    fclose($fp);
+    $thinkingBuffer = '';
+    $lastThinkingFlush = microtime(true);
+}
+
 function sseDoneWrite(): void {
+    flushThinkingBuffer(); // 确保最后一批思考内容也写入
     updateAsyncProgress(['status' => 'done', 'progress' => 100]);
 }
 
@@ -205,10 +239,13 @@ try {
         $novelId,
         function(string $token) { sseChunkWrite($token); },
         function(array $payload) { sseMsgWrite($payload); },
-        function() { sendHeartbeatWrite(); }
+        function() { sendHeartbeatWrite(); },
+        function(string $reasoning) { sseThinkingWrite($reasoning); }
     );
-    $fullContent = $result['content'];
-    $usedModel   = $result['model'];
+    $fullContent       = $result['content'];
+    $usedModel         = $result['model'];
+    $streamUsage       = $result['usage'] ?? null;
+    $streamDurationMs  = $result['duration_ms'] ?? null;
 } catch (Exception $e) {
     $msg = $e->getMessage();
     $isCancel = strpos($msg, '取消') !== false;
@@ -222,7 +259,7 @@ try {
 // ---- Phase 5: WriteEngine 保存章节 ----
 try {
     $saveResult = WriteEngine::saveChapter(
-        (int)$ch['id'], $novelId, $fullContent, $targetWords, $usedModel, $ch
+        (int)$ch['id'], $novelId, $fullContent, $targetWords, $usedModel, $ch, $streamUsage, $streamDurationMs
     );
     $words     = $saveResult['words'];
     $ch        = $saveResult['chapter'];

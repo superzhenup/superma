@@ -117,7 +117,7 @@ function pageHeader(string $title = '', string $activeNav = ''): void {
     </a>
   </nav>
   <div class="sidebar-footer">
-    <small>Super Ma Pro Agents v1.3</small>
+    <small>Super Ma Agents v1.3.5 <a href="https://f.wps.cn/g/DDu7qDj4/">问题反馈</a></small>
   </div>
 </div>
 

@@ -20,9 +20,6 @@ require_once __DIR__ . '/BaseAgent.php';
 
 class WritingStrategyAgent extends BaseAgent
 {
-    /** @var int 小说ID */
-    private $novelId;
-    
     /** @var string 小说题材 */
     private $genre;
     
@@ -48,8 +45,7 @@ class WritingStrategyAgent extends BaseAgent
      */
     public function __construct(int $novelId)
     {
-        parent::__construct('writing_strategy');
-        $this->novelId = $novelId;
+        parent::__construct('writing_strategy', $novelId);
         $this->loadNovelInfo();
     }
     
@@ -503,22 +499,23 @@ class WritingStrategyAgent extends BaseAgent
     }
     
     /**
-     * 获取API成功率
+     * 获取API成功率（基于chapters表，v1.5修复）
      */
     private function getAPISuccessRate(): float
     {
         try {
+            // v1.5: 用chapters表替代不存在的performance_logs
             $stats = DB::fetch(
                 'SELECT 
-                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success,
-                    COUNT(*) as total
-                 FROM performance_logs
-                 WHERE novel_id = ? AND phase = "streamWrite"
-                   AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)',
-                [$this->novelId]
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status = "completed" THEN 1 ELSE 0 END) as completed
+                 FROM chapters
+                 WHERE novel_id = ?
+                   AND chapter_number >= GREATEST(1, (SELECT MAX(chapter_number) - 20 FROM chapters WHERE novel_id = ?))',
+                [$this->novelId, $this->novelId]
             );
             
-            return $stats['total'] > 0 ? (int)$stats['success'] / (int)$stats['total'] : 1.0;
+            return $stats['total'] > 0 ? (int)$stats['completed'] / (int)$stats['total'] : 1.0;
         } catch (\Throwable $e) {
             return 1.0;
         }
@@ -540,8 +537,8 @@ class WritingStrategyAgent extends BaseAgent
         try {
             require_once __DIR__ . '/AgentDirectives.php';
             
-            // 获取下一个要写的章节号
-            $nextChapter = $this->currentChapter + 1;
+            // 获取下一个要写的章节号（getCurrentChapterNumber() 已返回 COUNT(*) + 1）
+            $nextChapter = $this->getCurrentChapterNumber();
             
             AgentDirectives::add(
                 $this->novelId,
@@ -553,6 +550,25 @@ class WritingStrategyAgent extends BaseAgent
             );
         } catch (\Throwable $e) {
             error_log("写入Agent指令失败: " . $e->getMessage());
+        }
+    }
+    
+    /**
+     * 获取当前章节号（已completed章节数+1，即下一个要写的章节）
+     */
+    private function getCurrentChapterNumber(): int
+    {
+        try {
+            $result = DB::fetch(
+                'SELECT COUNT(*) + 1 as next_chapter 
+                 FROM chapters 
+                 WHERE novel_id = ? AND status = "completed"',
+                [$this->novelId]
+            );
+            
+            return (int)($result['next_chapter'] ?? 1);
+        } catch (\Throwable $e) {
+            return 1;
         }
     }
     

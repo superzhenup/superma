@@ -8,7 +8,8 @@ defined('APP_LOADED') or die('Direct access denied.');
 
 /**
  * 章节完成后调用 AI 生成结构化摘要
- * 分段策略：首1500字 + 中间1000字 + 末1000字，避免截断丢失关键情节
+ * v1.7: 动态分段策略——不再硬编码 1500/1000/1000 的三段截取，
+ * 而是根据章节内容结构（对话密度、动作段落、情节转折点）智能选择保留段落。
  *
  * @return array{
  *   narrative_summary: string,
@@ -24,10 +25,63 @@ function generateChapterSummary(array $novel, array $chapter, string $content): 
     $len = safe_strlen($content);
 
     if ($len > 3500) {
-        $head      = safe_substr($content, 0, 1500);
-        $mid       = safe_substr($content, (int)($len / 2) - 500, 1000);
-        $tail      = safe_substr($content, $len - 1000);
-        $truncated = $head . "\n……（中间段节选）……\n" . $mid . "\n……（后段节选）……\n" . $tail;
+        // v1.7: 动态分段取代固定三段截取
+        // 按段落拆分，计算每段的"信息密度分数"（对话+动作+情绪关键词命中次数）
+        $paragraphs = preg_split('/\n\s*\n/', $content);
+        $paragraphs = array_values(array_filter($paragraphs, fn($p) => mb_strlen(trim($p)) > 10));
+
+        if (count($paragraphs) >= 5) {
+            $scored = [];
+            // 信息密度关键词：对话标记 + 动作词 + 情绪关键词
+            $densityKeywords = [
+                '[「」""\'\'""]', '打', '杀', '战', '破', '怒', '惊', '突破',
+                '反转', '爆发', '终于', '逆转', '对抗', '决定', '发现',
+                '死', '偷袭', '突破', '晋级', '获得', '失去',
+            ];
+
+            foreach ($paragraphs as $idx => $p) {
+                $score = 0;
+                // 对话密度加权
+                $dialogueChars = mb_substr_count($p, '「') + mb_substr_count($p, '」')
+                               + mb_substr_count($p, '"') + mb_substr_count($p, '"')
+                               + mb_substr_count($p, '"') + mb_substr_count($p, '"');
+                $score += $dialogueChars * 2;
+                // 关键词命中
+                foreach ($densityKeywords as $kw) {
+                    if (mb_strpos($p, $kw) !== false) $score++;
+                }
+                // 位置加权：首 20% 和末 20% 段落加权 1.5x（开篇和收尾最重要）
+                $totalParas = count($paragraphs);
+                if ($idx < $totalParas * 0.2 || $idx > $totalParas * 0.8) {
+                    $score = (int)($score * 1.5);
+                }
+                $scored[] = ['idx' => $idx, 'score' => $score, 'text' => $p];
+            }
+
+            // 按分数降序排列，取前 60% 的段落（高密度优先）
+            usort($scored, fn($a, $b) => $b['score'] - $a['score']);
+            $keepCount = max(3, (int)(count($paragraphs) * 0.6));
+            $selected = array_slice($scored, 0, $keepCount);
+
+            // 恢复原始顺序
+            usort($selected, fn($a, $b) => $a['idx'] - $b['idx']);
+
+            $truncated = '';
+            $prevIdx = -1;
+            foreach ($selected as $sel) {
+                if ($prevIdx >= 0 && $sel['idx'] > $prevIdx + 1) {
+                    $truncated .= "\n……（省略 " . ($sel['idx'] - $prevIdx - 1) . " 段）……\n";
+                }
+                $truncated .= $sel['text'] . "\n";
+                $prevIdx = $sel['idx'];
+            }
+        } else {
+            // 段落太少，直接用旧策略
+            $head      = safe_substr($content, 0, 1500);
+            $mid       = safe_substr($content, (int)($len / 2) - 500, 1000);
+            $tail      = safe_substr($content, $len - 1000);
+            $truncated = $head . "\n……（中间段节选）……\n" . $mid . "\n……（后段节选）……\n" . $tail;
+        }
     } else {
         $truncated = $content;
     }
@@ -170,10 +224,11 @@ EOT
 }
 
 /**
- * AI 辅助人物状态冲突检测
- * 对比最新章节摘要与当前人物状态卡片，找出矛盾
+ * AI 辅助人物状态冲突检测（v1.7: 多模型交叉验证）
+ * 对比最新章节摘要与当前人物状态卡片，找出矛盾。
+ * 主模型检测后，备用模型做二次验证，减少误报。
  *
- * @return array{character: string, issue: string, severity: string}[]
+ * @return array{character: string, issue: string, severity: string, backup_confirmed: bool}[]
  */
 function detectCharacterConflictsWithAI(int $novelId, array $novel): array {
     // 从 character_cards 读取当前人物状态（替代老的 novels.character_states JSON）
@@ -190,21 +245,20 @@ function detectCharacterConflictsWithAI(int $novelId, array $novel): array {
     );
     if (!$latestChapter || empty($latestChapter['chapter_summary'])) return [];
 
-    try {
-        $ai = getAIClient($novel['model_id'] ?: null);
+    // 把 character_cards 压成 AI 友好的简短 JSON
+    $statesForAi = [];
+    foreach ($cards as $c) {
+        $statesForAi[$c['name']] = [
+            'alive'  => $c['alive'] ? 1 : 0,
+            'title'  => $c['title']  ?? '',
+            'status' => $c['status'] ?? '',
+        ];
+    }
+    $characterStatesJson = json_encode($statesForAi, JSON_UNESCAPED_UNICODE);
 
-        // 把 character_cards 压成 AI 友好的简短 JSON
-        $statesForAi = [];
-        foreach ($cards as $c) {
-            $statesForAi[$c['name']] = [
-                'alive'  => $c['alive'] ? 1 : 0,
-                'title'  => $c['title']  ?? '',
-                'status' => $c['status'] ?? '',
-            ];
-        }
-        $characterStatesJson = json_encode($statesForAi, JSON_UNESCAPED_UNICODE);
+    $systemPrompt = '你是一个小说一致性检测专家，擅长发现人物设定冲突';
 
-        $prompt = <<<EOT
+    $userPrompt = <<<EOT
 小说当前人物状态如下：
 {$characterStatesJson}
 
@@ -222,22 +276,97 @@ function detectCharacterConflictsWithAI(int $novelId, array $novel): array {
 如果无矛盾，输出空数组 []。不要输出任何其他文字。
 EOT;
 
-        $result = $ai->chat([
-            ['role' => 'system', 'content' => '你是一个小说一致性检测专家，擅长发现人物设定冲突'],
-            ['role' => 'user',   'content' => $prompt],
-        ], 'structured');
+    $messages = [
+        ['role' => 'system', 'content' => $systemPrompt],
+        ['role' => 'user',   'content' => $userPrompt],
+    ];
 
-        if (preg_match('/```(?:json)?\s*([\s\S]*?)```/i', $result, $m)) {
-            $result = $m[1];
+    // 封装结果解析逻辑
+    $parseResult = function(string $raw): array {
+        if (preg_match('/```(?:json)?\s*([\s\S]*?)```/i', $raw, $m)) {
+            $raw = $m[1];
         }
-        $result = trim($result);
-        $start  = strpos($result, '[');
+        $raw = trim($raw);
+        $start = strpos($raw, '[');
         if ($start !== false) {
-            $result = substr($result, $start);
+            $raw = substr($raw, $start);
+        }
+        $conflicts = json_decode($raw, true);
+        return is_array($conflicts) ? $conflicts : [];
+    };
+
+    try {
+        // --- 主模型检测 ---
+        $ai = getAIClient($novel['model_id'] ?: null);
+        $raw = trim($ai->chat($messages, 'structured'));
+        $primaryConflicts = $parseResult($raw);
+
+        // 主模型未检测到冲突，直接返回
+        if (empty($primaryConflicts)) return [];
+
+        // --- v1.7: 备用模型交叉验证 ---
+        // 主模型检测到冲突时，用备用模型做二次验证
+        // 两模型一致的冲突才标记为高置信度（backup_confirmed=true）
+        try {
+            $allModels = getModelFallbackList($novel['model_id'] ?: null, 'structured');
+            // 找第二个模型（跳过主模型自己）
+            $backupModel = null;
+            foreach ($allModels as $m) {
+                if ((int)$m['id'] !== (int)($novel['model_id'] ?? 0)) {
+                    $backupModel = $m;
+                    break;
+                }
+            }
+
+            if ($backupModel) {
+                $backupAi = new AIClient($backupModel);
+                $backupRaw = trim($backupAi->chat($messages, 'structured'));
+                $backupConflicts = $parseResult($backupRaw);
+
+                // 比较两模型结果：构建「人物名-问题」键做交集
+                $primaryKeys = [];
+                foreach ($primaryConflicts as $c) {
+                    $primaryKeys[] = $c['character'] . '::' . mb_substr($c['issue'] ?? '', 0, 20);
+                }
+                $backupKeys = [];
+                foreach ($backupConflicts as $c) {
+                    $backupKeys[] = $c['character'] . '::' . mb_substr($c['issue'] ?? '', 0, 20);
+                }
+                $confirmedKeys = array_intersect($primaryKeys, $backupKeys);
+
+                // 标记交叉验证结果
+                $verified = [];
+                foreach ($primaryConflicts as $c) {
+                    $key = $c['character'] . '::' . mb_substr($c['issue'] ?? '', 0, 20);
+                    $c['backup_confirmed'] = in_array($key, $confirmedKeys);
+                    // 仅备用模型也确认的保留 high；单模型标记降级为 low
+                    if (!$c['backup_confirmed'] && $c['severity'] === 'high') {
+                        $c['severity'] = 'medium';
+                    }
+                    $verified[] = $c;
+                }
+
+                // 记录交叉验证结果，便于诊断
+                $confByBoth = count($confirmedKeys);
+                $onlyPrimary = count($primaryConflicts) - $confByBoth;
+                if ($onlyPrimary > 0 || count($backupConflicts) - $confByBoth > 0) {
+                    $backupLabel = $backupModel['name'] ?? '备用模型';
+                    error_log("人物冲突检测交叉验证：双模型共识{$confByBoth}条，仅主模型{$onlyPrimary}条，备用模型{$backupLabel}");
+                }
+
+                return $verified;
+            }
+        } catch (Throwable $e) {
+            // 备用模型不可用时，主模型结果降级处理
+            error_log('人物冲突备用模型验证失败：' . $e->getMessage());
         }
 
-        $conflicts = json_decode($result, true);
-        return is_array($conflicts) ? $conflicts : [];
+        // 无备用模型或验证失败 → 返回主模型结果（全部标记未验证）
+        foreach ($primaryConflicts as &$c) {
+            $c['backup_confirmed'] = false;
+        }
+        return $primaryConflicts;
+
     } catch (Throwable $e) {
         return [];
     }

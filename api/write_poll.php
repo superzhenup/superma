@@ -85,6 +85,7 @@ try {
         'status'   => $finalStatus,
         'progress' => $progress['progress'] ?? 0,
         'content'  => $progress['content'] ?? '',
+        'thinking_content' => $progress['thinking_content'] ?? '',
         'messages' => $progress['messages'] ?? [],
         'model_used' => $progress['model_used'] ?? null,
         'words'    => $progress['words'] ?? 0,

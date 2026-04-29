@@ -139,3 +139,33 @@ function getWritingDefaults(): array
         'ws_quality_min_score'           => ['default' => 6.0,     'type' => 'float'],
     ];
 }
+
+/**
+ * 约束框架默认配置 — 全局唯一来源
+ * @return array
+ */
+function getConstraintDefaults(): array
+{
+    return [
+        // ── 总开关 ──
+        'cf_enabled'                     => ['default' => '1',     'type' => 'bool'],
+        'cf_strict_mode'                 => ['default' => '0',     'type' => 'bool'],
+        // ── 角色约束 ──
+        'cf_combat_ratio_min'            => ['default' => '40',    'type' => 'int'],
+        'cf_combat_ratio_max'            => ['default' => '60',    'type' => 'int'],
+        'cf_speed_factor'                => ['default' => '10',    'type' => 'int'],
+        'cf_rival_factor'                => ['default' => '0.8',   'type' => 'float'],
+        // ── 情节约束 ──
+        'cf_max_same_conflict'           => ['default' => '1',     'type' => 'int'],
+        'cf_max_coincidences'            => ['default' => '5',     'type' => 'int'],
+        // ── 信息/伏笔约束 ──
+        'cf_foreshadowing_recovery_min'  => ['default' => '70',    'type' => 'int'],
+        'cf_max_new_info_per_ch'         => ['default' => '2',     'type' => 'int'],
+        // ── 节奏约束 ──
+        'cf_min_buffer_release'          => ['default' => '2',     'type' => 'int'],
+        'cf_cooldown_after_climax'       => ['default' => '1',     'type' => 'int'],
+        // ── 语言/风格约束 ──
+        'cf_max_banned_word_usage'       => ['default' => '15',    'type' => 'int'],
+        'cf_banned_words'                => ['default' => '绝境,反杀,真相,背水,逆袭', 'type' => 'string'],
+    ];
+}

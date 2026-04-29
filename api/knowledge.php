@@ -9,7 +9,7 @@ require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/error_handler.php';
 registerApiErrorHandlers();
 require_once __DIR__ . '/../includes/auth.php';
-requireLogin();
+requireLoginApi();
 require_once __DIR__ . '/../includes/db.php';
 require_once __DIR__ . '/../includes/embedding.php';
 

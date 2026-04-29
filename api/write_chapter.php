@@ -68,6 +68,10 @@ set_exception_handler(function (Throwable $e) {
 });
 
 set_error_handler(function ($severity, $message, $file, $line) {
+    // 尊重 @ 错误抑制符：error_reporting() 在 @ 抑制时返回 0
+    if (!(error_reporting() & $severity)) {
+        return false;
+    }
     throw new ErrorException($message, 0, $severity, $file, $line);
 });
 
@@ -239,6 +243,16 @@ function sseMsgWrite(array $payload): void {
     }
 }
 
+function sseThinkingWrite(string $thinkingChunk): void {
+    global $asyncTaskId;
+    // SSE 模式：发送 thinking 事件，前端可以据此展示深度思考过程
+    // 异步模式：思考过程不写入进度文件（write_chapter_worker 有独立实现）
+    echo "event: thinking\n";
+    echo 'data: ' . json_encode(['thinking' => $thinkingChunk], JSON_UNESCAPED_UNICODE) . "\n\n";
+    if (ob_get_level()) ob_flush();
+    flush();
+}
+
 function sseDoneWrite(): void {
     global $asyncTaskId;
     if ($asyncTaskId) {
@@ -269,7 +283,10 @@ $GLOBALS['sendWaiting'] = function(int $elapsedSeconds) {
 
 // ============================================================
 // Phase 1–3: WriteEngine 解析章节 / 记忆初始化 / 组装 Prompt
+// 发送状态消息，避免前端在初始化期间看到空白 Modal
 // ============================================================
+sseMsgWrite(['waiting' => true, 'msg' => '正在解析章节状态...']);
+
 try {
     $resolved   = WriteEngine::resolveChapter($novelId, $chapterId);
     $novel      = $resolved['n'];
@@ -278,6 +295,8 @@ try {
     sseMsgWrite(['error' => $e->getMessage()]);
     sseDoneWrite(); exit;
 }
+
+sseMsgWrite(['waiting' => true, 'msg' => '正在加载记忆引擎...']);
 
 try {
     $memResult  = WriteEngine::initMemory($novelId, $ch);
@@ -289,6 +308,8 @@ try {
     $engine    = new MemoryEngine($novelId);
     $memoryCtx = null;
 }
+
+sseMsgWrite(['waiting' => true, 'msg' => '正在组装写作提示词...']);
 
 $messages    = WriteEngine::buildPrompt($novel, $ch, $memoryCtx);
 $targetWords = (int)$novel['chapter_words'];
@@ -305,10 +326,13 @@ try {
         $novelId,
         function(string $token) { sseChunkWrite($token); },
         function(array $payload) { sseMsgWrite($payload); },
-        function() { sendHeartbeatWrite(); }
+        function() { sendHeartbeatWrite(); },
+        function(string $reasoning) { sseThinkingWrite($reasoning); }
     );
-    $fullContent = $result['content'];
-    $usedModel   = $result['model'];
+    $fullContent       = $result['content'];
+    $usedModel         = $result['model'];
+    $streamUsage       = $result['usage'] ?? null;
+    $streamDurationMs  = $result['duration_ms'] ?? null;
 } catch (Exception $e) {
     $msg = $e->getMessage();
     $isCancel = strpos($msg, '取消') !== false;
@@ -333,7 +357,7 @@ try {
 // ---- Phase 5: WriteEngine 保存章节 ----
 try {
     $saveResult = WriteEngine::saveChapter(
-        (int)$ch['id'], $novelId, $fullContent, $targetWords, $usedModel, $ch
+        (int)$ch['id'], $novelId, $fullContent, $targetWords, $usedModel, $ch, $streamUsage, $streamDurationMs
     );
     $words        = $saveResult['words'];
     $ch           = $saveResult['chapter'];
@@ -365,11 +389,18 @@ try {
         $currentCh = DB::fetch('SELECT status FROM chapters WHERE id=?', [$ch['id']]);
         if ($currentCh && $currentCh['status'] === 'writing') {
             $words = countWords($fullContent);
-            DB::update('chapters', [
+            $backupUpdates = [
                 'content' => $fullContent,
                 'words'   => $words,
                 'status'  => 'completed',
-            ], 'id=?', [$ch['id']]);
+            ];
+            if ($streamUsage !== null && isset($streamUsage['total_tokens'])) {
+                $backupUpdates['tokens_used'] = (int)$streamUsage['total_tokens'];
+            }
+            if ($streamDurationMs !== null) {
+                $backupUpdates['duration_ms'] = $streamDurationMs;
+            }
+            DB::update('chapters', $backupUpdates, 'id=?', [$ch['id']]);
             updateNovelStats($novelId);
             addLog($novelId, 'write', "落盘异常后保底保存：第{$ch['chapter_number']}章，{$words}字");
         }

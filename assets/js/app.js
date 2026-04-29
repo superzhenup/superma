@@ -713,6 +713,7 @@ async function editStoryOutline() {
         if (res.success && res.data) {
             document.getElementById('edit-story-arc').value = res.data.story_arc || '';
             document.getElementById('edit-character-arcs').value = res.data.character_arcs || '';
+            document.getElementById('edit-character-endpoints').value = res.data.character_endpoints || '';
             document.getElementById('edit-world-evolution').value = res.data.world_evolution || '';
         }
     } catch (e) {
@@ -726,6 +727,7 @@ async function saveStoryOutline() {
     const novelId = parseInt(document.getElementById('edit-novel-id').value);
     const storyArc = document.getElementById('edit-story-arc').value.trim();
     const characterArcs = document.getElementById('edit-character-arcs').value.trim();
+    const characterEndpoints = document.getElementById('edit-character-endpoints').value.trim();
     const worldEvolution = document.getElementById('edit-world-evolution').value.trim();
 
     if (!storyArc) {
@@ -742,6 +744,7 @@ async function saveStoryOutline() {
             novel_id: novelId,
             story_arc: storyArc,
             character_arcs: characterArcs,
+            character_endpoints: characterEndpoints,
             world_evolution: worldEvolution
         });
 
@@ -1027,9 +1030,15 @@ async function startAutoWrite() {
     const myGen      = ++autoWriteGen;   // 本次运行的代号
 
     const ui = _aw();
+    _lastThinkingLength = 0; // 重置思考过程长度
     setAutoWriteUI(true);
     ui.wrap.style.display = '';
     ui.stream.textContent = '';
+    // 清空思考过程展示区
+    const streamThinking = document.getElementById('write-stream-thinking');
+    if (streamThinking) streamThinking.textContent = '';
+    const streamThinkingDetails = streamThinking?.closest('details');
+    if (streamThinkingDetails) streamThinkingDetails.open = false;
     if (ui.cursor) ui.stream.appendChild(ui.cursor);
     ui.spinner.style.display = '';
     ui.label.textContent = '正在启动自动写作...';
@@ -1331,10 +1340,16 @@ async function refreshChapterList() {
 // ============================================================
 
 function _openWriteModal(title) {
+    _lastThinkingLength = 0; // 重置思考过程长度
     const modal = new bootstrap.Modal(document.getElementById('writeModal'));
     modal.show();
     const contentEl = document.getElementById('writeModalContent');
     contentEl.textContent = '';
+    // 清空思考过程展示区
+    const thinkingBox = document.getElementById('writeModalThinking');
+    if (thinkingBox) thinkingBox.textContent = '';
+    const thinkingDetails = thinkingBox?.closest('details');
+    if (thinkingDetails) thinkingDetails.open = false;
     // 添加光标
     const cur = document.createElement('span');
     cur.className = 'outline-stream-cursor';
@@ -1495,6 +1510,41 @@ let USE_ASYNC_WRITE = true;
 let EXEC_DISABLED = null;
 
 /**
+ * 将深度思考过程文本追加到思考过程展示区域
+ * 同时支持 Write Modal 和自动写作面板两种场景
+ */
+let _lastThinkingLength = 0;
+function appendThinkingContent(chunk) {
+    // 优先写入 Write Modal 的思考区域
+    const modalBox = document.getElementById('writeModalThinking');
+    const modalWrap = document.getElementById('writeModalThinkingWrap');
+    // 其次写入自动写作面板的思考区域
+    const streamBox = document.getElementById('write-stream-thinking');
+    const streamWrap = document.getElementById('write-stream-thinking-wrap');
+
+    const target = modalBox || streamBox;
+    const wrap = modalWrap || streamWrap;
+    if (!target) return;
+
+    _lastThinkingLength += chunk.length;
+    target.textContent += chunk;
+
+    // 显示思考区域容器
+    if (wrap) wrap.style.display = '';
+
+    // 更新字数徽章
+    const lenBadge = document.getElementById('writeModalThinkingLen')
+                  || document.getElementById('write-stream-thinking-len');
+    if (lenBadge) lenBadge.textContent = _lastThinkingLength + '字';
+
+    // 自动展开思考面板（首次收到内容时）
+    if (target.closest('details') && !target.closest('details').open) {
+        target.closest('details').open = true;
+    }
+    target.scrollTop = target.scrollHeight;
+}
+
+/**
  * 流式写章节 — 自动选择 SSE 直连或异步轮询模式
  * 优先使用 SSE（实时性更好），如果检测到连接被截断则自动切换到异步模式
  */
@@ -1627,13 +1677,20 @@ async function streamWriteChapterAsync(novelId, chapterId, onComplete, displayEl
             continue;
         }
         
-        const { status, content, messages, words, model_used, error, chapter_id } = pollRes;
+        const { status, content, thinking_content, messages, words, model_used, error, chapter_id } = pollRes;
         
         // 调试：定期打印轮询状态
         const nowTs = Date.now();
         if (nowTs - lastDebugLog > 3000 && nowTs - startTime < DEBUG_LOG_WINDOW) {
             console.log(`[write_chapter_async poll] status=${status} | content_len=${(content||'').length} | msgs_len=${(messages||[]).length} | elapsed=${Math.round((nowTs - startTime)/1000)}s`);
             lastDebugLog = nowTs;
+        }
+        
+        // 更新深度思考内容（增量）
+        if (thinking_content && thinking_content.length > _lastThinkingLength) {
+            const newThinking = thinking_content.substring(_lastThinkingLength);
+            _lastThinkingLength = thinking_content.length;
+            appendThinkingContent(newThinking);
         }
         
         // 更新实时内容
@@ -1746,6 +1803,7 @@ async function streamWriteChapterAsync(novelId, chapterId, onComplete, displayEl
  * @param cursorEl    光标元素（可选，跟随文字末尾）
  */
 async function streamWriteChapterSSE(novelId, chapterId, onComplete, displayEl, cursorEl) {
+    let currentSseEvent = ''; // 跟踪当前 SSE 事件类型
     const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
     const response = await fetch('api/write_chapter.php', {
         method:  'POST',
@@ -1824,6 +1882,12 @@ async function streamWriteChapterSSE(novelId, chapterId, onComplete, displayEl, 
             // 处理心跳事件
             if (line.startsWith('event: heartbeat')) {
                 lastActiveTime = Date.now();
+                currentSseEvent = '';
+                continue;
+            }
+            // 处理思考事件标记（下一个 data: 行属于 thinking 事件）
+            if (line.startsWith('event: thinking')) {
+                currentSseEvent = 'thinking';
                 continue;
             }
             
@@ -1835,6 +1899,15 @@ async function streamWriteChapterSSE(novelId, chapterId, onComplete, displayEl, 
                 const d = JSON.parse(payload);
                 gotData = true;
                 lastActiveTime = Date.now(); // 收到任何数据都更新活跃时间
+
+                // 处理深度思考过程事件
+                if (currentSseEvent === 'thinking' && d.thinking) {
+                    lastActiveTime = Date.now();
+                    appendThinkingContent(d.thinking);
+                    currentSseEvent = '';
+                    continue;
+                }
+                currentSseEvent = '';
 
                 if (d.chunk) {
                     fullText += d.chunk;

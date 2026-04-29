@@ -7,6 +7,10 @@
  *       + v17 Agent决策机制（智能写作策略、质量监控、系统优化）
  */
 
+// install.php 是安装向导，不依赖 config.php（它是被安装程序创建的）
+// 但后续 include 的 schema.php 等文件需要此常量，在此手动定义
+define('APP_LOADED', true);
+
 define('LOCK_FILE', __DIR__ . '/install.lock');
 
 // 安全加固：已安装后访问此页面直接返回 404。
@@ -75,6 +79,7 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `can_embed`             TINYINT(1)    NOT NULL DEFAULT 0 COMMENT '此API端点是否可调embedding',
                     `embedding_model_name`  VARCHAR(100)  NOT NULL DEFAULT '' COMMENT 'embedding模型名',
                     `embedding_dim`         INT UNSIGNED  NOT NULL DEFAULT 0 COMMENT 'embedding向量维度',
+                    `capabilities`          JSON          DEFAULT NULL COMMENT '模型能力标签(JSON数组:creative/structured/synopsis等)',
                     `created_at`            DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
 
@@ -158,6 +163,7 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `act_division`          JSON COMMENT '三幕划分',
                     `major_turning_points`  JSON COMMENT '重大转折点',
                     `character_arcs`        JSON COMMENT '人物成长轨迹',
+                    `character_endpoints`   TEXT COMMENT '人物弧线终点',
                     `world_evolution`       TEXT COMMENT '世界观演变',
                     `recurring_motifs`      JSON COMMENT '全书重复意象',
                     `created_at`            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -530,14 +536,20 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 "ALTER TABLE `volume_outlines` ADD COLUMN `volume_goals` JSON COMMENT '本卷写作目标' AFTER `foreshadowing`",
                 "ALTER TABLE `volume_outlines` ADD COLUMN `must_resolve_foreshadowing` JSON COMMENT '本卷必须回收的伏笔描述列表' AFTER `volume_goals`",
 
+                // P1#7: ai_models capabilities 字段（模型能力标签，老库升级兜底）
+                // 用于智能模型选择，按任务类型(creative/structured/synopsis)排序模型
+                "ALTER TABLE `ai_models` ADD COLUMN `capabilities` JSON DEFAULT NULL COMMENT '模型能力标签' AFTER `embedding_dim`",
+
                 // ==================== Agent决策机制表 ====================
                 
                 // Agent决策日志表
                 "CREATE TABLE IF NOT EXISTS `agent_decision_logs` (
                     `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id` INT NOT NULL COMMENT '小说ID',
                     `agent_type` VARCHAR(50) NOT NULL COMMENT 'Agent类型: writing_strategy, quality_monitor, optimization',
                     `decision_data` TEXT COMMENT '决策数据JSON',
                     `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    INDEX `idx_novel_id` (`novel_id`),
                     INDEX `idx_agent_type` (`agent_type`),
                     INDEX `idx_created_at` (`created_at`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent决策日志表'",
@@ -557,20 +569,7 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     INDEX `idx_status` (`status`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent动作日志表'",
                 
-                // Agent性能统计表
-                "CREATE TABLE IF NOT EXISTS `agent_performance_stats` (
-                    `id` INT AUTO_INCREMENT PRIMARY KEY,
-                    `agent_type` VARCHAR(50) NOT NULL COMMENT 'Agent类型',
-                    `stat_date` DATE NOT NULL COMMENT '统计日期',
-                    `decision_count` INT DEFAULT 0 COMMENT '决策次数',
-                    `action_count` INT DEFAULT 0 COMMENT '动作次数',
-                    `success_count` INT DEFAULT 0 COMMENT '成功次数',
-                    `failed_count` INT DEFAULT 0 COMMENT '失败次数',
-                    `avg_decision_time_ms` FLOAT DEFAULT 0 COMMENT '平均决策时间(毫秒)',
-                    `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-                    UNIQUE KEY `uk_agent_date` (`agent_type`, `stat_date`),
-                    INDEX `idx_stat_date` (`stat_date`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent性能统计表'",
+
                 
                 // Agent自然语言指令表（AgentDirectives机制）
                 "CREATE TABLE IF NOT EXISTS `agent_directives` (
@@ -589,6 +588,23 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     INDEX `idx_expires` (`expires_at`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent自然语言指令表'",
                 
+                // Agent指令效果反馈表（决策闭环核心）
+                "CREATE TABLE IF NOT EXISTS `agent_directive_outcomes` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id` INT NOT NULL COMMENT '小说ID',
+                    `directive_id` INT NOT NULL COMMENT '关联的指令ID',
+                    `chapter_number` INT NOT NULL COMMENT '被评估的章节号',
+                    `quality_before` DECIMAL(4,1) DEFAULT NULL COMMENT '指令生效前质量均值',
+                    `quality_after` DECIMAL(4,1) DEFAULT NULL COMMENT '本章质量评分',
+                    `quality_change` DECIMAL(4,1) DEFAULT NULL COMMENT '质量变化(正=改善)',
+                    `tokens_used` INT NOT NULL DEFAULT 0 COMMENT '本章token用量',
+                    `duration_ms` INT NOT NULL DEFAULT 0 COMMENT '本章生成耗时(毫秒)',
+                    `evaluated_at` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '评估时间',
+                    INDEX `idx_novel_directive` (`novel_id`, `directive_id`),
+                    INDEX `idx_evaluated_at` (`evaluated_at`),
+                    INDEX `idx_quality_change` (`quality_change`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent指令效果反馈表'",
+                
                 // Agent默认配置
                 "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES 
                     ('agent.enabled', '1'),
@@ -599,6 +615,23 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     ('agent.quality_agent.auto_fix', '1'),
                     ('agent.optimization_agent.enabled', '1'),
                     ('agent.optimization_agent.optimization_interval', '20')",
+
+                // 约束框架默认配置（Phase 1）
+                "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES 
+                    ('cf_enabled', '1'),
+                    ('cf_strict_mode', '0'),
+                    ('cf_word_tolerance_pct', '30'),
+                    ('cf_title_banned_words', '??,震惊,擦,卧槽,草,妈的,跌下神坛,扮猪吃虎,扮猪吃老虎'),
+                    ('cf_max_combat_ratio', '40'),
+                    ('cf_min_combat_ratio', '5'),
+                    ('cf_max_same_conflict', '3'),
+                    ('cf_cooldown_after_climax', '5'),
+                    ('cf_min_buffer_release', '2'),
+                    ('cf_coincidence_limit', '2'),
+                    ('cf_repeated_sentence_count', '3'),
+                    ('cf_direct_emotion_limit', '3'),
+                    ('cf_banned_word_strict', '0'),
+                    ('cf_protagonist_voice_ratio', '60')",
             ];
 
             foreach ($statements as $sql) {
@@ -609,6 +642,18 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     $code = (int)($e->errorInfo[1] ?? 0);
                     if ($code !== 1061 && $code !== 1060 && $code !== 1054) throw $e;
                 }
+            }
+
+            // v1.5.2: Schema 单一真理源兜底建表
+            // 即使上面 $statements 列表漏了某张 Schema 类管理的表（如新增 agent_xxx 表），
+            // Schema::applyAll 会自动补全。新增表只需在 Schema::tables() 一处添加。
+            try {
+                require_once __DIR__ . '/includes/schema.php';
+                if (class_exists('Schema')) {
+                    Schema::applyAll($pdo);
+                }
+            } catch (\Throwable $e) {
+                error_log('Install: Schema::applyAll 兜底失败 — ' . $e->getMessage());
             }
 
             // 生成密码散列
@@ -705,16 +750,25 @@ function getWritingSettings(array \$keys): array {
 }
 PHP;
 
-            file_put_contents(__DIR__ . '/config.php', $configContent);
-            file_put_contents(LOCK_FILE,
-                "Installed at: " . date('Y-m-d H:i:s') . "\n" .
-                "DB Host: $host\n" .
-                "DB Name: $dbname\n" .
-                "Admin: $adminUser\n" .
-                "Version: v1.2 (Thinking + KnowledgeBase + CoverImage + Agent)\n"
-            );
+            // 写入前检查目录权限
+            if (!is_writable(__DIR__)) {
+                $who = function_exists('posix_getpwuid') ? posix_getpwuid(posix_geteuid())['name'] : 'web';
+                $error = "项目目录不可写（" . __DIR__ . "），Web 进程用户（{$who}）没有写入权限。"
+                       . "请在服务器执行：<code>chmod -R 755 " . htmlspecialchars(__DIR__) . "</code> "
+                       . "或 <code>chown -R www:www " . htmlspecialchars(__DIR__) . "</code>"
+                       . "（将 www:www 替换为你的 Web 用户）";
+            } else {
+                file_put_contents(__DIR__ . '/config.php', $configContent);
+                file_put_contents(LOCK_FILE,
+                    "Installed at: " . date('Y-m-d H:i:s') . "\n" .
+                    "DB Host: $host\n" .
+                    "DB Name: $dbname\n" .
+                    "Admin: $adminUser\n" .
+                    "Version: v1.2 (Thinking + KnowledgeBase + CoverImage + Agent)\n"
+                );
 
-            $success = "安装成功！管理员账号：<strong>" . htmlspecialchars($adminUser) . "</strong>，数据库已就绪。";
+                $success = "安装成功！管理员账号：<strong>" . htmlspecialchars($adminUser) . "</strong>，数据库已就绪。";
+            }
 
         } catch (PDOException $e) {
             $error = '数据库连接失败：' . htmlspecialchars($e->getMessage());
@@ -807,8 +861,9 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
         <li><strong style="color:#10b981">ai_models 扩展：thinking_enabled / can_embed / embedding_model_name / embedding_dim</strong></li>
         <li><strong style="color:#10b981">agent_decision_logs — Agent决策日志表</strong></li>
         <li><strong style="color:#10b981">agent_action_logs — Agent动作日志表</strong></li>
-        <li><strong style="color:#10b981">agent_performance_stats — Agent性能统计表</strong></li>
+
         <li><strong style="color:#10b981">agent_directives — Agent自然语言指令表（指令注入机制）</strong></li>
+        <li><strong style="color:#10b981">agent_directive_outcomes — Agent指令效果反馈表（决策闭环）</strong></li>
       </ul>
     </div>
     <a href="login.php" class="btn btn-primary btn-install w-100">
@@ -1229,8 +1284,9 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           <li>ai_models 扩展：thinking_enabled / can_embed / embedding_model_name / embedding_dim</li>
           <li><strong>agent_decision_logs — Agent决策日志表</strong></li>
           <li><strong>agent_action_logs — Agent动作日志表</strong></li>
-          <li><strong>agent_performance_stats — Agent性能统计表</strong></li>
+
           <li><strong>agent_directives — Agent自然语言指令表（指令注入机制）</strong></li>
+          <li><strong>agent_directive_outcomes — Agent指令效果反馈表（决策闭环）</strong></li>
         </ul>
       </div>
 

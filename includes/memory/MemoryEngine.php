@@ -245,6 +245,164 @@ final class MemoryEngine
      *   - semantic_hits       [['content'=>..,'type'=>..,'score'=>..], ...] 语义召回的长尾 atoms
      *   - debug               ['budget_used'=>..,'budget_total'=>..,'dropped'=>[...]]
      */
+    /**
+     * v1.4 批量预取入口：一次性拉取 getPromptContext 需要的所有关系型数据，
+     * 将 ~12 个散布在各私有方法的 SQL 调用收敛到 ~7 个查询，
+     * 减少连接开销和重复往返，同时让数据流显式可见。
+     *
+     * @return array 结构化预取数据，key 语义与 ctx 字段一一对应
+     */
+    private function buildBatch(int $currentChapter, int $keyEventLimit): array
+    {
+        // ── Q1: novels 全局设定 ──────────────────────────────────────
+        $novel = DB::fetch(
+            'SELECT protagonist_name, protagonist_info, world_settings, plot_settings, writing_style, genre,
+                    extra_settings, style_vector, ref_author
+             FROM novels WHERE id=?',
+            [$this->novelId]
+        );
+
+        // ── Q2: novel_state 故事势能 ─────────────────────────────────
+        $novelState = DB::fetch(
+            'SELECT * FROM novel_state WHERE novel_id=?',
+            [$this->novelId]
+        );
+
+        // ── Q3: arc_summaries 弧段摘要 ──────────────────────────────
+        $arcSummaries = DB::fetchAll(
+            'SELECT arc_index, chapter_from, chapter_to, summary
+             FROM arc_summaries
+             WHERE novel_id=? AND chapter_to < ?
+             ORDER BY chapter_to DESC LIMIT 2',
+            [$this->novelId, $currentChapter]
+        );
+
+        // ── Q4: chapters 三合一（近章大纲 + 前章尾文 + 钩子类型）──
+        // 近章大纲（同一表，不同列）
+        $recentChapters = DB::fetchAll(
+            "SELECT chapter_number, title, outline, hook, key_points, opening_type, emotion_score, emotion_density
+             FROM chapters
+             WHERE novel_id=? AND chapter_number < ? AND status = 'completed'
+             ORDER BY chapter_number DESC LIMIT 8",
+            [$this->novelId, $currentChapter]
+        );
+
+        // 前章尾文
+        $previousTail = '';
+        if ($currentChapter > 1) {
+            $prev = DB::fetch(
+                "SELECT content FROM chapters
+                 WHERE novel_id=? AND chapter_number = ? AND status = 'completed' LIMIT 1",
+                [$this->novelId, $currentChapter - 1]
+            );
+            if ($prev && !empty($prev['content'])) {
+                $content = $prev['content'];
+                $len = mb_strlen($content);
+                $tailLength = min(800, max(400, (int)($len * 0.15)));
+                $tailLength = min($tailLength, $len);
+                $previousTail = mb_substr($content, -$tailLength);
+            }
+        }
+
+        // 近章钩子类型
+        $hookTypeRows = [];
+        try {
+            $hookTypeRows = DB::fetchAll(
+                "SELECT chapter_number, hook_type FROM chapters
+                 WHERE novel_id=? AND chapter_number < ?
+                   AND status IN ('completed','outlined') AND hook_type IS NOT NULL AND hook_type != ''
+                 ORDER BY chapter_number DESC LIMIT 10",
+                [$this->novelId, $currentChapter]
+            );
+        } catch (\Throwable $e) {
+            // hook_type 字段可能不存在，兼容旧库
+        }
+
+        // ── Q5: character_cards 人物状态 ────────────────────────────
+        $cards = DB::fetchAll(
+            'SELECT * FROM character_cards WHERE novel_id=? AND alive=1 ORDER BY name ASC',
+            [$this->novelId]
+        );
+
+        // ── Q6: foreshadowing_items 三合一 ──────────────────────────
+        // 一次查询拉取所有未回收伏笔，在 PHP 侧按 deadline 分类，
+        // 消除 listDueSoon + listOverdue + listPending 三次独立查询。
+        $allUnresolvedFs = DB::fetchAll(
+            'SELECT id, description, planted_chapter, deadline_chapter
+             FROM foreshadowing_items
+             WHERE novel_id=? AND resolved_chapter IS NULL
+             ORDER BY planted_chapter ASC',
+            [$this->novelId]
+        );
+
+        // 在 PHP 侧按 deadline 分类（替代 3 次 DB 查询）
+        $fsDueSoon = [];
+        $fsOverdue = [];
+        $fsOther   = [];
+        foreach ($allUnresolvedFs as $f) {
+            $dl = $f['deadline_chapter'];
+            if ($dl !== null) {
+                if ($dl < $currentChapter - 3) {
+                    $fsOverdue[] = $f;   // deadline 已过缓冲期
+                } elseif ($dl <= $currentChapter + 5) {
+                    $fsDueSoon[] = $f;   // deadline 临近
+                } else {
+                    $fsOther[] = $f;
+                }
+            } else {
+                $fsOther[] = $f;
+            }
+        }
+
+        // ── Q7: memory_atoms 双合一（关键事件 + 爽点历史）─────────
+        // 用一次 UNION 查询拉取两种 atom_type，在 PHP 侧拆分
+        $atomRows = DB::fetchAll(
+            "SELECT atom_type, content, source_chapter, metadata FROM memory_atoms
+             WHERE novel_id=? AND atom_type IN ('plot_detail','cool_point')
+               AND source_chapter IS NOT NULL AND source_chapter < ?
+             ORDER BY source_chapter DESC LIMIT ?",
+            [$this->novelId, $currentChapter, max($keyEventLimit, 20) + 20]
+        );
+
+        // 拆分 UNION 结果
+        $keyEventRows = [];
+        $coolPointRows = [];
+        foreach ($atomRows as $r) {
+            if ($r['atom_type'] === 'plot_detail') {
+                $meta = json_decode($r['metadata'] ?? '{}', true) ?: [];
+                if (!empty($meta['is_key_event'])) {
+                    $keyEventRows[] = $r;
+                    if (count($keyEventRows) >= $keyEventLimit) break;
+                }
+            } elseif ($r['atom_type'] === 'cool_point') {
+                $coolPointRows[] = $r;
+            }
+        }
+        // 对 cool_point 单独补足（UNION 可能被 keyEvent 截断）
+        if (count($coolPointRows) < 20) {
+            try {
+                $extraCoolPoints = DB::fetchAll(
+                    "SELECT source_chapter, content, metadata FROM memory_atoms
+                     WHERE novel_id=? AND atom_type='cool_point'
+                       AND source_chapter IS NOT NULL AND source_chapter < ?
+                     ORDER BY source_chapter DESC LIMIT 20",
+                    [$this->novelId, $currentChapter]
+                );
+                $coolPointRows = $extraCoolPoints; // 补足查询更精确
+            } catch (\Throwable $e) {
+                // 静默降级
+            }
+        }
+
+        return compact(
+            'novel', 'novelState', 'arcSummaries',
+            'recentChapters', 'previousTail', 'hookTypeRows',
+            'cards',
+            'allUnresolvedFs', 'fsDueSoon', 'fsOverdue', 'fsOther',
+            'keyEventRows', 'coolPointRows'
+        );
+    }
+
     public function getPromptContext(
         int $currentChapter,
         ?string $queryText = null,     // 用来做语义召回的查询文本(通常是本章大纲+前文尾)
@@ -252,69 +410,91 @@ final class MemoryEngine
         int $keyEventLimit = 20,
         int $semanticTopK = 8
     ): array {
+        // ── v1.4 批量预取：一次性拉取所有关系型数据 ─────────────────
+        $b = $this->buildBatch($currentChapter, $keyEventLimit);
+
         $ctx = [
-            // 四层记忆架构
             'L1_global_settings'    => [],
             'L2_arc_summaries'      => [],
             'L3_recent_chapters'    => [],
-            'L4_previous_tail'      => '',
-            // 核心记忆数据
+            'L4_previous_tail'      => $b['previousTail'],
             'character_states'      => [],
             'key_events'            => [],
             'pending_foreshadowing' => [],
-            'story_momentum'        => '',
-            'arc_summaries'         => [],  // 保留旧字段兼容性
+            'story_momentum'        => $b['novelState']['story_momentum'] ?? '',
+            'current_arc_summary'   => $b['novelState']['current_arc_summary'] ?? '',
+            'arc_summaries'         => [],
             'semantic_hits'         => [],
-            // Phase 2 新增：爽点调度历史 + 钩子类型建议
-            'cool_point_history'    => [],  // 近N章的爽点记录，供调度算法使用
-            'recent_hook_types'     => [],  // 近N章已用钩子类型，防重复
-            'debug'                 => ['budget_used' => 0, 'budget_total' => $tokenBudget, 'dropped' => []],
+            'cool_point_history'    => [],
+            'recent_hook_types'     => [],
+            'debug'                 => [
+                'budget_used'  => 0,
+                'budget_total' => $tokenBudget,
+                'dropped'      => [],
+                'batch_queries'=> 7, // 文档化批量查询数量
+            ],
         ];
 
-        // ============ 四层记忆架构（按优先级从高到低）============
-        
-        // L1 全局设定（P0 - 最高优先级）
-        $ctx['L1_global_settings'] = $this->getGlobalSettings();
-        
-        // L2 弧段摘要（P0 - 全局历史记忆）
-        $ctx['L2_arc_summaries'] = $this->getArcSummaries($currentChapter);
-        $ctx['arc_summaries'] = $ctx['L2_arc_summaries'];  // 兼容旧字段
-        
-        // L3 近章大纲（P1 - 最近8章）
-        $ctx['L3_recent_chapters'] = $this->getRecentChapters($currentChapter, 8);
-        
-        // L4 前章尾文（P0 - 直接衔接上下文）
-        $ctx['L4_previous_tail'] = $this->getPreviousTail($currentChapter);
-
-        // ============ 核心记忆数据 ============
-        
-        // 人物状态 — 最关键,防职务穿越
-        $cards = $this->cards->listAll(true);
-        foreach ($cards as $c) {
-            $ctx['character_states'][$c['name']] = [
-                'title'         => $c['title'],
-                'status'        => $c['status'],
-                'alive'         => $c['alive'],
-                'last_chapter'  => $c['last_updated_chapter'],
+        // ── L1 全局设定 ──────────────────────────────────────────────
+        if ($b['novel']) {
+            $ctx['L1_global_settings'] = [
+                'protagonist_name' => $b['novel']['protagonist_name'] ?? '',
+                'protagonist_info' => $b['novel']['protagonist_info'] ?? '',
+                'world_settings'   => $b['novel']['world_settings']   ?? '',
+                'plot_settings'    => $b['novel']['plot_settings']    ?? '',
+                'writing_style'    => $b['novel']['writing_style']    ?? '',
+                'genre'            => $b['novel']['genre']            ?? '',
+                'extra_settings'   => $b['novel']['extra_settings']   ?? '',
+                'style_vector'     => $b['novel']['style_vector']     ?? '',
+                'ref_author'       => $b['novel']['ref_author']       ?? '',
             ];
         }
 
-        // 故事势能
-        $state = DB::fetch('SELECT * FROM novel_state WHERE novel_id=?', [$this->novelId]);
-        $ctx['story_momentum'] = $state['story_momentum'] ?? '';
+        // ── L2 弧段摘要 ──────────────────────────────────────────────
+        $ctx['L2_arc_summaries'] = array_reverse($b['arcSummaries']);
+        $ctx['arc_summaries'] = $ctx['L2_arc_summaries'];
 
-        // 待回收伏笔 — 优先临近 deadline 的
-        $dueSoon = $this->foreshadowing->listDueSoon($currentChapter, 5);
-        $overdue = $this->foreshadowing->listOverdue($currentChapter, 3);
-        // overdue 排前面,紧急度高
-        $pending = array_merge($overdue, $dueSoon);
-        // 再补充一些远期伏笔(最多 3 条)让 AI 全局视野，限制在回溯窗口内
+        // ── L3 近章大纲 ──────────────────────────────────────────────
+        $recentChapters = array_reverse($b['recentChapters']);
+        foreach ($recentChapters as $ch) {
+            $ctx['L3_recent_chapters'][] = [
+                'chapter_number'  => (int)$ch['chapter_number'],
+                'chapter'         => (int)$ch['chapter_number'],
+                'title'           => $ch['title']       ?? '',
+                'outline'         => $ch['outline']     ?? '',
+                'hook'            => $ch['hook']        ?? '',
+                'key_points'      => json_decode($ch['key_points'] ?? '[]', true),
+                'opening_type'    => $ch['opening_type'] ?? '',
+                'emotion_score'   => $ch['emotion_score'] ?? null,
+                'emotion_density' => $ch['emotion_density'] ?? null,
+            ];
+        }
+
+        // ── 人物状态（使用批量预取数据，跳过 Repo hydrate 但语义一致）──
+        foreach ($b['cards'] as $c) {
+            $attrs = null;
+            if (!empty($c['attributes'])) {
+                $attrs = is_string($c['attributes'])
+                    ? json_decode($c['attributes'], true)
+                    : $c['attributes'];
+            }
+            $ctx['character_states'][$c['name']] = [
+                'title'         => $c['title'],
+                'status'        => $c['status'],
+                'alive'         => (int)$c['alive'] === 1,
+                'last_chapter'  => $c['last_updated_chapter'],
+                'attributes'    => $attrs ?: null,
+            ];
+        }
+
+        // ── 待回收伏笔（使用批量预取分类数据）────────────────────────
+        $pending = array_merge($b['fsOverdue'], $b['fsDueSoon']);
         $lookback = (int)getSystemSetting('ws_foreshadowing_lookback', 10, 'int');
-        $allPending = array_filter($this->foreshadowing->listPending(), function($p) use ($currentChapter, $lookback) {
+        $otherInWindow = array_filter($b['fsOther'], function($p) use ($currentChapter, $lookback) {
             return $p['planted_chapter'] >= $currentChapter - $lookback;
         });
         $seenIds = array_flip(array_column($pending, 'id'));
-        foreach ($allPending as $p) {
+        foreach ($otherInWindow as $p) {
             if (isset($seenIds[$p['id']])) continue;
             $pending[] = $p;
             if (count($pending) >= 8) break;
@@ -328,81 +508,42 @@ final class MemoryEngine
             ];
         }
 
-        // 关键事件(从 plot_detail 型 atom 里取 is_key_event=1)
-        // 注:这里用 metadata JSON 查询,对 MySQL 5.7+ 有效
-        $keyEventRows = DB::fetchAll(
-            "SELECT content, source_chapter FROM memory_atoms
-             WHERE novel_id=? AND atom_type='plot_detail'
-               AND source_chapter IS NOT NULL AND source_chapter < ?
-               AND JSON_EXTRACT(metadata, '$.is_key_event') = 1
-             ORDER BY source_chapter DESC LIMIT ?",
-            [$this->novelId, $currentChapter, $keyEventLimit]
-        );
-        // 反转成正序
-        foreach (array_reverse($keyEventRows) as $e) {
+        // ── 关键事件 ─────────────────────────────────────────────────
+        foreach (array_reverse($b['keyEventRows']) as $e) {
             $ctx['key_events'][] = [
                 'chapter' => (int)$e['source_chapter'],
                 'event'   => $e['content'],
             ];
         }
 
-        // Phase 2 新增：爽点历史记录（从 cool_point 型 atom 取最近20条）
-        // 供 calculateCoolPointSchedule() 调度算法使用
-        try {
-            $coolPointRows = DB::fetchAll(
-                "SELECT source_chapter, content, metadata FROM memory_atoms
-                 WHERE novel_id=? AND atom_type='cool_point'
-                   AND source_chapter IS NOT NULL AND source_chapter < ?
-                 ORDER BY source_chapter DESC LIMIT 20",
-                [$this->novelId, $currentChapter]
-            );
-            foreach ($coolPointRows as $cp) {
-                $meta = json_decode($cp['metadata'] ?? '{}', true) ?: [];
-                $ctx['cool_point_history'][] = [
-                    'chapter' => (int)$cp['source_chapter'],
-                    'type'    => $meta['cool_type']    ?? '',
-                    'name'    => $meta['type_name']     ?? '',
-                ];
-            }
-            // 反转为正序
-            $ctx['cool_point_history'] = array_reverse($ctx['cool_point_history']);
-        } catch (\Throwable $e) {
-            $ctx['debug']['coolpoint_error'] = $e->getMessage();
+        // ── 爽点历史 ─────────────────────────────────────────────────
+        foreach ($b['coolPointRows'] as $cp) {
+            $meta = json_decode($cp['metadata'] ?? '{}', true) ?: [];
+            $ctx['cool_point_history'][] = [
+                'chapter' => (int)$cp['source_chapter'],
+                'type'    => $meta['cool_type'] ?? '',
+                'name'    => $meta['type_name']  ?? '',
+            ];
         }
+        $ctx['cool_point_history'] = array_reverse($ctx['cool_point_history']);
 
-        // Phase 2 新增：近章已用钩子类型（从 chapters 表取 hook_type 字段）
-        // 用于 prompt 层 suggestHookType 的防重复逻辑
-        try {
-            $hookTypeRows = DB::fetchAll(
-                "SELECT chapter_number, hook_type FROM chapters
-                 WHERE novel_id=? AND chapter_number < ?
-                   AND status IN ('completed','outlined') AND hook_type IS NOT NULL AND hook_type != ''
-                 ORDER BY chapter_number DESC LIMIT 10",
-                [$this->novelId, $currentChapter]
-            );
-            $ctx['recent_hook_types'] = array_map(fn($r) => [
-                'chapter'   => (int)$r['chapter_number'],
-                'hook_type' => $r['hook_type'],
-            ], array_reverse($hookTypeRows));
-        } catch (\Throwable $e) {
-            // hook_type 字段可能还不存在（旧版本兼容），静默忽略
-            $ctx['debug']['hooktype_error'] = $e->getMessage();
-        }
+        // ── 近章钩子类型 ─────────────────────────────────────────────
+        $ctx['recent_hook_types'] = array_map(fn($r) => [
+            'chapter'   => (int)$r['chapter_number'],
+            'hook_type' => $r['hook_type'],
+        ], array_reverse($b['hookTypeRows']));
 
-        // 语义召回 — 长尾 atoms + KnowledgeBase (角色/世界观/情节/风格)
-        // includeKB=true 打开对 novel_embeddings 的召回,让 KB 手动维护的知识
-        // 也进入 prompt 的 semantic_hits 里,无需前端单独调 kb->getWritingContext
+        // ── 语义召回 ─────────────────────────────────────────────────
         if ($queryText && EmbeddingProvider::getConfig()) {
             try {
-                $hits = $this->semanticSearch($queryText, $semanticTopK, $currentChapter, true);
+                $hits = $this->semanticSearch($queryText, $semanticTopK, $currentChapter, true, true);
                 $ctx['semantic_hits'] = $hits;
             } catch (\Throwable $e) {
-                // 语义召回失败静默降级,不影响主流程
                 $ctx['debug']['semantic_error'] = $e->getMessage();
             }
         }
 
-        // ============ token budget 裁剪 ============
+        // ── token budget 裁剪 ────────────────────────────────────────
         $this->applyBudget($ctx, $tokenBudget);
 
         return $ctx;
@@ -530,7 +671,7 @@ final class MemoryEngine
      * 三路召回 + 合并:
      *   A. 精确路(character_cards 已在 getPromptContext 里,这里不重复)
      *   B. 关键词路(FULLTEXT / LIKE) - 只扫 memory_atoms
-     *   C. 语义路(embedding 余弦) - memory_atoms + 可选 novel_embeddings (KB)
+     *   C. 语义路(embedding 余弦) - memory_atoms + 可选 novel_embeddings (KB) + 可选 foreshadowing_items
      * 最后去重合并,按 score 降序。
      *
      * 只从"长尾 atoms"(character_trait/world_setting/style_preference/constraint)中召回,
@@ -541,12 +682,14 @@ final class MemoryEngine
      * @param ?int   $beforeChapter    只召回 chapter < 此值的 atoms(节流避免召回未来的)
      * @param bool   $includeKB        是否把 KnowledgeBase 的 novel_embeddings 一并召回
      *                                 (character/worldbuilding/plot/style 四类)
+     * @param bool   $includeForeshadowing 是否把 foreshadowing_items 一并召回
      */
     public function semanticSearch(
         string $query,
         int $topK = 8,
         ?int $beforeChapter = null,
-        bool $includeKB = false
+        bool $includeKB = false,
+        bool $includeForeshadowing = true
     ): array {
         $excludeTypes = ['plot_detail']; // 避免关键事件被重复召回
         $longTailTypes = array_values(array_diff(AtomRepo::VALID_TYPES, $excludeTypes));
@@ -558,9 +701,10 @@ final class MemoryEngine
             $kwHits = array_merge($kwHits, $this->atoms->search($query, $t, 2, $beforeChapter));
         }
 
-        // 语义路 - 先给 query 做一次 embedding,然后分别召 atoms 和 KB
+        // 语义路 - 先给 query 做一次 embedding,然后分别召 atoms、KB 和 foreshadowing
         $embHits = [];
         $kbHits  = [];
+        $fsHits  = [];
         $qEmb = EmbeddingProvider::embed($query);
         if ($qEmb && !empty($qEmb['vec'])) {
             // atoms 向量
@@ -568,7 +712,7 @@ final class MemoryEngine
             foreach ($longTailTypes as $t) {
                 $atomCandidates = array_merge(
                     $atomCandidates,
-                    $this->atoms->listWithEmbedding($t, $beforeChapter, 200)
+                    $this->atoms->listWithEmbedding($t, $beforeChapter, 100)
                 );
             }
             if (!empty($atomCandidates)) {
@@ -587,22 +731,52 @@ final class MemoryEngine
                     $kbHits = Vector::topK($qEmb['vec'], $kbCandidates, $topK, 0.3);
                 }
             }
+
+            // foreshadowing_items 向量
+            if ($includeForeshadowing) {
+                $fsCandidates = DB::fetchAll(
+                    "SELECT id, description AS content, embedding AS `blob`, planted_chapter
+                     FROM foreshadowing_items
+                     WHERE novel_id=? AND embedding IS NOT NULL AND resolved_chapter IS NULL",
+                    [$this->novelId]
+                );
+                if (!empty($fsCandidates)) {
+                    $fsHits = Vector::topK($qEmb['vec'], $fsCandidates, $topK, 0.3);
+                }
+            }
         }
 
         // 合并:先建索引避免去重时看不到 atom 和 KB 重名
         $merged = [];
 
+        // 辅助函数：根据 source 和 type 确定 category
+        $getCategory = function(string $source, string $type): string {
+            if ($source === 'atom') {
+                if ($type === 'character_trait') return 'character_moments';
+                if ($type === 'plot_detail') return 'plot_nodes';
+                return 'misc';
+            } elseif ($source === 'kb') {
+                if ($type === 'character') return 'character_moments';
+                if ($type === 'plot') return 'plot_nodes';
+                return 'misc';
+            } elseif ($source === 'foreshadowing') {
+                return 'foreshadow_origins';
+            }
+            return 'misc';
+        };
+
         // 关键词路(只有 atoms) -> 用 "atom:{id}" 做 key 避免和 KB 的 id 冲突
         foreach ($kwHits as $r) {
             $key = 'atom:' . $r['id'];
             $merged[$key] = [
-                'id'      => (int)$r['id'],
-                'source'  => 'atom',
-                'type'    => $r['atom_type'],
-                'content' => $r['content'],
-                'chapter' => $r['source_chapter'] ? (int)$r['source_chapter'] : null,
-                'score'   => (float)($r['_rel'] ?? 0.5),
-                'via'     => 'keyword',
+                'id'       => (int)$r['id'],
+                'source'   => 'atom',
+                'type'     => $r['atom_type'],
+                'content'  => $r['content'],
+                'chapter'  => $r['source_chapter'] ? (int)$r['source_chapter'] : null,
+                'score'    => (float)($r['_rel'] ?? 0.5),
+                'via'      => 'keyword',
+                'category' => $getCategory('atom', $r['atom_type']),
             ];
         }
 
@@ -614,13 +788,14 @@ final class MemoryEngine
                 $merged[$key]['via']   = 'both';
             } else {
                 $merged[$key] = [
-                    'id'      => (int)$r['id'],
-                    'source'  => 'atom',
-                    'type'    => $r['atom_type'],
-                    'content' => $r['content'],
-                    'chapter' => $r['source_chapter'] ? (int)$r['source_chapter'] : null,
-                    'score'   => (float)$r['_score'],
-                    'via'     => 'embedding',
+                    'id'       => (int)$r['id'],
+                    'source'   => 'atom',
+                    'type'     => $r['atom_type'],
+                    'content'  => $r['content'],
+                    'chapter'  => $r['source_chapter'] ? (int)$r['source_chapter'] : null,
+                    'score'    => (float)$r['_score'],
+                    'via'      => 'embedding',
+                    'category' => $getCategory('atom', $r['atom_type']),
                 ];
             }
         }
@@ -629,13 +804,29 @@ final class MemoryEngine
         foreach ($kbHits as $r) {
             $key = 'kb:' . $r['source_type'] . ':' . $r['id'];
             $merged[$key] = [
-                'id'      => (int)$r['id'],
-                'source'  => 'kb',
-                'type'    => $r['source_type'], // character / worldbuilding / plot / style
-                'content' => $r['content'],
-                'chapter' => null,
-                'score'   => (float)$r['_score'],
-                'via'     => 'embedding',
+                'id'       => (int)$r['id'],
+                'source'   => 'kb',
+                'type'     => $r['source_type'], // character / worldbuilding / plot / style
+                'content'  => $r['content'],
+                'chapter'  => null,
+                'score'    => (float)$r['_score'],
+                'via'      => 'embedding',
+                'category' => $getCategory('kb', $r['source_type']),
+            ];
+        }
+
+        // foreshadowing 的语义路
+        foreach ($fsHits as $r) {
+            $key = 'foreshadowing:' . $r['id'];
+            $merged[$key] = [
+                'id'       => (int)$r['id'],
+                'source'   => 'foreshadowing',
+                'type'     => 'foreshadowing',
+                'content'  => $r['content'],
+                'chapter'  => $r['planted_chapter'] ? (int)$r['planted_chapter'] : null,
+                'score'    => (float)$r['_score'],
+                'via'      => 'embedding',
+                'category' => 'foreshadow_origins',
             ];
         }
 
@@ -795,6 +986,7 @@ final class MemoryEngine
             'major_turning_points'        => [],
             'character_arcs'              => [],
             'volume_progress'             => '',
+            'recurring_motifs'            => [],
         ];
 
         try {
@@ -855,7 +1047,7 @@ final class MemoryEngine
 
             // ── 全书转折点（标注是否已过）────────────────────────────
             $storyOutline = DB::fetch(
-                'SELECT major_turning_points, character_arcs FROM story_outlines WHERE novel_id=?',
+                'SELECT major_turning_points, character_arcs, recurring_motifs FROM story_outlines WHERE novel_id=?',
                 [$this->novelId]
             );
             if ($storyOutline) {
@@ -873,6 +1065,9 @@ final class MemoryEngine
                 // 主角成长轨迹
                 $charArcs = json_decode($storyOutline['character_arcs'] ?? '{}', true) ?: [];
                 $ctx['character_arcs'] = $charArcs;
+
+                // 全书重复意象
+                $ctx['recurring_motifs'] = json_decode($storyOutline['recurring_motifs'] ?? '[]', true) ?: [];
             }
 
             // ── 卷进度 ───────────────────────────────────────────────

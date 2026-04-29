@@ -31,6 +31,7 @@ require_once __DIR__ . '/includes/auth.php';
 requireLogin();
 require_once __DIR__ . '/includes/db.php';
 require_once __DIR__ . '/includes/functions.php';
+require_once __DIR__ . '/includes/helpers.php';
 require_once __DIR__ . '/includes/layout.php';
 
 $id    = (int)($_GET['id'] ?? 0);
@@ -70,8 +71,15 @@ if (!$novel) {
     exit;
 }
 
-$chapters = getNovelChapters($id);
-$models   = DB::fetchAll('SELECT * FROM ai_models ORDER BY is_default DESC, id ASC');
+$allChapters = getNovelChapters($id);
+$models      = DB::fetchAll('SELECT * FROM ai_models ORDER BY is_default DESC, id ASC');
+
+// 章节分页：50章/页
+$totalChapterCount = count($allChapters);
+$perPage           = 50;
+$totalPages        = max(1, (int)ceil($totalChapterCount / $perPage));
+$currentPage       = max(1, min($totalPages, (int)($_GET['page'] ?? 1)));
+$chapters          = array_slice($allChapters, ($currentPage - 1) * $perPage, $perPage);
 
 // 安全查询日志，添加超时保护
 // 注意：writing_logs 表没有 message 字段，需要兼容处理
@@ -108,8 +116,8 @@ try {
 }
 $synopsisMap = array_column($synopsisRows, 'synopsis', 'chapter_number');
 
-$outlined  = count(array_filter($chapters, fn($c) => in_array($c['status'], ['outlined','writing','completed'])));
-$completed = count(array_filter($chapters, fn($c) => $c['status'] === 'completed'));
+$outlined  = count(array_filter($allChapters, fn($c) => in_array($c['status'], ['outlined','writing','completed'])));
+$completed = count(array_filter($allChapters, fn($c) => $c['status'] === 'completed'));
 $progress  = $novel['target_chapters'] > 0 ? round($completed / $novel['target_chapters'] * 100) : 0;
 $created   = isset($_GET['created']);
 $saved     = isset($_GET['saved']);
@@ -157,6 +165,7 @@ pageHeader('小说管理 - ' . $novel['title'], 'home');
   <button type="button" class="btn-close btn-close-white" data-bs-dismiss="alert"></button>
 </div>
 <?php endif; ?>
+
 
 
 <!-- Novel Header Card -->
@@ -266,9 +275,6 @@ pageHeader('小说管理 - ' . $novel['title'], 'home');
         <a href="create.php?edit=<?= $id ?>" class="btn btn-sm btn-outline-secondary">
           <i class="bi bi-pencil me-1"></i>编辑设定
         </a>
-        <button class="btn btn-sm btn-outline-pink" onclick="showCoverModal(<?= $id ?>)" title="管理封面">
-          <i class="bi bi-image me-1"></i>封面
-        </button>
         <button class="btn btn-sm btn-outline-danger" onclick="event.stopPropagation(); deleteNovel(<?= $id ?>)">
           <i class="bi bi-trash me-1"></i>删除
         </button>
@@ -297,6 +303,10 @@ pageHeader('小说管理 - ' . $novel['title'], 'home');
 // 兼容旧库缺少 `story_outlines` 表时自动降级为空，避免详情页整体报错。
 try {
     $storyOutline = DB::fetch('SELECT * FROM story_outlines WHERE novel_id = ?', [$id]);
+    // 如果 character_endpoints 为空，尝试从 character_arcs 中提取终点的 end 值
+    if ($storyOutline && empty($storyOutline['character_endpoints']) && !empty($storyOutline['character_arcs'])) {
+        $storyOutline['character_endpoints'] = extractCharacterEndpoints($storyOutline['character_arcs']);
+    }
 } catch (Throwable $e) {
     error_log('novel.php: 查询故事大纲失败 — ' . $e->getMessage());
     $storyOutline = null;
@@ -306,7 +316,7 @@ try {
   <div class="p-3 border-bottom border-secondary d-flex justify-content-between align-items-center">
     <div class="d-flex align-items-center gap-2">
       <i class="bi bi-map text-primary fs-5"></i>
-      <span class="fw-semibold text-light">全书故事大纲</span>
+      <span class="fw-semibold">全书故事大纲</span>
       <?php if ($storyOutline): ?>
       <span class="badge bg-success ms-2">已生成</span>
       <?php endif; ?>
@@ -323,19 +333,25 @@ try {
   <div class="p-3" id="story-outline-content">
     <?php if ($storyOutline): ?>
     <div class="mb-3">
-      <h6 class="text-muted small mb-2"><i class="bi bi-diagram-3 me-1"></i>故事主线</h6>
-      <div class="text-light" style="white-space: pre-wrap; line-height: 1.8;"><?= h($storyOutline['story_arc']) ?></div>
+      <h6 class="small mb-2" style="color:var(--bs-body-color);opacity:.7"><i class="bi bi-diagram-3 me-1"></i>故事主线</h6>
+      <div style="white-space: pre-wrap; line-height: 1.8;color:var(--bs-body-color)"><?= h($storyOutline['story_arc']) ?></div>
     </div>
     <?php if ($storyOutline['character_arcs']): ?>
     <div class="mb-3">
-      <h6 class="text-muted small mb-2"><i class="bi bi-people me-1"></i>人物成长轨迹</h6>
-      <div class="text-light" style="white-space: pre-wrap; line-height: 1.8;"><?= h($storyOutline['character_arcs']) ?></div>
+      <h6 class="small mb-2" style="color:var(--bs-body-color);opacity:.7"><i class="bi bi-people me-1"></i>人物成长轨迹</h6>
+      <div style="white-space: pre-wrap; line-height: 1.8;color:var(--bs-body-color)"><?= h(formatCharacterArcsForDisplay($storyOutline['character_arcs'])) ?></div>
+    </div>
+    <?php endif; ?>
+    <?php if ($storyOutline['character_endpoints']): ?>
+    <div class="mb-3">
+      <h6 class="small mb-2" style="color:var(--bs-body-color);opacity:.7"><i class="bi bi-flag me-1"></i>人物弧线终点</h6>
+      <div style="white-space: pre-wrap; line-height: 1.8;color:var(--bs-body-color)"><?= h($storyOutline['character_endpoints']) ?></div>
     </div>
     <?php endif; ?>
     <?php if ($storyOutline['world_evolution']): ?>
     <div class="mb-3">
-      <h6 class="text-muted small mb-2"><i class="bi bi-globe me-1"></i>世界观演变</h6>
-      <div class="text-light" style="white-space: pre-wrap; line-height: 1.8;"><?= h($storyOutline['world_evolution']) ?></div>
+      <h6 class="small mb-2" style="color:var(--bs-body-color);opacity:.7"><i class="bi bi-globe me-1"></i>世界观演变</h6>
+      <div style="white-space: pre-wrap; line-height: 1.8;color:var(--bs-body-color)"><?= h($storyOutline['world_evolution']) ?></div>
     </div>
     <?php endif; ?>
     <div class="text-muted small mt-3">
@@ -374,6 +390,11 @@ try {
                     placeholder="描述主要人物的成长轨迹..."></textarea>
         </div>
         <div class="mb-3">
+          <label class="form-label text-light">人物弧线终点</label>
+          <textarea class="form-control bg-secondary border-secondary text-light" id="edit-character-endpoints" rows="4"
+                    placeholder="描述各人物在故事结局时的最终状态..."></textarea>
+        </div>
+        <div class="mb-3">
           <label class="form-label text-light">世界观演变</label>
           <textarea class="form-control bg-secondary border-secondary text-light" id="edit-world-evolution" rows="4"
                     placeholder="描述世界观如何随着故事发展而演变..."></textarea>
@@ -397,7 +418,7 @@ try {
       <div class="d-flex justify-content-between align-items-center mb-2">
         <div class="d-flex align-items-center gap-2">
           <div class="spinner-border spinner-border-sm text-primary" id="write-spinner"></div>
-          <span class="fw-semibold text-light" id="write-progress-label">正在写作...</span>
+          <span class="fw-semibold" id="write-progress-label">正在写作...</span>
         </div>
         <button class="btn btn-sm btn-outline-danger" id="btn-stop-write" onclick="stopAutoWrite()">
           <i class="bi bi-stop-fill me-1"></i>停止
@@ -413,6 +434,14 @@ try {
       </div>
     </div>
     <!-- 实时流式内容 -->
+    <!-- 深度思考过程展示（可折叠） -->
+    <details id="write-stream-thinking-wrap" class="write-thinking-wrap" style="display:none">
+      <summary class="write-thinking-summary">
+        <i class="bi bi-cpu me-1"></i>深度思考过程
+        <span class="badge bg-secondary ms-2" id="write-stream-thinking-len">0字</span>
+      </summary>
+      <div id="write-stream-thinking" class="write-thinking-box"></div>
+    </details>
     <div id="write-stream-box" class="write-stream-box">
       <span class="outline-stream-cursor" id="write-cursor"></span>
     </div>
@@ -424,7 +453,7 @@ try {
   <div class="p-3 border-bottom border-secondary d-flex justify-content-between align-items-center">
     <div class="d-flex align-items-center gap-2">
       <i class="bi bi-robot text-success fs-5"></i>
-      <span class="fw-semibold text-light">挂机写作进行中</span>
+      <span class="fw-semibold">挂机写作进行中</span>
       <span class="badge bg-success" id="daemon-badge">运行中</span>
     </div>
     <button class="btn btn-sm btn-outline-danger" onclick="DaemonWrite.stop()">
@@ -486,7 +515,7 @@ try {
     <div class="p-3 border-bottom border-secondary d-flex align-items-center justify-content-between">
       <div class="d-flex align-items-center gap-2">
         <div class="spinner-border spinner-border-sm text-info" id="outline-spinner"></div>
-        <span class="fw-semibold text-light" id="outline-progress-label">正在生成大纲...</span>
+        <span class="fw-semibold" id="outline-progress-label">正在生成大纲...</span>
       </div>
       <div class="d-flex gap-3 small" id="outline-token-bar" style="display:none">
         <span class="text-muted">输入 <span class="text-info fw-semibold" id="tok-prompt">0</span></span>
@@ -510,7 +539,7 @@ try {
     <div class="p-3 border-bottom border-secondary d-flex align-items-center justify-content-between">
       <div class="d-flex align-items-center gap-2">
         <div class="spinner-border spinner-border-sm text-primary"></div>
-        <span class="fw-semibold text-light" id="story-outline-progress-label">正在生成全书故事大纲...</span>
+        <span class="fw-semibold" id="story-outline-progress-label">正在生成全书故事大纲...</span>
       </div>
     </div>
     <div id="story-outline-stream-box" class="outline-stream-box">
@@ -525,7 +554,7 @@ try {
     <div class="p-3 border-bottom border-secondary d-flex align-items-center justify-content-between">
       <div class="d-flex align-items-center gap-2">
         <div class="spinner-border spinner-border-sm text-success"></div>
-        <span class="fw-semibold text-light" id="optimize-outline-progress-label">正在优化大纲逻辑...</span>
+        <span class="fw-semibold" id="optimize-outline-progress-label">正在优化大纲逻辑...</span>
       </div>
       <span class="text-muted small" id="optimize-outline-stats"></span>
     </div>
@@ -542,7 +571,7 @@ try {
     <div class="p-3 border-bottom border-secondary d-flex align-items-center justify-content-between">
       <div class="d-flex align-items-center gap-2">
         <div class="spinner-border spinner-border-sm text-secondary"></div>
-        <span class="fw-semibold text-light" id="synopsis-progress-label">正在生成章节概要...</span>
+        <span class="fw-semibold" id="synopsis-progress-label">正在生成章节概要...</span>
       </div>
     </div>
     <div id="synopsis-stream-box" class="outline-stream-box">
@@ -555,7 +584,7 @@ try {
 <ul class="nav nav-tabs novel-tabs mb-3" id="novelTabs">
   <li class="nav-item">
     <a class="nav-link active" data-bs-toggle="tab" href="#tab-chapters">
-      <i class="bi bi-list-ul me-1"></i>章节列表 <span class="badge bg-secondary ms-1"><?= count($chapters) ?></span>
+      <i class="bi bi-list-ul me-1"></i>章节列表 <span class="badge bg-secondary ms-1"><?= $totalChapterCount ?></span>
     </a>
   </li>
   <li class="nav-item">
@@ -569,6 +598,11 @@ try {
     </a>
   </li>
   <li class="nav-item">
+    <a class="nav-link" data-bs-toggle="tab" href="#tab-agent">
+      <i class="bi bi-cpu me-1"></i>Agent 决策
+    </a>
+  </li>
+  <li class="nav-item">
     <a class="nav-link" data-bs-toggle="tab" href="#tab-logs">
       <i class="bi bi-clock-history me-1"></i>操作日志
     </a>
@@ -579,7 +613,7 @@ try {
 
   <!-- Chapters Tab -->
   <div class="tab-pane fade show active" id="tab-chapters">
-    <?php if (empty($chapters)): ?>
+    <?php if (empty($allChapters)): ?>
     <div class="empty-state">
       <div class="empty-icon"><i class="bi bi-list-ol"></i></div>
       <h6>暂无章节</h6>
@@ -609,6 +643,9 @@ try {
           <i class="bi bi-upload me-1"></i>导入章节概要
         </button>
         <input type="file" id="import-file-input" accept=".json,.csv,.txt" style="display:none" onchange="importSynopses(this.files[0])">
+        <button type="button" class="btn btn-sm btn-outline-danger" onclick="clearAllChapters()" title="清空所有章节内容">
+          <i class="bi bi-trash"></i>
+        </button>
       </div>
       <!-- 章节列表头 -->
       <div class="chapter-list-header">
@@ -689,6 +726,60 @@ try {
       </div>
       <?php endforeach; ?>
     </div>
+
+    <!-- 章节分页 -->
+    <?php if ($totalPages > 1): ?>
+    <div class="d-flex justify-content-center align-items-center mt-3 gap-2 flex-wrap">
+      <span class="text-muted small me-2">第 <?= $currentPage ?> / <?= $totalPages ?> 页（共 <?= $totalChapterCount ?> 章）</span>
+      <nav aria-label="章节分页">
+        <ul class="pagination pagination-sm mb-0">
+          <?php
+            $pageUrl = fn($p) => 'novel.php?id=' . $id . '&page=' . $p;
+            // 上一页
+            if ($currentPage > 1): ?>
+              <li class="page-item">
+                <a class="page-link" href="<?= $pageUrl($currentPage - 1) ?>"><i class="bi bi-chevron-left"></i></a>
+              </li>
+            <?php else: ?>
+              <li class="page-item disabled"><span class="page-link"><i class="bi bi-chevron-left"></i></span></li>
+            <?php endif;
+
+            // 页码按钮
+            $pageStart = max(1, $currentPage - 2);
+            $pageEnd   = min($totalPages, $currentPage + 2);
+            if ($pageStart > 1): ?>
+              <li class="page-item"><a class="page-link" href="<?= $pageUrl(1) ?>">1</a></li>
+              <?php if ($pageStart > 2): ?>
+                <li class="page-item disabled"><span class="page-link">…</span></li>
+              <?php endif;
+            endif;
+            for ($p = $pageStart; $p <= $pageEnd; $p++):
+              if ($p === $currentPage): ?>
+                <li class="page-item active"><span class="page-link"><?= $p ?></span></li>
+              <?php else: ?>
+                <li class="page-item"><a class="page-link" href="<?= $pageUrl($p) ?>"><?= $p ?></a></li>
+              <?php endif;
+            endfor;
+            if ($pageEnd < $totalPages):
+              if ($pageEnd < $totalPages - 1): ?>
+                <li class="page-item disabled"><span class="page-link">…</span></li>
+              <?php endif; ?>
+              <li class="page-item"><a class="page-link" href="<?= $pageUrl($totalPages) ?>"><?= $totalPages ?></a></li>
+            <?php endif;
+            // 下一页
+            if ($currentPage < $totalPages): ?>
+              <li class="page-item">
+                <a class="page-link" href="<?= $pageUrl($currentPage + 1) ?>"><i class="bi bi-chevron-right"></i></a>
+              </li>
+            <?php else: ?>
+              <li class="page-item disabled"><span class="page-link"><i class="bi bi-chevron-right"></i></span></li>
+            <?php endif; ?>
+        </ul>
+      </nav>
+    </div>
+    <?php endif; ?>
+    <!-- /章节分页 -->
+
     <?php endif; ?>
   </div>
 
@@ -698,7 +789,7 @@ try {
       <!-- 记忆引擎状态和控制 -->
       <div class="d-flex justify-content-between align-items-center mb-4">
         <div>
-          <h5 class="text-light mb-1"><i class="bi bi-memory me-2"></i>Super-Ma 记忆引擎</h5>
+          <h5 class="mb-1"><i class="bi bi-memory me-2"></i>Super-Ma 记忆引擎</h5>
           <p class="text-muted small mb-0">四层渐进式记忆Pyramid架构，增强写作一致性</p>
         </div>
         <div class="d-flex gap-2 align-items-center">
@@ -777,7 +868,7 @@ try {
         <div class="tab-pane fade show active" id="memory-atoms">
           <div class="d-flex justify-content-between align-items-center mb-3">
             <div class="d-flex gap-2">
-              <select class="form-select form-select-sm bg-secondary border-secondary text-light" id="atomTypeFilter" style="width: auto;">
+              <select class="form-select form-select-sm" id="atomTypeFilter" style="width: auto;">
                 <option value="">全部类型</option>
                 <option value="character_trait">角色特征</option>
                 <option value="plot_detail">情节细节</option>
@@ -788,9 +879,9 @@ try {
                 <option value="world_state">世界/场景状态</option>
                 <option value="cool_point">亮点</option>
               </select>
-              <select class="form-select form-select-sm bg-secondary border-secondary text-light" id="atomChapterFilter" style="width: auto;">
+              <select class="form-select form-select-sm" id="atomChapterFilter" style="width: auto;">
                 <option value="">全部章节</option>
-                <?php foreach ($chapters as $ch): ?>
+                <?php foreach ($allChapters as $ch): ?>
                 <option value="<?= $ch['chapter_number'] ?>">第<?= $ch['chapter_number'] ?>章</option>
                 <?php endforeach; ?>
               </select>
@@ -811,7 +902,7 @@ try {
         <div class="tab-pane fade" id="memory-cards">
           <div class="d-flex justify-content-between align-items-center mb-3">
             <div class="d-flex gap-2 align-items-center">
-              <select class="form-select form-select-sm bg-secondary border-secondary text-light" id="cardAliveFilter" style="width: auto;">
+              <select class="form-select form-select-sm" id="cardAliveFilter" style="width: auto;">
                 <option value="">全部角色</option>
                 <option value="1">存活</option>
                 <option value="0">已死亡/离场</option>
@@ -849,7 +940,7 @@ try {
           <div class="mb-3">
             <div class="input-group">
               <span class="input-group-text bg-secondary border-secondary"><i class="bi bi-search text-muted"></i></span>
-              <input type="text" class="form-control bg-secondary border-secondary text-light" 
+              <input type="text" class="form-control"
                      id="memorySearchInput" placeholder="搜索记忆内容...">
               <button class="btn btn-outline-primary" id="btn-search-memory">搜索</button>
             </div>
@@ -926,6 +1017,97 @@ try {
     </div>
   </div>
 
+  <!-- Agent Decision Tab -->
+  <div class="tab-pane fade" id="tab-agent">
+    <div class="page-card p-4">
+      <div class="d-flex justify-content-between align-items-center mb-4">
+        <h5 class="mb-0"><i class="bi bi-cpu me-2"></i>Agent 决策中心</h5>
+        <div class="d-flex gap-2">
+          <span class="badge bg-success" id="agent-status-badge">运行中</span>
+          <button class="btn btn-sm btn-outline-light" onclick="AgentPanel.refresh()" title="刷新">
+            <i class="bi bi-arrow-clockwise"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- Stats Row -->
+      <div class="row g-3 mb-4" id="agent-stats-row">
+        <div class="col-md-3">
+          <div class="p-3 rounded-3 bg-dark-subtle text-center">
+            <div class="fs-4 fw-bold text-primary" id="stat-total-decisions">-</div>
+            <small class="text-muted">总决策次数</small>
+          </div>
+        </div>
+        <div class="col-md-3">
+          <div class="p-3 rounded-3 bg-dark-subtle text-center">
+            <div class="fs-4 fw-bold text-success" id="stat-success-rate">-</div>
+            <small class="text-muted">指令有效率</small>
+          </div>
+        </div>
+        <div class="col-md-3">
+          <div class="p-3 rounded-3 bg-dark-subtle text-center">
+            <div class="fs-4 fw-bold text-info" id="stat-active-directives">-</div>
+            <small class="text-muted">活跃指令数</small>
+          </div>
+        </div>
+        <div class="col-md-3">
+          <div class="p-3 rounded-3 bg-dark-subtle text-center">
+            <div class="fs-4 fw-bold text-warning" id="stat-avg-improvement">-</div>
+            <small class="text-muted">平均质量改善</small>
+          </div>
+        </div>
+      </div>
+
+      <!-- Sub Tabs -->
+      <ul class="nav nav-pills mb-3" id="agentSubTabs">
+        <li class="nav-item">
+          <button class="nav-link active" data-bs-toggle="pill" data-bs-target="#agent-timeline" type="button">
+            <i class="bi bi-clock-history me-1"></i>决策时间线
+          </button>
+        </li>
+        <li class="nav-item">
+          <button class="nav-link" data-bs-toggle="pill" data-bs-target="#agent-directives" type="button">
+            <i class="bi bi-chat-right-text me-1"></i>活跃指令
+          </button>
+        </li>
+        <li class="nav-item">
+          <button class="nav-link" data-bs-toggle="pill" data-bs-target="#agent-outcomes" type="button">
+            <i class="bi bi-graph-up me-1"></i>效果分析
+          </button>
+        </li>
+      </ul>
+
+      <div class="tab-content">
+        <!-- Timeline Panel -->
+        <div class="tab-pane fade show active" id="agent-timeline">
+          <div id="agent-timeline-content">
+            <div class="text-center text-muted py-5">
+              <div class="spinner-border spinner-border-sm me-2"></div>加载中...
+            </div>
+          </div>
+        </div>
+
+        <!-- Active Directives Panel -->
+        <div class="tab-pane fade" id="agent-directives">
+          <div id="agent-directives-content">
+            <div class="text-center text-muted py-5">
+              <div class="spinner-border spinner-border-sm me-2"></div>加载中...
+            </div>
+          </div>
+        </div>
+
+        <!-- Outcomes Analysis Panel -->
+        <div class="tab-pane fade" id="agent-outcomes">
+          <div id="agent-outcomes-content">
+            <div class="text-center text-muted py-5">
+              <div class="spinner-border spinner-border-sm me-2"></div>加载中...
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Logs Tab -->
   <div class="tab-pane fade" id="tab-logs">
     <div class="page-card">
@@ -936,8 +1118,8 @@ try {
         <?php foreach ($logs as $log): ?>
         <div class="list-group-item bg-transparent border-secondary">
           <div class="d-flex justify-content-between">
-            <span class="text-light small"><?= h($log['message']) ?></span>
-            <span class="text-muted small"><?= $log['created_at'] ?></span>
+            <span class="small" style="color:var(--text)"><?= h($log['message']) ?></span>
+            <span class="small" style="color:var(--text-muted)"><?= $log['created_at'] ?></span>
           </div>
         </div>
         <?php endforeach; ?>
@@ -1058,6 +1240,14 @@ try {
         <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
       </div>
       <div class="modal-body">
+        <!-- 深度思考过程展示（可折叠） -->
+        <details id="writeModalThinkingWrap" class="write-thinking-wrap mb-3" style="display:none">
+          <summary class="write-thinking-summary">
+            <i class="bi bi-cpu me-1"></i>深度思考过程
+            <span class="badge bg-secondary ms-2" id="writeModalThinkingLen">0字</span>
+          </summary>
+          <div id="writeModalThinking" class="write-thinking-box"></div>
+        </details>
         <div id="writeModalContent" class="chapter-content-preview"></div>
         <div id="writeModalSpinner" class="text-center py-3">
           <div class="spinner-border text-primary"></div>
@@ -1861,7 +2051,7 @@ const MemoryUI = {
                 <label class="form-label text-light">来源章节（可选）</label>
                 <select class="form-select bg-secondary border-secondary text-light" id="newAtomChapter">
                   <option value="">无</option>
-                  <?php foreach ($chapters as $ch): ?>
+                  <?php foreach ($allChapters as $ch): ?>
                   <option value="<?= $ch['chapter_number'] ?>">第<?= $ch['chapter_number'] ?>章</option>
                   <?php endforeach; ?>
                 </select>
@@ -2105,6 +2295,7 @@ const MemoryUI = {
 // 页面加载完成后初始化记忆引擎
 document.addEventListener('DOMContentLoaded', () => {
   MemoryUI.init();
+  AgentPanel.init();
 
   // ================================================================
   // 章节列表按钮绑定（查看 / 写作 / 详情Modal操作）
@@ -2814,6 +3005,319 @@ function deleteCoverFromModal(novelId) {
         status.innerHTML = '<i class="bi bi-x-circle me-1"></i>' + err.message;
     });
 }
+
+// ================================================================
+// Agent 决策面板
+// ================================================================
+
+const AgentPanel = {
+  _data: null,
+
+  // ── 初始化 ──────────────────────────────────────────────────
+  init() {
+    // 监听 Agent 决策 Tab 切换
+    const agentTab = document.querySelector('a[href="#tab-agent"]');
+    if (agentTab) {
+      agentTab.addEventListener('shown.bs.tab', () => {
+        if (!this._data) this.loadAll();
+      });
+    }
+
+    // 监听子标签页切换（不需要重新加载数据，只做渲染）
+    document.querySelectorAll('#agentSubTabs [data-bs-toggle="pill"]').forEach(tab => {
+      tab.addEventListener('shown.bs.tab', (e) => {
+        if (!this._data) return;
+        const target = e.target.getAttribute('data-bs-target');
+        if (target === '#agent-timeline') this.renderTimeline();
+        if (target === '#agent-directives') this.renderDirectives();
+        if (target === '#agent-outcomes') this.renderOutcomes();
+      });
+    });
+  },
+
+  // ── 加载全部数据 ────────────────────────────────────────────
+  async loadAll() {
+    this.showLoading();
+    try {
+      const res = await fetch('api/agent_status.php?novel_id=' + NOVEL_ID);
+      const data = await res.json();
+      if (!data.ok) {
+        this.showError(data.msg || '加载失败');
+        return;
+      }
+      this._data = data;
+      this.updateStats(data.stats);
+      this.renderTimeline();
+    } catch (e) {
+      this.showError(e.message);
+    }
+  },
+
+  // ── 刷新 ────────────────────────────────────────────────────
+  async refresh() {
+    this._data = null;
+    await this.loadAll();
+  },
+
+  // ── 加载中态 ────────────────────────────────────────────────
+  showLoading() {
+    ['agent-timeline-content','agent-directives-content','agent-outcomes-content'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = '<div class="text-center text-muted py-5"><div class="spinner-border spinner-border-sm me-2"></div>加载中...</div>';
+    });
+    // 重置状态徽章为加载态
+    const badge = document.getElementById('agent-status-badge');
+    if (badge) { badge.className = 'badge bg-light text-dark'; badge.textContent = '加载中...'; }
+  },
+
+  showError(msg) {
+    ['agent-timeline-content'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = '<div class="text-center text-danger py-5"><p>' + this._esc(msg) + '</p></div>';
+    });
+    // 更新状态徽章
+    const badge = document.getElementById('agent-status-badge');
+    if (badge) { badge.className = 'badge bg-danger'; badge.textContent = '连接失败'; }
+  },
+
+  // ── 更新统计卡片 ────────────────────────────────────────────
+  updateStats(s) {
+    document.getElementById('stat-total-decisions').textContent = s.total_decisions ?? '-';
+    document.getElementById('stat-success-rate').textContent = (s.success_rate ?? '-') + '%';
+    document.getElementById('stat-active-directives').textContent = s.active_directives ?? '-';
+    document.getElementById('stat-avg-improvement').textContent = (s.avg_improvement ?? 0) >= 0
+      ? '+' + ((s.avg_improvement ?? 0) * 100).toFixed(1) + '%'
+      : ((s.avg_improvement ?? 0) * 100).toFixed(1) + '%';
+
+    // 更新 Agent 运行状态徽章
+    const badge = document.getElementById('agent-status-badge');
+    if (badge) {
+      if ((s.active_directives ?? 0) > 0) {
+        badge.className = 'badge bg-success';
+        badge.textContent = '运行中';
+      } else {
+        badge.className = 'badge bg-secondary';
+        badge.textContent = '待命中';
+      }
+    }
+  },
+
+  // ── 决策时间线渲染 ──────────────────────────────────────────
+  renderTimeline() {
+    const container = document.getElementById('agent-timeline-content');
+    if (!container) return;
+    const items = this._data?.timeline || [];
+    if (!items.length) {
+      container.innerHTML = '<div class="text-center text-muted py-5"><i class="bi bi-clock-history fs-1 d-block mb-2"></i><p>暂无决策记录</p><small>Agent 将在章节写作过程中自动产生决策</small></div>';
+      return;
+    }
+
+    const typeIcons = {
+      'writing_strategy': 'bi bi-pencil-square',
+      'quality_monitor':  'bi bi-shield-check',
+      'optimization':     'bi bi-lightning-charge'
+    };
+    const typeColors = {
+      'writing_strategy': '#6366f1',
+      'quality_monitor':  '#10b981',
+      'optimization':     '#f59e0b'
+    };
+    const typeLabels = {
+      'writing_strategy': '策略',
+      'quality_monitor':  '质量',
+      'optimization':     '优化'
+    };
+
+    const statusIcons = {
+      'success':  'bi bi-check-circle text-success',
+      'failed':   'bi bi-x-circle text-danger',
+      'skipped':  'bi bi-dash-circle text-muted',
+      'decided':  'bi bi-lightbulb text-warning'
+    };
+
+    const html = items.map((item, i) => {
+      const icon = typeIcons[item.agent_type] || 'bi bi-cpu';
+      const color = typeColors[item.agent_type] || '#6b7280';
+      const label = typeLabels[item.agent_type] || item.agent_type;
+      const statusIcon = statusIcons[item.status] || 'bi bi-dot';
+      const time = (item.created_at || '').replace(' ', String.fromCharCode(160)).slice(5, 16);
+      const detailStr = item.detail
+        ? JSON.stringify(item.detail, null, 1).replace(/[{}"]/g, '').replace(/\n\s*/g, ' ').substring(0, 100)
+        : '';
+      const actionName = item.action || '未知操作';
+
+      return `
+        <div class="d-flex align-items-start py-2 ${i > 0 ? 'border-top border-secondary' : ''}">
+          <div class="me-2 rounded-circle d-flex align-items-center justify-content-center"
+               style="width:28px;height:28px;background:${color}22;flex-shrink:0">
+            <i class="${icon}" style="color:${color};font-size:14px"></i>
+          </div>
+          <div class="flex-grow-1 min-w-0">
+            <div class="d-flex justify-content-between align-items-center">
+              <small class="fw-bold text-light">${this._esc(actionName)}</small>
+              <small class="text-muted ms-2 flex-shrink-0">${time}</small>
+            </div>
+            <div class="d-flex align-items-center gap-1 mt-1">
+              <span class="badge bg-secondary bg-opacity-25 text-muted" style="font-size:10px">${label}</span>
+              <i class="${statusIcon}" style="font-size:12px"></i>
+              ${detailStr ? '<small class="text-muted text-truncate d-inline-block" style="max-width:300px">' + this._esc(detailStr) + '</small>' : ''}
+            </div>
+          </div>
+        </div>`;
+    }).join('');
+
+    container.innerHTML = html;
+  },
+
+  // ── 活跃指令渲染 ────────────────────────────────────────────
+  renderDirectives() {
+    const container = document.getElementById('agent-directives-content');
+    if (!container) return;
+    const items = this._data?.directives || [];
+    if (!items.length) {
+      container.innerHTML = '<div class="text-center text-muted py-5"><i class="bi bi-chat-right-text fs-1 d-block mb-2"></i><p>暂无活跃指令</p><small>Agent 会在写作过程中自动注入优化指令</small></div>';
+      return;
+    }
+
+    const typeColors = {
+      'quality':       'badge bg-success bg-opacity-25 text-success',
+      'strategy':      'badge bg-primary bg-opacity-25 text-primary',
+      'optimization':  'badge bg-warning bg-opacity-25 text-warning'
+    };
+
+    const html = items.map((d, i) => {
+      const typeBadge = typeColors[d.type] || 'badge bg-secondary';
+      const createdAt = (d.created_at || '').replace(' ', ' ').slice(0, 16);
+      const expiresAt = d.expires_at ? (d.expires_at || '').replace(' ', ' ').slice(0, 16) : null;
+
+      return `
+        <div class="card bg-secondary border-0 mb-2">
+          <div class="card-body p-3">
+            <div class="d-flex justify-content-between align-items-start mb-2">
+              <span class="${typeBadge}">${d.type}</span>
+              <small class="text-muted">${createdAt}</small>
+            </div>
+            <div class="text-light small mb-2">${this._esc(d.directive)}</div>
+            <div class="d-flex justify-content-between align-items-center">
+              <small class="text-muted">
+                <i class="bi bi-book me-1"></i>第${d.apply_from}-${d.apply_to}章
+              </small>
+              ${expiresAt ? '<small class="text-muted"><i class="bi bi-clock me-1"></i>过期: ' + expiresAt + '</small>' : '<small class="text-success"><i class="bi bi-infinity me-1"></i>永不过期</small>'}
+              <button class="btn btn-sm btn-outline-danger" onclick="AgentPanel.deactivateDirective(${d.id})" title="停用">
+                <i class="bi bi-x-lg"></i>
+              </button>
+            </div>
+          </div>
+        </div>`;
+    }).join('');
+
+    container.innerHTML = html;
+  },
+
+  // ── 效果分析渲染 ────────────────────────────────────────────
+  renderOutcomes() {
+    const container = document.getElementById('agent-outcomes-content');
+    if (!container) return;
+    const outcomes = this._data?.outcomes;
+    if (!outcomes) {
+      container.innerHTML = '<div class="text-center text-muted py-5">暂无评估数据</div>';
+      return;
+    }
+
+    let html = '';
+
+    // 按类型统计表
+    const byType = outcomes.by_type || [];
+    if (byType.length > 0) {
+      html += '<h6 class="text-muted mb-3"><i class="bi bi-pie-chart me-2"></i>按指令类型统计</h6>';
+      html += '<div class="table-responsive mb-4"><table class="table table-sm table-dark table-borderless"><thead><tr><th class="text-muted">类型</th><th class="text-muted text-end">评估次数</th><th class="text-muted text-end">平均改善</th><th class="text-muted text-end">改善率</th></tr></thead><tbody>';
+      byType.forEach(row => {
+        const total = parseInt(row.outcome_count) || 0;
+        const improved = parseInt(row.improved) || 0;
+        const rate = total > 0 ? Math.round((improved / total) * 100) : 0;
+        const avg = row.avg_change !== null ? parseFloat(row.avg_change).toFixed(1) : '0.0';
+        const avgClass = parseFloat(avg) > 0 ? 'text-success' : parseFloat(avg) < 0 ? 'text-danger' : 'text-muted';
+        html += `<tr>
+          <td><span class="badge bg-secondary bg-opacity-25">${this._esc(row.type)}</span></td>
+          <td class="text-end">${total}</td>
+          <td class="text-end ${avgClass}">${avg >= 0 ? '+' : ''}${avg}</td>
+          <td class="text-end">${rate}%</td>
+        </tr>`;
+      });
+      html += '</tbody></table></div>';
+    }
+
+    // 最有效 TOP5
+    const topEff = outcomes.top_effective || [];
+    if (topEff.length > 0) {
+      html += '<h6 class="text-muted mb-3"><i class="bi bi-graph-up-arrow me-2 text-success"></i>改善最大的指令</h6>';
+      html += '<div class="mb-4">';
+      topEff.forEach((item, i) => {
+        html += `
+          <div class="d-flex justify-content-between align-items-center py-2 ${i > 0 ? 'border-top border-secondary' : ''}">
+            <div class="small min-w-0 me-2">
+              <span class="badge bg-secondary bg-opacity-25">${this._esc(item.type)}</span>
+              <span class="text-light ms-1 text-truncate d-inline-block" style="max-width:350px">${this._esc(item.directive || '')}</span>
+            </div>
+            <span class="small text-success fw-bold flex-shrink-0">+${parseFloat(item.quality_change).toFixed(1)}</span>
+          </div>`;
+      });
+      html += '</div>';
+    }
+
+    // 最有副作用 TOP5
+    const topHarm = outcomes.top_harmful || [];
+    if (topHarm.length > 0) {
+      html += '<h6 class="text-muted mb-3"><i class="bi bi-graph-down-arrow me-2 text-danger"></i>需要关注的指令（质量下降）</h6>';
+      html += '<div>';
+      topHarm.forEach((item, i) => {
+        html += `
+          <div class="d-flex justify-content-between align-items-center py-2 ${i > 0 ? 'border-top border-secondary' : ''}">
+            <div class="small min-w-0 me-2">
+              <span class="badge bg-secondary bg-opacity-25">${this._esc(item.type)}</span>
+              <span class="text-light ms-1 text-truncate d-inline-block" style="max-width:350px">${this._esc(item.directive || '')}</span>
+            </div>
+            <span class="small text-danger fw-bold flex-shrink-0">${parseFloat(item.quality_change).toFixed(1)}</span>
+          </div>`;
+      });
+      html += '</div>';
+    }
+
+    if (!byType.length && !topEff.length && !topHarm.length) {
+      html = '<div class="text-center text-muted py-5"><i class="bi bi-graph-up fs-1 d-block mb-2"></i><p>暂无效果数据</p><small>Agent 指令效果将在章节完成后自动评估</small></div>';
+    }
+
+    container.innerHTML = html;
+  },
+
+  // ── 停用指令 ────────────────────────────────────────────────
+  async deactivateDirective(id) {
+    if (!confirm('确定停用该指令？')) return;
+    try {
+      const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+      const res = await fetch('api/agent_status.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+        body: JSON.stringify({ action: 'deactivate', novel_id: NOVEL_ID, directive_id: id })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        this.refresh();
+      } else {
+        alert(data.msg || '停用失败');
+      }
+    } catch (e) {
+      alert('停用失败: ' + e.message);
+    }
+  },
+
+  // ── 工具函数 ────────────────────────────────────────────────
+  _esc(s) {
+    const div = document.createElement('div');
+    div.textContent = String(s || '');
+    return div.innerHTML;
+  }
+};
 </script>
 
 <?php

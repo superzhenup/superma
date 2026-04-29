@@ -97,7 +97,7 @@ $endCh   = (int)($input['end_chapter']   ?? $startCh + 4);
 $novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$novelId]);
 if (!$novel) { sse('error', ['msg' => '小说不存在']); sseDone(); exit; }
 
-try { getModelFallbackList($novel['model_id'] ?: null); }
+try { getModelFallbackList($novel['model_id'] ?: null, 'structured'); }
 catch (RuntimeException $e) { sse('error', ['msg' => $e->getMessage()]); sseDone(); exit; }
 
 // 限制每批最多 10 章，防止单次请求过大

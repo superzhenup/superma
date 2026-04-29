@@ -30,8 +30,14 @@ function handleCoverUpload(int $novelId, ?array $existingNovel): ?string {
     if ($file['size'] > 10 * 1024 * 1024) return null;
 
     $allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
-    $finfo = new finfo(FILEINFO_MIME_TYPE);
-    $mimeType = $finfo->file($file['tmp_name']);
+    // 检测 MIME 类型，优先用 finfo，不可用时回退到 getimagesize()
+    if (class_exists('finfo')) {
+        $finfo = new finfo(FILEINFO_MIME_TYPE);
+        $mimeType = $finfo->file($file['tmp_name']);
+    } else {
+        $imgInfo = @getimagesize($file['tmp_name']);
+        $mimeType = $imgInfo ? $imgInfo['mime'] : '';
+    }
     if (!in_array($mimeType, $allowedTypes)) return null;
 
     $coversDir = defined('BASE_PATH') ? BASE_PATH . '/storage/covers' : dirname(__DIR__) . '/storage/covers';
@@ -375,18 +381,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
             <div class="form-text">推荐分辨率 1086×1448，支持 JPG/PNG/WebP，最大 10MB</div>
           </div>
           <div class="mb-3">
-            <label class="form-label small text-muted">AI 生成封面（Super Ma PRO专享）</label>
-            <div class="input-group input-group-sm">
-              <input type="text" class="form-control" id="cover-keyword" placeholder="输入封面描述关键词，如：仙侠少年持剑立于云端，背景是巍峨仙山">
-              <button type="button" class="btn btn-outline-info" id="btn-generate-cover" onclick="generateCoverAI()">
-                <i class="bi bi-stars me-1"></i>AI 生成
-              </button>
-            </div>
-            <div class="form-text">需要先在模型设置中配置图片生成 API。生成尺寸约 1024×1536，会自动缩放。</div>
-            <div id="cover-generate-status" class="small mt-1" style="display:none"></div>
-          </div>
-          <div class="mb-3">
-            <label class="form-label small text-muted">封面颜色（无封面图时显示）</label>
+            <label class="form-label small text-muted">封面颜色（无封面图时显示，Pro版本支持一键生成封面）</label>
             <input type="color" name="cover_color" class="form-control form-control-sm" style="width:60px;height:36px;padding:2px" value="<?= h($v['cover_color'] ?? '#6366f1') ?>">
           </div>
         </div>

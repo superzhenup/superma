@@ -90,6 +90,9 @@ function buildOutlinePrompt(
     $characterStates   = $memoryCtx['character_states']      ?? [];
     $pendingForeshadow = $memoryCtx['pending_foreshadowing'] ?? [];
     $storyMomentum     = $memoryCtx['story_momentum']        ?? '';
+    $currentArcSummary = $memoryCtx['current_arc_summary']   ?? '';
+    $recentHookTypes   = $memoryCtx['recent_hook_types']     ?? [];
+    $coolPointHistory  = $memoryCtx['cool_point_history']    ?? [];
 
     // 弧段摘要（全局历史记忆）
     $arcSection   = '';
@@ -112,8 +115,13 @@ function buildOutlinePrompt(
         foreach (array_slice($recentOutlines, -10) as $oc) {
             $summary = safe_substr(trim($oc['outline'] ?? ''), 0, 120);
             $hookTip = !empty($oc['hook']) ? " →钩：{$oc['hook']}" : '';
+            $openTip = !empty($oc['opening_type']) ? " [{$oc['opening_type']}式]" : '';
+            $emoTip  = '';
+            if (isset($oc['emotion_score']) && $oc['emotion_score'] !== null && (float)$oc['emotion_score'] < 60) {
+                $emoTip = " ⚠️情绪{$oc['emotion_score']}分";
+            }
             $ocNum = (int)($oc['chapter_number'] ?? $oc['chapter'] ?? 0);
-            $lines[] = "第{$ocNum}章《{$oc['title']}》：{$summary}{$hookTip}";
+            $lines[] = "第{$ocNum}章《{$oc['title']}》：{$summary}{$hookTip}{$openTip}{$emoTip}";
         }
         $contextSection = "\n【前情参考】\n" . implode("\n", $lines) . "\n";
     }
@@ -142,6 +150,22 @@ function buildOutlinePrompt(
             $parts = [];
             if (!empty($state['title']))  $parts[] = "职：{$state['title']}";
             if (!empty($state['status'])) $parts[] = "境：{$state['status']}";
+            // 扩展属性（境界/等级/能力等）
+            $attrs = $state['attributes'] ?? [];
+            if (is_array($attrs)) {
+                $attrLabels = [
+                    'realm' => '境界', 'level' => '等级', 'power' => '战力',
+                    'ability' => '能力', 'bloodline' => '血脉', 'treasure' => '法宝',
+                ];
+                foreach ($attrLabels as $key => $label) {
+                    if (!empty($attrs[$key])) $parts[] = "{$label}：{$attrs[$key]}";
+                }
+                // 其他未命名的属性也展示
+                foreach ($attrs as $key => $val) {
+                    if (isset($attrLabels[$key]) || $key === 'recent_change') continue;
+                    if (is_scalar($val) && !empty($val)) $parts[] = "{$key}：{$val}";
+                }
+            }
             if (!empty($parts)) {
                 $lines[] = "{$name}——" . implode('，', $parts);
             }
@@ -172,6 +196,31 @@ function buildOutlinePrompt(
     $momentumSection = $storyMomentum
         ? "\n【故事势能】\n{$storyMomentum}\n"
         : '';
+
+    // 当前弧段摘要（从 novel_state）
+    $arcSummarySection = $currentArcSummary
+        ? "\n【当前弧段摘要】\n{$currentArcSummary}\n"
+        : '';
+
+    // 近章钩子类型历史
+    $hookHistorySection = '';
+    if (!empty($recentHookTypes)) {
+        $lines = [];
+        foreach (array_slice($recentHookTypes, 0, 5) as $h) {
+            $lines[] = "第{$h['chapter']}章：{$h['hook_type']}";
+        }
+        $hookHistorySection = "\n【近章钩子类型（避免连续重复）】\n" . implode("\n", $lines) . "\n";
+    }
+
+    // 爽点类型历史
+    $coolPointSection = '';
+    if (!empty($coolPointHistory)) {
+        $lines = [];
+        foreach (array_slice($coolPointHistory, 0, 8) as $c) {
+            $lines[] = "第{$c['chapter']}章：{$c['name']}";
+        }
+        $coolPointSection = "\n【近期爽点类型记录（避免连续重复）】\n" . implode("\n", $lines) . "\n";
+    }
 
     // 卷大纲上下文（强化：注入 volume_goals + must_resolve_foreshadowing）
     $volumeSection = '';
@@ -217,8 +266,8 @@ function buildOutlinePrompt(
         // ForeshadowingRepo 不可用时静默跳过
     }
 
-    // 计算本批爽点排期（Phase 1 新增）
-    $coolPointSchedule = calculateCoolPointSchedule($startChapter, $count);
+    // 计算本批爽点排期（Phase 1 + v1.6 P1#7: 传入 novelId 自动加载实际爽点历史）
+    $coolPointSchedule = calculateCoolPointSchedule($startChapter, $count, [], (int)$novel['id']);
 
     // ── 全书进度感知 + 故事大纲引用（F1/F3/F6 优化）───────────────────
     $progressSection  = '';
@@ -297,7 +346,7 @@ function buildOutlinePrompt(
 
         // F3/F6: 读取全书故事大纲（细纲层首次引入）
         $storyOutline = DB::fetch(
-            'SELECT story_arc, act_division, character_arcs, world_evolution, major_turning_points
+            'SELECT story_arc, act_division, character_arcs, world_evolution, major_turning_points, recurring_motifs
              FROM story_outlines WHERE novel_id=?',
             [$novel['id']]
         );
@@ -374,6 +423,12 @@ function buildOutlinePrompt(
                     }
                 }
             }
+
+            // 全书重复意象（供大纲设计参考）
+            $motifs = json_decode($storyOutline['recurring_motifs'] ?? '[]', true) ?: [];
+            if (!empty($motifs)) {
+                $progressLines[] = "♻️ 全书重复意象（大纲中可安排呼应）：" . implode('、', $motifs);
+            }
         }
 
         $progressSection = "\n【📊 全书进度感知——生成细纲时必须对齐以下进度】\n"
@@ -430,7 +485,8 @@ function buildOutlinePrompt(
 16. 如有【严重逾期伏笔】，必须在第1章或第2章的key_points中明确安排回收，违反则大纲无效
 17. 如有【本卷必须回收的逾期伏笔】，须在本批内安排完毕，不得拖到下一批
 18. 如处于收尾阶段，核心矛盾须获得实质性推进或解决，不再开启新支线
-19. 尽量不要用"——"、禁用高频AI词汇，包括但不限于：深邃、凝视、缓缓、蓦然、骤然、 indeed、无疑、显然、事实上、值得注意的是、毫无疑问、通常来说、在此基础上、应当注意到、铁锈味、指节泛白、沉默下来、看了几秒、一愣、沉默了几秒、泛白、愣在原地、愣了一下等。换成更生动的表达，比如"老实说"、"很多时候"、"这么一来"、"这里有个细节"、少用破折号【】以及禁用非对话的""
+19. 禁止使用"——"、禁用高频AI词汇，包括但不限于：深邃、凝视、缓缓、蓦然、骤然、 indeed、无疑、显然、事实上、值得注意的是、毫无疑问、通常来说、在此基础上、应当注意到、铁锈味、指节泛白、沉默下来、看了几秒、一愣、沉默了几秒、泛白、愣在原地、愣了一下等。换成更生动的表达，比如"老实说"、"很多时候"、"这么一来"、"这里有个细节"、少用破折号【】以及禁用非对话的""
+20. 我发给你的提示词不要出现在文章里面，举例：**章末钩子(info bomb型)：**、【信息爆炸型钩子：检测到信息揭示情节】、**高潮段(约700字)**、**(发展段：约600字，对话密集)**、**（铺垫段：约450字）**
 
 EOT;
 
@@ -442,7 +498,7 @@ EOT;
 情节：{$plotSettings}
 世界观：{$worldSettings}
 其他：{$extraSettings}
-{$progressSection}{$endingContext}{$storyOutlineSection}{$volumeSection}{$overdueSection}{$volumeForceResolve}{$arcSection}{$contextSection}{$prevHookSection}{$momentumSection}{$keyEventsSection}{$characterSection}{$foreshadowSection}
+{$progressSection}{$endingContext}{$storyOutlineSection}{$volumeSection}{$overdueSection}{$volumeForceResolve}{$arcSection}{$contextSection}{$prevHookSection}{$momentumSection}{$arcSummarySection}{$hookHistorySection}{$coolPointSection}{$keyEventsSection}{$characterSection}{$foreshadowSection}
 输出JSON数组（{$count}个元素）：
 [{"chapter_number":整数,"title":"标题","summary":"概要","key_points":["点1","点2"],"hook":"钩子","hook_type":"六选一","pacing":"快/中/慢","suspense":"有/无"},...]
 
@@ -476,502 +532,10 @@ function buildChapterPrompt(
     string $previousTail = '',
     ?array $memoryCtx = null
 ): array {
-    $targetWords = (int)$novel['chapter_words'];
-    
-    // 使用动态容差计算
-    $dynamicTolerance = calculateDynamicTolerance($targetWords);
-    $minWords = $dynamicTolerance['min'];
-    $maxWords = $dynamicTolerance['max'];
-    $earlyFinishWords = $dynamicTolerance['early_finish'];
-    
-    // 生成多级预警提示
-    $wordCountWarnings = generateWordCountWarnings($targetWords);
-
-    $genre = $novel['genre'] ?? '';
-    $densityGuidelines = getDensityGuidelines($genre);
-
-    // 章号（提前赋值，供 $system heredoc 使用）
-    $chNum = (int)($chapter['chapter_number'] ?? $chapter['chapter'] ?? 0);
-
-    // 章末钩子类型推荐
-    $hookSuggestion = suggestHookType($chapter);
-    $chapterHookType = $hookSuggestion['type'];
-    $hookTypeDescription = (HOOK_TYPES[$chapterHookType]['name'] ?? '') . '：' . ($hookSuggestion['reason'] ?? '默认轮换');
-
-    // v11: 从系统设置读取四段式结构占比
-    $segSetup  = (int)getSystemSetting('ws_segment_ratio_setup', 20, 'int');
-    $segRising = (int)getSystemSetting('ws_segment_ratio_rising', 30, 'int');
-    $segClimax = (int)getSystemSetting('ws_segment_ratio_climax', 35, 'int');
-    $segHook   = (int)getSystemSetting('ws_segment_ratio_hook', 15, 'int');
-
-    $system = <<<EOT
-你是一位专业的网络小说作家，正在创作小说《{$novel['title']}》。
-
-【写作铁律，必须遵守优先级最高】
-1. 字数硬性限制（最高优先级）：正文必须严格控制在 {$minWords} ~ {$maxWords} 字之间，绝对不可超过 {$maxWords} 字。
-2. 字数预警系统（写作时心中估算字数进度）：
-{$wordCountWarnings}
-3. 字数控制技巧：
-   - 开头快速入戏，黄金三行直接抓人
-   - 中间情节紧凑，对话与动作交替推进
-   - 写到约 {$earlyFinishWords} 字时必须进入钩子收尾
-   - 严禁超过 {$maxWords} 字，字数到达即停笔
-4. 人物一致性：所有人物的职务、身份、生死状态必须与【人物当前状态】完全一致，不得擅自改变
-5. 情节不重复：【全书已发生事件】中出现的任何事件，严禁以任何形式重演或变体重复
-6. 逻辑自洽：本章发生的事件必须是前情的自然延伸，因果链条清晰，不得出现无因之果
-7. 直接开始：从"第{$chNum}章 {$chapter['title']}"这一行直接开始输出正文，不要有任何前言、后记、解释或"好的，我来写"等废话
-8. 风格统一：保持与前文一致的叙事视角、语气和文风，不得中途切换人称
-
-【🔥 黄金三行——本章前三行必须满足以下至少一条】
-A. 悬念引导型：反常现象/危机爆发 → 主角处境 → 读者追问"接下来怎么办"
-B. 场景代入型：强画面感场景 → 主角感官体验 → 即将发生的变故
-C. 动作切入型：战斗/对抗正在进行 → 主角的险境 → 翻盘契机
-D. 对话切入型：关键对话 → 冲突暴露 → 行动决定
-⚠️ 禁忌：前三行内不得出现超过半行的纯环境/天气/风景描写！
-
-【📊 四段式节奏结构】
-- 铺垫段(~{$segSetup}%)：承接上文、建立场景、引入新信息（≤200字纯环境描写）
-- 发展段(~{$segRising}%)：推进冲突、角色互动、信息揭露（对话密集区）
-- 高潮段(~{$segClimax}%)：爽点释放、情绪顶点、反转或冲突升级
-- 钩子段(~{$segHook}%)：使用指定钩子类型收尾，制造强烈悬念
-
-【🎣 章末钩子——必须使用以下指定类型】
-本章节尾钩子类型：{$chapterHookType}
-类型说明：{$hookTypeDescription}
-⚠️ 绝对禁止以平静句结尾！（如"大家都睡了""夜深了""一切归于平静"等）
-
-【📏 描写密度标准——题材：{$genre}】
-{$densityGuidelines}
-
-【😊 情绪词汇要求——基于1590本小说分析】
-根据网络小说创作规律，本章必须满足以下情绪词汇密度标准：
-· 愤怒类词汇：15-20次/万字（如：愤怒、怒火、暴怒、咬牙切齿、火冒三丈）
-· 喜悦类词汇：20-30次/万字（如：喜悦、高兴、兴奋、狂喜、心花怒放）
-· 惊讶类词汇：10-15次/万字（如：惊讶、震惊、不可思议、目瞪口呆）
-· 恐惧类词汇：5-10次/万字（如：恐惧、害怕、战栗、毛骨悚然）
-· 悲伤类词汇：5-10次/万字（如：悲伤、悲痛、心碎、黯然神伤）
-
-情绪词汇使用原则：
-1. 情绪词汇要自然融入情节，不要刻意堆砌
-2. 每个情绪爆发点都要有铺垫和释放
-3. 避免情绪过于单一，要有起伏变化
-4. 高潮部分要加大情绪词汇密度
-5. 不同类型小说可适当调整：玄幻/游戏类愤怒词可更多，都市/言情类喜悦词可更多
-
-【💬 对话与文风】
-- 对话密度目标：每千字40-80句对话（都市类可更高至60-100）
-- 连续非对话文字不得超过300字（含描写+心理+叙述），超过时必须插入对话或动作打断
-- 平均段落150-300字，平均句长20-40字，避免超长段落造成阅读疲劳
-- 多用短句推进情节，少用长句堆砌描写
-EOT;
-
-    // 关键情节点
-    $keyPoints = '';
-    if (!empty($chapter['key_points'])) {
-        $pts = json_decode($chapter['key_points'], true) ?? [];
-        if ($pts) $keyPoints = "\n关键情节点：\n- " . implode("\n- ", $pts);
-    }
-    $hookLine = !empty($chapter['hook'])
-        ? "\n结尾钩子（本章结尾要体现）：{$chapter['hook']}"
-        : '';
-
-    // ================================================================
-    // 记忆数据来源：优先 MemoryEngine 上下文；未传入时降级为空段
-    // ================================================================
-    // 弧段摘要（L2）
-    $arcSummaries = $memoryCtx['L2_arc_summaries']
-        ?? $memoryCtx['arc_summaries']
-        ?? [];
-
-    // 人物状态（新 schema：title/status/attributes.recent_change/alive）
-    $characterStates = $memoryCtx['character_states'] ?? [];
-
-    // 全书关键事件
-    $keyEvents = $memoryCtx['key_events'] ?? [];
-
-    // 待回收伏笔（已按紧急度排序：overdue + due_soon）
-    $pendingForeshadow = $memoryCtx['pending_foreshadowing'] ?? [];
-
-    // 故事势能
-    $storyMomentum = $memoryCtx['story_momentum'] ?? '';
-
-    // 近章大纲（L3）—— 提供最近 8 章的大纲结构信息，与 previousSummary（摘要）互补
-    // L3 侧重"章节结构和情节点"，previousSummary 侧重"情节摘要回顾"
-    $recentChapters = $memoryCtx['L3_recent_chapters'] ?? [];
-
-    // 近5章意象禁用（这项 MemoryEngine 未聚合，继续走 chapters.used_tropes）
-    $prevTropes = getPreviousUsedTropes((int)$novel['id'], $chNum);
-
-    // 弧段摘要（第二层记忆，全局历史防失忆）
-    $arcChapterSection = '';
-    if (!empty($arcSummaries)) {
-        $arcLines = [];
-        foreach ($arcSummaries as $arc) {
-            if ((int)$arc['chapter_to'] < $chNum) {
-                $arcLines[] = "【第{$arc['chapter_from']}-{$arc['chapter_to']}章故事线】{$arc['summary']}";
-            }
-        }
-        if (!empty($arcLines)) {
-            $arcChapterSection = "【全书故事线回顾（必须与此保持一致，不得产生矛盾）】\n"
-                               . implode("\n\n", $arcLines) . "\n\n";
-        }
-    }
-
-    // 前情提要
-    $prevSection = $previousSummary
-        ? "【前情提要（前几章摘要）】\n{$previousSummary}\n\n"
-        : "【说明】本章为小说第一章，请从头开始。\n\n";
-
-    // 近章大纲（L3）—— 最近 8 章的结构信息
-    $recentChapterSection = '';
-    if (!empty($recentChapters)) {
-        $lines = [];
-        foreach ($recentChapters as $rc) {
-            $rcNum = (int)($rc['chapter_number'] ?? $rc['chapter'] ?? 0);
-            $title = $rc['title'] ?? '';
-            $outline = safe_substr(trim($rc['outline'] ?? ''), 0, 100);
-            $hookTip = !empty($rc['hook']) ? "  →钩子：{$rc['hook']}" : '';
-            $lines[] = "第{$rcNum}章《{$title}》：{$outline}{$hookTip}";
-        }
-        $recentChapterSection = "【近章大纲（章节结构参考，保持连贯）】\n"
-                              . implode("\n", $lines) . "\n\n";
-    }
-
-    // 前文衔接
-    $tailSection = $previousTail
-        ? "【前文衔接（上一章结尾原文，请自然衔接，不要重复这段文字）】\n……{$previousTail}\n\n"
-        : '';
-
-    // 人物当前状态（MemoryEngine schema: title/status/alive/attributes/last_chapter）
-    $characterSection = '';
-    if (!empty($characterStates)) {
-        $lines = [];
-        foreach ($characterStates as $name => $state) {
-            // 死亡人物不再出现在写作指引里（alive=false）
-            if (isset($state['alive']) && !$state['alive']) continue;
-
-            $parts = [];
-            if (!empty($state['title']))  $parts[] = "职务：{$state['title']}";
-            if (!empty($state['status'])) $parts[] = "处境：{$state['status']}";
-
-            // 近况从 attributes.recent_change 读取（mapLegacyCharacterUpdate 迁移过来的）
-            $attrs = $state['attributes'] ?? [];
-            if (is_array($attrs) && !empty($attrs['recent_change'])) {
-                $parts[] = "近况：{$attrs['recent_change']}";
-            }
-
-            if (!empty($parts)) {
-                $lines[] = "· {$name}——" . implode('，', $parts);
-            }
-        }
-        if (!empty($lines)) {
-            $characterSection = "【人物当前状态（必须严格遵守，不得与此矛盾）】\n"
-                              . implode("\n", $lines) . "\n\n";
-        }
-    }
-
-    // 全书关键事件
-    $eventsSection = '';
-    if (!empty($keyEvents)) {
-        $lines = [];
-        foreach ($keyEvents as $e) {
-            $lines[] = "第{$e['chapter']}章：{$e['event']}";
-        }
-        $eventsSection = "【全书已发生事件（严禁重写或矛盾）】\n" . implode("\n", $lines) . "\n\n";
-    }
-
-    // 故事势能（MemoryEngine 新引入，帮助保持冲突张力）
-    $momentumSection = '';
-    if ($storyMomentum !== '') {
-        $momentumSection = "【当前故事势能（本章需延续或推进此张力）】\n{$storyMomentum}\n\n";
-    }
-
-    // 近5章意象禁用
-    $tropesSection = '';
-    if (!empty($prevTropes)) {
-        $tropesSection = "【本章禁止重复使用的意象/场景（近期已用，需要新鲜感）】："
-                       . implode('、', $prevTropes) . "\n\n";
-    }
-
-    // 临近 deadline 的伏笔提示
-    // MemoryEngine 输出已按紧急度排好序（overdue 在前），这里只负责格式化
-    $foreshadowSection = '';
-    $dueForeshadow = array_filter(
-        $pendingForeshadow,
-        fn($f) => !empty($f['deadline']) && $chNum >= (int)$f['deadline'] - 3
-    );
-    if (!empty($dueForeshadow)) {
-        $lines = [];
-        foreach ($dueForeshadow as $f) {
-            $deadline = (int)$f['deadline'];
-            $lines[]  = ($chNum >= $deadline - 2 && $chNum <= $deadline + 2)
-                ? "⚠️【紧急】第{$f['chapter']}章埋：{$f['desc']}（应{$deadline}章前回收）"
-                : "第{$f['chapter']}章埋：{$f['desc']}（建议{$deadline}章前回收）";
-        }
-        $foreshadowSection = "【本章应考虑回收的伏笔（已到期或临近，请自然安排回收）】\n"
-                           . implode("\n", $lines) . "\n\n";
-    }
-
-    // 语义召回命中（MemoryEngine 的 semantic_hits）—— 长尾记忆补充
-    // hits 可能混合两种来源：source='atom'（MemoryEngine）/ source='kb'（KnowledgeBase）
-    $semanticSection = '';
-    $semanticHits = $memoryCtx['semantic_hits'] ?? [];
-    if (!empty($semanticHits)) {
-        // KB 来源的类别名称映射（用于提示 AI 这条线索属于什么资料）
-        $kbTypeLabels = [
-            'character'     => '角色资料',
-            'worldbuilding' => '世界观设定',
-            'plot'          => '情节线索',
-            'style'         => '风格参考',
-        ];
-        $lines = [];
-        foreach ($semanticHits as $hit) {
-            if (($hit['source'] ?? 'atom') === 'kb') {
-                $label = $kbTypeLabels[$hit['type']] ?? 'KB';
-                $lines[] = "· [{$label}] {$hit['content']}";
-            } else {
-                $chTag = !empty($hit['chapter']) ? "[第{$hit['chapter']}章] " : '';
-                $lines[] = "· {$chTag}{$hit['content']}";
-            }
-        }
-        $semanticSection = "【相关历史线索（语义关联，可作背景参考）】\n"
-                         . implode("\n", $lines) . "\n\n";
-    }
-
-    // 章节简介蓝图（如已生成）
-    $synopsisSection = '';
-    if (!empty($chapter['synopsis_id'])) {
-        $synopsis = \DB::fetch('SELECT * FROM chapter_synopses WHERE id=?', [$chapter['synopsis_id']]);
-        if ($synopsis) {
-            $synopsisSection = "【章节简介（详细写作蓝图，必须遵循）】\n简介：{$synopsis['synopsis']}\n\n";
-
-            $sceneBreakdown = json_decode($synopsis['scene_breakdown'] ?? '[]', true);
-            if (!empty($sceneBreakdown)) {
-                $synopsisSection .= "场景分解：\n";
-                foreach ($sceneBreakdown as $scene) {
-                    $chars = implode('、', $scene['characters'] ?? []);
-                    $synopsisSection .= "场景{$scene['scene']}：{$scene['location']}，人物：{$chars}，{$scene['action']}（{$scene['emotion']}）\n";
-                }
-                $synopsisSection .= "\n";
-            }
-
-            $dialogueBeats = json_decode($synopsis['dialogue_beats'] ?? '[]', true);
-            if (!empty($dialogueBeats)) {
-                $synopsisSection .= "对话要点：" . implode('；', $dialogueBeats) . "\n\n";
-            }
-
-            $sensoryDetails = json_decode($synopsis['sensory_details'] ?? '{}', true);
-            if (!empty($sensoryDetails)) {
-                $parts = [];
-                if (!empty($sensoryDetails['visual']))     $parts[] = "视觉-{$sensoryDetails['visual']}";
-                if (!empty($sensoryDetails['auditory']))   $parts[] = "听觉-{$sensoryDetails['auditory']}";
-                if (!empty($sensoryDetails['atmosphere'])) $parts[] = "氛围-{$sensoryDetails['atmosphere']}";
-                $synopsisSection .= "感官细节：" . implode(' ', $parts) . "\n\n";
-            }
-
-            $synopsisSection .= "节奏：{$synopsis['pacing']}  |  结尾悬念：{$synopsis['cliffhanger']}\n\n";
-        }
-    }
-
-    // 当前卷目标注入（让正文写作感知全书进度目标）
-    $volumeGoalSection = '';
-    try {
-        $currentVolume = \DB::fetch(
-            'SELECT volume_goals, must_resolve_foreshadowing, volume_number, title
-             FROM volume_outlines
-             WHERE novel_id=? AND start_chapter <= ? AND end_chapter >= ?
-             LIMIT 1',
-            [(int)$novel['id'], $chNum, $chNum]
-        );
-        if ($currentVolume) {
-            $volGoals    = json_decode($currentVolume['volume_goals'] ?? '[]', true) ?: [];
-            $mustResolve = json_decode($currentVolume['must_resolve_foreshadowing'] ?? '[]', true) ?: [];
-            if (!empty($volGoals)) {
-                $volumeGoalSection .= "【第{$currentVolume['volume_number']}卷《{$currentVolume['title']}》写作目标（本章需推进）】\n"
-                    . implode("\n", array_map(fn($g) => "· {$g}", $volGoals)) . "\n\n";
-            }
-            if (!empty($mustResolve)) {
-                $volumeGoalSection .= "【本卷必须回收的伏笔（若本章是回收时机，请自然融入情节）】\n"
-                    . implode("\n", array_map(fn($f) => "· {$f}", $mustResolve)) . "\n\n";
-            }
-        }
-    } catch (\Throwable $e) {
-        // 查询失败静默跳过
-    }
-
-    // 全书进度感知（精简版，正文写作用）
-    $chapterProgressSection = '';
-    $chapterEndingContext   = '';  // 全书收尾指令（进度 >= 90% 时注入）
-    try {
-        // 优先使用传入的 memoryCtx 中的进度上下文，避免重复创建 MemoryEngine
-        if (isset($memoryCtx['progress_context'])) {
-            $prog = $memoryCtx['progress_context'];
-        } else {
-            $progressEngine = new MemoryEngine((int)$novel['id']);
-            $prog = $progressEngine->getProgressContext($chNum);
-        }
-        if ($prog['target_chapters'] > 0) {
-            $pLines = [];
-            $pLines[] = "当前第{$chNum}章 / 全书{$prog['target_chapters']}章（{$prog['progress_pct']}%，剩余{$prog['remaining_chapters']}章）";
-            if ($prog['act_phase'])      $pLines[] = "叙事阶段：{$prog['act_phase']}";
-            if ($prog['volume_progress']) $pLines[] = "所在卷：{$prog['volume_progress']}";
-            $pendingCnt = $prog['pending_foreshadowing_count'];
-            $overdueCnt = $prog['overdue_foreshadowing_count'];
-            if ($pendingCnt > 0) {
-                $overdueNote = $overdueCnt > 0 ? "，{$overdueCnt}条已逾期" : '';
-                $pLines[] = "未回收伏笔：{$pendingCnt}条{$overdueNote}";
-            }
-            // 最近未触发的转折点
-            $nextTurning = array_values(array_filter(
-                $prog['major_turning_points'],
-                fn($t) => !$t['passed'] && $t['chapter'] > $chNum
-            ));
-            if (!empty($nextTurning)) {
-                $nt = $nextTurning[0];
-                $pLines[] = "下一个全书转折点：第{$nt['chapter']}章——{$nt['event']}";
-            }
-            $chapterProgressSection = "【📊 全书进度】" . implode("  ·  ", $pLines) . "\n\n";
-
-            // 全书收尾感知：进度 >= CFG_ENDING_START_RATIO 时注入收尾指令
-            $chapterEndingContext = buildEndingContext($prog, $chNum);
-        }
-    } catch (\Throwable $e) {
-        // 静默跳过
-    }
-
-    // ── 动态节奏调整（基于1590本小说分析）────────────────────────────────────
-    $rhythmSection = '';
-    try {
-        require_once __DIR__ . '/rhythm_adjuster.php';
-        $rhythmAdjuster = new RhythmAdjuster((int)$novel['id']);
-        
-        // 获取近期爽点历史（从数据库读取）
-        $coolPointHistory = [];
-        $recentChapters = DB::fetchAll(
-            'SELECT chapter_number, cool_point_type FROM chapters 
-             WHERE novel_id=? AND chapter_number < ? AND cool_point_type IS NOT NULL 
-             ORDER BY chapter_number DESC LIMIT 20',
-            [(int)$novel['id'], $chNum]
-        );
-        foreach ($recentChapters as $rc) {
-            if (!empty($rc['cool_point_type'])) {
-                $coolPointHistory[] = [
-                    'chapter' => (int)$rc['chapter_number'],
-                    'type' => $rc['cool_point_type'],
-                ];
-            }
-        }
-        
-        $rhythm = $rhythmAdjuster->calculateRhythm($chNum, $coolPointHistory);
-        $rhythmSection = $rhythmAdjuster->generateRhythmInstructions($rhythm);
-        
-        // 如果节奏调整器要求爽点，更新四段式比例
-        if (!empty($rhythm['segment_ratios'])) {
-            $segSetup  = $rhythm['segment_ratios']['setup'];
-            $segRising = $rhythm['segment_ratios']['rising'];
-            $segClimax = $rhythm['segment_ratios']['climax'];
-            $segHook   = $rhythm['segment_ratios']['hook'];
-        }
-    } catch (\Throwable $e) {
-        // 节奏调整器失败静默跳过
-    }
-    
-    // ── 收尾阶段强制指令（解决后续章节无法自动收尾问题）────────────────────
-    $endingSection = '';
-    try {
-        require_once __DIR__ . '/ending_enforcer.php';
-        $endingEnforcer = new EndingEnforcer((int)$novel['id'], $chNum);
-        
-        if ($endingEnforcer->needsEndingEnforcement()) {
-            $endingSection = $endingEnforcer->generateEndingInstructions();
-            
-            // 如果有伏笔回收建议，也添加进来
-            $foreshadowAdvice = $endingEnforcer->generateForeshadowResolutionAdvice();
-            if ($foreshadowAdvice) {
-                $endingSection .= "\n\n" . $foreshadowAdvice;
-            }
-        }
-    } catch (\Throwable $e) {
-        // 收尾强制指令失败静默跳过
-    }
-
-    // ================================================================
-    // v6/B3：KB 上下文注入改由 MemoryEngine::semanticSearch(includeKB=true) 承担。
-    // ================================================================
-
-    $user = <<<EOT
-{$arcChapterSection}{$prevSection}{$recentChapterSection}{$tailSection}{$characterSection}{$momentumSection}{$eventsSection}{$semanticSection}{$tropesSection}{$foreshadowSection}{$volumeGoalSection}{$chapterProgressSection}{$chapterEndingContext}{$rhythmSection}{$endingSection}{$synopsisSection}【小说信息】
-书名：{$novel['title']}  |  类型：{$genre}  |  风格：{$novel['writing_style']}
-主角：{$novel['protagonist_info']}
-世界观：{$novel['world_settings']}
-
-【本章大纲】
-第{$chNum}章：{$chapter['title']}
-概要：{$chapter['outline']}{$keyPoints}{$hookLine}
-
-【📏 本章描写密度要求（题材：{$genre}）】
-{$densityGuidelines}
-请严格按此比例分配各元素篇幅。
-
-【🎣 本章章末钩子类型】
-指定类型：{$chapterHookType}（{$hookTypeDescription}）
-结尾必须用该类型制造强烈悬念，绝对禁止平静收尾！
-
-【写作铁律——逐条遵守】
-1. 【字数硬限】正文必须严格控制在 {$minWords} ~ {$maxWords} 字，超过 {$maxWords} 字即为违规。当已写约 {$earlyFinishWords} 字时立即启动收尾，禁止再引入新情节。
-2. 【黄金三行】本章前三行必须是动作/对话/悬念/异常之一，禁止纯环境描写开头
-3. 【四段节奏】铺垫(~{$segSetup}%)→发展/对话密集区(~{$segRising}%)→高潮/爽点释放(~{$segClimax}%)→钩子收尾(~{$segHook}%)
-4. 【情绪密度】必须满足情绪词汇密度标准（愤怒15-20次/万字、喜悦20-30次/万字、惊讶10-15次/万字），高潮段落要加大情绪词密度
-5. 对话自然生动，有个性，符合各自性格；对话密度每千字40-80句
-6. 连续非对话文字不超过300字，超长段落必须插入对话或动作打断
-7. 情节紧凑，张弛有度，不拖沓
-8. 结尾使用指定钩子类型制造强烈悬念，引发读者急切想知道下文
-9. 与前文衔接自然，保持语气和叙事风格一致
-10. 人物职务/身份必须与上方【人物当前状态】完全一致
-11. 如有【章节简介】，必须严格遵循其中的场景分解和对话要点
-
-【字数控制技巧】
-- 开头快速入戏，黄金三行直接抓人，不要冗长的环境铺垫
-- 中间情节紧凑，对话与动作交替推进，保持描写密度符合题材标准
-- 高潮段集中释放爽点情绪，不要分散
-- 写到约 {$earlyFinishWords} 字时必须进入钩子收尾，禁止继续新情节
-- 严禁超过 {$maxWords} 字，字数到达即停笔
-
-请开始写作：
-EOT;
-
-    // ── Agent 指令注入（AgentDirectives）────────────────────────────────────
-    $agentDirectivesSection = '';
-    try {
-        require_once __DIR__ . '/agents/AgentDirectives.php';
-        $directives = AgentDirectives::active((int)$novel['id'], $chNum);
-        
-        if (!empty($directives)) {
-            $directiveLines = [];
-            foreach ($directives as $directive) {
-                $typeLabel = match($directive['type']) {
-                    'quality' => '质量监控',
-                    'strategy' => '写作策略',
-                    'optimization' => '优化建议',
-                    default => 'Agent指令'
-                };
-                $directiveLines[] = "· [{$typeLabel}] {$directive['directive']}";
-            }
-            
-            $agentDirectivesSection = "\n\n【🤖 Agent 指令（本章写作必须遵循）】\n"
-                . implode("\n", $directiveLines) . "\n";
-        }
-    } catch (\Throwable $e) {
-        // Agent 指令获取失败静默跳过
-    }
-    
-    // 将 Agent 指令添加到 user content 末尾
-    $user .= $agentDirectivesSection;
-
-    return [
-        ['role' => 'system', 'content' => $system],
-        ['role' => 'user',   'content' => $user],
-    ];
+    // v1.4: 委托给 ChapterPromptBuilder，保留此函数保证向后兼容
+    require_once __DIR__ . '/ChapterPromptBuilder.php';
+    $builder = new ChapterPromptBuilder($novel, $chapter, $previousSummary, $previousTail, $memoryCtx);
+    return $builder->build();
 }
 
 /**
@@ -1046,6 +610,7 @@ EOT;
   "character_arcs": {
     "{$novel['protagonist_name']}": {"start": "初始状态", "midpoint": "中期变化", "end": "最终状态"}
   },
+  "character_endpoints": "各人物在故事结局时的最终状态（人物弧线终点，如：主角：成长为一代宗师、配角：牺牲自己完成救赎）",
   "world_evolution": "世界观如何随故事发展演变（50字）",
   "recurring_motifs": ["重复意象1", "重复意象2", "重复意象3"]
 }
@@ -1584,13 +1149,40 @@ function suggestHookType(array $chapter): array
  *   3. 输出格式增加 【双爽点】【大爽点】 标记，便于 AI 写章时感知爽点强度
  *   4. 过渡章（无候选时）降低频率：cooldown 压缩后，过渡章比例应 <10%
  *
- * @param int   $startChapter 起始章号
- * @param int   $count        章节数量
- * @param array $history      已有爽点记录 [['chapter'=>N,'type'=>'xxx'], ...]
+ * @param int      $startChapter 起始章号
+ * @param int      $count        章节数量
+ * @param array    $history      已有爽点记录 [['chapter'=>N,'type'=>'xxx'], ...]
+ * @param int|null $novelId      小说ID（v1.6: 用于自动加载实际爽点历史）
  * @return string 可读的爽点排期说明
  */
-function calculateCoolPointSchedule(int $startChapter, int $count, array $history = []): string
+function calculateCoolPointSchedule(int $startChapter, int $count, array $history = [], ?int $novelId = null): string
 {
+    // v1.6 P1#7: 当未传入历史时，自动从 chapters 表读取实际检测到的爽点类型
+    // 这解决了"排期器只看计划不看实际"的反馈缺失问题
+    if (empty($history) && $novelId !== null) {
+        try {
+            $actualRows = \DB::fetchAll(
+                'SELECT chapter_number, actual_cool_point_types FROM chapters
+                 WHERE novel_id=? AND chapter_number < ? AND actual_cool_point_types IS NOT NULL
+                 ORDER BY chapter_number ASC',
+                [$novelId, $startChapter]
+            );
+            foreach ($actualRows as $row) {
+                $types = json_decode($row['actual_cool_point_types'] ?? '[]', true) ?: [];
+                foreach ($types as $t) {
+                    if (is_string($t) && !empty($t)) {
+                        $history[] = [
+                            'chapter' => (int)$row['chapter_number'],
+                            'type'    => $t,
+                        ];
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            // 自动加载失败不影响排期，使用空历史继续
+        }
+    }
+
     $densityTarget = (float)getSystemSetting('ws_cool_point_density_target', 0.88, 'float');
     if ($densityTarget < 0.3) $densityTarget = 0.3;
     $cooldownMultiplier = 0.88 / $densityTarget;
@@ -1705,4 +1297,78 @@ function calculateCoolPointSchedule(int $startChapter, int $count, array $histor
     }
 
     return implode("\n", $result);
+}
+
+// ================================================================
+// v1.6 P1#7: 爽点实际类型识别——关键词匹配映射
+// 修复反馈缺失：之前 calculateCoolPointSchedule 的 lastUsed 只记录"计划排期"
+// 而非 AI 实际写到的类型，导致排期器无法学习真实行为
+// ================================================================
+
+/**
+ * 9 种爽点类型的关键词映射
+ * 用于在章节正文中检测 AI 实际写到的爽点类型
+ */
+const COOL_POINT_KEYWORDS = [
+    'underdog_win'  => ['越级', '以弱胜强', '跨境界', '逆袭击败', '低境击败', '跨境击杀',
+                        '越阶', '跨境', '不可思议地击败', '跨级秒杀', '碾压高阶',
+                        '以下犯上', '低阶击败高阶', '弱者赢', '蝼蚁撼大树'],
+    'face_slap'     => ['打脸', '啪啪打脸', '当场打脸', '狠狠打脸', '被羞辱',
+                        '啪啪响', '被打脸', '自取其辱', '自取其咎', '颜面扫地',
+                        '脸色铁青', '脸色苍白', '脸色一变', '尴尬', '下不了台',
+                        '哑口无言', '无地自容', '脸色难看', '气得发抖'],
+    'treasure_find' => ['宝物', '奇遇', '机缘', '秘境', '传承', '异宝',
+                        '天材地宝', '神兵', '灵宝', '造化', '机缘巧合',
+                        '获得', '到手', '收获颇丰', '满载而归', '入手'],
+    'breakthrough'  => ['突破', '晋级', '晋升', '境界突破', '修为突破', '瓶颈突破',
+                        '蜕变', '进阶', '破境', '修为暴涨', '力量暴涨',
+                        '更上一层', '迈入', '踏入', '气息暴涨', '实力大增'],
+    'power_expand'  => ['势力扩张', '吞并', '收服', '联盟', '招揽', '壮大势力',
+                        '势力', '扩张版图', '建立势力', '收编', '归顺',
+                        '麾下', '臣服', '效忠', '投靠', '收为'],
+    'romance_win'   => ['红颜', '倾心', '倾慕', '芳心', '情愫', '钟情',
+                        '爱慕', '心动', '脸红', '亲密接触', '以身相许', '暗生情愫',
+                        '面红耳赤', '心跳加速', '怦然心动', '含情脉脉', '深情对望'],
+    'truth_reveal'  => ['真相', '揭露', '秘密曝光', '身份揭晓', '幕后黑手',
+                        '原来是', '竟然是他', '惊天秘密', '真相大白', '水落石出',
+                        '真面目', '揭开', '原来如此', '幕后真凶', '大白于天下'],
+    'last_stand'    => ['背水一战', '绝境', '孤注一掷', '拼死', '舍命',
+                        '最后一击', '同归于尽', '死战', '绝地', '别无选择',
+                        '生死关头', '九死一生', '险象环生', '绝处', '殊死搏斗'],
+    'sacrifice'     => ['牺牲', '舍身', '献身', '以命相救', '用生命',
+                        '以身挡', '赴死', '为救', '舍己', '用身体挡住',
+                        '挡在前面', '替死', '以命换命', '挡下', '挺身而出'],
+];
+
+/**
+ * 从章节正文中检测实际写到的爽点类型
+ *
+ * v1.5.2 改进：
+ * - 关键词扩充（每类增加 5 个场景化短语，总词数从 90 → 135）
+ * - LLM 已判定的 cool_point_type 兜底（关键词 0 命中时回退）
+ *
+ * @param string $content 章节正文（去除段落标记后）
+ * @param string|null $llmJudgedType LLM summary 给出的爽点类型（兜底用）
+ * @return array 检测到的爽点类型数组 ['underdog_win', 'face_slap', ...]
+ */
+function detectCoolPointTypes(string $content, ?string $llmJudgedType = null): array
+{
+    $detected = [];
+    foreach (COOL_POINT_KEYWORDS as $typeId => $keywords) {
+        foreach ($keywords as $kw) {
+            if (mb_strpos($content, $kw) !== false) {
+                $detected[] = $typeId;
+                break; // 命中一个关键词即可
+            }
+        }
+    }
+    $detected = array_unique($detected);
+
+    // 兜底：关键词全没命中时，用 LLM 判定的类型作为唯一结果
+    // 关键词词典再大也无法覆盖所有写法，LLM 看完整章的语义判断更可靠
+    if (empty($detected) && $llmJudgedType && isset(COOL_POINT_KEYWORDS[$llmJudgedType])) {
+        $detected[] = $llmJudgedType;
+    }
+
+    return $detected;
 }

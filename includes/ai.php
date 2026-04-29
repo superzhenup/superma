@@ -19,6 +19,18 @@ class AIClient {
     private bool   $thinkingEnabled;
 
     /**
+     * v1.4: 心跳回调（替代 $GLOBALS['sendHeartbeat']）
+     * 在流式写作期间定期调用，用于 SSE 保活信号和进度文件更新
+     */
+    private $heartbeatCallback = null;
+
+    /**
+     * v1.4: 等待回调（替代 $GLOBALS['sendWaiting']）
+     * 静默超时时调用，通知前端等待状态
+     */
+    private $waitingCallback = null;
+
+    /**
      * 最近一次收到 AI chunk 的 Unix 时间戳（秒）
      * 用于 write_chapter.php 检测流式是否卡住
      */
@@ -56,6 +68,17 @@ class AIClient {
         $this->maxTokens       = (int)($cfg['max_tokens']   ?? 4096);
         $this->temperature     = (float)($cfg['temperature'] ?? 0.8);
         $this->thinkingEnabled = !empty($cfg['thinking_enabled']);
+    }
+
+    /**
+     * v1.4: 设置回调函数（替代 $GLOBALS 全局变量注入）
+     *
+     * @param callable|null $heartbeat 心跳回调 fn(): void
+     * @param callable|null $waiting   等待回调 fn(int $elapsedSeconds): void
+     */
+    public function setCallbacks(?callable $heartbeat, ?callable $waiting): void {
+        $this->heartbeatCallback = $heartbeat;
+        $this->waitingCallback   = $waiting;
     }
 
     /**
@@ -97,9 +120,9 @@ class AIClient {
      * 流式请求
      * @param string $taskType creative | structured | synopsis
      */
-    public function chatStream(array $messages, callable $onChunk, string $taskType = 'creative'): array {
+    public function chatStream(array $messages, callable $onChunk, string $taskType = 'creative', ?callable $onThinking = null): array {
         try {
-            return $this->doStream($messages, $onChunk, true, $taskType);
+            return $this->doStream($messages, $onChunk, true, $taskType, $onThinking);
         } catch (RuntimeException $e) {
             $msg = $e->getMessage();
             // 判断是否为"不支持某参数"导致的 400 错误
@@ -122,7 +145,7 @@ class AIClient {
                 $origThinking = $this->thinkingEnabled;
                 $this->thinkingEnabled = false;
                 try {
-                    return $this->doStream($messages, $onChunk, false, $taskType);
+                    return $this->doStream($messages, $onChunk, false, $taskType, $onThinking);
                 } finally {
                     $this->thinkingEnabled = $origThinking;
                 }
@@ -131,7 +154,7 @@ class AIClient {
         }
     }
 
-    private function doStream(array $messages, callable $onChunk, bool $includeUsage, string $taskType = 'creative'): array {
+    private function doStream(array $messages, callable $onChunk, bool $includeUsage, string $taskType = 'creative', ?callable $onThinking = null): array {
         $body     = $this->buildPayload($messages, true, $includeUsage, $taskType);
         $url      = $this->apiUrl . '/chat/completions';
         $buffer   = '';
@@ -152,11 +175,20 @@ class AIClient {
         $that = $this;  // 闭包内访问 $this 的别名（兼容 PHP 7/8）
         $ch = curl_init($url);
         curl_setopt_array($ch, [
-            CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => json_encode($body),
-            CURLOPT_HTTPHEADER     => $this->headers(),
-            CURLOPT_TIMEOUT        => CFG_CURL_TIMEOUT_STREAM,
-            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_POST            => true,
+            CURLOPT_POSTFIELDS      => json_encode($body),
+            CURLOPT_HTTPHEADER      => $this->headers(),
+            CURLOPT_TIMEOUT         => CFG_CURL_TIMEOUT_STREAM,
+            CURLOPT_CONNECTTIMEOUT  => 30,          // 连接超时 30 秒
+            CURLOPT_RETURNTRANSFER  => false,
+            CURLOPT_SSL_VERIFYPEER  => true,
+            CURLOPT_SSL_VERIFYHOST  => 2,
+            // TCP Keepalive — 防止防火墙/代理杀掉长时间空闲连接
+            CURLOPT_TCP_KEEPALIVE   => 1,
+            CURLOPT_TCP_KEEPIDLE    => 60,
+            CURLOPT_TCP_KEEPINTVL   => 15,
+            // 强制 HTTP/1.1，避免 HTTP/2 在某些代理下导致连接重置
+            CURLOPT_HTTP_VERSION    => CURL_HTTP_VERSION_1_1,
             CURLOPT_HEADERFUNCTION => function ($ch, $header) use (&$httpCode) {
                 if (preg_match('/^HTTP\/\S+\s+(\d+)/i', $header, $m)) {
                     $httpCode = (int)$m[1];
@@ -164,13 +196,15 @@ class AIClient {
                 return strlen($header);
             },
             CURLOPT_WRITEFUNCTION  => function ($ch, $data) use (
-                &$buffer, &$usage, &$httpCode, &$rawBody, &$streamErr, &$finishReason, $onChunk, &$lastHeartbeat, $heartbeatInterval, &$lastAiChunk, $that
+                &$buffer, &$usage, &$httpCode, &$rawBody, &$streamErr, &$finishReason, $onChunk, $onThinking, &$lastHeartbeat, $heartbeatInterval, &$lastAiChunk, $that
             ) {
                 // 在收到数据时检查并发送心跳
                 $now = time();
                 if ($now - $lastHeartbeat >= $heartbeatInterval) {
-                    // 调用全局心跳函数（如果存在）
-                    if (isset($GLOBALS['sendHeartbeat']) && is_callable($GLOBALS['sendHeartbeat'])) {
+                    // v1.4: 优先使用显式注入的回调，回退到 $GLOBALS 兼容模式
+                    if ($that->heartbeatCallback) {
+                        ($that->heartbeatCallback)();
+                    } elseif (isset($GLOBALS['sendHeartbeat']) && is_callable($GLOBALS['sendHeartbeat'])) {
                         call_user_func($GLOBALS['sendHeartbeat']);
                     }
                     $lastHeartbeat = $now;
@@ -221,7 +255,10 @@ class AIClient {
                     if ($reasoning !== null) {
                         $lastAiChunk = time();
                         $that->lastChunkTime = $lastAiChunk;  // 思考过程也算活跃
-                        // 不调用 $onChunk，思考过程不输出到正文
+                        // 通过可选回调将思考过程传递给上层（用于前端可视化）
+                        if ($onThinking) {
+                            $onThinking($reasoning);
+                        }
                     }
                 }
                 return strlen($data);
@@ -232,7 +269,10 @@ class AIClient {
                 $now = time();
                 // 每5秒发送一次心跳
                 if ($now - $lastHeartbeat >= $heartbeatInterval) {
-                    if (isset($GLOBALS['sendHeartbeat']) && is_callable($GLOBALS['sendHeartbeat'])) {
+                    // v1.4: 优先使用显式注入的回调，回退到 $GLOBALS 兼容模式
+                    if ($that->heartbeatCallback) {
+                        ($that->heartbeatCallback)();
+                    } elseif (isset($GLOBALS['sendHeartbeat']) && is_callable($GLOBALS['sendHeartbeat'])) {
                         call_user_func($GLOBALS['sendHeartbeat']);
                     }
                     $lastHeartbeat = $now;
@@ -240,7 +280,10 @@ class AIClient {
                 // 静默检测：超过阈值无 AI 文字输出时，发送等待状态
                 if ($now - $lastAiChunk >= $silenceThreshold && $now - $lastWaitingSent >= $silenceThreshold) {
                     $elapsed = $now - $lastAiChunk;
-                    if (isset($GLOBALS['sendWaiting']) && is_callable($GLOBALS['sendWaiting'])) {
+                    // v1.4: 优先使用显式注入的回调，回退到 $GLOBALS 兼容模式
+                    if ($that->waitingCallback) {
+                        ($that->waitingCallback)($elapsed);
+                    } elseif (isset($GLOBALS['sendWaiting']) && is_callable($GLOBALS['sendWaiting'])) {
                         call_user_func($GLOBALS['sendWaiting'], $elapsed);
                     }
                     $lastWaitingSent = $now;
@@ -255,7 +298,7 @@ class AIClient {
 
         if ($curlErr) throw new RuntimeException("CURL Error: $curlErr");
 
-        if ($httpCode && $httpCode !== 200) {
+        if ($httpCode !== 0 && $httpCode !== 200) {
             $errData = json_decode($rawBody, true);
             $errMsg  = $errData['error']['message'] ?? safe_substr($rawBody, 0, 300);
             throw new RuntimeException("API Error ($httpCode): $errMsg");
@@ -431,20 +474,80 @@ class AIClient {
     }
 
     private function doRequest(array $body): array {
-        $ch = curl_init($this->apiUrl . '/chat/completions');
-        curl_setopt_array($ch, [
-            CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => json_encode($body),
-            CURLOPT_HTTPHEADER     => $this->headers(),
-            CURLOPT_TIMEOUT        => CFG_CURL_TIMEOUT_SYNC,
-            CURLOPT_RETURNTRANSFER => true,
-        ]);
-        $resp = curl_exec($ch);
-        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $err  = curl_error($ch);
-        curl_close($ch);
-        if ($err) throw new RuntimeException("CURL Error: $err");
-        return [$code, $resp];
+        // 可重试的 cURL 错误（网络层 transient 错误）
+        $retryableErrors = [
+            'Connection reset by peer',
+            'Connection refused',
+            'Connection timed out',
+            'Timeout was reached',
+            'Recv failure',
+            'Send failure',
+            'Failed to connect',
+            'SSL connection timeout',
+            'SSL read',
+            'SSL_write',
+            'Empty reply from server',
+            'transfer closed',
+            'OpenSSL SSL_read',
+        ];
+
+        $maxRetries = 3;
+        $lastErr    = '';
+
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+            if ($attempt > 1) {
+                // 指数退避：2s, 4s, 8s（最多 10 秒）
+                $delay = pow(2, $attempt - 1);  // 2, 4, 8
+                usleep(min($delay * 1000000, 10000000));
+            }
+
+            $ch = curl_init($this->apiUrl . '/chat/completions');
+            curl_setopt_array($ch, [
+                CURLOPT_POST            => true,
+                CURLOPT_POSTFIELDS      => json_encode($body),
+                CURLOPT_HTTPHEADER      => $this->headers(),
+                CURLOPT_TIMEOUT         => CFG_CURL_TIMEOUT_SYNC,
+                CURLOPT_CONNECTTIMEOUT  => 30,          // 连接超时 30 秒
+                CURLOPT_RETURNTRANSFER  => true,
+                CURLOPT_SSL_VERIFYPEER  => true,
+                CURLOPT_SSL_VERIFYHOST  => 2,
+                // TCP Keepalive — 防止防火墙/代理杀掉长时间空闲连接
+                CURLOPT_TCP_KEEPALIVE   => 1,
+                CURLOPT_TCP_KEEPIDLE    => 60,
+                CURLOPT_TCP_KEEPINTVL   => 15,
+                // 强制 HTTP/1.1，避免 HTTP/2 在某些代理下导致连接重置
+                CURLOPT_HTTP_VERSION    => CURL_HTTP_VERSION_1_1,
+                // 允许跟随重定向
+                CURLOPT_FOLLOWLOCATION  => true,
+                CURLOPT_MAXREDIRS       => 3,
+            ]);
+
+            $resp = curl_exec($ch);
+            $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $err  = curl_error($ch);
+            curl_close($ch);
+
+            if (!$err) {
+                return [$code, $resp];
+            }
+
+            $lastErr = $err;
+
+            // 检查是否为可重试的错误
+            $isRetryable = false;
+            foreach ($retryableErrors as $pattern) {
+                if (stripos($err, $pattern) !== false) {
+                    $isRetryable = true;
+                    break;
+                }
+            }
+
+            if (!$isRetryable || $attempt >= $maxRetries) {
+                break;
+            }
+        }
+
+        throw new RuntimeException("CURL Error: $lastErr");
     }
 }
 
@@ -461,32 +564,83 @@ function getAIClient(?int $modelId = null): AIClient {
 }
 
 // ================================================================
-// 获取 fallback 模型列表
+// 获取 fallback 模型列表（支持按任务类型智能排序）
 // ================================================================
-function getModelFallbackList(?int $preferredModelId = null): array {
+/**
+ * 获取模型列表，支持按任务类型智能排序
+ * 
+ * @param int|null $preferredModelId 首选模型ID（可选）
+ * @param string|null $taskType 任务类型: creative|structured|synopsis（可选）
+ * @return array 排序后的模型列表
+ */
+function getModelFallbackList(?int $preferredModelId = null, ?string $taskType = null): array {
     $all = DB::fetchAll('SELECT * FROM ai_models ORDER BY is_default DESC, id ASC');
     if (empty($all)) {
         throw new RuntimeException('请先在【模型设置】中添加至少一个AI模型。');
     }
-    if (!$preferredModelId) return $all;
-
-    usort($all, function ($a, $b) use ($preferredModelId) {
-        if ((int)$a['id'] === $preferredModelId) return -1;
-        if ((int)$b['id'] === $preferredModelId) return 1;
-        return (int)$b['is_default'] - (int)$a['is_default'];
+    
+    // 如果没有指定任务类型，使用原有逻辑
+    if (!$taskType) {
+        if (!$preferredModelId) return $all;
+        
+        usort($all, function ($a, $b) use ($preferredModelId) {
+            if ((int)$a['id'] === $preferredModelId) return -1;
+            if ((int)$b['id'] === $preferredModelId) return 1;
+            return (int)$b['is_default'] - (int)$a['is_default'];
+        });
+        return $all;
+    }
+    
+    // 按任务类型智能排序
+    usort($all, function ($a, $b) use ($preferredModelId, $taskType) {
+        // 1. 首选模型优先级最高
+        if ($preferredModelId) {
+            if ((int)$a['id'] === $preferredModelId) return -1;
+            if ((int)$b['id'] === $preferredModelId) return 1;
+        }
+        
+        // 2. 检查模型能力标签
+        $aCaps = json_decode($a['capabilities'] ?? '[]', true) ?: [];
+        $bCaps = json_decode($b['capabilities'] ?? '[]', true) ?: [];
+        
+        $aHasTask = in_array($taskType, $aCaps, true);
+        $bHasTask = in_array($taskType, $bCaps, true);
+        
+        // 有能力标签的优先
+        if ($aHasTask && !$bHasTask) return -1;
+        if (!$aHasTask && $bHasTask) return 1;
+        
+        // 3. 都有或都没有能力标签，按默认模型优先
+        if ((int)$a['is_default'] !== (int)$b['is_default']) {
+            return (int)$b['is_default'] - (int)$a['is_default'];
+        }
+        
+        // 4. 最后按ID排序
+        return (int)$a['id'] - (int)$b['id'];
     });
+    
     return $all;
 }
 
 // ================================================================
-// 通用 fallback 执行器
+// 通用 fallback 执行器（支持按任务类型智能选择）
 // ================================================================
+/**
+ * 通用 fallback 执行器
+ * 
+ * @param int|null $preferredModelId 首选模型ID
+ * @param callable $callback 回调函数
+ * @param callable|null $onSwitch 模型切换回调
+ * @param string|null $taskType 任务类型: creative|structured|synopsis
+ * @return mixed
+ */
 function withModelFallback(
     ?int     $preferredModelId,
     callable $callback,
-    ?callable $onSwitch = null
+    ?callable $onSwitch = null,
+    ?string $taskType = null
 ): mixed {
-    $models    = getModelFallbackList($preferredModelId);
+    $models    = getModelFallbackList($preferredModelId, $taskType);
     $lastError = null;
 
     foreach ($models as $idx => $modelCfg) {

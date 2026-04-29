@@ -198,4 +198,171 @@ class AgentDirectives
             ];
         }
     }
+    
+    /**
+     * 记录指令效果反馈
+     * 
+     * 在章节完成后评估当前有效的Agent指令对质量的影响。
+     * 
+     * @param int $novelId 小说ID
+     * @param int $chapterNumber 当前章节号
+     * @return array{recorded: int, outcomes: array} 记录数及详情
+     */
+    public static function recordOutcomes(int $novelId, int $chapterNumber): array
+    {
+        $recorded = 0;
+        $outcomes = [];
+        try {
+            // 1. 获取当前章节的 quality_score / tokens_used / duration_ms
+            $chapter = DB::fetch(
+                'SELECT quality_score, tokens_used, duration_ms FROM chapters 
+                 WHERE novel_id = ? AND chapter_number = ? AND status = "completed"',
+                [$novelId, $chapterNumber]
+            );
+            if (empty($chapter)) {
+                return ['recorded' => 0, 'outcomes' => []];
+            }
+            $currentQuality = $chapter['quality_score'] !== null ? (float)$chapter['quality_score'] : null;
+            $tokensUsed = (int)($chapter['tokens_used'] ?? 0);
+            $durationMs = (int)($chapter['duration_ms'] ?? 0);
+            
+            if ($currentQuality === null) {
+                return ['recorded' => 0, 'outcomes' => []];
+            }
+            
+            // 2. 计算基线质量（前5章平均 quality_score）
+            $baseline = DB::fetch(
+                'SELECT AVG(quality_score) as avg_q FROM chapters 
+                 WHERE novel_id = ? AND chapter_number < ? AND quality_score IS NOT NULL
+                 ORDER BY chapter_number DESC LIMIT 5',
+                [$novelId, $chapterNumber]
+            );
+            $qualityBefore = $baseline && $baseline['avg_q'] !== null ? round((float)$baseline['avg_q'], 1) : $currentQuality;
+            
+            // 3. 获取本章有效的指令
+            $activeDirectives = self::active($novelId, $chapterNumber);
+            
+            foreach ($activeDirectives as $d) {
+                // 检查是否已评估过（幂等）
+                $exists = DB::fetch(
+                    'SELECT id FROM agent_directive_outcomes WHERE novel_id = ? AND directive_id = ? AND chapter_number = ?',
+                    [$novelId, (int)$d['id'], $chapterNumber]
+                );
+                if ($exists) continue;
+                
+                $qualityChange = round($currentQuality - $qualityBefore, 1);
+                DB::insert('agent_directive_outcomes', [
+                    'novel_id' => $novelId,
+                    'directive_id' => (int)$d['id'],
+                    'chapter_number' => $chapterNumber,
+                    'quality_before' => $qualityBefore,
+                    'quality_after' => $currentQuality,
+                    'quality_change' => $qualityChange,
+                    'tokens_used' => $tokensUsed,
+                    'duration_ms' => $durationMs,
+                ]);
+                $outcomes[] = [
+                    'directive_id' => (int)$d['id'],
+                    'type' => $d['type'],
+                    'quality_change' => $qualityChange,
+                ];
+                $recorded++;
+            }
+        } catch (\Throwable $e) {
+            error_log("记录Agent指令效果失败: " . $e->getMessage());
+        }
+        return ['recorded' => $recorded, 'outcomes' => $outcomes];
+    }
+    
+    /**
+     * 查询指令效果历史
+     * 
+     * @param int $novelId 小说ID
+     * @param array $options 查询选项: limit, type, directive_id, min_change
+     * @return array 效果记录列表
+     */
+    public static function getOutcomes(int $novelId, array $options = []): array
+    {
+        try {
+            $limit = max(1, min(200, (int)($options['limit'] ?? 50)));
+            $where = 'WHERE o.novel_id = ?';
+            $params = [$novelId];
+            
+            if (!empty($options['directive_id'])) {
+                $where .= ' AND o.directive_id = ?';
+                $params[] = (int)$options['directive_id'];
+            }
+            if (!empty($options['type'])) {
+                $where .= ' AND d.type = ?';
+                $params[] = $options['type'];
+            }
+            if (isset($options['min_change'])) {
+                $where .= ' AND o.quality_change >= ?';
+                $params[] = (float)$options['min_change'];
+            }
+            
+            return DB::fetchAll(
+                "SELECT o.*, d.type as directive_type, d.directive 
+                 FROM agent_directive_outcomes o 
+                 LEFT JOIN agent_directives d ON o.directive_id = d.id 
+                 {$where} ORDER BY o.evaluated_at DESC LIMIT ?",
+                array_merge($params, [$limit])
+            ) ?: [];
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+    
+    /**
+     * 获取指令效果聚合统计
+     * 
+     * @param int $novelId 小说ID
+     * @return array{by_type: array, top_effective: array, top_harmful: array}
+     */
+    public static function getOutcomeStats(int $novelId): array
+    {
+        try {
+            // 按类型统计
+            $byType = DB::fetchAll(
+                'SELECT d.type, 
+                    COUNT(*) as outcome_count,
+                    AVG(o.quality_change) as avg_change,
+                    SUM(CASE WHEN o.quality_change > 0 THEN 1 ELSE 0 END) as improved,
+                    SUM(CASE WHEN o.quality_change < 0 THEN 1 ELSE 0 END) as declined
+                 FROM agent_directive_outcomes o
+                 JOIN agent_directives d ON o.directive_id = d.id
+                 WHERE o.novel_id = ?
+                 GROUP BY d.type',
+                [$novelId]
+            ) ?: [];
+            
+            // 最有效的指令（改善最大）
+            $topEffective = DB::fetchAll(
+                'SELECT o.*, d.type, d.directive 
+                 FROM agent_directive_outcomes o
+                 JOIN agent_directives d ON o.directive_id = d.id
+                 WHERE o.novel_id = ? AND o.quality_change > 0
+                 ORDER BY o.quality_change DESC LIMIT 5',
+                [$novelId]
+            ) ?: [];
+            
+            // 最有副作用的指令
+            $topHarmful = DB::fetchAll(
+                'SELECT o.*, d.type, d.directive 
+                 FROM agent_directive_outcomes o
+                 JOIN agent_directives d ON o.directive_id = d.id
+                 WHERE o.novel_id = ? AND o.quality_change < 0
+                 ORDER BY o.quality_change ASC LIMIT 5',
+                [$novelId]
+            ) ?: [];
+            
+            return [
+                'by_type' => $byType,
+                'top_effective' => $topEffective,
+                'top_harmful' => $topHarmful,
+            ];
+        } catch (\Throwable $e) {
+            return ['by_type' => [], 'top_effective' => [], 'top_harmful' => []];
+        }
+    }
 }

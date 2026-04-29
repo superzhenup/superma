@@ -226,16 +226,16 @@ echo "----------------------------------------\n";
 
 $perfBefore = DB::fetch(
     'SELECT AVG(duration_ms) as avg_time 
-     FROM performance_logs 
-     WHERE novel_id = ? AND phase = "streamWrite" AND created_at < ?
+     FROM chapters 
+     WHERE novel_id = ? AND status = "completed" AND created_at < ?
      AND duration_ms IS NOT NULL',
     [$novelId, $agentEnabledDate]
 );
 
 $perfAfter = DB::fetch(
     'SELECT AVG(duration_ms) as avg_time 
-     FROM performance_logs 
-     WHERE novel_id = ? AND phase = "streamWrite" AND created_at >= ?
+     FROM chapters 
+     WHERE novel_id = ? AND status = "completed" AND created_at >= ?
      AND duration_ms IS NOT NULL',
     [$novelId, $agentEnabledDate]
 );

@@ -55,6 +55,9 @@ try {
         if ($action === 'cancel') {
             // 取消写作：设置取消标志（后端写作进程会检查此标志自行终止）
             DB::query('UPDATE novels SET cancel_flag = 1 WHERE id = ?', [$novelId]);
+            // v1.4 文件系统加速：避免每 50 token 查一次 DB，用 file_exists() 快 100+ 倍
+            @mkdir(BASE_PATH . '/storage', 0755, true);
+            file_put_contents(BASE_PATH . "/storage/write_cancel_{$novelId}.flag", time(), LOCK_EX);
             
             // 重置所有正在写作的章节状态（不清空内容，保留部分写作成果供恢复）
             // 注意：如果后端 ignore_user_abort 仍在运行，落盘时 WHERE status="writing" 条件
@@ -79,10 +82,12 @@ try {
             
             // 重置小说状态（paused 为有效枚举值，outlined 不在 novels.status 枚举中）
             DB::query('UPDATE novels SET status = "paused", cancel_flag = 0 WHERE id = ?', [$novelId]);
+            @unlink(BASE_PATH . "/storage/write_cancel_{$novelId}.flag");
             
             $message = '已重置所有未完成章节';
         } else if ($action === 'reset_chapter' && $chapterId) {
             // 重置单个章节
+            @unlink(BASE_PATH . "/storage/write_cancel_{$novelId}.flag");
             DB::query(
                 'UPDATE chapters SET content = "", words = 0, status = "outlined" 
                  WHERE id = ? AND novel_id = ?',

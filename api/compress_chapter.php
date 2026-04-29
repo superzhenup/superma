@@ -128,18 +128,21 @@ PROMPT;
 sse('message', ['status' => 'compressing', 'from_words' => $currentWords, 'target_words' => $targetWords]);
 
 // ---- 流式压缩（边收边发，用户实时看到内容）----
-$fullContent = '';
-$usedModel   = null;
-$novelId     = (int)$novel['id'];
+$fullContent  = '';
+$usedModel    = null;
+$novelId      = (int)$novel['id'];
+$modelTried   = [];
+$lastModelErr = '';
 
 try {
-    withModelFallback($novel['model_id'] ?? null, function($ai) use ($compressSystem, $compressUser, &$fullContent, &$usedModel) {
+    withModelFallback($novel['model_id'] ?? null, function($ai) use ($compressSystem, $compressUser, &$fullContent, &$usedModel, &$modelTried) {
         $usedModel = $ai->modelLabel;
+        $modelTried[] = $usedModel;
         $maxTok = $ai->getMaxTokens();
         $ai->setMaxTokens(max($maxTok, 8192));
 
         // chatStream 边收边发，每收到一个 chunk 都实时推送
-        $ai->chatStream(
+        $usage = $ai->chatStream(
             [
                 ['role' => 'system', 'content' => $compressSystem],
                 ['role' => 'user',   'content' => $compressUser],
@@ -150,19 +153,30 @@ try {
             },
             'creative'
         );
-    }, function($nextAi, $errMsg) {
+
+        // 如果 chatStream 返回了但 content 为空，打印 usage 信息用于调试
+        if (trim($fullContent) === '' && !empty($usage)) {
+            error_log("compress_chapter.php: 模型 {$usedModel} 返回了 usage 但 content 为空. tokens: " . json_encode($usage));
+        }
+    }, function($nextAi, $errMsg) use (&$modelTried, &$lastModelErr) {
+        $lastModelErr = $errMsg;
+        $modelTried[] = '(尝试切换: ' . $nextAi->modelLabel . ')';
         sse('message', ['model_switch' => true, 'to' => $nextAi->modelLabel, 'reason' => $errMsg]);
     });
 } catch (Throwable $e) {
-    error_log('compress_chapter.php 异常: ' . $e->getMessage());
-    sse('message', ['error' => '压缩失败：' . $e->getMessage()]);
+    $errMsg = $e->getMessage();
+    error_log('compress_chapter.php 异常: ' . $errMsg . ' | 已尝试模型: ' . implode(', ', $modelTried));
+    $detail = $modelTried ? '（已尝试: ' . implode(' → ', $modelTried) . '）' : '';
+    sse('message', ['error' => '压缩失败：' . $errMsg . $detail]);
     sseDone();
     exit;
 }
 
 // ---- 保存压缩结果 ----
 if (trim($fullContent) === '') {
-    sse('message', ['error' => '压缩失败：LLM 未返回有效内容。']);
+    $detail = $modelTried ? '（已尝试模型: ' . implode(', ', $modelTried) . '）' : '';
+    $extra  = $lastModelErr ? ' 最后错误: ' . $lastModelErr : '';
+    sse('message', ['error' => '压缩失败：所有模型均未返回有效内容。' . $detail . $extra . ' 请检查模型 API 配置或尝试切换模型。']);
     sseDone();
     exit;
 }

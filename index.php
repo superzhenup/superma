@@ -101,17 +101,22 @@ pageHeader('我的书库', 'home');
       ? round($novel['current_chapter'] / $novel['target_chapters'] * 100)
       : 0;
     $color = $novel['cover_color'] ?: '#6366f1';
-    $hasCoverImage = !empty($novel['cover_image']);
+    $coverPath = !empty($novel['cover_image']) ? $novel['cover_image'] : null;
+    // 检查封面图片是否真实存在
+    $hasCoverImage = $coverPath && file_exists((defined('BASE_PATH') ? BASE_PATH : dirname(__DIR__)) . '/' . ltrim($coverPath, '/'));
+    $coverUrl = $hasCoverImage ? $coverPath : null;
   ?>
-  <div class="col-12 col-md-6 col-xl-4">
+  <div class="col-4 col-md-2 col-xl-2">
     <div class="novel-card" onclick="location.href='novel.php?id=<?= $novel['id'] ?>'">
-      <div class="novel-cover" style="<?= $hasCoverImage ? 'height:160px' : 'height:120px;background: linear-gradient(135deg, ' . h($color) . ', ' . h($color) . '99)' ?>">
-        <?php if ($hasCoverImage): ?>
-        <img src="<?= h($novel['cover_image']) ?>" alt="<?= h($novel['title']) ?>" style="display:block;width:100%;height:100%;object-fit:cover">
+      <!-- 封面区：3:2 比例，统一尺寸 -->
+      <div class="novel-cover" style="<?= $coverUrl ? '' : 'background: linear-gradient(135deg, ' . h($color) . ', ' . h($color) . '99)' ?>">
+        <?php if ($coverUrl): ?>
+        <img src="<?= h($coverUrl) ?>" alt="<?= h($novel['title']) ?>" loading="lazy">
         <?php else: ?>
         <div class="novel-cover-title"><?= h(safe_substr($novel['title'], 0, 4)) ?></div>
         <?php endif; ?>
       </div>
+      <!-- 信息区 -->
       <div class="novel-info">
         <div class="d-flex align-items-start justify-content-between mb-1">
           <h6 class="novel-title"><?= h($novel['title']) ?></h6>
@@ -128,7 +133,7 @@ pageHeader('我的书库', 'home');
         <div class="mt-2">
           <div class="d-flex justify-content-between mb-1">
             <small class="text-muted">章节进度</small>
-            <small class="text-muted"><?= $novel['current_chapter'] ?>/<?= $novel['target_chapters'] ?> 章</small>
+            <small class="text-muted"><?= $novel['current_chapter'] ?>/<?= $novel['target_chapters'] ?> 章 · <?= $progress ?>%</small>
           </div>
           <div class="progress" style="height:4px">
             <div class="progress-bar" style="width:<?= $progress ?>%;background:<?= h($color) ?>"></div>

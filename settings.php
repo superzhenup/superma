@@ -25,6 +25,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $is_default = isset($_POST['is_default']) ? 1 : 0;
         $embedding_enabled = isset($_POST['embedding_enabled']) ? 1 : 0;
         $thinking_enabled  = isset($_POST['thinking_enabled'])  ? 1 : 0;
+        
+        // 处理capabilities字段（多选checkbox）
+        $capabilities = [];
+        if (isset($_POST['cap_creative']))   $capabilities[] = 'creative';
+        if (isset($_POST['cap_structured'])) $capabilities[] = 'structured';
+        if (isset($_POST['cap_synopsis']))   $capabilities[] = 'synopsis';
+        $capabilities_json = !empty($capabilities) ? json_encode($capabilities) : null;
 
         if (!$name || !$api_url || !$model_name) {
             $error = '请填写名称、API地址和模型标识符。';
@@ -58,6 +65,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'is_default'          => $is_default,
                     'embedding_enabled'   => $embedding_enabled,
                     'thinking_enabled'    => $thinking_enabled,
+                    'capabilities'        => $capabilities_json,
                     'can_embed'           => $embedding_enabled,
                     'embedding_model_name'=> $embedding_model_name,
                 ], 'id=?', [$editId]);
@@ -74,6 +82,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'is_default'          => $is_default,
                     'embedding_enabled'   => $embedding_enabled,
                     'thinking_enabled'    => $thinking_enabled,
+                    'capabilities'        => $capabilities_json,
                     'can_embed'           => $embedding_enabled,
                     'embedding_model_name'=> $embedding_model_name,
                 ]);
@@ -163,7 +172,7 @@ $presets = [
 <div class="row g-4">
 
   <!-- Model List -->
-  <div class="col-12 col-lg-7">
+  <div class="col-12 col-lg-7 order-lg-2">
     <div class="page-card">
       <div class="page-card-header"><i class="bi bi-cpu me-2"></i>已配置模型</div>
       <?php if ($msg): ?>
@@ -173,7 +182,7 @@ $presets = [
       <div class="empty-state py-4">
         <div class="empty-icon"><i class="bi bi-cpu"></i></div>
         <h6>尚未添加模型</h6>
-        <p class="text-muted small">请在右侧表单添加您的AI模型</p>
+        <p class="text-muted small">请在左侧表单添加您的AI模型</p>
       </div>
       <?php else: ?>
       <div class="list-group list-group-flush">
@@ -182,7 +191,7 @@ $presets = [
           <div class="d-flex align-items-start justify-content-between">
             <div class="flex-grow-1">
               <div class="d-flex align-items-center gap-2 mb-1">
-                <span class="fw-semibold text-light"><?= h($m['name']) ?></span>
+                <span class="fw-semibold" style="color:var(--text)"><?= h($m['name']) ?></span>
                 <?php if ($m['is_default']): ?>
                 <span class="badge bg-primary">默认</span>
                 <?php endif; ?>
@@ -197,6 +206,21 @@ $presets = [
                 · <span class="text-info"><i class="bi bi-lightbulb me-1"></i>深度思考</span>
                 <?php endif; ?>
               </div>
+              <?php 
+              $caps = json_decode($m['capabilities'] ?? '[]', true) ?: [];
+              if (!empty($caps)): ?>
+              <div class="small mt-1">
+                <?php foreach ($caps as $cap): ?>
+                <?php if ($cap === 'creative'): ?>
+                <span class="badge bg-primary me-1">creative</span>
+                <?php elseif ($cap === 'structured'): ?>
+                <span class="badge bg-info me-1">structured</span>
+                <?php elseif ($cap === 'synopsis'): ?>
+                <span class="badge bg-warning me-1">synopsis</span>
+                <?php endif; ?>
+                <?php endforeach; ?>
+              </div>
+              <?php endif; ?>
             </div>
             <div class="d-flex gap-1 ms-2 flex-shrink-0">
               <?php if (!$m['is_default']): ?>
@@ -230,68 +254,33 @@ $presets = [
       <?php endif; ?>
     </div>
 
-    <!-- 方舟 Coding Plan 推荐卡片 -->
+    <!-- 官方公告（iframe 嵌入远程页面） -->
+<?php $announcementUrl = ConfigCenter::get('announcement_url', 'https://www.itzo.cn/api/super.html', 'string'); ?>
     <div class="page-card mt-3" style="border-color:rgba(99,102,241,.4);background:linear-gradient(135deg,rgba(99,102,241,.08),rgba(139,92,246,.08))">
-      <div class="page-card-header" style="border-color:rgba(99,102,241,.3)">
-        <i class="bi bi-stars me-2" style="color:#a78bfa"></i>算力平台推荐：
+      <div class="page-card-header d-flex align-items-center justify-content-between" style="border-color:rgba(99,102,241,.3)">
+        <div><i class="bi bi-stars me-2" style="color:#a78bfa"></i>官方公告</div>
+        <div class="small text-muted" id="announce-status" style="font-size:.75rem"></div>
       </div>
       <div class="p-3">
-        <div class="d-flex align-items-start gap-3">
-          <div class="flex-shrink-0 mt-1">
-            <div style="width:42px;height:42px;border-radius:10px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:flex;align-items:center;justify-content:center">
-              <i class="bi bi-lightning-charge-fill text-white fs-5"></i>
-            </div>
-          </div>
-          <div class="flex-grow-1">
-            <div class="fw-semibold text-light mb-1" style="font-size:.9rem">Super MA 智算中心 - AI加速创作</div>
-            <ul class="small text-muted mb-2 ps-3" style="line-height:1.8">
-              <li>赤云智算中心 按量计费</li>
-              <li>支持：GPT / Claude / Grok / DeepSeek-V3.2 / GLM / MiniMax / Kimi / Doubao 等世界顶尖模型，低延迟高并发</li>
-              <li>量大管饱，专为 AI 写作 / 编程场景优化</li>
-            </ul>
-            <a href="https://api.6zhen.cn/"
-               target="_blank" rel="noopener"
-               class="btn btn-sm"
-               style="background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;color:#fff;font-weight:600">
-              <i class="bi bi-box-arrow-up-right me-1"></i>立即注册使用
-            </a>
-          </div>
-		   <div class="flex-grow-2">
-            <div class="fw-semibold text-light mb-1" style="font-size:.9rem">火山方舟 Coding Plan</div>
-            <ul class="small text-muted mb-2 ps-3" style="line-height:1.8">
-              <li>字节跳动旗下AI基座平台</li>
-              <li>DeepSeek-V3.2 / Doubao / GLM / MiniMax / Kimi等顶尖模型，低延迟高并发</li>
-              <li>量大管饱，专为 AI 写作 / 编程场景优化</li>
-            </ul>
-            <a href="https://www.volcengine.com/activity/codingplan?utm_source=7&utm_medium=daren_cpa&utm_term=daren_cpa_gaodingai_doumeng&utm_campaign=0&utm_content=codingplan_doumeng"
-               target="_blank" rel="noopener"
-               class="btn btn-sm"
-               style="background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;color:#fff;font-weight:600">
-              <i class="bi bi-box-arrow-up-right me-1"></i>立即注册使用
-            </a>
-          </div>
+        <!-- URL 配置行 -->
+
+        <!-- iframe 嵌入远程公告 -->
+        <div id="announce-iframe-wrap" style="max-height:600px;overflow:hidden;border-radius:6px;<?= $announcementUrl ? '' : 'display:none' ?>">
+          <iframe id="announce-iframe"
+                  src="<?= $announcementUrl ? h($announcementUrl) : '' ?>"
+                  style="width:100%;height:600px;border:none;background:transparent"
+                  sandbox="allow-scripts allow-same-origin allow-popups allow-top-navigation"
+                  loading="lazy"
+                  onload="this.style.height=Math.min(this.contentDocument?.body?.scrollHeight+20||380,400)+'px'"
+                  onerror="document.getElementById('announce-placeholder').style.display='';this.parentElement.style.display='none'">
+          </iframe>
         </div>
-      </div>
-    </div>
-	
-	 <!-- 搞定AI公众号推荐卡片 -->
-    <div class="page-card mt-3" style="border-color:rgba(99,102,241,.4);background:linear-gradient(135deg,rgba(99,102,241,.08),rgba(139,92,246,.08))">
-      <div class="page-card-header" style="border-color:rgba(99,102,241,.3)">
-        <i class="bi bi-stars me-2" style="color:#a78bfa"></i>更多好玩微信关注“搞定AI”
-      </div>
-      <div class="p-3">
-        <div class="d-flex align-items-start gap-3">
-          <div class="flex-shrink-0 mt-1">
-            <div style="width:42px;height:42px;border-radius:10px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:flex;align-items:center;justify-content:center">
-              <i class="bi bi-lightning-charge-fill text-white fs-5"></i>
-            </div>
-          </div>
-          <div class="vxx">
-                <img height="300" width="300" src="https://www.itzo.cn/api/ai.jpg" alt="搞定AI" class="ai-img">
-            </div>
+        <!-- 无 URL 时的提示 -->
+        <div id="announce-placeholder" class="text-center text-muted py-3 small"
+             style="<?= $announcementUrl ? 'display:none' : '' ?>">
+          <i class="bi bi-info-circle me-1"></i>加载失败
         </div>
-      </div>
-    </div>
+		</div></div>
 
     <!-- Test connection -->
     <div class="page-card mt-3">
@@ -318,29 +307,38 @@ $presets = [
   </div>
 
   <!-- Add/Edit Form -->
-  <div class="col-12 col-lg-5">
+  <div class="col-12 col-lg-5 order-lg-1">
     <div class="page-card">
-      <div class="page-card-header" id="form-header">
-        <i class="bi bi-plus-circle me-2"></i>添加模型
+      <!-- Tab Navigation -->
+      <div class="engine-tabs">
+        <button type="button" class="engine-tab active" data-tab="text-engine">
+          <i class="bi bi-cpu me-1"></i>文本生成引擎
+        </button>
+        <button type="button" class="engine-tab" data-tab="image-engine">
+          <i class="bi bi-image me-1"></i>图片生成引擎
+        </button>
       </div>
-      <?php if ($error): ?>
-      <div class="alert alert-danger m-3 alert-sm"><?= h($error) ?></div>
-      <?php endif; ?>
 
-      <!-- Preset buttons -->
-      <div class="p-3 pb-0">
-        <div class="small text-muted mb-2">快速选择预设：</div>
-        <div class="d-flex flex-wrap gap-1 mb-3">
-          <?php foreach ($presets as $key => $p): ?>
-          <button type="button" class="btn btn-xs btn-outline-secondary btn-preset"
-                  data-preset='<?= json_encode($p, JSON_HEX_APOS) ?>'>
-            <?= h($p['name']) ?>
-          </button>
-          <?php endforeach; ?>
+      <!-- ===== Tab 1: 文本生成引擎 ===== -->
+      <div class="engine-panel active" id="text-engine-panel">
+        <?php if ($error): ?>
+        <div class="alert alert-danger m-3 alert-sm"><?= h($error) ?></div>
+        <?php endif; ?>
+
+        <!-- Preset buttons -->
+        <div class="p-3 pb-0">
+          <div class="small text-muted mb-2">快速选择预设：</div>
+          <div class="d-flex flex-wrap gap-1 mb-3">
+            <?php foreach ($presets as $key => $p): ?>
+            <button type="button" class="btn btn-xs btn-outline-secondary btn-preset"
+                    data-preset='<?= json_encode($p, JSON_HEX_APOS) ?>'>
+              <?= h($p['name']) ?>
+            </button>
+            <?php endforeach; ?>
+          </div>
         </div>
-      </div>
 
-      <form method="post" id="model-form" class="px-3 pb-3">
+        <form method="post" id="model-form" class="px-3 pb-3">
         <input type="hidden" name="_token" value="<?= csrf_token() ?>">
         <input type="hidden" name="action" id="form-action" value="add">
         <input type="hidden" name="edit_id" id="form-edit-id" value="">
@@ -394,23 +392,55 @@ $presets = [
         <div class="mb-3 p-3 rounded" style="background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2)">
           <div class="form-check mb-2">
             <input class="form-check-input" type="checkbox" name="thinking_enabled" id="f-thinking">
-            <label class="form-check-label text-light fw-semibold" for="f-thinking">
+            <label class="form-check-label fw-semibold" style="color:var(--text)" for="f-thinking">
               <i class="bi bi-lightbulb me-1" style="color:#eab308"></i>深度思考 Enable Thinking
             </label>
           </div>
           <div class="small text-muted" style="line-height:1.6">
-            开启后，AI 在生成回复前会进行深度推理（思维链），显著提升复杂推理和创作质量。系统会根据 API 地址自动识别厂商并使用对应的参数格式：
+            开启后，AI 在生成回复前会进行深度推理（思维链），显著提升复杂推理和创作质量(会增加 Token 消耗和响应时间)。系统会根据 API 地址自动识别厂商并使用对应的参数格式：
           </div>
           <div class="small mt-2" style="line-height:1.5">
             <table class="w-100" style="font-size:.75rem">
               <tr><td class="text-warning" style="width:10px">●</td><td class="text-muted">DeepSeek / 火山方舟 / 硅基流动</td><td class="text-secondary">thinking: {"type":"enabled"}</td></tr>
               <tr><td class="text-warning">●</td><td class="text-muted">阿里云百炼（通义千问）</td><td class="text-secondary">enable_thinking + thinking_budget</td></tr>
-              <tr><td class="text-warning">●</td><td class="text-muted">智谱GLM / Kimi</td><td class="text-secondary">enable_thinking: true</td></tr>
-              <tr><td class="text-warning">●</td><td class="text-muted">OpenAI（o1/o3）</td><td class="text-secondary">reasoning_effort: "high"</td></tr>
             </table>
           </div>
+        </div>
+        
+        <!-- 模型能力标签 -->
+        <div class="mb-3 p-3 rounded" style="background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2)">
+          <div class="mb-2">
+            <label class="form-label fw-semibold mb-1" style="color:var(--text)">
+              <i class="bi bi-tags me-1" style="color:#22c55e"></i>模型能力标签
+            </label>
+          </div>
+          <div class="small text-muted mb-2" style="line-height:1.6">
+            标记此模型擅长的任务类型，系统会根据任务类型智能选择最合适的模型。未标记的模型仍可作为备用。
+          </div>
+          <div class="d-flex flex-wrap gap-3">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="cap_creative" id="f-cap-creative">
+              <label class="form-check-label text-muted" for="f-cap-creative">
+                <span class="badge bg-primary me-1">creative</span>正文写作
+              </label>
+            </div>
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="cap_structured" id="f-cap-structured">
+              <label class="form-check-label text-muted" for="f-cap-structured">
+                <span class="badge bg-info me-1">structured</span>结构化任务
+              </label>
+            </div>
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="cap_synopsis" id="f-cap-synopsis">
+              <label class="form-check-label text-muted" for="f-cap-synopsis">
+                <span class="badge bg-warning me-1">synopsis</span>章节简介
+              </label>
+            </div>
+          </div>
           <div class="small text-muted mt-2" style="line-height:1.6">
-            开启后会增加 Token 消耗和响应时间，但输出质量更高。不支持深度思考的模型请勿开启，否则可能报错（系统会自动回退重试）。
+            <strong>creative</strong>：正文写作，需要高创意和文采<br>
+            <strong>structured</strong>：大纲生成、摘要提取、JSON解析等结构化任务<br>
+            <strong>synopsis</strong>：章节简介生成，介于创意和结构之间
           </div>
         </div>
         
@@ -418,12 +448,12 @@ $presets = [
         <div class="mb-3 p-3 rounded" style="background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.2)">
           <div class="form-check mb-2">
             <input class="form-check-input" type="checkbox" name="embedding_enabled" id="f-embedding" onchange="validateEmbedding()">
-            <label class="form-check-label text-light fw-semibold" for="f-embedding">
+            <label class="form-check-label fw-semibold" style="color:var(--text)" for="f-embedding">
               <i class="bi bi-lightning-charge me-1" style="color:#a78bfa"></i>记忆增强-Embedding模型
             </label>
           </div>
           <div class="small text-muted mb-2" style="line-height:1.6">
-            使用方舟Coding Plan API时自动开启，提升大模型记忆能力以及写作能力（会增加token消耗）。其他API暂不支持。
+            使用方舟Coding Plan API时自动开启，提升大模型记忆能力（会增加token消耗）。其他API暂不支持。
           </div>
           <input type="hidden" name="embedding_model_name" id="f-embedding-model" value="">
           <div id="embedding-error" class="small text-danger" style="display:none">
@@ -433,7 +463,7 @@ $presets = [
             <i class="bi bi-check-circle me-1"></i>已自动开启记忆增强（doubao-embedding-vision）
           </div>
           <div id="embedding-test-result" class="small mt-2" style="display:none"></div>
-          <button type="button" class="btn btn-outline-light btn-sm mt-2" onclick="testEmbedding()" id="btn-test-embedding">
+          <button type="button" class="btn btn-outline-info btn-sm mt-2" onclick="testEmbedding()" id="btn-test-embedding">
             <i class="bi bi-lightning-charge me-1"></i>检测记忆增强是否生效
           </button>
         </div>
@@ -446,11 +476,153 @@ $presets = [
                   style="display:none" onclick="resetForm()">取消</button>
         </div>
       </form>
-    </div>
+      </div><!-- /text-engine-panel -->
 
-   
+      <!-- ===== Tab 2: 图片生成引擎 ===== -->
+      <div class="engine-panel" id="image-engine-panel">
+      <div class="p-3">
+        <div class="small text-muted mb-3" style="line-height:1.6">
+          配置图片生成 API，用于 AI 生成小说封面图片。支持 OpenAI 兼容的 Images API（<code>/images/generations</code>）。
+        </div>
 
+        <!-- 预设快捷填充 -->
+        <div class="mb-3">
+          <div class="small text-muted mb-2">快速选择预设：</div>
+          <div class="d-flex flex-wrap gap-1">
+            <button type="button" class="btn btn-xs btn-outline-secondary img-preset"
+                    data-img-preset='{"name":"赤云优算","api_url":"https://api.6zhen.cn/v1","model":"gpt-image-2"}'>
+              赤云优算
+            </button>
+            <button type="button" class="btn btn-xs btn-outline-secondary img-preset"
+                    data-img-preset='{"name":"OpenAI 官方","api_url":"https://api.openai.com/v1","model":"gpt-image-2"}'>
+              OpenAI 官方
+            </button>
+            <button type="button" class="btn btn-xs btn-outline-secondary img-preset"
+                    data-img-preset='{"name":"自定义","api_url":"","model":"gpt-image-2"}'>
+              自定义
+            </button>
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">API 地址 <span class="text-danger">*</span></label>
+          <input type="url" class="form-control form-control-sm" id="img-api-url"
+                 placeholder="https://api.openai.com/v1" value="">
+          <div class="form-text">OpenAI 兼容的 API 地址（不含 <code>/images/generations</code>）</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">API 密钥</label>
+          <div class="input-group input-group-sm">
+            <input type="password" class="form-control form-control-sm" id="img-api-key"
+                   placeholder="sk-...">
+            <button class="btn btn-outline-secondary" type="button" id="toggle-img-api-key" title="显示/隐藏">
+              <i class="bi bi-eye" id="img-eye-icon"></i>
+            </button>
+          </div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">模型名称 <span class="text-danger">*</span></label>
+          <input type="text" class="form-control form-control-sm" id="img-model-name"
+                 placeholder="gpt-image-2" value="gpt-image-2">
+          <div class="form-text">图片生成模型标识符，如 <code>gpt-image-2</code>、<code>dall-e-3</code>、<code>FLUX.1-schnell</code> 等</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">生成尺寸</label>
+          <select class="form-select form-select-sm" id="img-size">
+            <option value="1024x1536" selected>1024×1536（推荐，接近 1086×1448 比例）</option>
+            <option value="1024x1024">1024×1024（方形）</option>
+            <option value="1536x1024">1536×1024（横版）</option>
+          </select>
+          <div class="form-text">生成后系统会自动缩放到 1086×1448 封面标准分辨率</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">默认封面 Prompt 前缀</label>
+          <textarea class="form-control form-control-sm" id="img-prompt-prefix" rows="2"
+                    placeholder="A professional book cover illustration for a novel. Style: high quality, detailed, dramatic lighting."></textarea>
+          <div class="form-text">生成封面时，用户输入的关键词会追加在此前缀之后。留空则使用系统默认。</div>
+        </div>
+
+        <div class="d-flex gap-2">
+          <button type="button" class="btn btn-sm flex-grow-1" style="background:linear-gradient(135deg,#ec4899,#a855f7);border:none;color:#fff;font-weight:600" onclick="saveImageApiConfig()">
+            <i class="bi bi-check-lg me-1"></i>保存配置
+          </button>
+          <button type="button" class="btn btn-sm btn-outline-info" onclick="testImageApi()">
+            <i class="bi bi-send me-1"></i>测试
+          </button>
+        </div>
+        <div id="img-api-status" class="mt-2 small" style="display:none"></div>
+      </div>
+      </div><!-- /image-engine-panel -->
+    </div><!-- /page-card -->
+  </div>
+</div>
+
+<style>
+/* Engine Tabs */
+.engine-tabs {
+  display: flex;
+  border-bottom: 2px solid var(--border);
+  gap: 0;
+}
+.engine-tab {
+  flex: 1;
+  padding: 12px 16px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: .875rem;
+  font-weight: 600;
+  cursor: pointer;
+  position: relative;
+  transition: all .2s;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+}
+.engine-tab:hover {
+  color: var(--text-sub);
+  background: var(--bg-hover);
+}
+.engine-tab.active {
+  color: var(--text);
+  border-bottom-color: #6366f1;
+  background: var(--primary-bg);
+}
+.engine-tab.active i {
+  color: #a78bfa;
+}
+.engine-panel {
+  display: none;
+}
+.engine-panel.active {
+  display: block;
+}
+/* 远程公告内容样式 */
+.remote-announce {
+  color: var(--text);
+  font-size: .85rem;
+  line-height: 1.7;
+}
+.remote-announce a { color: #a78bfa; }
+.remote-announce h3, .remote-announce h4 { color: var(--text); margin: .8em 0 .4em; font-size: .95rem; }
+.remote-announce ul, .remote-announce ol { padding-left: 1.2em; }
+.remote-announce li { margin-bottom: .25em; }
+.remote-announce img { max-width: 100%; border-radius: 8px; }
+.remote-announce p { margin-bottom: .5em; }
+</style>
 <script>
+// Engine Tab Switching
+document.querySelectorAll('.engine-tab').forEach(tab => {
+    tab.addEventListener('click', function() {
+        const targetId = this.dataset.tab + '-panel';
+        // Update tabs
+        document.querySelectorAll('.engine-tab').forEach(t => t.classList.remove('active'));
+        this.classList.add('active');
+        // Update panels
+        document.querySelectorAll('.engine-panel').forEach(p => p.classList.remove('active'));
+        document.getElementById(targetId).classList.add('active');
+    });
+});
+
 // Toggle API key visibility
 document.getElementById('toggle-api-key').addEventListener('click', function() {
     const input = document.getElementById('f-api-key');
@@ -560,7 +732,8 @@ document.querySelectorAll('.btn-preset').forEach(btn => {
 document.querySelectorAll('.btn-edit-model').forEach(btn => {
     btn.addEventListener('click', () => {
         const m = JSON.parse(btn.dataset.model);
-        document.getElementById('form-header').innerHTML  = '<i class="bi bi-pencil me-2"></i>编辑模型';
+        const formHeader = document.getElementById('form-header');
+        if (formHeader) formHeader.innerHTML = '<i class="bi bi-pencil me-2"></i>编辑模型';
         document.getElementById('form-action').value     = 'edit';
         document.getElementById('form-edit-id').value    = m.id;
         document.getElementById('f-name').value          = m.name;
@@ -572,6 +745,12 @@ document.querySelectorAll('.btn-edit-model').forEach(btn => {
         document.getElementById('f-default').checked     = m.is_default == 1;
         document.getElementById('f-embedding').checked   = (m.embedding_enabled ?? 0) == 1;
         document.getElementById('f-thinking').checked    = (m.thinking_enabled ?? 0) == 1;
+        
+        // 设置capabilities字段
+        const caps = JSON.parse(m.capabilities || '[]');
+        document.getElementById('f-cap-creative').checked   = caps.includes('creative');
+        document.getElementById('f-cap-structured').checked = caps.includes('structured');
+        document.getElementById('f-cap-synopsis').checked   = caps.includes('synopsis');
         // 联动显示 embedding 支持提示
         const isArkApi = (m.api_url || '').includes('ark.cn-beijing.volces.com') || (m.api_url || '').includes('volces.com');
         const embCheckbox = document.getElementById('f-embedding');
@@ -609,7 +788,8 @@ function resetForm() {
     document.getElementById('model-form').reset();
     document.getElementById('form-action').value = 'add';
     document.getElementById('form-edit-id').value = '';
-    document.getElementById('form-header').innerHTML = '<i class="bi bi-plus-circle me-2"></i>添加模型';
+    const formHeader = document.getElementById('form-header');
+    if (formHeader) formHeader.innerHTML = '<i class="bi bi-plus-circle me-2"></i>添加模型';
     document.getElementById('form-submit-btn').innerHTML = '<i class="bi bi-plus-lg me-1"></i>添加模型';
     document.getElementById('form-cancel-btn').style.display = 'none';
     // 重置embedding验证状态
@@ -619,6 +799,10 @@ function resetForm() {
     // 移除可能残留的 hidden input
     const hiddenEmb = document.getElementById('f-embedding-hidden');
     if (hiddenEmb) hiddenEmb.remove();
+    // 重置capabilities字段
+    document.getElementById('f-cap-creative').checked = false;
+    document.getElementById('f-cap-structured').checked = false;
+    document.getElementById('f-cap-synopsis').checked = false;
 }
 
 // 检测记忆增强（Embedding）是否生效
@@ -819,6 +1003,112 @@ async function testConnection() {
         console.error('测试连接错误:', e);
     }
 }
+
+// ── 远程公告加载（15秒超时）─────────────────────────────────────
+async function loadAnnounce(url) {
+    const contentWrap  = document.getElementById('announce-content-wrap');
+    const contentArea  = document.getElementById('announce-content');
+    const placeholder  = document.getElementById('announce-placeholder');
+    const statusEl     = document.getElementById('announce-status');
+
+    if (!url) {
+        contentWrap.style.display = 'none';
+        placeholder.style.display = '';
+        placeholder.innerHTML = '<i class="bi bi-info-circle me-1"></i>请设置公告源地址';
+        statusEl.textContent = '';
+        return;
+    }
+
+    // 显示加载状态
+    placeholder.style.display = '';
+    placeholder.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>正在加载公告...';
+    contentWrap.style.display = 'none';
+    statusEl.innerHTML = '<span class="text-muted"><i class="bi bi-arrow-repeat spin me-1"></i>加载中</span>';
+
+    const controller = new AbortController();
+    const timeoutId  = setTimeout(() => controller.abort(), 15000);
+
+    try {
+        const response = await fetch(url, {
+            signal: controller.signal,
+            headers: { 'Accept': 'text/html,text/plain,*/*' },
+        });
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            throw new Error('HTTP ' + response.status);
+        }
+
+        const html = await response.text();
+        if (!html.trim()) throw new Error('返回内容为空');
+
+        contentArea.innerHTML = html;
+        contentWrap.style.display = '';
+        placeholder.style.display = 'none';
+        statusEl.innerHTML = '<span class="text-success"><i class="bi bi-check-circle me-1"></i>已加载</span>';
+
+    } catch (e) {
+        clearTimeout(timeoutId);
+        contentWrap.style.display = 'none';
+        placeholder.style.display = '';
+        const errMsg = e.name === 'AbortError' ? '请求超时（15秒）' : e.message;
+        placeholder.innerHTML = '<i class="bi bi-exclamation-triangle me-1"></i><span class="text-warning">加载失败：' + escapeHtml(errMsg) + '</span>';
+        statusEl.innerHTML = '<span class="text-danger"><i class="bi bi-x-circle me-1"></i>失败</span>';
+    }
+}
+
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+function refreshAnnounce() {
+    const url = document.getElementById('announce-url').value.trim();
+    loadAnnounce(url);
+}
+
+// 保存公告地址到 system_settings
+async function saveAnnounceUrl() {
+    const url     = document.getElementById('announce-url').value.trim();
+    const statusEl = document.getElementById('announce-status');
+    const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+
+    statusEl.innerHTML = '<span class="text-muted"><i class="bi bi-hourglass-split me-1"></i>保存中</span>';
+
+    try {
+        const res = await fetch('api/actions.php', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+            body: JSON.stringify({ action: 'save_announcement_url', url: url }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+            statusEl.innerHTML = '<span class="text-success"><i class="bi bi-check-circle me-1"></i>已保存</span>';
+            // 保存成功后自动加载公告
+            loadAnnounce(url);
+        } else {
+            statusEl.innerHTML = '<span class="text-danger"><i class="bi bi-x-circle me-1"></i>' + (data.msg || '保存失败') + '</span>';
+        }
+    } catch(e) {
+        statusEl.innerHTML = '<span class="text-danger"><i class="bi bi-x-circle me-1"></i>保存失败</span>';
+    }
+}
+
+// 页面加载时自动拉取公告（如果已配置 URL）
+(function() {
+    const urlInput = document.getElementById('announce-url');
+    const url = urlInput?.value.trim();
+    if (url) {
+        // 延迟一小段等页面渲染完
+        setTimeout(() => loadAnnounce(url), 300);
+    }
+})();
+
+// 旋转动画
+const spinStyle = document.createElement('style');
+spinStyle.textContent = '.spin { animation: spin-ann 1s linear infinite; display: inline-block; } @keyframes spin-ann { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }';
+document.head.appendChild(spinStyle);
 </script>
 
 <?php pageFooter(); ?>

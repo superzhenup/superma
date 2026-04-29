@@ -21,9 +21,6 @@ require_once __DIR__ . '/BaseAgent.php';
 
 class QualityMonitorAgent extends BaseAgent
 {
-    /** @var int 小说ID */
-    private $novelId;
-    
     /** @var array 质量阈值配置 */
     private $qualityThresholds = [
         'excellent' => 85,
@@ -39,8 +36,7 @@ class QualityMonitorAgent extends BaseAgent
      */
     public function __construct(int $novelId)
     {
-        parent::__construct('quality_monitor');
-        $this->novelId = $novelId;
+        parent::__construct('quality_monitor', $novelId);
     }
     
     /**
@@ -436,17 +432,61 @@ class QualityMonitorAgent extends BaseAgent
     private function calculateCharacterConsistency(array $chapters): float
     {
         try {
-            $stats = DB::fetch(
-                'SELECT COUNT(*) as total, 
-                        SUM(CASE WHEN consistency_check = "pass" THEN 1 ELSE 0 END) as pass 
-                 FROM character_mentions
-                 WHERE novel_id = ?',
-                [$this->novelId]
+            if (empty($chapters)) return 1.0;
+            
+            // 获取最近章节的章节号范围
+            $chapterNumbers = array_column($chapters, 'chapter_number');
+            $minChapter = min($chapterNumbers);
+            $maxChapter = max($chapterNumbers);
+            
+            // 查询角色卡片变更历史
+            $history = DB::fetchAll(
+                'SELECT card_id, chapter_number, field_name 
+                 FROM character_card_history 
+                 WHERE novel_id = ? AND chapter_number BETWEEN ? AND ?
+                 ORDER BY chapter_number ASC',
+                [$this->novelId, $minChapter, $maxChapter]
             );
             
-            return $stats['total'] > 0 ? (int)$stats['pass'] / (int)$stats['total'] : 1.0;
+            if (empty($history)) {
+                // 没有变更记录，可能是新小说或角色状态稳定
+                return 1.0;
+            }
+            
+            // 统计每个角色的变更次数
+            $cardChanges = [];
+            foreach ($history as $record) {
+                $cardId = $record['card_id'];
+                if (!isset($cardChanges[$cardId])) {
+                    $cardChanges[$cardId] = 0;
+                }
+                $cardChanges[$cardId]++;
+            }
+            
+            // 计算变更频率得分
+            // 理想情况：每个角色在10章内变更1-2次（状态自然变化）
+            // 过于频繁的变更（每章都变）可能表示一致性有问题
+            $totalCards = count($cardChanges);
+            if ($totalCards === 0) return 1.0;
+            
+            $chapterCount = count($chapters);
+            $frequentChanges = 0;
+            
+            foreach ($cardChanges as $changeCount) {
+                // 如果变更次数超过章节数的一半，认为过于频繁
+                if ($changeCount > $chapterCount / 2) {
+                    $frequentChanges++;
+                }
+            }
+            
+            // 计算一致性得分：频繁变更的角色比例越低，得分越高
+            $consistency = 1.0 - ($frequentChanges / $totalCards);
+            
+            // 确保得分在合理范围内
+            return max(0.0, min(1.0, $consistency));
         } catch (\Throwable $e) {
-            return 1.0;
+            // 如果查询失败（比如表不存在），返回中性分数
+            return 0.8;
         }
     }
     
@@ -461,9 +501,38 @@ class QualityMonitorAgent extends BaseAgent
             
             // 统计描写性词汇比例
             $wordCount = mb_strlen(preg_replace('/\s+/', '', $content), 'UTF-8');
-            $descWords = preg_match_all('/(的|地|得|着|了|过|极其|非常|十分|格外)/u', $content);
+            if ($wordCount === 0) continue;
             
-            $richness = $wordCount > 0 ? min(1.0, $descWords / ($wordCount / 100) / 10) : 0;
+            // 扩展的描写性词汇列表
+            $descPatterns = [
+                // 形容词
+                '美丽|漂亮|英俊|丑陋|高大|矮小|强壮|虚弱|年轻|年老',
+                '明亮|黑暗|温暖|寒冷|炎热|凉爽|干燥|潮湿',
+                '安静|喧闹|热闹|冷清|繁华|荒凉|拥挤|空旷',
+                // 副词
+                '极其|非常|十分|格外|特别|尤其|相当|比较|稍微|略微',
+                '迅速|缓慢|轻轻|重重|悄悄|默默|静静|慢慢',
+                // 感官词汇
+                '看见|听到|闻到|尝到|摸到|感觉|察觉|发现',
+                '红色|蓝色|绿色|黄色|白色|黑色|金色|银色',
+                '声音|光线|气味|味道|触感|温度|湿度',
+                // 状态词汇
+                '着|了|过|正在|已经|曾经|将会|可能|似乎|好像',
+                '微笑|大笑|哭泣|愤怒|悲伤|高兴|惊讶|恐惧',
+            ];
+            
+            $descWords = 0;
+            foreach ($descPatterns as $pattern) {
+                $descWords += preg_match_all('/(' . $pattern . ')/u', $content);
+            }
+            
+            // 计算描写密度：每100字有多少描写词汇
+            $density = $descWords / ($wordCount / 100);
+            
+            // 将密度映射到0-1分数
+            // 理想密度：每100字5-15个描写词汇
+            $richness = min(1.0, max(0.0, ($density - 2) / 13));
+            
             $totalScore += $richness;
         }
         
@@ -502,7 +571,8 @@ class QualityMonitorAgent extends BaseAgent
             $effective = 0;
             foreach ($coolPoints as $cp) {
                 $metadata = json_decode($cp['metadata'] ?? '{}', true);
-                if (($metadata['intensity'] ?? 0) >= 0.7) {
+                // 检查是否有有效的爽点类型
+                if (!empty($metadata['cool_type']) && isset(\COOL_POINT_TYPES[$metadata['cool_type']])) {
                     $effective++;
                 }
             }

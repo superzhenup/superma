@@ -30,6 +30,40 @@ echo "========================================\n\n";
 $checks = [];
 $allPassed = true;
 
+// ==================== 检查0: DB白名单与实际表名一致性 ====================
+echo "【检查0】DB白名单与实际表名一致性\n";
+echo "----------------------------------------\n";
+
+try {
+    // 反射读取 ALLOWED_TABLES 常量
+    $ref = new ReflectionClass('DB');
+    $whitelist = $ref->getConstant('ALLOWED_TABLES') ?? [];
+
+    // 获取数据库实际存在的所有表
+    $schemaTables = DB::fetchAll("SHOW TABLES");
+    $schemaTableNames = array_map(fn($r) => array_values($r)[0], $schemaTables);
+
+    // 对账：实际存在但不在白名单的表
+    $missing = array_diff($schemaTableNames, $whitelist);
+    if (empty($missing)) {
+        echo "✓ 白名单完整\n";
+        $checks['whitelist'] = true;
+    } else {
+        foreach ($missing as $t) {
+            echo "✗ 表 {$t} 存在但不在白名单（DB::insert 会失败）\n";
+        }
+        echo "\n⚠ 请在 includes/db.php 的 ALLOWED_TABLES 常量中补充以上表名！\n";
+        $checks['whitelist'] = false;
+        $allPassed = false;
+    }
+} catch (Throwable $e) {
+    echo "✗ 白名单检查失败: {$e->getMessage()}\n";
+    $checks['whitelist'] = false;
+    $allPassed = false;
+}
+
+echo "\n";
+
 // ==================== 检查1: ConfigCenter类 ====================
 echo "【检查1】ConfigCenter类\n";
 echo "----------------------------------------\n";
@@ -76,7 +110,7 @@ echo "\n";
 echo "【检查2】Agent表\n";
 echo "----------------------------------------\n";
 
-$tables = ['agent_decision_logs', 'agent_action_logs', 'agent_performance_stats'];
+$tables = ['agent_decision_logs', 'agent_action_logs'];
 
 foreach ($tables as $table) {
     try {

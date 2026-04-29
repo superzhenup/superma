@@ -163,6 +163,10 @@ try {
                     'novel_state',
                     'memory_atoms',
                     'consistency_logs',
+                    'agent_decision_logs',
+                    'agent_action_logs',
+                    'agent_directives',
+                    'agent_directive_outcomes',
                 ];
                 foreach ($novelTables as $table) {
                     DB::delete($table, 'novel_id=?', [$novelId]);
@@ -468,6 +472,96 @@ try {
                 'novel_id'     => $ch['novel_id'],
                 'should_write' => true,
             ], '大纲已保存，准备重新生成');
+            break;
+
+        // -----------------------------------------------------------
+        case 'clear_all_chapters':
+            $novelId = (int)($input['novel_id'] ?? 0);
+            $novel   = getNovel($novelId);
+            if (!$novel) throw new RuntimeException('小说不存在');
+
+            $pdo = DB::getPdo();
+            $pdo->beginTransaction();
+            try {
+                // 1. 删除 chapter_versions（子表，通过 chapter_id 关联）
+                $chapterIds = DB::fetchAll('SELECT id FROM chapters WHERE novel_id=?', [$novelId]);
+                if ($chapterIds) {
+                    $ids = array_column($chapterIds, 'id');
+                    $ph  = implode(',', array_fill(0, count($ids), '?'));
+                    DB::execute("DELETE FROM chapter_versions WHERE chapter_id IN ($ph)", $ids);
+                }
+
+                // 2. 删除 character_card_history（子表，通过 card_id 关联）
+                $cardIds = DB::fetchAll('SELECT id FROM character_cards WHERE novel_id=?', [$novelId]);
+                if ($cardIds) {
+                    $ids = array_column($cardIds, 'id');
+                    $ph  = implode(',', array_fill(0, count($ids), '?'));
+                    DB::execute("DELETE FROM character_card_history WHERE card_id IN ($ph)", $ids);
+                }
+
+                // 3. 批量删除所有含 novel_id 的关联表
+                $novelTables = [
+                    'chapters',
+                    'chapter_synopses',
+                    'writing_logs',
+                    'story_outlines',
+                    'volume_outlines',
+                    'arc_summaries',
+                    'novel_characters',
+                    'novel_worldbuilding',
+                    'novel_plots',
+                    'novel_style',
+                    'novel_embeddings',
+                    'character_cards',
+                    'foreshadowing_items',
+                    'novel_state',
+                    'memory_atoms',
+                    'consistency_logs',
+                    'agent_decision_logs',
+                    'agent_action_logs',
+                    'agent_directives',
+                    'agent_directive_outcomes',
+                ];
+                foreach ($novelTables as $table) {
+                    DB::delete($table, 'novel_id=?', [$novelId]);
+                }
+
+                // 4. 重置小说状态
+                DB::update('novels', [
+                    'status'            => 'draft',
+                    'current_chapter'   => 0,
+                    'total_words'       => 0,
+                    'has_story_outline' => 0,
+                    'optimized_chapter' => 0,
+                ], 'id=?', [$novelId]);
+
+                $pdo->commit();
+                jsonResponse(true, ['novel_id' => $novelId], '已清空所有章节');
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                throw new RuntimeException('清空失败：' . $e->getMessage());
+            }
+            break;
+
+        // -----------------------------------------------------------
+        case 'save_announcement_url':
+            $url = trim($input['url'] ?? '');
+            // 基本校验
+            if ($url && !preg_match('#^https?://#i', $url)) {
+                jsonResponse(false, null, '请输入有效的 http/https 地址');
+                break;
+            }
+            // 如果 URL 为空则删除配置
+            if ($url === '') {
+                DB::query("DELETE FROM system_settings WHERE setting_key='announcement_url'");
+            } else {
+                $pdo = DB::connect();
+                $stmt = $pdo->prepare(
+                    "INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?"
+                );
+                $stmt->execute(['announcement_url', $url, $url]);
+            }
+            jsonResponse(true, ['url' => $url], '公告地址已保存');
             break;
 
         // -----------------------------------------------------------

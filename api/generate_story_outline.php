@@ -34,7 +34,7 @@ $novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$novelId]);
 if (!$novel) { sse('error', ['msg' => '小说不存在']); sseDone(); exit; }
 
 // 预检：至少要有一个模型
-try { getModelFallbackList($novel['model_id'] ?: null); }
+try { getModelFallbackList($novel['model_id'] ?: null, 'structured'); }
 catch (RuntimeException $e) { sse('error', ['msg' => $e->getMessage()]); sseDone(); exit; }
 
 // 检查是否已存在故事大纲——重新生成时先删除旧记录
@@ -88,6 +88,13 @@ if (empty($storyOutline)) {
     sseDone(); exit;
 }
 
+// ---- 提取人物弧线终点（AI 直接提供则用；否则从 character_arcs 中提取） ----
+require_once __DIR__ . '/../includes/helpers.php';
+$characterEndpoints = $storyOutline['character_endpoints'] ?? '';
+if (empty($characterEndpoints) && !empty($storyOutline['character_arcs'])) {
+    $characterEndpoints = extractCharacterEndpoints($storyOutline['character_arcs']);
+}
+
 // ---- 保存到数据库 ----
 DB::insert('story_outlines', [
     'novel_id'             => $novelId,
@@ -95,6 +102,7 @@ DB::insert('story_outlines', [
     'act_division'         => json_encode($storyOutline['act_division'] ?? [], JSON_UNESCAPED_UNICODE),
     'major_turning_points' => json_encode($storyOutline['major_turning_points'] ?? [], JSON_UNESCAPED_UNICODE),
     'character_arcs'       => json_encode($storyOutline['character_arcs'] ?? [], JSON_UNESCAPED_UNICODE),
+    'character_endpoints'  => $characterEndpoints ?: null,
     'world_evolution'      => $storyOutline['world_evolution'] ?? '',
     'recurring_motifs'     => json_encode($storyOutline['recurring_motifs'] ?? [], JSON_UNESCAPED_UNICODE),
 ]);

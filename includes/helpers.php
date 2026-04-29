@@ -114,6 +114,42 @@ function truncateToWordLimit(string $content, int $maxWords): string
 }
 
 /**
+ * 过滤AI模型误生成的段落标记
+ * 移除正文中的"铺垫段""发展段""高潮段""钩子段"等结构化标注
+ * @param string $content 原始内容
+ * @return string 过滤后的内容
+ */
+function stripSegmentMarkers(string $content): string
+{
+    // 模式1：**(铺垫段:约XXX字，xxx)**
+    // 模式2：**发展段(约XXX字)**
+    // 模式3：**高潮段:约XXX字**
+    // 模式4：单独的**铺垫段** / **高潮段** 等
+    $patterns = [
+        // 带字数描述的完整标记：**铺垫段:约600字，对话密集)**
+        '/\*{1,2}\s*(铺垫段|发展段|高潮段|钩子段|收尾段)[：:]\s*约?\d+\s*字[^\)]*\)?\*{1,2}/iu',
+        // 带括号的标记：**发展段(约600字)**
+        '/\*{1,2}\s*(铺垫段|发展段|高潮段|钩子段|收尾段)\s*\(约?\d+\s*字[^\)]*\)\*{1,2}/iu',
+        // 仅段落名称标记：**铺垫段**、**发展段** 等
+        '/\*{1,2}\s*(铺垫段|发展段|高潮段|钩子段|收尾段)\s*\*{1,2}/iu',
+        // 无星号的纯标记行：铺垫段:约600字
+        '/^(铺垫段|发展段|高潮段|钩子段|收尾段)[：:]\s*.*$/imu',
+        // 带括号的纯标记行：(发展段:约600字，对话密集)
+        '/^[\*\-—\s]*[\(（]\s*(铺垫段|发展段|高潮段|钩子段|收尾段)[：:]\s*[^\)）]*[\)）][\*\-—\s]*$/imu',
+        // 中文括号纯标记行：（高潮段）
+        '/^[\*\-—\s]*[\(（]\s*(铺垫段|发展段|高潮段|钩子段|收尾段)\s*[\)）][\*\-—\s]*$/imu',
+    ];
+
+    $content = preg_replace($patterns, '', $content);
+
+    // 清理可能产生的连续空行（超过2个换行压缩为2个）
+    $content = preg_replace("/\n{3,}/", "\n\n", $content);
+
+    // 去除首尾空白
+    return trim($content);
+}
+
+/**
  * 文本相似度（0-100），用于情节重复检测
  */
 function textSimilarity(string $text1, string $text2): float {
@@ -311,6 +347,83 @@ function extractChapterSynopsis(string $raw): array {
         'foreshadowing'   => (array)($decoded['foreshadowing']  ?? []),
         'callbacks'       => (array)($decoded['callbacks']      ?? []),
     ];
+}
+
+/**
+ * 将 character_arcs（对象/数组）格式化为可读文本（用于页面展示）
+ * 输入可能是 JSON 字符串或已解码数组
+ */
+function formatCharacterArcsForDisplay($characterArcs): string {
+    $arcs = is_string($characterArcs) ? json_decode($characterArcs, true) : $characterArcs;
+    if (!is_array($arcs) || empty($arcs)) return is_string($characterArcs) ? (string)$characterArcs : '';
+
+    // 简单字符串数组：[ "line1", "line2" ]
+    if (isset($arcs[0]) && is_string($arcs[0])) {
+        return implode("\n", $arcs);
+    }
+
+    // 对象格式：{"主角": {"start": "...", "midpoint": "...", "end": "..."}}
+    $lines = [];
+    foreach ($arcs as $name => $data) {
+        if (is_array($data)) {
+            $parts = [];
+            if (!empty($data['start']))    $parts[] = "起始：{$data['start']}";
+            if (!empty($data['midpoint'])) $parts[] = "中期：{$data['midpoint']}";
+            $lines[] = $name . '：' . implode(' → ', $parts);
+        } else {
+            $lines[] = $name . '：' . $data;
+        }
+    }
+    return implode("\n", $lines);
+}
+
+/**
+ * 从 character_arcs 对象中提取各人物的弧线终点（end 值）
+ * 输入可能是 JSON 字符串或已解码数组
+ */
+function extractCharacterEndpoints($characterArcs): string {
+    $arcs = is_string($characterArcs) ? json_decode($characterArcs, true) : $characterArcs;
+    if (!is_array($arcs) || empty($arcs)) return '';
+
+    // 简单字符串数组没有 end 概念
+    if (isset($arcs[0]) && is_string($arcs[0])) return '';
+
+    $endpoints = [];
+    foreach ($arcs as $name => $data) {
+        if (is_array($data) && !empty($data['end'])) {
+            $endpoints[] = $name . '：' . $data['end'];
+        }
+    }
+    return implode("\n", $endpoints);
+}
+
+/**
+ * 将 character_arcs 格式化为编辑框文本（新行分隔）
+ * 输入可能是 JSON 字符串或已解码数组
+ */
+function formatCharacterArcsForEdit($characterArcs): string {
+    $arcs = is_string($characterArcs) ? json_decode($characterArcs, true) : $characterArcs;
+    if (!is_array($arcs) || empty($arcs)) return is_string($characterArcs) ? (string)$characterArcs : '';
+
+    // 简单字符串数组
+    if (isset($arcs[0]) && is_string($arcs[0])) {
+        return implode("\n", $arcs);
+    }
+
+    // 对象格式：转换为 "角色：起始 → 中期 → 终点" 格式
+    $lines = [];
+    foreach ($arcs as $name => $data) {
+        if (is_array($data)) {
+            $parts = [];
+            if (!empty($data['start']))    $parts[] = $data['start'];
+            if (!empty($data['midpoint'])) $parts[] = $data['midpoint'];
+            if (!empty($data['end']))      $parts[] = $data['end'];
+            $lines[] = $name . '：' . implode(' → ', $parts);
+        } else {
+            $lines[] = $name . '：' . $data;
+        }
+    }
+    return implode("\n", $lines);
 }
 
 /**

@@ -109,3 +109,41 @@ async function importSynopses(file) {
     // 清空文件输入框
     document.getElementById('import-file-input').value = '';
 }
+
+/**
+ * 清空所有章节及其内容
+ */
+async function clearAllChapters() {
+    const novelId = new URLSearchParams(window.location.search).get('id');
+    if (!novelId) {
+        showToast('无法获取小说ID', 'error');
+        return;
+    }
+
+    if (!confirm('⚠️ 确认清空所有章节？\n\n此操作将：\n• 删除所有章节及其正文内容\n• 删除所有章节版本历史\n• 删除所有章节概要\n• 重置小说状态为"已创建"\n\n此操作不可撤销！')) {
+        return;
+    }
+
+    try {
+        showToast('正在清空...', 'info');
+
+        const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+        const response = await fetch('api/actions.php', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+            body: JSON.stringify({ action: 'clear_all_chapters', novel_id: parseInt(novelId) }),
+        });
+
+        const result = await response.json();
+
+        if (result.ok) {
+            showToast('已清空所有章节', 'success');
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            showToast('清空失败：' + (result.msg || '未知错误'), 'error');
+        }
+    } catch (err) {
+        console.error('清空失败：', err);
+        showToast('清空失败：' + err.message, 'error');
+    }
+}

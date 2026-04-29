@@ -99,7 +99,7 @@ if (empty($chapters)) {
     sseDone(); exit;
 }
 
-try { getModelFallbackList($novel['model_id'] ?: null); }
+try { getModelFallbackList($novel['model_id'] ?: null, 'structured'); }
 catch (RuntimeException $e) { sse('error', ['msg' => $e->getMessage()]); sseDone(); exit; }
 
 $totalChapters = count($chapters);

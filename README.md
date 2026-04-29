@@ -1,4 +1,4 @@
-# ✦ Super-Ma AI 智能小说创作辅助系统（平台）
+# ✦ Super Ma Ahents v1.3.5 — AI 智能小说创作辅助系统（平台）
 ## UI预览
 <img width="1921" height="906" alt="局部截取_20260427_204024" src="https://github.com/user-attachments/assets/5951459d-bada-4d90-b443-1ad7127c53e1" />
 <p> <p>
@@ -21,9 +21,10 @@
 - [功能特性](#功能特性)
 - [环境要求](#环境要求)
 - [快速安装](#快速安装)
+- [目录结构](#目录结构)
 - [使用指南](#使用指南)
 - [记忆引擎 v6](#记忆引擎-v6)
-- [Agents决策系统](#Agents决策系统)
+- [Agents 决策系统](#agents-决策系统)
 - [支持的 AI 模型](#支持的-ai-模型)
 - [常见问题](#常见问题)
 - [技术栈](#技术栈)
@@ -45,12 +46,12 @@
 | 🧠 记忆引擎 | 四层记忆架构（L1全局 / L2弧段 / L3近章 / L4前章尾文），防止长篇失忆 |
 | 🔄 模型 Fallback | 主模型失败时自动切换备用模型，保障写作连续性 |
 | 🤖 多模型支持 | 兼容所有 OpenAI 协议 API，内置 13 种预设配置 |
-| 🎨 双主题 | 暗色 / 亮色主题自由切换，保护持久保护视力 |
+| 🎨 双主题 | 暗色 / 亮色主题自由切换，偏好本地持久化 |
 | 🔍 语义召回 | Embedding 向量检索，双路召回长尾记忆原子 |
 | ✅ 质量检测 | 章节完成后自动质检（结构/人物/描写/爽点/一致性） |
 | 📊 知识库 | 角色/世界观/情节自动提取，章节完成即入库 |
 | 🎯 动态字数控制 | 基于目标字数的动态容差机制 + 多级预警系统，精准控制章节篇幅 |
-| ⭐ 其他功能： 一键仿写、挂机写作（Pro订阅专属）、封面生成（Pro订阅专属）
+
 ---
 
 ## 环境要求
@@ -62,7 +63,7 @@
 | PHP 扩展 | `pdo_mysql`、`curl`、`json` |
 | Web 服务器 | Apache / Nginx / 宝塔面板均可 |
 
-> **本地开发**：宝塔、XAMPP、PhpStudy、Laragon 等集成环境均可直接运行。
+> **本地开发**：XAMPP、PhpStudy、Laragon 等集成环境均可直接运行。
 
 ---
 
@@ -103,15 +104,88 @@ http://你的域名/install.php
 
 点击 **「一键安装」**，安装成功后自动跳转到登录页面。
 
-> 安装完成后，访问`install.php` 将自动进入"已安装"保护状态，无法重复执行。
-
+> 安装完成后，`install.php` 将自动进入"已安装"保护状态，无法重复执行。
 
 ---
 
-## 相关资源
+## 目录结构
 
-- **系统模块架构可视化**（推荐）：`docs/system-modules-visualization.html` - 包含 8 大核心模块详解、6 阶段写作引擎、Agent 系统、四层记忆架构
-- **系统运行时可视化**：`docs/system-runtime-visualization.html` - 系统运行时逻辑流程图
+```
+小说系统/
+├── index.php            # 书库首页（需登录）
+├── create.php           # 新建小说（需登录）
+├── novel.php            # 小说管理中心（需登录）
+├── chapter.php          # 章节查看/编辑（需登录）
+├── knowledge.php        # 智能知识库（需登录）
+├── workshop.php         # 章节工坊（需登录）
+├── settings.php         # AI 模型配置（需登录）
+├── writing_settings.php # 写作参数全局设置（需登录）
+├── login.php            # 登录页面
+├── logout.php           # 退出登录
+├── install.php          # 一键安装向导
+├── config.php           # 系统配置（由安装向导自动生成）
+│
+├── api/                 # 后端 API（42 个文件）
+│   ├── write_start.php          # 启动异步写作任务
+│   ├── write_chapter_worker.php # CLI 写作入口（后台进程）
+│   ├── write_chapter.php        # SSE 流式写作（核心）
+│   ├── write_poll.php           # 异步写作进度轮询
+│   ├── cancel_write.php         # 取消/重置写作
+│   ├── generate_outline.php      # 大纲生成 SSE
+│   ├── generate_story_outline.php # 全书故事大纲生成
+│   ├── get_story_outline.php     # 获取故事大纲
+│   ├── update_story_outline.php  # 更新故事大纲
+│   ├── generate_volume_outline.php # 卷纲生成
+│   ├── supplement_outline.php    # 大纲补写
+│   ├── optimize_outline.php      # 大纲优化
+│   ├── optimize_outline_v2.php   # 大纲优化 v2
+│   ├── polish_chapter.php        # 章节润色
+│   ├── compress_chapter.php      # 章节压缩/摘要
+│   ├── generate_chapter_synopsis.php # 生成章节简介
+│   ├── validate_consistency.php  # 一致性检查
+│   ├── memory_actions.php        # 记忆引擎管理
+│   ├── actions.php               # 通用 AJAX 操作（保存/删除等）
+│   ├── knowledge.php             # 知识库 CRUD
+│   ├── rebuild_embeddings.php    # 重建向量索引
+│   ├── export_novel.php          # 小说导出
+│   ├── novel_import.php          # 小说导入
+│   └── ...
+│
+├── includes/
+│   ├── auth.php         # 登录鉴权 + CSRF
+│   ├── db.php           # PDO 数据库封装（单例 + 自动迁移）
+│   ├── schema.php       # 数据库表结构定义（单一真理源）
+│   ├── ai.php           # AI 客户端（OpenAI 兼容协议）
+│   ├── write_engine.php # 写作引擎（6 阶段：解析→记忆→Prompt→流式→落盘→后处理）
+│   ├── prompt.php       # Prompt 构建
+│   ├── memory.php       # 章节摘要生成
+│   ├── data.php         # 通用数据访问
+│   ├── embedding.php    # 知识库管理类
+│   ├── helpers.php      # 纯工具函数
+│   ├── functions.php    # 入口加载器
+│   ├── error_handler.php # 错误处理
+│   ├── config_constants.php # 集中配置常量
+│   ├── heartbeat_helper.php # SSE 心跳辅助
+│   ├── layout.php       # 页面布局
+│   ├── constraints/     # 约束框架（v1.3.5）
+│   │   ├── ConstraintConfig.php      # 约束配置读取
+│   │   ├── ConstraintStateDB.php     # 约束状态存储
+│   │   ├── PostWriteValidator.php    # 后置校验器
+│   │   └── ConstraintStateUpdater.php # 约束状态更新
+│   └── memory/          # MemoryEngine 核心
+│       ├── MemoryEngine.php      # 门面类：ingest/getPromptContext/ensureEmbeddings
+│       ├── CharacterCardRepo.php # 人物卡片仓储
+│       ├── ForeshadowingRepo.php # 伏笔仓储
+│       ├── AtomRepo.php          # 原子记忆仓储
+│       ├── EmbeddingProvider.php # Embedding 客户端
+│       └── Vector.php            # 向量运算工具
+│
+├── assets/              # 前端静态资源（Bootstrap 5 + 原生 JS）
+├── migrations/          # SQL 迁移脚本
+└── storage/             # 运行时数据（Schema 锁文件、进度文件）
+```
+
+---
 
 ---
 
@@ -142,8 +216,33 @@ http://你的域名/install.php
 
 **便宜服务器（服务器部署更稳定）：**
 
-<p>  腾讯云 99元良心云 | https://curl.qcloud.com/CK0gNnTC <p> 
-<p>  阿里云 一流大牌云 | https://www.aliyun.com/minisite/goods?userCode=null <p> 
+|------|---------|
+| 腾讯云 99元良心云 | `https://curl.qcloud.com/CK0gNnTC` |
+| 腾讯云 一流大牌云 | `https://www.aliyun.com/minisite/goods?userCode=null` |
+
+**大模型特性（网络资料 仅供参考）：**
+
+| 排名 |            模型               | 梯队 |        核心定位         
+|:----:|:---------------------------:|:----:|:---------------------------------
+|  01  | Claude-Opus-4.6-thinking    | T0   | 严肃文学之神             ⭐⭐⭐☆ 
+|  02  | Claude-Sonnet-4.6           | T0   | 职业作家最佳工具         ⭐⭐⭐☆ 
+|  03  | GPT-Thinking-5.5            | T1   | 脑洞与类型创作          ⭐⭐⭐⭐ 
+|  04  | Kimi K2.5                   | T1   | 中文长篇之王           ⭐⭐⭐⭐⭐ 
+|──────|─────────────────────────────|──────|──────────────────────────────────
+|  05  | Gemini-3.1-Pro              | T1   | 超长结构架构专家        ⭐⭐⭐☆ 
+|  06  | DeepSeek-V4                 | T2   | 逻辑推理与暗黑风格      ⭐⭐⭐⭐⭐ 
+|  07  | Grok-4.2-thinking           | T2   | 讽刺与黑色幽默风格     ⭐⭐☆☆ 
+|  08  | Tongyi Qianwen              | T2   | 国风仙侠与商战创作     ⭐⭐⭐⭐⭐ 
+|──────|─────────────────────────────|──────|──────────────────────────────────
+|  09  | Claude-Sonnet-4.5           | T3   | 过时但仍可使用         ⭐⭐⭐☆ 
+|  10  | Gemini-3.1-Variant          | T3   | 片段协作与快速写作     ⭐⭐⭐☆ 
+|  11  | Grok-4.2-fast / auto        | T3   | 大纲生成与头脑风暴    ⭐⭐☆☆ 
+|──────|─────────────────────────────|──────|──────────────────────────────────
+|  12  | Doubao                      | T4   | 短剧与爽文大纲创作     ⭐⭐⭐⭐ 
+|  13  | Gemma-4                     | T4   | 本地轻量任务处理      ⭐⭐⭐☆ 
+|──────|─────────────────────────────|──────|──────────────────────────────────
+|  14  | Gpt-image-2                 |  —   | 图片生成                       
+
 
 
 ### 配置写作参数
@@ -209,9 +308,9 @@ http://你的域名/install.php
 
 ---
 
-## Agents决策系统
+## Agents 决策系统
 
-系统内置三个智能 Agent，协同优化写作过程：
+系统内置三个智能 Agent，持续赋能您的写作：
 
 ### WritingStrategyAgent（写作策略 Agent）
 - **触发条件**：每 10 章执行一次决策
@@ -291,7 +390,7 @@ http://你的域名/install.php
 > 在「新建小说」时尽量详细填写「世界设定」「情节设定」「主角背景」。同时可以尝试调高 Temperature（0.9~1.2）增加创意度。
 
 **Q：如何启用语义召回（Embedding）？**
-> 在「模型设置」里添加一个 embedding 模型（勾选 `can_embed`），然后在「系统设置」里将其设为全局 embedding 模型。MemoryEngine 会在写作前自动补齐记忆原子的向量索引。
+> 在「模型设置」里添加一个 embedding 模型（火山Coding Plan自动支持），然后在「系统设置」里将其设为全局 Embedding 模型。MemoryEngine 会在写作前自动补齐记忆原子的向量索引。
 
 **Q：大纲生成或写作时频繁"连接中断"？**
 > 这是 Nginx 的 `fastcgi_read_timeout` 默认60秒导致的。请在宝塔面板或 Nginx 配置中增加超时时间：
@@ -328,6 +427,18 @@ http://你的域名/install.php
 ---
 
 ## 更新日志
+
+### v1.3.5（2026-04-29）
+
+- **约束框架 Phase 1**：七维约束体系（结构/人物/情节/信息/节奏/语言/世界观），后置校验（P0/P1/P2 分级），约束状态跟踪
+  - 字数容差校验、标题禁用词、重复句式检测、直接情感陈述检测、巧合关键词监测
+  - 全局开关：零侵入设计，全部钩子包裹 try-catch 不影响核心写作流
+- **全书故事大纲编辑增强**：新增"人物弧线终点"约束，支持故事大纲独立编辑（故事主线/人物成长轨迹/人物弧线终点/世界观演变）
+- **AI 模型智能选择**：模型按能力标签自动分类，不同任务类型（创作/大纲/分析）自动选用最合适的模型，提高生成质量
+- **钩子类型语义匹配**：章节结尾钩子推荐从简单规则升级为语义向量匹配，推荐准确率显著提升
+- **MemoryEngine 分层召回**：语义搜索结果自动分类展示（人物/情节/伏笔/其他），写作时信息检索更精准
+- **Agent 反馈闭环**：Agent 指令效果完整记录，形成【决策→执行→评估】优化链路，持续为你的创作赋能
+- **Bug 修复**：修复所有已知Bug，感谢loneliness等用户反馈
 
 ### v1.3（2026-04-27）
 
@@ -391,4 +502,4 @@ http://你的域名/install.php
 
 ## License
 
-GPLv3
+GPLv3（允许个人学习研究，未经允许禁止商用）

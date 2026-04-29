@@ -5,7 +5,7 @@
 define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
-requireLogin();
+requireLoginApi();
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();

@@ -65,6 +65,12 @@ class WriteEngine
         if (!$ch) throw new RuntimeException('没有待写章节，请先生成大纲。');
 
         // 事务包裹：取消标志清零 + 章节置 writing + 小说置 writing 必须原子执行
+        // 注意：unlink 文件清理不在事务内——文件不存在不应对事务产生影响
+        $flagFile = BASE_PATH . "/storage/write_cancel_{$novelId}.flag";
+        if (file_exists($flagFile)) {
+            @unlink($flagFile);
+        }
+
         $pdo = DB::connect();
         $pdo->beginTransaction();
         try {
@@ -121,7 +127,10 @@ class WriteEngine
         $previousSummary = getPreviousSummary($novel['id'], (int)$chapter['chapter_number']);
         $previousTail    = $memoryCtx['L4_previous_tail']
             ?? getPreviousTail($novel['id'], (int)$chapter['chapter_number']);
-        return buildChapterPrompt($novel, $chapter, $previousSummary, $previousTail, $memoryCtx);
+        // v1.4: 使用 ChapterPromptBuilder 替代 497 行函数，段落独立可测试
+        require_once __DIR__ . '/ChapterPromptBuilder.php';
+        $builder = new ChapterPromptBuilder($novel, $chapter, $previousSummary, $previousTail, $memoryCtx);
+        return $builder->build();
     }
 
     /**
@@ -129,6 +138,7 @@ class WriteEngine
      * @param callable $onChunk      fn(string $token): void
      * @param callable $onMsg        fn(array $payload): void
      * @param callable $onHeartbeat  fn(): void
+     * @param callable|null $onThinking fn(string $reasoningChunk): void  深度思考过程回调
      * @return array{content: string, model: ?AIClient}
      * @throws Exception 取消或全部模型失败
      */
@@ -138,13 +148,16 @@ class WriteEngine
         int $novelId,
         callable $onChunk,
         callable $onMsg,
-        callable $onHeartbeat
+        callable $onHeartbeat,
+        ?callable $onThinking = null
     ): array {
         $modelList   = getModelFallbackList(null);
         $modelErrors = [];
         $fullContent = '';
         $usedModel   = null;
         $estTokens   = (int)($targetWords * CFG_TOKEN_RATIO) + CFG_TOKEN_BUFFER;
+        $usage       = null;
+        $durationMs  = null;
 
         foreach ($modelList as $modelCfg) {
             $modelId    = (int)($modelCfg['id'] ?? 0);
@@ -165,7 +178,8 @@ class WriteEngine
                     for ($w = 0; $w < $retryDelay; $w += RT_POLL_INTERVAL) {
                         sleep(min(RT_POLL_INTERVAL, $retryDelay - $w));
                         $onHeartbeat();
-                        if (DB::fetch('SELECT cancel_flag FROM novels WHERE id=?', [$novelId])['cancel_flag'] ?? 0) {
+                        // v1.4 文件系统检查替代 DB 查询，file_exists() 比 PDO prepare+execute 快 100+ 倍
+                        if (file_exists(BASE_PATH . "/storage/write_cancel_{$novelId}.flag")) {
                             throw new Exception('用户取消了写作');
                         }
                     }
@@ -190,16 +204,16 @@ class WriteEngine
 
                 $canceled = false; $cancelCount = 0;
                 try {
-                    $ai->chatStream($messages, function(string $token) use (&$fullContent, $novelId, &$canceled, &$cancelCount, $onChunk) {
+                    $usage = $ai->chatStream($messages, function(string $token) use (&$fullContent, $novelId, &$canceled, &$cancelCount, $onChunk) {
                         if (!$canceled && ++$cancelCount % 50 === 0) {
-                            $row = DB::fetch('SELECT cancel_flag FROM novels WHERE id=?', [$novelId]);
-                            if ($row && $row['cancel_flag']) $canceled = true;
+                            // v1.4 文件系统检查替代 DB 查询，file_exists() 比 PDO prepare+execute 快 100+ 倍
+                            if (file_exists(BASE_PATH . "/storage/write_cancel_{$novelId}.flag")) $canceled = true;
                         }
                         if ($canceled) throw new Exception('用户取消了写作');
                         if ($token === '[DONE]') return;
                         $fullContent .= $token;
                         $onChunk($token);
-                    }, 'creative');
+                    }, 'creative', $onThinking);
                 } catch (Exception $e) {
                     $errMsg = $e->getMessage();
                     if ($errMsg === '用户取消了写作') throw $e;
@@ -214,6 +228,9 @@ class WriteEngine
                     if ($sameModelRetries >= RT_SAME_MODEL_MAX) continue 2;
                     continue; // 重试当前模型
                 }
+
+                // v1.4: 采集 token 用量和实际耗时，为 OptimizationAgent 提供真实数据基础
+                $durationMs = (time() - $streamStart) * 1000;
 
                 $sinceLast = time() - ($ai->lastChunkTime ?: $streamStart);
                 if ($sinceLast >= $timeoutSec) {
@@ -240,15 +257,17 @@ class WriteEngine
             }
         }
 
-        return ['content' => $fullContent, 'model' => $usedModel];
+        return ['content' => $fullContent, 'model' => $usedModel, 'usage' => $usage, 'duration_ms' => $durationMs];
     }
 
     /**
      * Phase 5: 落盘正文 + 版本备份 + 取消检测
+     * @param ?array $usage     chatStream() 返回的 usage 数组 ['prompt_tokens','completion_tokens','total_tokens']
+     * @param ?int   $durationMs 本章生成耗时（毫秒）
      * @return array{words: int, chapter: array}
      * @throws RuntimeException
      */
-    public static function saveChapter(int $chapterId, int $novelId, string $fullContent, int $targetWords, ?AIClient $usedModel, array $chapter): array
+    public static function saveChapter(int $chapterId, int $novelId, string $fullContent, int $targetWords, ?AIClient $usedModel, array $chapter, ?array $usage = null, ?int $durationMs = null): array
     {
         $ch = $chapter;
         $chId = $chapterId;
@@ -272,16 +291,53 @@ class WriteEngine
             );
         }
 
-        // 落盘前取消检测
-        $currentFlag = DB::fetch('SELECT cancel_flag FROM novels WHERE id=?', [$novelId]);
-        if ($currentFlag && $currentFlag['cancel_flag']) {
+        // 落盘前取消检测（v1.4 文件系统加速）
+        if (file_exists(BASE_PATH . "/storage/write_cancel_{$novelId}.flag")) {
             throw new RuntimeException('canceled');
         }
 
+        // 过滤AI误生成的段落标记
+        $fullContent = stripSegmentMarkers($fullContent);
+
+        // === 约束框架后置校验（Phase 1）===
+        try {
+            require_once __DIR__ . '/constraints/ConstraintConfig.php';
+            require_once __DIR__ . '/constraints/ConstraintStateDB.php';
+            require_once __DIR__ . '/constraints/PostWriteValidator.php';
+            $validator = new PostWriteValidator($novelId, $ch, $fullContent, $targetWords);
+            $validationResult = $validator->run();
+            if ($validationResult['has_p0'] && ConstraintConfig::isStrictMode()) {
+                addLog($novelId, 'warn', "第{$ch['chapter_number']}章触发P0约束：{$validationResult['p0_issues'][0]['issue_desc']}");
+            } elseif ($validationResult['has_p1']) {
+                $p1Count = count($validationResult['p1_issues']);
+                addLog($novelId, 'warn', "第{$ch['chapter_number']}章触发{$p1Count}项P1约束");
+            }
+        } catch (\Throwable $e) {
+            addLog($novelId, 'warn', '约束后置校验跳过：' . $e->getMessage());
+        }
+
         $words = countWords($fullContent);
-        $affected = DB::update('chapters', [
+        $updates = [
             'content' => $fullContent, 'words' => $words, 'status' => 'completed',
-        ], 'id=? AND status="writing"', [$chId]);
+        ];
+        // v1.4: 落盘 token 用量和耗时数据，为 OptimizationAgent 提供真实数据基础
+        if ($usage !== null && isset($usage['total_tokens'])) {
+            $updates['tokens_used'] = (int)$usage['total_tokens'];
+        }
+        if ($durationMs !== null) {
+            $updates['duration_ms'] = $durationMs;
+        }
+        // v1.5: 落盘 hook_type，激活 suggestHookType 的"防连续重复"机制
+        // 之前该字段从未被写入，导致防重复逻辑形同虚设
+        try {
+            $hookSuggestion = suggestHookType($ch);
+            if (!empty($hookSuggestion['type'])) {
+                $updates['hook_type'] = $hookSuggestion['type'];
+            }
+        } catch (Throwable $e) {
+            // 钩子类型推荐失败不影响落盘
+        }
+        $affected = DB::update('chapters', $updates, 'id=? AND status="writing"', [$chId]);
 
         if ($affected === 0) {
             addLog($novelId, 'warn', "第{$ch['chapter_number']}章落盘被阻止：状态已被外部修改");
@@ -400,6 +456,127 @@ class WriteEngine
             }
         } catch (Throwable $e) {
             addLog($novelId, 'warn', '质量检测跳过：' . $e->getMessage());
+        }
+
+        // --- v1.5 情绪密度检测（激活 EmotionDictionary）---
+        // 之前 EmotionDictionary 模块完全是死代码，prompt 里教 AI 满足情绪密度
+        // 但写完后从未验证。本节将统计落盘，并在偏低时让 Agent 写指令影响下一章
+        try {
+            require_once __DIR__ . '/emotion_dict.php';
+            $emoDensity = EmotionDictionary::countEmotionDensity($fullContent);
+            $emoEval    = EmotionDictionary::evaluateDensity($emoDensity);
+
+            DB::update('chapters', [
+                'emotion_density' => json_encode($emoDensity, JSON_UNESCAPED_UNICODE),
+                'emotion_score'   => (float)$emoEval['overall_score'],
+            ], 'id=?', [$chId]);
+
+            addLog($novelId, 'info', sprintf(
+                '情绪密度：得分 %.1f/100（%d 项问题）',
+                $emoEval['overall_score'],
+                count($emoEval['issues'] ?? [])
+            ));
+
+            // 偏低时写一条 Agent 指令影响下章
+            if ($emoEval['overall_score'] < 60 && !empty($emoEval['issues'])) {
+                require_once __DIR__ . '/agents/AgentDirectives.php';
+                $issuesText = implode('；', array_slice($emoEval['issues'], 0, 2));
+                AgentDirectives::add(
+                    $novelId,
+                    (int)$chapter['chapter_number'] + 1,
+                    'quality',
+                    "前章情绪密度偏低（得分{$emoEval['overall_score']}）。问题：{$issuesText}。本章必须加大相应类别的情绪词使用频率。",
+                    3,  // 持续 3 章
+                    24  // 24 小时过期
+                );
+            }
+        } catch (Throwable $e) {
+            addLog($novelId, 'warn', '情绪密度检测跳过：' . $e->getMessage());
+        }
+
+        // --- v1.6 爽点实际类型检测（P1#7: 反馈闭环）---
+        // 之前 calculateCoolPointSchedule 的 lastUsed 记录的是"计划排期"
+        // 而非 AI 实际写到的类型。本节用关键词匹配检测正文中实际出现的爽点类型
+        // v1.5.2: 关键词检测无命中时回退到 LLM summary 给出的类型
+        try {
+            $llmJudgedType = (isset($summaryData) && is_array($summaryData))
+                ? ($summaryData['cool_point_type'] ?? null)
+                : null;
+            $actualCoolTypes = detectCoolPointTypes($fullContent, $llmJudgedType);
+            DB::update('chapters', [
+                'actual_cool_point_types' => !empty($actualCoolTypes)
+                    ? json_encode($actualCoolTypes, JSON_UNESCAPED_UNICODE)
+                    : null,
+            ], 'id=?', [$chId]);
+
+            if (!empty($actualCoolTypes)) {
+                $typeNames = array_map(fn($t) => COOL_POINT_TYPES[$t]['name'] ?? $t, $actualCoolTypes);
+                addLog($novelId, 'info', sprintf(
+                    '爽点检测：识别到 %d 种类型 —— %s',
+                    count($actualCoolTypes),
+                    implode('、', $typeNames)
+                ));
+            }
+        } catch (Throwable $e) {
+            addLog($novelId, 'warn', '爽点检测跳过：' . $e->getMessage());
+        }
+
+        // --- v1.5 收尾期合规检查（激活 EndingEnforcer.checkEndingCompliance）---
+        // 之前该方法是死代码，收尾期 AI 可能继续埋新伏笔/写新支线，系统不会发现
+        try {
+            require_once __DIR__ . '/ending_enforcer.php';
+            $enforcer = new EndingEnforcer($novelId, (int)$chapter['chapter_number']);
+            if ($enforcer->needsEndingEnforcement()) {
+                $compliance = $enforcer->checkEndingCompliance($fullContent);
+
+                if (!empty($compliance['issues'])) {
+                    $stage = $enforcer->getEndingStage();
+                    $issues = implode('；', array_slice($compliance['issues'], 0, 3));
+                    addLog($novelId, 'warn', sprintf(
+                        '收尾合规警告（%s阶段）：%s',
+                        $stage, $issues
+                    ));
+
+                    // 让下一章 prompt 注意修正
+                    require_once __DIR__ . '/agents/AgentDirectives.php';
+                    AgentDirectives::add(
+                        $novelId,
+                        (int)$chapter['chapter_number'] + 1,
+                        'quality',
+                        "前章收尾合规警告（{$stage}阶段）：{$issues}。本章必须按收尾阶段规则写作，回收旧伏笔，禁止引入新支线。",
+                        2,
+                        24
+                    );
+                }
+            }
+        } catch (Throwable $e) {
+            addLog($novelId, 'warn', '收尾合规检查跳过：' . $e->getMessage());
+        }
+
+        // --- Agent 指令效果反馈闭环（v1.5） ---
+        try {
+            require_once __DIR__ . '/agents/AgentDirectives.php';
+            $outcomeResult = AgentDirectives::recordOutcomes($novelId, (int)$chapter['chapter_number']);
+            if ($outcomeResult['recorded'] > 0) {
+                $improved = count(array_filter($outcomeResult['outcomes'], fn($o) => $o['quality_change'] > 0));
+                addLog($novelId, 'info', sprintf(
+                    'Agent反馈闭环：评估%d条指令效果，%d条正向改善',
+                    $outcomeResult['recorded'], $improved
+                ));
+            }
+        } catch (Throwable $e) {
+            // 反馈闭环失败不影响主流程
+        }
+
+        // === 约束框架状态更新（Phase 1）===
+        try {
+            require_once __DIR__ . '/constraints/ConstraintConfig.php';
+            require_once __DIR__ . '/constraints/ConstraintStateDB.php';
+            require_once __DIR__ . '/constraints/ConstraintStateUpdater.php';
+            $stateUpdater = new ConstraintStateUpdater($novelId, $chapter, $fullContent);
+            $stateUpdater->updateAll();
+        } catch (\Throwable $e) {
+            addLog($novelId, 'warn', '约束状态更新失败：' . $e->getMessage());
         }
 
         addLog($novelId, 'info', "第{$chapter['chapter_number']}章后处理完成（摘要/记忆/知识库/质检）");

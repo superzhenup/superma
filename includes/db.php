@@ -6,7 +6,10 @@ class DB {
 
     /**
      * 允许的表名白名单（防止表名注入）
-     * 新增表时在此处同步更新
+     *
+     * v1.5.2: 改为从 Schema::whitelist() 派生为单一真理源。
+     * 保留 ALLOWED_TABLES 常量作为兜底——当 Schema 类不可用时（极少见）
+     * 仍能保护数据库。新增表时只需在 Schema::tables() 一处添加。
      */
     private const ALLOWED_TABLES = [
         'novels', 'chapters', 'chapter_versions', 'chapter_synopses',
@@ -15,14 +18,47 @@ class DB {
         'foreshadowing_items', 'novel_state', 'memory_atoms',
         'arc_summaries', 'story_outlines', 'volume_outlines',
         'consistency_logs', 'writing_logs', 'novel_plots', 'novel_style',
-        'novel_logs',
+        // v1.4: Agent 体系表 + 书籍分析表
+        'agent_decision_logs', 'agent_action_logs',
+        'agent_directives', 'book_analyses',
+        // v1.5: Agent 反馈闭环
+        'agent_directive_outcomes',
+        // v1.3.5: 约束框架
+        'constraint_state', 'constraint_logs',
     ];
+
+    /**
+     * v1.5.2: 获取允许的表名（优先用 Schema::whitelist 派生，回退到 ALLOWED_TABLES 常量）
+     * @return string[]
+     */
+    private static function getAllowedTables(): array {
+        static $cache = null;
+        if ($cache !== null) return $cache;
+
+        // 优先用 Schema 单一真理源
+        $schemaFile = __DIR__ . '/schema.php';
+        if (is_readable($schemaFile)) {
+            require_once $schemaFile;
+            if (class_exists('Schema') && method_exists('Schema', 'whitelist')) {
+                try {
+                    $cache = Schema::whitelist();
+                    return $cache;
+                } catch (\Throwable $e) {
+                    error_log("Schema::whitelist failed, fallback to ALLOWED_TABLES: " . $e->getMessage());
+                }
+            }
+        }
+
+        // 回退到硬编码常量
+        $cache = self::ALLOWED_TABLES;
+        return $cache;
+    }
 
     /**
      * 校验表名是否在白名单中，防止表名 SQL 注入
      */
     private static function validateTable(string $table): void {
-        if (!in_array($table, self::ALLOWED_TABLES, true)) {
+        if (!in_array($table, self::getAllowedTables(), true)) {
             throw new \InvalidArgumentException("Invalid table name: {$table}");
         }
     }
@@ -46,9 +82,10 @@ class DB {
                 DB_HOST, DB_NAME, DB_CHARSET
             );
             self::$pdo = new PDO($dsn, DB_USER, DB_PASS, [
-                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                PDO::ATTR_EMULATE_PREPARES   => false,
+                PDO::ATTR_ERRMODE              => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE   => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES     => false,
+                PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => true,
             ]);
 
             // MySQL 5.7+ 版本检测（5.7 对 JSON/utf8mb4 支持完整，5.6 及以下有缺陷）
@@ -64,7 +101,7 @@ class DB {
                     try {
                         self::$pdo->exec("SET SESSION sql_mode = REPLACE(REPLACE(REPLACE(@@sql_mode, 'ONLY_FULL_GROUP_BY', ''), 'STRICT_TRANS_TABLES', ''), 'NO_ZERO_DATE', '')");
                     } catch (\Throwable $e) {
-                        // 权限不足时忽略（非超级用户无法修改 sql_mode）
+                        error_log('DB: sql_mode 设置失败 — ' . $e->getMessage());
                     }
                 }
             }
@@ -78,11 +115,12 @@ class DB {
      * 自动迁移：补齐数据库缺失的列，兼容旧版本数据库
      * 新增：pending_foreshadowing（待回收伏笔）、story_momentum（故事势能）字段
      *
-     * 性能优化：使用版本锁文件，迁移完成后后续每次请求直接跳过全部检查，
+     * 性能优化：使用版本锁文件 + DB advisory lock 双保险，避免并发迁移。
+     * 迁移完成后后续每次请求直接跳过全部检查，
      * 避免每次 PHP 请求都执行 9 次 information_schema 查询 + 5 次 CREATE TABLE IF NOT EXISTS。
      * 每次有结构变更时，递增 SCHEMA_VERSION 即可触发重新迁移。
      */
-    private const SCHEMA_VERSION = 16;
+    private const SCHEMA_VERSION = 24;
 
     private static function migrate(): void {
         // 优先使用数据库记录迁移状态，避免文件权限问题
@@ -113,12 +151,25 @@ class DB {
             return;
         }
 
-        // 确保 storage 目录存在（首次运行时创建）
-        if (!is_dir($storageDir)) {
-            @mkdir($storageDir, 0755, true);
+        // ========== 数据库级 advisory lock（防并发迁移） ==========
+        $locked = false;
+        try {
+            $lockResult = $pdo->query("SELECT GET_LOCK('db_migrate_v" . self::SCHEMA_VERSION . "', 10)")->fetchColumn();
+            $locked = ($lockResult == 1);
+            if (!$locked) {
+                error_log('DB Migrate: 未能获取迁移锁，另一进程可能正在迁移');
+                return;
+            }
+        } catch (\Throwable $e) {
+            error_log('DB Migrate: GET_LOCK 失败 — ' . $e->getMessage());
         }
 
-        $pdo = self::$pdo;
+        if (!$locked) {
+            return;
+        }
+
+        try {
+            // ========== 所有迁移操作在锁保护下执行 ==========
 
         $columns = [
             // novels 表
@@ -158,6 +209,19 @@ class DB {
              "ALTER TABLE `chapters` ADD COLUMN `quality_score` DECIMAL(3,1) DEFAULT NULL COMMENT '质量评分(0-100)' AFTER `suspense`"],
             ['chapters', 'gate_results',
              "ALTER TABLE `chapters` ADD COLUMN `gate_results` JSON DEFAULT NULL COMMENT '五关检测结果' AFTER `quality_score`"],
+            // [v18] OptimizationAgent 数据基础：章节 token 用量 + 生成耗时
+            ['chapters', 'tokens_used',
+             "ALTER TABLE `chapters` ADD COLUMN `tokens_used` INT NOT NULL DEFAULT 0 COMMENT 'AI生成本章消耗的token总数' AFTER `gate_results`"],
+            ['chapters', 'duration_ms',
+             "ALTER TABLE `chapters` ADD COLUMN `duration_ms` INT NOT NULL DEFAULT 0 COMMENT '本章生成耗时(毫秒)' AFTER `tokens_used`"],
+            // [v20] 写作算法反馈闭环：情绪密度统计（激活 EmotionDict）
+            ['chapters', 'emotion_density',
+             "ALTER TABLE `chapters` ADD COLUMN `emotion_density` JSON DEFAULT NULL COMMENT '情绪词频统计(各类别次/万字)' AFTER `duration_ms`"],
+            ['chapters', 'emotion_score',
+             "ALTER TABLE `chapters` ADD COLUMN `emotion_score` DECIMAL(4,1) DEFAULT NULL COMMENT '情绪密度评分(0-100)' AFTER `emotion_density`"],
+            // [v1.6] 写作算法反馈闭环：爽点实际类型识别（P1#7）
+            ['chapters', 'actual_cool_point_types',
+             "ALTER TABLE `chapters` ADD COLUMN `actual_cool_point_types` JSON DEFAULT NULL COMMENT '实际检测到的爽点类型(关键词匹配)' AFTER `emotion_score`"],
             // [v15] novels 表补全缺失字段（style_vector/ref_author，旧库升级遗漏）
             ['novels', 'style_vector',
              "ALTER TABLE `novels` ADD COLUMN `style_vector` TEXT DEFAULT NULL COMMENT '四维风格向量(JSON)' AFTER `cover_color`"],
@@ -166,6 +230,13 @@ class DB {
             // [v16] 封面图片字段
             ['novels', 'cover_image',
              "ALTER TABLE `novels` ADD COLUMN `cover_image` VARCHAR(500) DEFAULT NULL COMMENT '封面图片路径' AFTER `cover_color`"],
+            // [v22] agent_decision_logs 补全缺失的 novel_id 列（修复删除小说时报 1054 错误）
+            // 使用 DEFAULT 0 兼容 strict mode 下已有行的 NOT NULL 约束
+            ['agent_decision_logs', 'novel_id',
+             "ALTER TABLE `agent_decision_logs` ADD COLUMN `novel_id` INT NOT NULL DEFAULT 0 COMMENT '小说ID' FIRST, ADD INDEX `idx_novel_id` (`novel_id`)"],
+            // [v24] story_outlines 新增人物弧线终点字段
+            ['story_outlines', 'character_endpoints',
+             "ALTER TABLE `story_outlines` ADD COLUMN `character_endpoints` TEXT COMMENT '人物弧线终点' AFTER `character_arcs`"],
         ];
 
         foreach ($columns as [$table, $col, $sql]) {
@@ -180,7 +251,7 @@ class DB {
             $stmt->execute([$table, $col]);
             $has = (int)$stmt->fetchColumn();
             if (!$has) {
-                try { $pdo->exec($sql); } catch (\Throwable $e) { /* 忽略迁移失败，不中断服务 */ }
+                try { $pdo->exec($sql); } catch (\Throwable $e) { error_log('DB Migrate: 字段迁移失败 [' . $table . '.' . $col . '] — ' . $e->getMessage()); }
             }
         }
 
@@ -205,6 +276,7 @@ class DB {
             `act_division` JSON,
             `major_turning_points` JSON,
             `character_arcs` JSON,
+            `character_endpoints` TEXT COMMENT '人物弧线终点',
             `world_evolution` TEXT,
             `recurring_motifs` JSON,
             `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -267,7 +339,7 @@ class DB {
         if (!(int)$stmt->fetchColumn()) {
             try {
                 $pdo->exec("ALTER TABLE `ai_models` ADD COLUMN `embedding_enabled` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否启用Embedding模型' AFTER `is_default`");
-            } catch (\Throwable $e) { /* 忽略迁移失败 */ }
+            } catch (\Throwable $e) { error_log('DB Migrate: ai_models.embedding_enabled 迁移失败 — ' . $e->getMessage()); }
         }
 
         // [v7] MemoryEngine 核心表（原子记忆、人物卡片、伏笔）
@@ -452,11 +524,11 @@ class DB {
 
         // 性能优化：为高频查询字段补充缺失索引
         try { $pdo->exec("ALTER TABLE `novels` ADD INDEX `idx_status` (`status`)"); }
-        catch (\Throwable $e) { /* 已存在则忽略 */ }
+        catch (\Throwable $e) { error_log('DB Migrate: novels.idx_status 索引创建失败 — ' . $e->getMessage()); }
         try { $pdo->exec("ALTER TABLE `novels` ADD INDEX `idx_updated` (`updated_at`)"); }
-        catch (\Throwable $e) { /* 已存在则忽略 */ }
+        catch (\Throwable $e) { error_log('DB Migrate: novels.idx_updated 索引创建失败 — ' . $e->getMessage()); }
         try { $pdo->exec("ALTER TABLE `writing_logs` ADD INDEX `idx_novel_created` (`novel_id`, `created_at`)"); }
-        catch (\Throwable $e) { /* 已存在则忽略 */ }
+        catch (\Throwable $e) { error_log('DB Migrate: writing_logs.idx_novel_created 索引创建失败 — ' . $e->getMessage()); }
 
         // [v8] 扩展 memory_atoms.atom_type ENUM：新增 technique（功法）和 world_state（世界切换）
         // 对老库做幂等 ALTER：若 ENUM 已包含新值则 MySQL 自身不会报错（仍会重写元数据但无副作用）；
@@ -485,7 +557,7 @@ class DB {
                      ) NOT NULL"
                 );
             }
-        } catch (\Throwable $e) { /* 迁移失败不阻断服务 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: memory_atoms.atom_type(v8) ENUM 扩展失败 — ' . $e->getMessage()); }
 
         // [v9] 知识库扩展字段：角色功能模板 / 风格四维向量 / 伏笔类型
         $alterColumns = [
@@ -530,26 +602,26 @@ class DB {
             );
             $stmt->execute([$table, $col]);
             if (!(int)$stmt->fetchColumn()) {
-                try { $pdo->exec($sql); } catch (\Throwable $e) { /* 忽略迁移失败 */ }
+                try { $pdo->exec($sql); } catch (\Throwable $e) { error_log('DB Migrate: 列迁移失败 [' . $table . '.' . $col . '] — ' . $e->getMessage()); }
             }
         }
 
         // novel_embeddings: 修复 UNIQUE KEY（当前是 source_type+source_id，不含 novel_id）
         try {
             $pdo->exec("ALTER TABLE `novel_embeddings` DROP INDEX `unique_source`");
-        } catch (\Throwable $e) { /* 可能不存在或已存在则忽略 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: novel_embeddings DROP INDEX unique_source 失败 — ' . $e->getMessage()); }
         try {
             $pdo->exec("ALTER TABLE `novel_embeddings` ADD UNIQUE KEY `uk_source` (`novel_id`, `source_type`, `source_id`)");
-        } catch (\Throwable $e) { /* 可能已存在则忽略 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: novel_embeddings ADD UNIQUE KEY uk_source 失败 — ' . $e->getMessage()); }
 
         // [v10] novel_embeddings: blob/embedding 列名改为 embedding_blob（避免 MySQL 保留字冲突）
         // 线上可能是 blob（早期版本触发报错的根源）或 embedding（v9 版本），两条都试
         try {
             $pdo->exec("ALTER TABLE `novel_embeddings` CHANGE `blob` `embedding_blob` LONGBLOB DEFAULT NULL COMMENT '向量数据（float32 二进制存储）'");
-        } catch (\Throwable $e) { /* 列 blob 不存在则忽略 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: novel_embeddings CHANGE blob 失败 — ' . $e->getMessage()); }
         try {
             $pdo->exec("ALTER TABLE `novel_embeddings` CHANGE `embedding` `embedding_blob` LONGBLOB DEFAULT NULL COMMENT '向量数据（float32 二进制存储）'");
-        } catch (\Throwable $e) { /* 列 embedding 不存在则忽略 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: novel_embeddings CHANGE embedding 失败 — ' . $e->getMessage()); }
 
         // [v11] 写作参数全局设置：初始化 system_settings 中的 ws_ 前缀参数
         $pdo->exec("CREATE TABLE IF NOT EXISTS `system_settings` (
@@ -562,6 +634,12 @@ class DB {
         $wsDefaults = getWritingDefaults();
         $stmt = $pdo->prepare("INSERT IGNORE INTO `system_settings` (`setting_key`, `setting_value`) VALUES (?, ?)");
         foreach ($wsDefaults as $key => $def) {
+            $stmt->execute([$key, (string)$def['default']]);
+        }
+
+        // [v22] 约束框架默认配置：从集中配置获取默认值
+        $cfDefaults = getConstraintDefaults();
+        foreach ($cfDefaults as $key => $def) {
             $stmt->execute([$key, (string)$def['default']]);
         }
 
@@ -601,7 +679,7 @@ class DB {
                      ) NOT NULL"
                 );
             }
-        } catch (\Throwable $e) { /* 迁移失败不阻断服务 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: memory_atoms.atom_type(v14) ENUM 扩展失败 — ' . $e->getMessage()); }
 
         // [v14] novel_plots.status ENUM 扩展：添加 planted（已埋设）和 resolving（回收中）
         try {
@@ -622,7 +700,7 @@ class DB {
                      ) NOT NULL DEFAULT 'active'"
                 );
             }
-        } catch (\Throwable $e) { /* 迁移失败不阻断服务 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: novel_plots.status ENUM 扩展失败 — ' . $e->getMessage()); }
 
         // [v14] novel_plots.event_type ENUM 更新：'side' → 'subplot'，添加 'other'
         try {
@@ -647,7 +725,7 @@ class DB {
                      ) NOT NULL DEFAULT 'main'"
                 );
             }
-        } catch (\Throwable $e) { /* 迁移失败不阻断服务 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: novel_plots.event_type ENUM 更新失败 — ' . $e->getMessage()); }
 
         // [v14] novel_style.category 从 VARCHAR(30) 迁移为 ENUM（与代码一致）
         try {
@@ -665,7 +743,7 @@ class DB {
                      ) NOT NULL DEFAULT 'other'"
                 );
             }
-        } catch (\Throwable $e) { /* 迁移失败不阻断服务 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: novel_style.category ENUM 转换失败 — ' . $e->getMessage()); }
 
         // [v14] novel_characters 字段对齐线上：alias VARCHAR(100) DEFAULT NULL, gender VARCHAR(10) DEFAULT NULL
         try {
@@ -679,7 +757,7 @@ class DB {
             if (strpos($colType, 'varchar(200)') !== false) {
                 $pdo->exec("ALTER TABLE `novel_characters` MODIFY COLUMN `alias` VARCHAR(100) DEFAULT NULL COMMENT '别名/绰号'");
             }
-        } catch (\Throwable $e) { /* 迁移失败不阻断服务 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: novel_characters.alias 字段对齐失败 — ' . $e->getMessage()); }
         try {
             $row = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
@@ -691,7 +769,7 @@ class DB {
             if (strpos($colType, 'varchar(20)') !== false) {
                 $pdo->exec("ALTER TABLE `novel_characters` MODIFY COLUMN `gender` VARCHAR(10) DEFAULT NULL COMMENT '性别'");
             }
-        } catch (\Throwable $e) { /* 迁移失败不阻断服务 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: novel_characters.gender 字段对齐失败 — ' . $e->getMessage()); }
 
         // [v14] novel_worldbuilding 字段对齐线上：name VARCHAR(200), importance DEFAULT 3
         try {
@@ -705,14 +783,16 @@ class DB {
             if (strpos($colType, 'varchar(100)') !== false) {
                 $pdo->exec("ALTER TABLE `novel_worldbuilding` MODIFY COLUMN `name` VARCHAR(200) NOT NULL COMMENT '名称'");
             }
-        } catch (\Throwable $e) { /* 迁移失败不阻断服务 */ }
+        } catch (\Throwable $e) { error_log('DB Migrate: novel_worldbuilding.name 字段对齐失败 — ' . $e->getMessage()); }
 
         // 创建Agent决策机制表
         $pdo->exec("CREATE TABLE IF NOT EXISTS `agent_decision_logs` (
             `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `novel_id` INT NOT NULL COMMENT '小说ID',
             `agent_type` VARCHAR(50) NOT NULL COMMENT 'Agent类型: writing_strategy, quality_monitor, optimization',
             `decision_data` TEXT COMMENT '决策数据JSON',
             `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+            INDEX `idx_novel_id` (`novel_id`),
             INDEX `idx_agent_type` (`agent_type`),
             INDEX `idx_created_at` (`created_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent决策日志表'");
@@ -761,19 +841,57 @@ class DB {
             INDEX `idx_expires` (`expires_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent自然语言指令表'");
 
+        // [v19] Agent指令效果反馈表（决策闭环核心）
+        $pdo->exec("CREATE TABLE IF NOT EXISTS `agent_directive_outcomes` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `novel_id` INT NOT NULL COMMENT '小说ID',
+            `directive_id` INT NOT NULL COMMENT '关联的指令ID',
+            `chapter_number` INT NOT NULL COMMENT '被评估的章节号',
+            `quality_before` DECIMAL(4,1) DEFAULT NULL COMMENT '指令生效前质量均值',
+            `quality_after` DECIMAL(4,1) DEFAULT NULL COMMENT '本章质量评分',
+            `quality_change` DECIMAL(4,1) DEFAULT NULL COMMENT '质量变化(正=改善)',
+            `tokens_used` INT NOT NULL DEFAULT 0 COMMENT '本章token用量',
+            `duration_ms` INT NOT NULL DEFAULT 0 COMMENT '本章生成耗时(毫秒)',
+            `evaluated_at` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '评估时间',
+            INDEX `idx_novel_directive` (`novel_id`, `directive_id`),
+            INDEX `idx_evaluated_at` (`evaluated_at`),
+            INDEX `idx_quality_change` (`quality_change`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent指令效果反馈表'");
+
+        // [v21] Schema 单一真理源兜底——确保 Schema::tables() 中所有表都存在
+        // 即使上面 CREATE TABLE 列表漏了某张表，Schema::applyAll 也会补上。
+        // 这是对"加表忘记同步 db.php"类问题的根本性防线。
+        try {
+            require_once __DIR__ . '/schema.php';
+            if (class_exists('Schema')) {
+                Schema::applyAll($pdo);
+            }
+        } catch (\Throwable $e) {
+            error_log('DB Migrate: Schema::applyAll 兜底失败 — ' . $e->getMessage());
+        }
+
         // 在数据库中记录迁移状态（避免文件权限问题）
         try {
             $pdo->prepare("INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?")
                 ->execute(['schema_version_migrated', (string)self::SCHEMA_VERSION, (string)self::SCHEMA_VERSION]);
         } catch (\Throwable $e) {
-            // 静默失败，不影响主流程
+            error_log('DB Migrate: schema_version_migrated 写入失败 — ' . $e->getMessage());
         }
         
         // 尝试写入版本锁文件（兼容旧版本），但忽略权限错误
         try {
             @file_put_contents($lockFile, 'schema_v' . self::SCHEMA_VERSION . ' migrated at ' . date('Y-m-d H:i:s') . PHP_EOL);
         } catch (\Throwable $e) {
-            // 忽略文件写入错误，数据库记录已保存
+            error_log('DB Migrate: 锁文件写入失败 — ' . $e->getMessage());
+        }
+
+        } finally {
+            // 释放数据库迁移锁
+            try {
+                $pdo->exec("SELECT RELEASE_LOCK('db_migrate_v" . self::SCHEMA_VERSION . "')");
+            } catch (\Throwable $e) {
+                // 锁自动随连接释放
+            }
         }
     }
 

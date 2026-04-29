@@ -70,7 +70,7 @@ if (empty($chapters)) {
 }
 
 try {
-    getModelFallbackList($novel['model_id'] ?: null);
+    getModelFallbackList($novel['model_id'] ?: null, 'structured');
 } catch (RuntimeException $e) {
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
     exit;
@@ -217,9 +217,37 @@ try {
         }
     );
 } catch (Exception $e) {
+    $errMsg = $e->getMessage();
+    // 判断是否为可重试的网络错误（非 API 业务错误）
+    $isNetworkError = false;
+    $networkPatterns = [
+        'Connection reset by peer',
+        'Connection refused',
+        'Connection timed out',
+        'Timeout was reached',
+        'Recv failure',
+        'Send failure',
+        'Failed to connect',
+        'Empty reply from server',
+        'transfer closed',
+        'OpenSSL SSL_read',
+        'SSL connection timeout',
+    ];
+    foreach ($networkPatterns as $pattern) {
+        if (stripos($errMsg, $pattern) !== false) {
+            $isNetworkError = true;
+            break;
+        }
+    }
+
     echo json_encode([
-        'success' => false,
-        'message' => 'AI 调用失败: ' . $e->getMessage()
+        'success'         => false,
+        'message'         => 'AI 调用失败: ' . $errMsg,
+        'retryable'       => $isNetworkError,
+        'is_network_error'=> $isNetworkError,
+        'batch_index'     => $batchIndex,
+        'batch_from'      => $batchFrom,
+        'batch_to'        => $batchTo,
     ], JSON_UNESCAPED_UNICODE);
     exit;
 }

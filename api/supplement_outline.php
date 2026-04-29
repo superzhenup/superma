@@ -105,7 +105,7 @@ $novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$novelId]);
 if (!$novel) { sse('error', ['msg' => '小说不存在']); sseDone(); exit; }
 
 // 预检：至少要有一个模型
-try { getModelFallbackList($novel['model_id'] ?: null); }
+try { getModelFallbackList($novel['model_id'] ?: null, 'structured'); }
 catch (RuntimeException $e) { sse('error', ['msg' => $e->getMessage()]); sseDone(); exit; }
 
 // 初始化记忆引擎

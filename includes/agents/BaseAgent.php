@@ -18,6 +18,9 @@ abstract class BaseAgent
     /** @var string Agent类型标识 */
     protected $agentType;
     
+    /** @var int 小说ID（0=全局） */
+    protected $novelId = 0;
+    
     /** @var array 内存中的决策历史 */
     protected $decisionHistory = [];
     
@@ -28,10 +31,12 @@ abstract class BaseAgent
      * 构造函数
      * 
      * @param string $agentType Agent类型
+     * @param int $novelId 小说ID（0=全局）
      */
-    public function __construct(string $agentType)
+    public function __construct(string $agentType, int $novelId = 0)
     {
         $this->agentType = $agentType;
+        $this->novelId   = $novelId;
     }
     
     /**
@@ -81,6 +86,7 @@ abstract class BaseAgent
             }
             
             $result = DB::insert('agent_decision_logs', [
+                'novel_id'   => $this->novelId,
                 'agent_type' => $this->agentType,
                 'decision_data' => $jsonData,
                 'created_at' => date('Y-m-d H:i:s'),
@@ -110,10 +116,10 @@ abstract class BaseAgent
         try {
             $logs = DB::fetchAll(
                 'SELECT * FROM agent_decision_logs 
-                 WHERE agent_type = ? 
+                 WHERE agent_type = ? AND novel_id = ?
                  ORDER BY created_at DESC 
                  LIMIT ?',
-                [$this->agentType, $limit]
+                [$this->agentType, $this->novelId, $limit]
             );
             
             // 检查返回值是否有效
@@ -215,25 +221,25 @@ abstract class BaseAgent
         
         try {
             $stats = DB::fetch(
-                'SELECT 
+                'SELECT
                     COUNT(*) as decision_count,
                     MIN(created_at) as first_decision,
                     MAX(created_at) as last_decision
                  FROM agent_decision_logs
-                 WHERE agent_type = ? 
+                 WHERE agent_type = ? AND novel_id = ?
                  AND created_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)',
-                [$this->agentType, $hours]
+                [$this->agentType, $this->novelId, $hours]
             );
-            
+
             $actionStats = DB::fetch(
-                'SELECT 
+                'SELECT
                     COUNT(*) as action_count,
                     SUM(CASE WHEN status = "success" THEN 1 ELSE 0 END) as success_count,
                     SUM(CASE WHEN status = "failed" THEN 1 ELSE 0 END) as failed_count
                  FROM agent_action_logs
-                 WHERE agent_type = ?
+                 WHERE agent_type = ? AND novel_id = ?
                  AND created_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)',
-                [$this->agentType, $hours]
+                [$this->agentType, $this->novelId, $hours]
             );
             
             // 防止除零错误

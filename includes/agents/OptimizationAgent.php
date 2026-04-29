@@ -19,9 +19,6 @@ require_once __DIR__ . '/BaseAgent.php';
 
 class OptimizationAgent extends BaseAgent
 {
-    /** @var int 小说ID */
-    private $novelId;
-    
     /**
      * 构造函数
      * 
@@ -29,8 +26,7 @@ class OptimizationAgent extends BaseAgent
      */
     public function __construct(int $novelId)
     {
-        parent::__construct('optimization');
-        $this->novelId = $novelId;
+        parent::__construct('optimization', $novelId);
     }
     
     /**
@@ -85,6 +81,7 @@ class OptimizationAgent extends BaseAgent
             'performance_trends' => $this->analyzePerformanceTrends(),
             'quality_trends' => $this->analyzeQualityTrends(),
             'cost_efficiency' => $this->analyzeCostEfficiency(),
+            'directive_effectiveness' => $this->analyzeDirectiveEffectiveness(),
         ];
     }
     
@@ -312,24 +309,33 @@ class OptimizationAgent extends BaseAgent
     // ==================== 辅助分析方法 ====================
     
     /**
-     * 分析性能趋势
+     * 分析性能趋势（基于chapters表的真实duration_ms数据）
      */
     private function analyzePerformanceTrends(): array
     {
         try {
+            // v1.5: 使用 chapters.duration_ms（真实写入数据），替代不存在的 performance_logs
             $stats = DB::fetch(
-                'SELECT AVG(duration_ms) as avg_time 
-                 FROM performance_logs 
-                 WHERE novel_id = ? AND phase = "streamWrite" 
-                   AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)',
-                [$this->novelId]
+                'SELECT AVG(duration_ms) as avg_time, 
+                        MAX(duration_ms) as max_time,
+                        MIN(duration_ms) as min_time,
+                        COUNT(*) as sample_count
+                 FROM chapters 
+                 WHERE novel_id = ? AND status = "completed" 
+                   AND duration_ms > 0
+                   AND chapter_number >= GREATEST(1, (SELECT MAX(chapter_number) - 20 FROM chapters WHERE novel_id = ? AND status = "completed"))',
+                [$this->novelId, $this->novelId]
             );
             
+            $avgTime = (float)($stats['avg_time'] ?? 0);
             return [
-                'avg_write_time' => (float)($stats['avg_time'] ?? 0) / 1000,
+                'avg_write_time' => $avgTime > 0 ? $avgTime / 1000 : 25.0,
+                'max_write_time' => (float)($stats['max_time'] ?? 0) / 1000,
+                'min_write_time' => (float)($stats['min_time'] ?? 0) / 1000,
+                'sample_count' => (int)($stats['sample_count'] ?? 0),
             ];
         } catch (\Throwable $e) {
-            return ['avg_write_time' => 25.0];
+            return ['avg_write_time' => 25.0, 'sample_count' => 0];
         }
     }
     
@@ -396,14 +402,18 @@ class OptimizationAgent extends BaseAgent
     }
     
     /**
-     * 计算ROI
+     * 计算ROI（融合指令效果反馈，v1.5升级）
      */
     private function calculateROI(array $proposal): float
     {
         $improvement = $proposal['estimated_improvement'] ?? 0;
         $risk = $this->assessRisk($proposal);
+        $baseRoi = $improvement * (1 - $risk);
         
-        return $improvement * (1 - $risk);
+        // v1.5: 读取同类型指令的历史效果，调整ROI
+        $effectivenessBonus = $this->getDirectiveEffectivenessBonus($proposal['type']);
+        
+        return $baseRoi * (1 + $effectivenessBonus);
     }
     
     /**
@@ -434,6 +444,78 @@ class OptimizationAgent extends BaseAgent
         ];
         
         return $feasibilityMap[$cost] ?? 'medium';
+    }
+    
+    /**
+     * 分析指令效果（基于 agent_directive_outcomes 反馈数据）
+     * 
+     * @return array{by_type: array, overall_effectiveness: float}
+     */
+    private function analyzeDirectiveEffectiveness(): array
+    {
+        try {
+            require_once __DIR__ . '/AgentDirectives.php';
+            $stats = AgentDirectives::getOutcomeStats($this->novelId);
+            
+            $byType = [];
+            foreach ($stats['by_type'] as $row) {
+                $byType[$row['type']] = [
+                    'avg_change' => round((float)$row['avg_change'], 2),
+                    'improved' => (int)$row['improved'],
+                    'declined' => (int)$row['declined'],
+                    'total' => (int)$row['outcome_count'],
+                    'effectiveness' => (int)$row['outcome_count'] > 0
+                        ? round((int)$row['improved'] / (int)$row['outcome_count'], 2)
+                        : 0,
+                ];
+            }
+            
+            // 整体有效性 = 所有改善次数 / 总评估次数
+            $totalOutcomes = array_sum(array_column($stats['by_type'], 'outcome_count'));
+            $totalImproved = array_sum(array_column($stats['by_type'], 'improved'));
+            $overallEffectiveness = $totalOutcomes > 0 ? round($totalImproved / $totalOutcomes, 2) : 0;
+            
+            return [
+                'by_type' => $byType,
+                'overall_effectiveness' => $overallEffectiveness,
+            ];
+        } catch (\Throwable $e) {
+            return ['by_type' => [], 'overall_effectiveness' => 0];
+        }
+    }
+    
+    /**
+     * 获取特定类型指令的历史效果奖金系数
+     * 
+     * @param string $directiveType 指令类型: performance/cost/quality
+     * @return float 奖金系数 [-0.3, +0.3]
+     */
+    private function getDirectiveEffectivenessBonus(string $directiveType): float
+    {
+        try {
+            $typeMap = ['performance' => 'optimization', 'cost' => 'optimization', 'quality' => 'quality'];
+            $dbType = $typeMap[$directiveType] ?? $directiveType;
+            
+            $stats = DB::fetch(
+                'SELECT AVG(quality_change) as avg_change, 
+                        SUM(CASE WHEN quality_change > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0) as improvement_rate
+                 FROM agent_directive_outcomes o
+                 JOIN agent_directives d ON o.directive_id = d.id
+                 WHERE o.novel_id = ? AND d.type = ?
+                 ORDER BY o.evaluated_at DESC LIMIT 20',
+                [$this->novelId, $dbType]
+            );
+            
+            if (empty($stats) || !$stats['avg_change']) return 0;
+            
+            $avgChange = (float)$stats['avg_change'];
+            $improvementRate = (float)($stats['improvement_rate'] ?? 0);
+            
+            // 质量改善越多，奖金越高（最大±0.3）
+            return round(max(-0.3, min(0.3, ($avgChange / 10) * $improvementRate)), 2);
+        } catch (\Throwable $e) {
+            return 0;
+        }
     }
     
     /**

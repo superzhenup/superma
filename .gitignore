@@ -20,3 +20,8 @@ storage/covers/
 # Word 临时文件
 ~$*
 *.tmp
+
+# Schema 版本锁文件（不应分发）
+storage/*.lock
+# 写作取消标志文件（运行时临时文件）
+storage/write_cancel_*.flag

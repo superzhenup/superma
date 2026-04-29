@@ -59,7 +59,7 @@ $storyOutline = DB::fetch('SELECT * FROM story_outlines WHERE novel_id=?', [$nov
 
 // 预检：至少要有一个模型
 try {
-    $modelList = getModelFallbackList($novel['model_id'] ?: null);
+    $modelList = getModelFallbackList($novel['model_id'] ?: null, 'synopsis');
 } catch (RuntimeException $e) {
     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
     exit;

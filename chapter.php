@@ -387,7 +387,7 @@ window.saveChapter = async function saveChapter(chapterId) {
     try {
         var res = await fetch('api/actions.php', {
             method: 'POST',
-            headers: {'Content-Type':'application/json'},
+            headers: {'Content-Type':'application/json', 'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || ''},
             body: JSON.stringify({
                 action: 'save_chapter',
                 chapter_id: chapterId,
@@ -534,25 +534,34 @@ window.previewVersion     = previewVersion;
             const contentEl = document.getElementById('rewriteContent');
             const spinnerEl = document.getElementById('rewriteSpinner');
             const statsEl   = document.getElementById('rewriteStats');
-            if (contentEl) contentEl.textContent = '';
+            if (contentEl) contentEl.textContent = '⏳ 正在初始化写作引擎...';
             if (spinnerEl) spinnerEl.style.display = '';
             if (statsEl)   statsEl.textContent = '';
 
             try {
+                console.log('[SSE-写入] 开始连接 write_chapter.php');
                 const response = await fetch('api/write_chapter.php', {
                     method: 'POST',
-                    headers: {'Content-Type':'application/json'},
+                    headers: {'Content-Type':'application/json', 'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || ''},
                     body: JSON.stringify({ novel_id: NOVEL_ID, chapter_id: CHAPTER_ID })
                 });
+                console.log('[SSE-写入] HTTP 状态:', response.status, response.ok);
+                if (!response.ok) {
+                    const errText = await response.text();
+                    throw new Error('HTTP ' + response.status + ': ' + errText.slice(0, 200));
+                }
                 const reader   = response.body.getReader();
                 const decoder  = new TextDecoder();
                 let   fullText = '';
                 let   sseBuf   = '';
-                if (spinnerEl) spinnerEl.style.display = 'none';
+                let   hasError = false;
+                let   hasContent = false;
+                // 保持 spinner 显示直到收到第一个有效事件
+                let   firstEvent = false;
 
                 while (true) {
                     const { value, done } = await reader.read();
-                    if (done) break;
+                    if (done) { console.log('[SSE-写入] 流结束'); break; }
                     sseBuf += decoder.decode(value, { stream: true });
                     const events = sseBuf.split('\n\n');
                     sseBuf = events.pop();
@@ -560,25 +569,56 @@ window.previewVersion     = previewVersion;
                         let dataLine = '';
                         for (const ln of eventBlock.split('\n')) {
                             if (ln.startsWith('data: ')) dataLine = ln;
+                            if (ln.startsWith('event: ')) console.log('[SSE-写入] 事件:', ln.slice(7));
                         }
                         if (!dataLine) continue;
                         const payload = dataLine.slice(6).trim();
-                        if (payload === '[DONE]') break;
+                        if (payload === '[DONE]') {
+                            console.log('[SSE-写入] 收到 [DONE]');
+                            if (hasContent) { window._contentUpdated = true; }
+                            break;
+                        }
                         try {
                             const d = JSON.parse(payload);
-                            if (d.chunk && contentEl) {
+                            // 首个有效事件到达后隐藏 spinner
+                            if (!firstEvent) { if (spinnerEl) spinnerEl.style.display = 'none'; firstEvent = true; }
+                            if (d.error) {
+                                console.error('[SSE-写入] 服务端错误:', d.error);
+                                hasError = true;
+                                if (contentEl) contentEl.textContent = '❌ 写作失败：' + d.error;
+                                if (statsEl) statsEl.textContent = '写作出错，请关闭对话框后重试';
+                            }
+                            if (d.warning) {
+                                console.warn('[SSE-写入] 警告:', d.warning);
+                                if (statsEl) statsEl.textContent = '⚠️ ' + d.warning;
+                            }
+                            if (d.info) { console.log('[SSE-写入] 信息:', d.info); }
+                            if (d.chunk && contentEl && !hasError) {
+                                hasContent = true;
                                 fullText += d.chunk;
                                 contentEl.textContent = fullText;
                                 contentEl.scrollTop = contentEl.scrollHeight;
                             }
-                            if (d.stats && statsEl) {
+                            if (d.stats && statsEl && !hasError) {
                                 statsEl.textContent = d.stats;
                             }
-                        } catch(e) {}
+                            if (d.waiting && d.msg && statsEl && !hasError) {
+                                statsEl.textContent = d.msg;
+                            }
+                            if (d.model && d.attempt) {
+                                if (statsEl) statsEl.textContent = '🔄 尝试模型 ' + d.model + ' (第' + d.attempt + '次)...';
+                            }
+                        } catch(e) { console.warn('[SSE-写入] JSON解析失败:', payload.slice(0, 100)); }
                     }
                 }
+                if (!hasContent && !hasError && contentEl) {
+                    contentEl.textContent = '⚠️ 未收到生成内容，请检查 AI 模型配置和 API 连接，然后重试。';
+                    if (statsEl) statsEl.textContent = '';
+                }
             } catch(err) {
+                console.error('[SSE-写入] 连接异常:', err);
                 if (contentEl) contentEl.textContent = '写作失败：' + err.message;
+                if (spinnerEl) spinnerEl.style.display = 'none';
             }
         });
     });
@@ -608,7 +648,7 @@ window.previewVersion     = previewVersion;
 
             const res = await fetch('api/actions.php', {
                 method: 'POST',
-                headers: {'Content-Type':'application/json'},
+                headers: {'Content-Type':'application/json', 'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || ''},
                 body: JSON.stringify({
                     action:      'save_chapter_outline',
                     chapter_id:  CHAPTER_ID,
@@ -654,7 +694,7 @@ async function runQualityCheck() {
     try {
         const res = await fetch('api/validate_consistency.php', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            headers: {'Content-Type': 'application/json', 'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || ''},
             body: JSON.stringify({ novel_id: NOVEL_ID, chapter_id: CHAPTER_ID })
         });
         const data = await res.json();
@@ -769,7 +809,7 @@ window.polishChapter = async function polishChapter(chapterId) {
     try {
         var checkRes = await fetch('api/validate_consistency.php', {
             method: 'POST',
-            headers: {'Content-Type':'application/json'},
+            headers: {'Content-Type':'application/json', 'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || ''},
             body: JSON.stringify({ novel_id: NOVEL_ID, chapter_id: chapterId })
         });
         var checkData = await checkRes.json();
@@ -841,7 +881,7 @@ window.polishChapter = async function polishChapter(chapterId) {
     try {
         var response = await fetch('api/polish_chapter.php', {
             method: 'POST',
-            headers: {'Content-Type':'application/json'},
+            headers: {'Content-Type':'application/json', 'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || ''},
             body: JSON.stringify({
                 chapter_id: chapterId,
                 quality_feedback: qualityFeedback
@@ -1040,23 +1080,30 @@ window.compressChapter = async function compressChapter(chapterId) {
     var _compressedContent = '';
 
     try {
+        console.log('[SSE-压缩] 开始连接 compress_chapter.php (chapter_id=' + chapterId + ', target=' + targetWords + ')');
         var response = await fetch('api/compress_chapter.php', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            headers: {'Content-Type': 'application/json', 'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || ''},
             body: JSON.stringify({
                 chapter_id: chapterId,
                 target_words: targetWords
             })
         });
+        console.log('[SSE-压缩] HTTP 状态:', response.status, response.ok);
+        if (!response.ok) {
+            var errText = await response.text();
+            throw new Error('HTTP ' + response.status + ': ' + errText.slice(0, 200));
+        }
         var reader  = response.body.getReader();
         var decoder = new TextDecoder();
         var fullText = '';
         var sseBuffer = '';          // SSE 分片缓冲区
-        if (spinnerEl) spinnerEl.style.display = 'none';
+        var firstEvent = false;
+        var hasError = false;
 
         while (true) {
             var result = await reader.read();
-            if (result.done) break;
+            if (result.done) { console.log('[SSE-压缩] 流结束'); break; }
             sseBuffer += decoder.decode(result.value, { stream: true });
 
             // 按 SSE 标准双换行分割事件块
@@ -1073,32 +1120,46 @@ window.compressChapter = async function compressChapter(chapterId) {
                 }
                 if (!dataLine) continue;
                 var payload = dataLine.slice(6).trim();
-                if (payload === '[DONE]') { _compressDone = true; break; }
+                if (payload === '[DONE]') { console.log('[SSE-压缩] 收到 [DONE]'); if (!hasError) _compressDone = true; break; }
                 try {
                     var d = JSON.parse(payload);
-                    if (d.debug && statsEl) {
-                        statsEl.textContent = d.debug;
+                    if (!firstEvent) { if (spinnerEl) spinnerEl.style.display = 'none'; firstEvent = true; }
+                    if (d.error) {
+                        console.error('[SSE-压缩] 服务端错误:', d.error);
+                        hasError = true;
+                        if (statsEl) statsEl.textContent = '❌ ' + d.error;
+                        _compressDone = false;
                     }
-                    if (d.chunk) {
+                    if (d.warning) {
+                        console.warn('[SSE-压缩] 警告:', d.warning);
+                        if (statsEl) statsEl.textContent = '⚠️ ' + d.warning;
+                    }
+                    if (d.model_switch) {
+                        console.log('[SSE-压缩] 模型切换:', d.to, d.reason);
+                        if (statsEl) statsEl.textContent = '🔄 切换到模型 ' + d.to + (d.reason ? ' (' + d.reason + ')' : '');
+                    }
+                    if (d.status === 'compressing' && statsEl) {
+                        statsEl.textContent = '开始压缩：' + d.from_words + '字 → 目标 ' + d.target_words + '字...';
+                    }
+                    if (d.chunk && !hasError) {
                         fullText += d.chunk;
                     }
-                    if (d.content) {
+                    if (d.content && !hasError) {
                         // 非流式模式：一次性收到完整内容
                         fullText = d.content;
                     }
                     // 实时同步到预览区
-                    if (fullText && streamContent) {
+                    if (fullText && streamContent && !hasError) {
                         streamContent.textContent = fullText;
                         streamContent.scrollTop = streamContent.scrollHeight;
                     }
-                    if (d.stats && statsEl) {
+                    if (d.stats && statsEl && !hasError) {
                         statsEl.textContent = d.stats;
                     }
-                    if (d.error) {
-                        if (statsEl) statsEl.textContent = '❌ ' + d.error;
-                        _compressDone = false;
+                    if (d.version_saved) {
+                        console.log('[SSE-压缩] 版本已备份 v' + d.version, d.words + '字');
                     }
-                } catch(e) {}
+                } catch(e) { console.warn('[SSE-压缩] JSON解析失败:', payload.slice(0, 100)); }
             }
         }
 
@@ -1108,11 +1169,14 @@ window.compressChapter = async function compressChapter(chapterId) {
             if (statsEl) statsEl.textContent = '✓ 压缩完成！已更新编辑框，请点击「保存」持久化';
             if (modalTitle) modalTitle.textContent = '压缩完成';
             window._contentUpdated = true;
-        } else if (!fullText || fullText.trim().length === 0) {
-            if (statsEl) statsEl.textContent = '❌ 压缩失败：LLM 未返回有效内容，请检查 API 配置';
+        } else if (!hasError && (!fullText || fullText.trim().length === 0)) {
+            // 仅在服务端未发送错误详情时才显示兜底消息
+            if (statsEl) statsEl.textContent = '❌ 压缩失败：所有模型均未返回有效内容，请检查 API 配置';
         }
     } catch(err) {
+        console.error('[SSE-压缩] 连接异常:', err);
         if (streamContent) streamContent.textContent = '压缩失败：' + err.message;
+        if (spinnerEl) spinnerEl.style.display = 'none';
     } finally {
         if (btn) { btn.disabled = false; btn.innerHTML = origBtnHtml; }
     }
@@ -1146,13 +1210,16 @@ window.compressChapter = async function compressChapter(chapterId) {
 
         try {
             // 1. 先保存大纲并标记需要重新生成
+            console.log('[重新生成] 步骤1/3: 保存大纲 (chapter_id=' + CHAPTER_ID + ')');
             var keyPoints = kpEl.value.split('\n')
                 .map(function(s) { return s.trim(); })
                 .filter(function(s) { return s.length > 0; });
 
+            var csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+
             var res = await fetch('api/actions.php', {
                 method: 'POST',
-                headers: {'Content-Type':'application/json'},
+                headers: {'Content-Type':'application/json', 'X-CSRF-Token': csrfToken},
                 body: JSON.stringify({
                     action: 'regenerate_chapter',
                     chapter_id: CHAPTER_ID,
@@ -1162,6 +1229,7 @@ window.compressChapter = async function compressChapter(chapterId) {
                 })
             });
             var data = await res.json();
+            console.log('[重新生成] 步骤1 结果:', data);
 
             if (!data.ok) {
                 alert('操作失败：' + (data.msg || '未知错误'));
@@ -1171,14 +1239,23 @@ window.compressChapter = async function compressChapter(chapterId) {
             }
 
             // 2. 重置章节状态为 outlined（让 write_chapter.php 能重新写入）
-            await fetch('api/actions.php', {
+            console.log('[重新生成] 步骤2/3: 重置章节状态');
+            var resetRes = await fetch('api/actions.php', {
                 method: 'POST',
-                headers: {'Content-Type':'application/json'},
+                headers: {'Content-Type':'application/json', 'X-CSRF-Token': csrfToken},
                 body: JSON.stringify({
                     action: 'reset_chapter',
                     chapter_id: CHAPTER_ID
                 })
             });
+            var resetData = await resetRes.json();
+            console.log('[重新生成] 步骤2 结果:', resetData);
+            if (!resetData.ok) {
+                alert('重置失败：' + (resetData.msg || '未知错误'));
+                btn.innerHTML = origHtml;
+                btn.disabled = false;
+                return;
+            }
 
             // 3. 调用流式写作 API
             btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>生成中...';
@@ -1190,24 +1267,32 @@ window.compressChapter = async function compressChapter(chapterId) {
             var contentEl = document.getElementById('rewriteContent');
             var spinnerEl = document.getElementById('rewriteSpinner');
             var statsEl   = document.getElementById('rewriteStats');
-            if (contentEl) contentEl.textContent = '';
+            if (contentEl) contentEl.textContent = '⏳ 正在初始化写作引擎...';
             if (spinnerEl) spinnerEl.style.display = '';
             if (statsEl)   statsEl.textContent = '';
 
+            console.log('[SSE-重新生成] 开始连接 write_chapter.php (novel_id=' + NOVEL_ID + ', chapter_id=' + CHAPTER_ID + ')');
             var response = await fetch('api/write_chapter.php', {
                 method: 'POST',
-                headers: {'Content-Type':'application/json'},
+                headers: {'Content-Type':'application/json', 'X-CSRF-Token': csrfToken},
                 body: JSON.stringify({ novel_id: NOVEL_ID, chapter_id: CHAPTER_ID })
             });
+            console.log('[SSE-重新生成] HTTP 状态:', response.status, response.ok);
+            if (!response.ok) {
+                var errText = await response.text();
+                throw new Error('HTTP ' + response.status + ': ' + errText.slice(0, 200));
+            }
             var reader  = response.body.getReader();
             var decoder = new TextDecoder();
             var fullText = '';
             var sseBuf3 = '';
-            if (spinnerEl) spinnerEl.style.display = 'none';
+            var hasError = false;
+            var hasContent = false;
+            var firstEvent = false;
 
             while (true) {
                 var result = await reader.read();
-                if (result.done) break;
+                if (result.done) { console.log('[SSE-重新生成] 流结束'); break; }
                 sseBuf3 += decoder.decode(result.value, { stream: true });
                 var events3 = sseBuf3.split('\n\n');
                 sseBuf3 = events3.pop();
@@ -1216,24 +1301,61 @@ window.compressChapter = async function compressChapter(chapterId) {
                     var elines3 = events3[ei3].split('\n');
                     for (var li3 = 0; li3 < elines3.length; li3++) {
                         if (elines3[li3].startsWith('data: ')) dataLine3 = elines3[li3];
+                        if (elines3[li3].startsWith('event: ')) console.log('[SSE-重新生成] 事件:', elines3[li3].slice(7));
                     }
                     if (!dataLine3) continue;
                     var payload3 = dataLine3.slice(6).trim();
-                    if (payload3 === '[DONE]') { window._contentUpdated = true; break; }
+                    if (payload3 === '[DONE]') {
+                        console.log('[SSE-重新生成] 收到 [DONE]');
+                        // 只有生成了实际内容才标记为需要刷新
+                        if (hasContent) { window._contentUpdated = true; }
+                        break;
+                    }
                     try {
                         var d = JSON.parse(payload3);
-                        if (d.chunk && contentEl) {
+                        if (!firstEvent) { if (spinnerEl) spinnerEl.style.display = 'none'; firstEvent = true; }
+                        // 优先展示错误信息
+                        if (d.error) {
+                            console.error('[SSE-重新生成] 服务端错误:', d.error);
+                            hasError = true;
+                            if (contentEl) contentEl.textContent = '❌ 生成失败：' + d.error;
+                            if (statsEl) statsEl.textContent = '生成出错，请关闭对话框后重试';
+                        }
+                        // 展示警告信息
+                        if (d.warning) {
+                            console.warn('[SSE-重新生成] 警告:', d.warning);
+                            if (statsEl) statsEl.textContent = '⚠️ ' + d.warning;
+                        }
+                        if (d.info) { console.log('[SSE-重新生成] 信息:', d.info); }
+                        // 流式内容
+                        if (d.chunk && contentEl && !hasError) {
+                            hasContent = true;
                             fullText += d.chunk;
                             contentEl.textContent = fullText;
                             contentEl.scrollTop = contentEl.scrollHeight;
                         }
-                        if (d.stats && statsEl) {
+                        // 状态/统计信息
+                        if (d.stats && statsEl && !hasError) {
                             statsEl.textContent = d.stats;
                         }
-                    } catch(e) {}
+                        // 等待中消息
+                        if (d.waiting && d.msg && statsEl && !hasError) {
+                            statsEl.textContent = d.msg;
+                        }
+                        if (d.model && d.attempt) {
+                            if (statsEl) statsEl.textContent = '🔄 尝试模型 ' + d.model + ' (第' + d.attempt + '次)...';
+                        }
+                    } catch(e) { console.warn('[SSE-重新生成] JSON解析失败:', payload3.slice(0, 100)); }
                 }
             }
+
+            // 如果没有收到任何内容也没有错误，提示用户
+            if (!hasContent && !hasError && contentEl) {
+                contentEl.textContent = '⚠️ 未收到生成内容，请检查 AI 模型配置和 API 连接，然后重试。';
+                if (statsEl) statsEl.textContent = '';
+            }
         } catch(err) {
+            console.error('[SSE-重新生成] 连接异常:', err);
             alert('重新生成失败：' + err.message);
         } finally {
             btn.innerHTML = origHtml;
