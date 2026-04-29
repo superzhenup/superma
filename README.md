@@ -1,4 +1,4 @@
-# ✦ Super Ma Ahents v1.3.5 — AI 智能小说创作辅助系统（平台）
+# ✦ Super-Ma AI 智能小说创作辅助系统（平台）
 ## UI预览
 <img width="1921" height="906" alt="局部截取_20260427_204024" src="https://github.com/user-attachments/assets/5951459d-bada-4d90-b443-1ad7127c53e1" />
 <p> <p>

@@ -480,8 +480,9 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `updated_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='系统设置表'",
 
-                // 初始化 system_settings：embedding 模型 ID + 写作参数默认值
+                // 初始化 system_settings：迁移版本标记 + embedding 模型 ID + 写作参数默认值
                 "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES
+                  ('schema_version_migrated', '24'),
                   ('global_embedding_model_id', ''),
                   ('ws_chapter_words',              '2000'),
                   ('ws_chapter_word_tolerance',     '150'),
@@ -829,7 +830,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
   <div class="card-install p-4 p-md-5 shadow-lg">
     <div class="text-center mb-4">
       <div class="logo">✦ Super Ma AI创作系统</div>
-      <p class="text-muted mt-1 mb-0" style="font-size:.8rem">安装向导 · v1.2</p>
+      <p class="text-muted mt-1 mb-0" style="font-size:.8rem">安装向导 · v1.3.5</p>
     </div>
 
     <?php if ($success): ?>

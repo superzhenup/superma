@@ -89,7 +89,9 @@ class DB {
             ]);
 
             // MySQL 5.7+ 版本检测（5.7 对 JSON/utf8mb4 支持完整，5.6 及以下有缺陷）
-            $version = self::$pdo->query('SELECT VERSION()')->fetchColumn();
+            $verStmt = self::$pdo->query('SELECT VERSION()');
+            $version = $verStmt->fetchColumn();
+            $verStmt->closeCursor();
             if ($version && preg_match('/(\d+)\.(\d+)/', $version, $m)) {
                 $major = (int)$m[1];
                 $minor = (int)$m[2];
@@ -127,12 +129,14 @@ class DB {
         $pdo = self::$pdo;
         
         // 检查 system_settings 表是否存在
-        $tableExists = $pdo->query("SHOW TABLES LIKE 'system_settings'")->fetch();
+        $stmt = $pdo->query("SHOW TABLES LIKE 'system_settings'");
+        $tableExists = $stmt->fetch();
+        $stmt->closeCursor();
         if ($tableExists) {
             // 检查迁移状态
-            $stmt = $pdo->prepare("SELECT setting_value FROM system_settings WHERE setting_key = ?");
-            $stmt->execute(['schema_version_migrated']);
-            $migratedVersion = $stmt->fetchColumn();
+            $stmt2 = $pdo->prepare("SELECT setting_value FROM system_settings WHERE setting_key = ?");
+            $stmt2->execute(['schema_version_migrated']);
+            $migratedVersion = $stmt2->fetchColumn();
             if ($migratedVersion !== false && (int)$migratedVersion >= self::SCHEMA_VERSION) {
                 return; // 已迁移，直接跳过
             }
@@ -154,7 +158,9 @@ class DB {
         // ========== 数据库级 advisory lock（防并发迁移） ==========
         $locked = false;
         try {
-            $lockResult = $pdo->query("SELECT GET_LOCK('db_migrate_v" . self::SCHEMA_VERSION . "', 10)")->fetchColumn();
+            $stmtLock = $pdo->query("SELECT GET_LOCK('db_migrate_v" . self::SCHEMA_VERSION . "', 10)");
+            $lockResult = $stmtLock->fetchColumn();
+            $stmtLock->closeCursor();
             $locked = ($lockResult == 1);
             if (!$locked) {
                 error_log('DB Migrate: 未能获取迁移锁，另一进程可能正在迁移');
@@ -534,12 +540,14 @@ class DB {
         // 对老库做幂等 ALTER：若 ENUM 已包含新值则 MySQL 自身不会报错（仍会重写元数据但无副作用）；
         // 为避免不必要的元数据重写，先查询一次当前 ENUM 定义。
         try {
-            $row = $pdo->query(
+            $stmtMemAtomV8 = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'memory_atoms'
                    AND COLUMN_NAME  = 'atom_type'"
-            )->fetch();
+            );
+            $row = $stmtMemAtomV8->fetch();
+            $stmtMemAtomV8->closeCursor();
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             $needAlter = $colType !== '' &&
                 (strpos($colType, "'technique'") === false
@@ -658,12 +666,14 @@ class DB {
 
         // [v14] 补全 memory_atoms.atom_type ENUM：添加 cool_point（v8迁移遗漏）
         try {
-            $row = $pdo->query(
+            $stmtMemAtomV14 = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'memory_atoms'
                    AND COLUMN_NAME  = 'atom_type'"
-            )->fetch();
+            );
+            $row = $stmtMemAtomV14->fetch();
+            $stmtMemAtomV14->closeCursor();
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             if (strpos($colType, "'cool_point'") === false) {
                 $pdo->exec(
@@ -683,12 +693,14 @@ class DB {
 
         // [v14] novel_plots.status ENUM 扩展：添加 planted（已埋设）和 resolving（回收中）
         try {
-            $row = $pdo->query(
+            $stmtPlotsStatus = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_plots'
                    AND COLUMN_NAME  = 'status'"
-            )->fetch();
+            );
+            $row = $stmtPlotsStatus->fetch();
+            $stmtPlotsStatus->closeCursor();
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             $needAlter = $colType !== '' &&
                 (strpos($colType, "'planted'") === false
@@ -704,12 +716,14 @@ class DB {
 
         // [v14] novel_plots.event_type ENUM 更新：'side' → 'subplot'，添加 'other'
         try {
-            $row = $pdo->query(
+            $stmtPlotsType = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_plots'
                    AND COLUMN_NAME  = 'event_type'"
-            )->fetch();
+            );
+            $row = $stmtPlotsType->fetch();
+            $stmtPlotsType->closeCursor();
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             $needAlter = $colType !== '' &&
                 (strpos($colType, "'subplot'") === false
@@ -729,12 +743,14 @@ class DB {
 
         // [v14] novel_style.category 从 VARCHAR(30) 迁移为 ENUM（与代码一致）
         try {
-            $row = $pdo->query(
+            $stmtStyleCat = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_style'
                    AND COLUMN_NAME  = 'category'"
-            )->fetch();
+            );
+            $row = $stmtStyleCat->fetch();
+            $stmtStyleCat->closeCursor();
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             if (strpos($colType, 'enum') === false) {
                 $pdo->exec(
@@ -747,24 +763,28 @@ class DB {
 
         // [v14] novel_characters 字段对齐线上：alias VARCHAR(100) DEFAULT NULL, gender VARCHAR(10) DEFAULT NULL
         try {
-            $row = $pdo->query(
+            $stmtCharAlias = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_characters'
                    AND COLUMN_NAME  = 'alias'"
-            )->fetch();
+            );
+            $row = $stmtCharAlias->fetch();
+            $stmtCharAlias->closeCursor();
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             if (strpos($colType, 'varchar(200)') !== false) {
                 $pdo->exec("ALTER TABLE `novel_characters` MODIFY COLUMN `alias` VARCHAR(100) DEFAULT NULL COMMENT '别名/绰号'");
             }
         } catch (\Throwable $e) { error_log('DB Migrate: novel_characters.alias 字段对齐失败 — ' . $e->getMessage()); }
         try {
-            $row = $pdo->query(
+            $stmtCharGender = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_characters'
                    AND COLUMN_NAME  = 'gender'"
-            )->fetch();
+            );
+            $row = $stmtCharGender->fetch();
+            $stmtCharGender->closeCursor();
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             if (strpos($colType, 'varchar(20)') !== false) {
                 $pdo->exec("ALTER TABLE `novel_characters` MODIFY COLUMN `gender` VARCHAR(10) DEFAULT NULL COMMENT '性别'");
@@ -773,12 +793,14 @@ class DB {
 
         // [v14] novel_worldbuilding 字段对齐线上：name VARCHAR(200), importance DEFAULT 3
         try {
-            $row = $pdo->query(
+            $stmtWbName = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_worldbuilding'
                    AND COLUMN_NAME  = 'name'"
-            )->fetch();
+            );
+            $row = $stmtWbName->fetch();
+            $stmtWbName->closeCursor();
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             if (strpos($colType, 'varchar(100)') !== false) {
                 $pdo->exec("ALTER TABLE `novel_worldbuilding` MODIFY COLUMN `name` VARCHAR(200) NOT NULL COMMENT '名称'");
