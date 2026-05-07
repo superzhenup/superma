@@ -66,7 +66,12 @@ if ($action === 'check') {
                     $memoryCtx = null;
                 }
 
-                $messages = buildOutlinePrompt($novel, 1, 5, $recentOutlines, '', $memoryCtx);
+                $existingTitleRows = DB::fetchAll(
+                    'SELECT chapter_number, title FROM chapters WHERE novel_id=? AND title IS NOT NULL AND title != "" ORDER BY chapter_number ASC',
+                    [$novelId]
+                );
+                $existingTitles = array_column($existingTitleRows, 'title', 'chapter_number');
+                $messages = buildOutlinePrompt($novel, 1, 5, $recentOutlines, '', $memoryCtx, null, $existingTitles);
                 $promptLabel = '大纲生成（第1-5章）';
                 break;
 
@@ -104,7 +109,12 @@ if ($action === 'check') {
                 }
 
                 $endCh = $startCh + 4;
-                $messages = buildOutlinePrompt($novel, $startCh, $endCh, $recentOutlines, $prevHook, $memoryCtx);
+                $existingTitleRows = DB::fetchAll(
+                    'SELECT chapter_number, title FROM chapters WHERE novel_id=? AND title IS NOT NULL AND title != "" ORDER BY chapter_number ASC',
+                    [$novelId]
+                );
+                $existingTitles = array_column($existingTitleRows, 'title', 'chapter_number');
+                $messages = buildOutlinePrompt($novel, $startCh, $endCh, $recentOutlines, $prevHook, $memoryCtx, null, $existingTitles);
                 $promptLabel = "大纲生成（第{$startCh}-{$endCh}章，有前情上下文）";
                 break;
 

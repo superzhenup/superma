@@ -35,6 +35,35 @@ pageHeader("第{$chapter['chapter_number']}章 - {$novel['title']}", 'home');
   </ol>
 </nav>
 
+<style>
+.inline-edit-bar {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    z-index: 100;
+    padding: 8px 12px;
+    background: linear-gradient(135deg, #1e2230, #242836);
+    border: 1px solid #6366f1;
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    animation: inlineSlideDown 0.2s ease;
+    user-select: none;
+    -webkit-user-select: none;
+}
+.inline-edit-bar #inline-edit-instruction::placeholder {
+    color: #6c757d;
+    font-size: .78rem;
+}
+@keyframes inlineSlideDown {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.inline-edit-bar .btn-warning {
+    white-space: nowrap;
+    font-size: .8rem;
+}
+</style>
+
 <div class="row g-4">
   <!-- Main content -->
   <div class="col-12 col-xl-8">
@@ -100,9 +129,27 @@ pageHeader("第{$chapter['chapter_number']}章 - {$novel['title']}", 'home');
           <label class="form-label">章节标题</label>
           <input type="text" id="edit-title" class="form-control" value="<?= h($chapter['title']) ?>">
         </div>
-        <div class="mb-1">
+        <div class="mb-1" style="position:relative">
           <label class="form-label">章节内容</label>
           <textarea id="edit-content" class="form-control chapter-editor" oninput="updateWordCount()"><?= h($chapter['content']) ?></textarea>
+
+          <!-- 选中文字优化工具栏 -->
+          <div id="inline-edit-bar" class="inline-edit-bar" style="display:none">
+            <div class="d-flex align-items-center gap-2">
+              <i class="bi bi-highlighter text-warning small"></i>
+              <input type="text" id="inline-edit-instruction"
+                     class="form-control form-control-sm"
+                     placeholder="输入优化指令（留空=默认润色）"
+                     style="min-width:220px;background:#2d3239;border-color:#495057;color:#e9ecef;font-size:.8rem">
+              <button class="btn btn-warning btn-sm" id="btn-inline-polish" onclick="polishSelection()">
+                <i class="bi bi-magic me-1"></i>优化
+              </button>
+              <button class="btn btn-outline-secondary btn-sm" onclick="hideInlineBar()">
+                <i class="bi bi-x"></i>
+              </button>
+            </div>
+          </div>
+
           <!-- 字数统计条 -->
           <div class="d-flex justify-content-between align-items-center mt-1">
             <span id="word-count-bar" class="small" style="color:#28a745;">
@@ -1360,6 +1407,184 @@ window.compressChapter = async function compressChapter(chapterId) {
         } finally {
             btn.innerHTML = origHtml;
             btn.disabled = false;
+        }
+    });
+})();
+
+// ========== 选中文字优化功能 ==========
+(function() {
+    var contentEl = document.getElementById('edit-content');
+    var barEl = document.getElementById('inline-edit-bar');
+    var instructionEl = document.getElementById('inline-edit-instruction');
+    var polishBtn = document.getElementById('btn-inline-polish');
+
+    if (!contentEl || !barEl) return;
+
+    var lastSelection = { start: 0, end: 0, text: '' };
+
+    function getSelection() {
+        var start = contentEl.selectionStart;
+        var end = contentEl.selectionEnd;
+        if (start === end) return null;
+        var text = contentEl.value.substring(start, end);
+        if (text.trim().length < 10) return null;
+        return { start: start, end: end, text: text };
+    }
+
+    function getContext(sel, chars) {
+        var before = contentEl.value.substring(Math.max(0, sel.start - chars), sel.start);
+        var after = contentEl.value.substring(sel.end, Math.min(contentEl.value.length, sel.end + chars));
+        return { before: before, after: after };
+    }
+
+    function calcBarPosition(sel) {
+        var textBefore = contentEl.value.substring(0, sel.end);
+        var textareaStyle = window.getComputedStyle(contentEl);
+        var lineHeight = parseFloat(textareaStyle.lineHeight) || 20;
+        var paddingTop = parseFloat(textareaStyle.paddingTop) || 0;
+
+        var width = contentEl.clientWidth;
+        var cols = contentEl.cols || 80;
+        var charWidth = width / cols;
+
+        var totalLines = 1;
+        var lines = textBefore.split('\n');
+        for (var i = 0; i < lines.length; i++) {
+            var lineChars = lines[i].length;
+            var wrappedLines = Math.max(1, Math.ceil(lineChars * charWidth / width));
+            totalLines += (i === lines.length - 1) ? wrappedLines : 1;
+        }
+
+        return paddingTop + (totalLines * lineHeight);
+    }
+
+    function showBar() {
+        var sel = getSelection();
+        if (!sel) {
+            sel = lastSelection;
+            if (!sel || !sel.text) return;
+            sel.start = lastSelection.start;
+            sel.end = lastSelection.end;
+        }
+        lastSelection = sel;
+        barEl.style.display = '';
+        barEl.style.top = calcBarPosition(sel) + 'px';
+        instructionEl.value = '';
+    }
+
+    function hideBar() {
+        barEl.style.display = 'none';
+        instructionEl.value = '';
+        lastSelection = { start: 0, end: 0, text: '' };
+    }
+
+    window.hideInlineBar = hideBar;
+
+    contentEl.addEventListener('mouseup', function() {
+        setTimeout(function() {
+            var sel = getSelection();
+            if (sel) {
+                showBar();
+            } else {
+                if (!lastSelection.text) return;
+                if (document.activeElement !== contentEl && !barEl.contains(document.activeElement)) {
+                    hideBar();
+                }
+            }
+        }, 10);
+    });
+
+    contentEl.addEventListener('keyup', function(e) {
+        if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
+        var sel = getSelection();
+        if (sel) {
+            showBar();
+        } else {
+            if (!lastSelection.text) return;
+            if (!barEl.contains(document.activeElement)) {
+                hideBar();
+            }
+        }
+    });
+
+    instructionEl.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            polishSelection();
+        }
+        if (e.key === 'Escape') {
+            hideBar();
+            contentEl.focus();
+        }
+    });
+
+    window.polishSelection = async function() {
+        var sel = lastSelection;
+        if (!sel || !sel.text) return;
+
+        var instruction = instructionEl.value.trim();
+        var context = getContext(sel, 200);
+
+        var origBtnHtml = polishBtn.innerHTML;
+        polishBtn.disabled = true;
+        polishBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>优化中...';
+
+        try {
+            var resp = await fetch('api/polish_selection.php', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    chapter_id: CHAPTER_ID,
+                    selected_text: sel.text,
+                    instruction: instruction,
+                    context_before: context.before,
+                    context_after: context.after
+                })
+            });
+            var data = await resp.json();
+
+            if (!data.success) {
+                alert('优化失败：' + (data.error || '未知错误'));
+                return;
+            }
+
+            var optimized = data.optimized_text;
+            var full = contentEl.value;
+            contentEl.value = full.substring(0, sel.start) + optimized + full.substring(sel.end);
+
+            if (typeof updateWordCount === 'function') updateWordCount();
+
+            hideBar();
+            contentEl.focus();
+            contentEl.setSelectionRange(sel.start, sel.start + optimized.length);
+
+        } catch (err) {
+            alert('网络错误：' + err.message);
+        } finally {
+            polishBtn.disabled = false;
+            polishBtn.innerHTML = origBtnHtml;
+        }
+    };
+
+    // 点击 textarea 其他位置：重新选中时更新，否则关闭
+    contentEl.addEventListener('click', function() {
+        if (lastSelection.text) {
+            setTimeout(function() {
+                var sel = getSelection();
+                if (!sel) {
+                    hideBar();
+                } else if (sel.start !== lastSelection.start || sel.end !== lastSelection.end) {
+                    showBar();
+                }
+            }, 10);
+        }
+    });
+
+    // 点击工具栏外部关闭
+    document.addEventListener('click', function(e) {
+        if (barEl.style.display === 'none') return;
+        if (!barEl.contains(e.target) && e.target !== contentEl) {
+            hideBar();
         }
     });
 })();

@@ -4,6 +4,8 @@ Thumbs.db
 *.swp
 *.swo
 
+# 配置文件（敏感信息）
+config.php
 *.log
 
 # IDE

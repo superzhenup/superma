@@ -34,14 +34,15 @@ class AgentDirectives
         string $type,
         string $directive,
         int $applyRange = 3,
-        ?int $expiresInHours = null
+        ?int $expiresInHours = null,
+        string $source = 'system'
     ): bool {
         try {
             $applyTo = $applyFrom + $applyRange - 1;
-            $expiresAt = $expiresInHours 
+            $expiresAt = $expiresInHours
                 ? date('Y-m-d H:i:s', time() + $expiresInHours * 3600)
                 : null;
-            
+
             DB::insert('agent_directives', [
                 'novel_id' => $novelId,
                 'apply_from' => $applyFrom,
@@ -51,11 +52,52 @@ class AgentDirectives
                 'expires_at' => $expiresAt,
                 'is_active' => 1,
             ]);
-            
+
+            // 同时记录到 agent_action_logs（用于决策时间线显示）
+            self::logAction($novelId, $type, $source, $directive, $applyFrom, $applyTo);
+
             return true;
         } catch (\Throwable $e) {
             error_log("添加Agent指令失败: " . $e->getMessage());
             return false;
+        }
+    }
+
+    /**
+     * 记录动作日志到 agent_action_logs
+     */
+    private static function logAction(
+        int $novelId,
+        string $type,
+        string $source,
+        string $directive,
+        int $applyFrom,
+        int $applyTo
+    ): void {
+        try {
+            $actionMap = [
+                'quality' => '质量改进指令',
+                'strategy' => '策略调整指令',
+                'optimization' => '优化指令',
+                'urgent' => '紧急修复指令',
+                'global' => '全局指令',
+            ];
+
+            DB::insert('agent_action_logs', [
+                'novel_id' => $novelId,
+                'agent_type' => $source,
+                'action' => $actionMap[$type] ?? "{$type}指令",
+                'status' => 'success',
+                'params' => json_encode([
+                    'type' => $type,
+                    'apply_from' => $applyFrom,
+                    'apply_to' => $applyTo,
+                    'directive_preview' => mb_substr($directive, 0, 100),
+                ], JSON_UNESCAPED_UNICODE),
+                'created_at' => date('Y-m-d H:i:s'),
+            ]);
+        } catch (\Throwable $e) {
+            error_log("AgentDirectives日志记录失败: " . $e->getMessage());
         }
     }
     
@@ -173,9 +215,11 @@ class AgentDirectives
                 'SELECT 
                     COUNT(*) as total,
                     SUM(CASE WHEN is_active = 1 AND (expires_at IS NULL OR expires_at > ?) THEN 1 ELSE 0 END) as active,
+                    SUM(CASE WHEN type = "urgent" THEN 1 ELSE 0 END) as urgent_count,
                     SUM(CASE WHEN type = "quality" THEN 1 ELSE 0 END) as quality_count,
                     SUM(CASE WHEN type = "strategy" THEN 1 ELSE 0 END) as strategy_count,
-                    SUM(CASE WHEN type = "optimization" THEN 1 ELSE 0 END) as optimization_count
+                    SUM(CASE WHEN type = "optimization" THEN 1 ELSE 0 END) as optimization_count,
+                    SUM(CASE WHEN type = "global" THEN 1 ELSE 0 END) as global_count
                  FROM agent_directives 
                  WHERE novel_id = ?',
                 [$now, $novelId]
@@ -184,17 +228,21 @@ class AgentDirectives
             return $stats ?: [
                 'total' => 0,
                 'active' => 0,
+                'urgent_count' => 0,
                 'quality_count' => 0,
                 'strategy_count' => 0,
                 'optimization_count' => 0,
+                'global_count' => 0,
             ];
         } catch (\Throwable $e) {
             return [
                 'total' => 0,
                 'active' => 0,
+                'urgent_count' => 0,
                 'quality_count' => 0,
                 'strategy_count' => 0,
                 'optimization_count' => 0,
+                'global_count' => 0,
             ];
         }
     }
@@ -237,7 +285,12 @@ class AgentDirectives
                  ORDER BY chapter_number DESC LIMIT 5',
                 [$novelId, $chapterNumber]
             );
-            $qualityBefore = $baseline && $baseline['avg_q'] !== null ? round((float)$baseline['avg_q'], 1) : $currentQuality;
+            $qualityBefore = $baseline && $baseline['avg_q'] !== null ? round((float)$baseline['avg_q'], 1) : null;
+            
+            // 如果没有前面的章节作为基线，不记录效果反馈（第一章没有对比）
+            if ($qualityBefore === null) {
+                return ['recorded' => 0, 'outcomes' => []];
+            }
             
             // 3. 获取本章有效的指令
             $activeDirectives = self::active($novelId, $chapterNumber);

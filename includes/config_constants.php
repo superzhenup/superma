@@ -36,9 +36,13 @@ if (!defined('RT_POLL_INTERVAL'))        define('RT_POLL_INTERVAL', 5);
 // 二、执行时间限制（原分散在 10+ 个 API 文件的 set_time_limit()）
 // ============================================================
 if (!defined('CFG_TIME_LONG'))           define('CFG_TIME_LONG', 600);   // 写作/大纲生成
+if (!defined('CFG_TIME_LONG_1M'))       define('CFG_TIME_LONG_1M', 1200); // 1M上下文模式（更长超时）
 if (!defined('CFG_TIME_MEDIUM'))         define('CFG_TIME_MEDIUM', 300); // 压缩/润色/分析
 if (!defined('CFG_TIME_SHORT'))          define('CFG_TIME_SHORT', 120);  // 同步请求
 if (!defined('CFG_TIME_UNLIMITED'))      define('CFG_TIME_UNLIMITED', 0); // CLI Worker / 重建
+// v1.6: 动态超时 — 静默超时时间（有输出时重置，只有连续静默才触发超时）
+if (!defined('CFG_TIME_SILENCE_TIMEOUT')) define('CFG_TIME_SILENCE_TIMEOUT', 180); // 静默超时（秒）
+if (!defined('CFG_TIME_SILENCE_1M'))      define('CFG_TIME_SILENCE_1M', 600);      // 1M模式静默超时
 
 // ============================================================
 // 三、CURL 超时（原硬编码在 ai.php / EmbeddingProvider.php）
@@ -49,11 +53,16 @@ if (!defined('CFG_CURL_TIMEOUT_EMBED'))  define('CFG_CURL_TIMEOUT_EMBED', 60);
 
 // ============================================================
 // 四、SSE / 心跳（原分散在多处且有重复定义）
+// v1.5.3: 语义化命名 — 旧常量保留兼容，新常量含义更清晰
 // ============================================================
-if (!defined('CFG_SSE_HEARTBEAT'))       define('CFG_SSE_HEARTBEAT', 10);  // SSE 心跳间隔（秒）
-if (!defined('CFG_SSE_SILENCE'))         define('CFG_SSE_SILENCE', 30);    // AI 静默检测阈值（秒）
-if (!defined('CFG_SSE_AI_CHECK'))        define('CFG_SSE_AI_CHECK', 5);    // AI chunk 心跳间隔（秒）
-
+// 语义化命名（推荐使用）
+if (!defined('CFG_SSE_CLIENT_PING_INTERVAL'))  define('CFG_SSE_CLIENT_PING_INTERVAL', 10);  // 向前端发送心跳间隔（秒），防止连接超时
+if (!defined('CFG_SSE_AI_SILENCE_THRESHOLD'))  define('CFG_SSE_AI_SILENCE_THRESHOLD', 30);  // AI无响应判定阈值（秒），超时视为异常
+if (!defined('CFG_SSE_AI_CHUNK_INTERVAL'))     define('CFG_SSE_AI_CHUNK_INTERVAL', 5);      // 检测AI数据流的轮询间隔（秒）
+// 兼容旧命名（映射到新常量）
+if (!defined('CFG_SSE_HEARTBEAT'))             define('CFG_SSE_HEARTBEAT', CFG_SSE_CLIENT_PING_INTERVAL);
+if (!defined('CFG_SSE_SILENCE'))               define('CFG_SSE_SILENCE', CFG_SSE_AI_SILENCE_THRESHOLD);
+if (!defined('CFG_SSE_AI_CHECK'))              define('CFG_SSE_AI_CHECK', CFG_SSE_AI_CHUNK_INTERVAL);
 // ============================================================
 // 五、路径（原在 6+ 个文件中拼写相同字符串）
 // ============================================================
@@ -114,7 +123,9 @@ function getWritingDefaults(): array
         // ── 基础生成参数 ──
         'ws_chapter_words'               => ['default' => 2000,    'type' => 'int'],
         'ws_chapter_word_tolerance'      => ['default' => 150,     'type' => 'int'],
-        'ws_outline_batch'               => ['default' => 20,      'type' => 'int'],
+        'ws_outline_batch'               => ['default' => 5,       'type' => 'int'],
+        'ws_outline_batch_1m'            => ['default' => 30,      'type' => 'int'],
+        'ws_context_mode'                => ['default' => 'auto',  'type' => 'string'],
         'ws_auto_write_interval'         => ['default' => 2,       'type' => 'int'],
         // ── 爽点调度参数 ──
         'ws_cool_point_density_target'   => ['default' => 0.88,    'type' => 'float'],
@@ -137,6 +148,14 @@ function getWritingDefaults(): array
         // ── 质量检查参数 ──
         'ws_quality_check_enabled'       => ['default' => true,    'type' => 'bool'],
         'ws_quality_min_score'           => ['default' => 6.0,     'type' => 'float'],
+
+        // ── 写作质量增强（v1.9 盲点修复）──
+        'ws_rewrite_enabled'             => ['default' => true,    'type' => 'bool'],
+        'ws_rewrite_threshold'           => ['default' => 70,      'type' => 'int'],
+        'ws_rewrite_min_gain'            => ['default' => 10,      'type' => 'int'],
+        'ws_critic_enabled'              => ['default' => true,    'type' => 'bool'],
+        'ws_style_guard_enabled'         => ['default' => true,    'type' => 'bool'],
+        'ws_ai_patterns_check_enabled'   => ['default' => true,    'type' => 'bool'],
     ];
 }
 

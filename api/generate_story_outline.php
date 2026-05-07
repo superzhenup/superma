@@ -47,7 +47,23 @@ if ($existing) {
 
 sse('progress', ['msg' => '正在生成全书故事大纲...']);
 
-$messages = buildStoryOutlinePrompt($novel);
+// 检测是否有已完成的章节——有则从章节反向推导
+$completedChapters = [];
+try {
+    $completedChapters = DB::fetchAll(
+        'SELECT chapter_number, title, outline, chapter_summary, content
+         FROM chapters WHERE novel_id=? AND status="completed" AND (outline IS NOT NULL OR chapter_summary IS NOT NULL)
+         ORDER BY chapter_number ASC LIMIT 200',
+        [$novelId]
+    );
+} catch (\Throwable $e) { /* 降级：查询失败则当作无章节处理 */ }
+
+if (!empty($completedChapters)) {
+    sse('progress', ['msg' => '检测到 ' . count($completedChapters) . ' 章已有内容，将基于现有章节反向推导故事大纲...']);
+    $messages = buildStoryOutlineFromChaptersPrompt($novel, $completedChapters);
+} else {
+    $messages = buildStoryOutlinePrompt($novel);
+}
 $rawResponse = '';
 $usage = ['prompt_tokens' => 0, 'completion_tokens' => 0];
 
@@ -56,14 +72,38 @@ try {
         $novel['model_id'] ?: null,
         function (AIClient $ai) use ($messages, &$rawResponse, &$usage) {
             $rawResponse = '';
-            $usage = $ai->chatStream($messages, function (string $token) use (&$rawResponse) {
+            // v1.11.5: 思考过程回调——CFG_SHOW_OUTLINE_THINKING=1时发送thinking事件
+            // 长思考期间每收到推理token就延长超时，防止PHP/FPM超时
+            $thinkingTimeout = defined('CFG_OUTLINE_THINKING_TIMEOUT') ? CFG_OUTLINE_THINKING_TIMEOUT : 600;
+            $onThinking = (defined('CFG_SHOW_OUTLINE_THINKING') && CFG_SHOW_OUTLINE_THINKING)
+                ? function (string $reasoning) use ($thinkingTimeout) {
+                    static $lastReset = 0;
+                    $now = time();
+                    if ($now - $lastReset >= 10) {
+                        set_time_limit($thinkingTimeout);
+                        $lastReset = $now;
+                    }
+                    echo "event: thinking\n";
+                    echo 'data: ' . json_encode(['thinking' => $reasoning], JSON_UNESCAPED_UNICODE) . "\n\n";
+                    if (ob_get_level()) ob_flush();
+                    flush();
+                  }
+                : null;
+            $usage = $ai->chatStream($messages, function (string $token) use (&$rawResponse, $thinkingTimeout) {
+                // v1.11.5: 内容输出期间也保持长超时，防止间歇停顿被PHP kill
+                static $lastContentReset = 0;
+                $now = time();
+                if ($now - $lastContentReset >= 30) {
+                    set_time_limit($thinkingTimeout);
+                    $lastContentReset = $now;
+                }
                 if ($token === '[DONE]') return;
                 $rawResponse .= $token;
                 echo "event: chunk\n";
                 echo 'data: ' . json_encode(['t' => $token], JSON_UNESCAPED_UNICODE) . "\n\n";
                 if (ob_get_level()) ob_flush();
                 flush();
-            });
+            }, 'creative', $onThinking);
         },
         function (AIClient $nextAi, string $errMsg) {
             sse('model_switch', [
@@ -95,23 +135,32 @@ if (empty($characterEndpoints) && !empty($storyOutline['character_arcs'])) {
     $characterEndpoints = extractCharacterEndpoints($storyOutline['character_arcs']);
 }
 
-// ---- 保存到数据库 ----
-DB::insert('story_outlines', [
-    'novel_id'             => $novelId,
-    'story_arc'            => $storyOutline['story_arc'] ?? '',
-    'act_division'         => json_encode($storyOutline['act_division'] ?? [], JSON_UNESCAPED_UNICODE),
-    'major_turning_points' => json_encode($storyOutline['major_turning_points'] ?? [], JSON_UNESCAPED_UNICODE),
-    'character_arcs'       => json_encode($storyOutline['character_arcs'] ?? [], JSON_UNESCAPED_UNICODE),
-    'character_endpoints'  => $characterEndpoints ?: null,
-    'world_evolution'      => $storyOutline['world_evolution'] ?? '',
-    'recurring_motifs'     => json_encode($storyOutline['recurring_motifs'] ?? [], JSON_UNESCAPED_UNICODE),
-]);
-
-// 更新小说状态
-DB::update('novels', ['has_story_outline' => 1], 'id=?', [$novelId]);
-
-// 将故事大纲的转折点回写到对应卷（丰富卷信息，不覆盖用户已填的标题/范围）
+// ---- 核对 character_progression 列是否存在（兜底迁移）----
 try {
+    $hasCol = DB::fetch("SHOW COLUMNS FROM story_outlines LIKE 'character_progression'");
+    if (!$hasCol) {
+        DB::query("ALTER TABLE `story_outlines` ADD COLUMN `character_progression` JSON DEFAULT NULL COMMENT '角色等级/境界发展轨迹' AFTER `character_endpoints`");
+    }
+} catch (\Throwable $e) { /* 非致命，老数据库尽力而为 */ }
+
+// ---- 保存到数据库 ----
+try {
+    DB::insert('story_outlines', [
+        'novel_id'             => $novelId,
+        'story_arc'            => $storyOutline['story_arc'] ?? '',
+        'act_division'         => json_encode($storyOutline['act_division'] ?? [], JSON_UNESCAPED_UNICODE),
+        'major_turning_points' => json_encode($storyOutline['major_turning_points'] ?? [], JSON_UNESCAPED_UNICODE),
+        'character_arcs'       => json_encode($storyOutline['character_arcs'] ?? [], JSON_UNESCAPED_UNICODE),
+        'character_endpoints'  => $characterEndpoints ?: null,
+        'character_progression' => json_encode($storyOutline['character_progression'] ?? [], JSON_UNESCAPED_UNICODE),
+        'world_evolution'      => $storyOutline['world_evolution'] ?? '',
+        'recurring_motifs'     => json_encode($storyOutline['recurring_motifs'] ?? [], JSON_UNESCAPED_UNICODE),
+    ]);
+
+    // 更新小说状态
+    DB::update('novels', ['has_story_outline' => 1], 'id=?', [$novelId]);
+
+    // 将故事大纲的转折点回写到对应卷
     $presetVolumes = DB::fetchAll(
         'SELECT id, volume_number, start_chapter, end_chapter FROM volume_outlines WHERE novel_id=? ORDER BY volume_number ASC',
         [$novelId]
@@ -119,14 +168,12 @@ try {
     if (!empty($presetVolumes)) {
         $turningPoints = $storyOutline['major_turning_points'] ?? [];
         foreach ($presetVolumes as $pv) {
-            // 找属于本卷的转折点
             $volTurnings = array_values(array_filter($turningPoints, function($tp) use ($pv) {
                 $ch = (int)($tp['chapter'] ?? 0);
                 return $ch >= $pv['start_chapter'] && $ch <= $pv['end_chapter'];
             }));
             $updateData = ['status' => 'generated'];
             if (!empty($volTurnings)) {
-                // 把转折点作为 key_events 写入（追加，不覆盖已有）
                 $existingEvents = json_decode(
                     DB::fetch('SELECT key_events FROM volume_outlines WHERE id=?', [$pv['id']])['key_events'] ?? '[]',
                     true
@@ -140,17 +187,21 @@ try {
         }
         sse('progress', ['msg' => '卷结构已与故事大纲关联完成']);
     }
+
+    addLog($novelId, 'story_outline', "生成全书故事大纲");
+
+    sse('complete', [
+        'msg'               => '全书故事大纲生成完成！',
+        'story_arc'         => $storyOutline['story_arc'] ?? '',
+        'prompt_tokens'     => $usage['prompt_tokens'],
+        'completion_tokens' => $usage['completion_tokens'],
+        'total_tokens'      => $usage['prompt_tokens'] + $usage['completion_tokens'],
+    ]);
 } catch (\Throwable $e) {
-    // 回写失败不影响主流程
+    sse('error', [
+        'msg' => '保存故事大纲失败：' . $e->getMessage(),
+    ]);
 }
 
-addLog($novelId, 'story_outline', "生成全书故事大纲");
-
-sse('complete', [
-    'msg'               => '全书故事大纲生成完成！',
-    'story_arc'         => $storyOutline['story_arc'] ?? '',
-    'prompt_tokens'     => $usage['prompt_tokens'],
-    'completion_tokens' => $usage['completion_tokens'],
-    'total_tokens'      => $usage['prompt_tokens'] + $usage['completion_tokens'],
-]);
 sseDone();
+exit;

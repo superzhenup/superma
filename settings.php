@@ -154,7 +154,7 @@ pageHeader('模型设置', 'settings');
 
 // Preset model configs
 $presets = [
-    'CHIYUN'    => ['name'=>'赤云优算（官方）',       'api_url'=>'https://api.6zhen.cn/v1',        'model_name'=>'DeepSeek-V3.2'],
+    'CHIYUN'    => ['name'=>'赤云优算（官方）',       'api_url'=>'https://api.6zhen.cn/v1',        'model_name'=>'deepseek-v4-flash[1m]'],
     'openai-gpt4o'    => ['name'=>'方舟Coding Plan',       'api_url'=>'https://ark.cn-beijing.volces.com/api/coding/v3',        'model_name'=>'DeepSeek-V3.2'],
     'openai-gpt35'    => ['name'=>'硅基流动',       'api_url'=>'https://api.siliconflow.cn/v1',        'model_name'=>'Qwen/Qwen3.6-35B-A3B'],
     'deepseek-chat'   => ['name'=>'DeepSeek Chat',         'api_url'=>'https://api.deepseek.com/v1',     'model_name'=>'deepseek-chat'],

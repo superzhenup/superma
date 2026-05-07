@@ -118,6 +118,9 @@ function csrf_verify(): void {
  */
 function csrf_verify_api(): void {
     $token = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+    if (empty($token)) {
+        $token = $_POST['_token'] ?? '';
+    }
     $sessionToken = $_SESSION['csrf_token'] ?? '';
 
     if (empty($token) || empty($sessionToken) || !hash_equals($sessionToken, $token)) {

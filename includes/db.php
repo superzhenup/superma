@@ -22,9 +22,28 @@ class DB {
         'agent_decision_logs', 'agent_action_logs',
         'agent_directives', 'book_analyses',
         // v1.5: Agent 反馈闭环
-        'agent_directive_outcomes',
+        'agent_directive_outcomes', 'agent_performance_stats',
         // v1.3.5: 约束框架
         'constraint_state', 'constraint_logs',
+        // v1.7: 作者画像系统表
+        'author_profiles', 'author_writing_habits', 'author_narrative_styles',
+        'author_sentiment_analysis', 'author_creative_identity', 'author_uploaded_works',
+        // v1.1: 迭代改进设置表
+        'iterative_settings',
+        // v1.10.3: PID控制器状态表
+        'pid_states',
+        // v1.10.3: 金句表
+        'novel_catchphrases',
+        // v1.10.3: 场景模板使用记录表
+        'novel_scene_templates',
+        // v1.11.1: 使用统计表（远程上报数据源）
+        'usage_stats',
+        // v1.11.2: 角色情绪历史表（情绪连续性）
+        'character_emotion_history',
+        // v1.11.5: 伏笔提及日志表（支持重写回滚）
+        'foreshadowing_mention_log',
+        // v1.11.5: 金句回调日志表（支持重写回滚）
+        'catchphrase_callback_log',
     ];
 
     /**
@@ -120,14 +139,16 @@ class DB {
      * 避免每次 PHP 请求都执行 9 次 information_schema 查询 + 5 次 CREATE TABLE IF NOT EXISTS。
      * 每次有结构变更时，递增 SCHEMA_VERSION 即可触发重新迁移。
      */
-    private const SCHEMA_VERSION = 25;
+    private const SCHEMA_VERSION = 35;
 
     private static function migrate(): void {
         // 优先使用数据库记录迁移状态，避免文件权限问题
         $pdo = self::$pdo;
         
         // 检查 system_settings 表是否存在
-        $tableExists = $pdo->query("SHOW TABLES LIKE 'system_settings'")->fetch();
+        $tableExistsStmt = $pdo->query("SHOW TABLES LIKE 'system_settings'");
+        $tableExists = $tableExistsStmt->fetch();
+        $tableExistsStmt->closeCursor(); // 必须关闭游标
         if ($tableExists) {
             // 检查迁移状态
             $stmt = $pdo->prepare("SELECT setting_value FROM system_settings WHERE setting_key = ?");
@@ -154,7 +175,9 @@ class DB {
         // ========== 数据库级 advisory lock（防并发迁移） ==========
         $locked = false;
         try {
-            $lockResult = $pdo->query("SELECT GET_LOCK('db_migrate_v" . self::SCHEMA_VERSION . "', 10)")->fetchColumn();
+            $lockStmt = $pdo->query("SELECT GET_LOCK('db_migrate_v" . self::SCHEMA_VERSION . "', 10)");
+            $lockResult = $lockStmt->fetchColumn();
+            $lockStmt->closeCursor(); // 必须关闭游标
             $locked = ($lockResult == 1);
             if (!$locked) {
                 error_log('DB Migrate: 未能获取迁移锁，另一进程可能正在迁移');
@@ -237,6 +260,55 @@ class DB {
             // [v24] story_outlines 新增人物弧线终点字段
             ['story_outlines', 'character_endpoints',
              "ALTER TABLE `story_outlines` ADD COLUMN `character_endpoints` TEXT COMMENT '人物弧线终点' AFTER `character_arcs`"],
+            // [v25] foreshadowing_items 新增 priority 字段（伏笔优先级）
+            ['foreshadowing_items', 'priority',
+             "ALTER TABLE `foreshadowing_items` ADD COLUMN `priority` ENUM('critical','major','minor') NOT NULL DEFAULT 'minor' COMMENT '伏笔优先级' AFTER `description`"],
+            // [v26] chapters 新增 actual_opening_type 字段（实际开篇类型检测）
+            ['chapters', 'actual_opening_type',
+             "ALTER TABLE `chapters` ADD COLUMN `actual_opening_type` VARCHAR(30) DEFAULT NULL COMMENT '实际检测到的开篇类型' AFTER `opening_type`"],
+            // [v27] 作者画像系统6张新表（Schema::applyAll 会自动创建，此处记录变更历史）
+            // [v28] novels 表新增 author_profile_id 字段（绑定作者画像）
+            ['novels', 'author_profile_id',
+             "ALTER TABLE `novels` ADD COLUMN `author_profile_id` INT UNSIGNED DEFAULT NULL COMMENT '绑定的作者画像ID' AFTER `ref_author`"],
+            // [v29] author_profiles 新增4个风格提示词字段（写作习惯/叙事手法/思想情感/创作个性）
+            ['author_profiles', 'writing_habits_prompt',
+             "ALTER TABLE `author_profiles` ADD COLUMN `writing_habits_prompt` TEXT DEFAULT NULL COMMENT '写作习惯提示词' AFTER `influences`"],
+            ['author_profiles', 'narrative_style_prompt',
+             "ALTER TABLE `author_profiles` ADD COLUMN `narrative_style_prompt` TEXT DEFAULT NULL COMMENT '叙事手法提示词' AFTER `writing_habits_prompt`"],
+            ['author_profiles', 'sentiment_prompt',
+             "ALTER TABLE `author_profiles` ADD COLUMN `sentiment_prompt` TEXT DEFAULT NULL COMMENT '思想情感提示词' AFTER `narrative_style_prompt`"],
+            ['author_profiles', 'creative_identity_prompt',
+             "ALTER TABLE `author_profiles` ADD COLUMN `creative_identity_prompt` TEXT DEFAULT NULL COMMENT '创作个性提示词' AFTER `sentiment_prompt`"],
+
+            // [v30] story_outlines 表新增 character_progression 字段（角色等级发展轨迹）
+            ['story_outlines', 'character_progression',
+             "ALTER TABLE `story_outlines` ADD COLUMN `character_progression` JSON DEFAULT NULL COMMENT '角色等级/境界发展轨迹' AFTER `character_endpoints`"],
+
+            // [v31] chapters 表新增 v1.9 盲点修复字段
+            ['chapters', 'rewritten',
+             "ALTER TABLE `chapters` ADD COLUMN `rewritten` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否被RewriteAgent重写过' AFTER `quality_score`"],
+            ['chapters', 'critic_scores',
+             "ALTER TABLE `chapters` ADD COLUMN `critic_scores` JSON DEFAULT NULL COMMENT 'CriticAgent读者视角评分' AFTER `rewritten`"],
+            ['chapters', 'ai_pattern_issues',
+             "ALTER TABLE `chapters` ADD COLUMN `ai_pattern_issues` JSON DEFAULT NULL COMMENT 'StyleGuard AI痕迹检测结果' AFTER `critic_scores`"],
+
+            // [v32] chapters 表新增 v1.10 迭代精炼系统字段（之前在 update_iterative_refinement.php 独立脚本，
+            // 现纳入主迁移流程。修复 IterativeRefinementController 写库时字段不存在导致全链路死代码的问题）
+            ['chapters', 'iterations_used',
+             "ALTER TABLE `chapters` ADD COLUMN `iterations_used` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '迭代改进轮数' AFTER `ai_pattern_issues`"],
+            ['chapters', 'total_improvement',
+             "ALTER TABLE `chapters` ADD COLUMN `total_improvement` DECIMAL(5,2) NOT NULL DEFAULT 0.00 COMMENT '总质量提升分数' AFTER `iterations_used`"],
+            ['chapters', 'iterative_history',
+             "ALTER TABLE `chapters` ADD COLUMN `iterative_history` JSON DEFAULT NULL COMMENT '迭代历史详情' AFTER `total_improvement`"],
+            ['chapters', 'iteration_evaluation',
+             "ALTER TABLE `chapters` ADD COLUMN `iteration_evaluation` JSON DEFAULT NULL COMMENT '迭代效果评估' AFTER `iterative_history`"],
+            ['chapters', 'rewrite_time',
+             "ALTER TABLE `chapters` ADD COLUMN `rewrite_time` DATETIME DEFAULT NULL COMMENT '最后一次重写时间' AFTER `iteration_evaluation`"],
+            // [v34] chapters 表新增认知负荷字段（信息密度管理）
+            ['chapters', 'cognitive_load',
+             "ALTER TABLE `chapters` ADD COLUMN `cognitive_load` JSON DEFAULT NULL COMMENT '认知负荷分析：新元素数量、累计趋势' AFTER `rewrite_time`"],
+            // [v35] v1.11.5 重写日志子表（foreshadowing_mention_log + catchphrase_callback_log）
+            // 此处仅升级 SCHEMA_VERSION 触发 Schema::applyAll() 自动建表，无字段 ALTER 需求
         ];
 
         foreach ($columns as [$table, $col, $sql]) {
@@ -255,6 +327,10 @@ class DB {
                 try { $pdo->exec($sql); } catch (\Throwable $e) { error_log('DB Migrate: 字段迁移失败 [' . $table . '.' . $col . '] — ' . $e->getMessage()); }
             }
         }
+
+        // [v25] foreshadowing_items.priority 索引（加速按优先级查询未回收伏笔）
+        try { $pdo->exec("ALTER TABLE `foreshadowing_items` ADD INDEX `idx_priority` (`novel_id`, `priority`)"); }
+        catch (\Throwable $e) { error_log('DB Migrate: foreshadowing_items.idx_priority 索引创建失败 — ' . $e->getMessage()); }
 
         // 确保 arc_summaries 表存在（弧段摘要，每10章压缩一次）
         $pdo->exec("CREATE TABLE IF NOT EXISTS `arc_summaries` (
@@ -537,12 +613,14 @@ class DB {
         // 对老库做幂等 ALTER：若 ENUM 已包含新值则 MySQL 自身不会报错（仍会重写元数据但无副作用）；
         // 为避免不必要的元数据重写，先查询一次当前 ENUM 定义。
         try {
-            $row = $pdo->query(
+            $enumStmt = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'memory_atoms'
                    AND COLUMN_NAME  = 'atom_type'"
-            )->fetch();
+            );
+            $row = $enumStmt->fetch();
+            $enumStmt->closeCursor(); // 必须关闭游标
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             $needAlter = $colType !== '' &&
                 (strpos($colType, "'technique'") === false
@@ -594,6 +672,22 @@ class DB {
             // novel_embeddings: 新增 embedding_updated_at（用于懒触发器）
             ['novel_embeddings', 'embedding_updated_at',
              "ALTER TABLE `novel_embeddings` ADD COLUMN `embedding_updated_at` TIMESTAMP NULL DEFAULT NULL COMMENT '向量更新时间' AFTER `embedding_model`"],
+            // [v1.10.3] character_cards: 新增 voice_profile（角色语音指纹）
+            ['character_cards', 'voice_profile',
+             "ALTER TABLE `character_cards` ADD COLUMN `voice_profile` JSON DEFAULT NULL COMMENT '角色语音指纹JSON' AFTER `attributes`"],
+            // [v1.10.3] foreshadowing_items: 新增伏笔生命周期字段
+            ['foreshadowing_items', 'last_mentioned_chapter',
+             "ALTER TABLE `foreshadowing_items` ADD COLUMN `last_mentioned_chapter` INT DEFAULT NULL COMMENT '最近一次被提及的章节'"],
+            ['foreshadowing_items', 'mention_count',
+             "ALTER TABLE `foreshadowing_items` ADD COLUMN `mention_count` INT NOT NULL DEFAULT 0 COMMENT '被提及次数'"],
+            // [v1.10.3] novels: 新增 target_reader（读者画像）
+            ['novels', 'target_reader',
+             "ALTER TABLE `novels` ADD COLUMN `target_reader` VARCHAR(30) NOT NULL DEFAULT 'general' COMMENT '目标读者画像'"],
+            // [v1.10.3] chapters: 人工评分 + 校准后Critic评分
+            ['chapters', 'human_critic_scores',
+             "ALTER TABLE `chapters` ADD COLUMN `human_critic_scores` JSON DEFAULT NULL COMMENT '人工读者视角评分(5维)'"],
+            ['chapters', 'calibrated_critic_scores',
+             "ALTER TABLE `chapters` ADD COLUMN `calibrated_critic_scores` JSON DEFAULT NULL COMMENT '校准后的Critic评分'"],
         ];
 
         foreach ($alterColumns as [$table, $col, $sql]) {
@@ -663,12 +757,14 @@ class DB {
 
         // [v14] 补全 memory_atoms.atom_type ENUM：添加 cool_point（v8迁移遗漏）
         try {
-            $row = $pdo->query(
+            $enumStmt = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'memory_atoms'
                    AND COLUMN_NAME  = 'atom_type'"
-            )->fetch();
+            );
+            $row = $enumStmt->fetch();
+            $enumStmt->closeCursor(); // 必须关闭游标
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             if (strpos($colType, "'cool_point'") === false) {
                 $pdo->exec(
@@ -688,12 +784,14 @@ class DB {
 
         // [v14] novel_plots.status ENUM 扩展：添加 planted（已埋设）和 resolving（回收中）
         try {
-            $row = $pdo->query(
+            $enumStmt = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_plots'
                    AND COLUMN_NAME  = 'status'"
-            )->fetch();
+            );
+            $row = $enumStmt->fetch();
+            $enumStmt->closeCursor(); // 必须关闭游标
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             $needAlter = $colType !== '' &&
                 (strpos($colType, "'planted'") === false
@@ -709,12 +807,14 @@ class DB {
 
         // [v14] novel_plots.event_type ENUM 更新：'side' → 'subplot'，添加 'other'
         try {
-            $row = $pdo->query(
+            $enumStmt = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_plots'
                    AND COLUMN_NAME  = 'event_type'"
-            )->fetch();
+            );
+            $row = $enumStmt->fetch();
+            $enumStmt->closeCursor(); // 必须关闭游标
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             $needAlter = $colType !== '' &&
                 (strpos($colType, "'subplot'") === false
@@ -734,12 +834,14 @@ class DB {
 
         // [v14] novel_style.category 从 VARCHAR(30) 迁移为 ENUM（与代码一致）
         try {
-            $row = $pdo->query(
+            $enumStmt = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_style'
                    AND COLUMN_NAME  = 'category'"
-            )->fetch();
+            );
+            $row = $enumStmt->fetch();
+            $enumStmt->closeCursor(); // 必须关闭游标
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             if (strpos($colType, 'enum') === false) {
                 $pdo->exec(
@@ -752,24 +854,28 @@ class DB {
 
         // [v14] novel_characters 字段对齐线上：alias VARCHAR(100) DEFAULT NULL, gender VARCHAR(10) DEFAULT NULL
         try {
-            $row = $pdo->query(
+            $enumStmt = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_characters'
                    AND COLUMN_NAME  = 'alias'"
-            )->fetch();
+            );
+            $row = $enumStmt->fetch();
+            $enumStmt->closeCursor(); // 必须关闭游标
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             if (strpos($colType, 'varchar(200)') !== false) {
                 $pdo->exec("ALTER TABLE `novel_characters` MODIFY COLUMN `alias` VARCHAR(100) DEFAULT NULL COMMENT '别名/绰号'");
             }
         } catch (\Throwable $e) { error_log('DB Migrate: novel_characters.alias 字段对齐失败 — ' . $e->getMessage()); }
         try {
-            $row = $pdo->query(
+            $enumStmt = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_characters'
                    AND COLUMN_NAME  = 'gender'"
-            )->fetch();
+            );
+            $row = $enumStmt->fetch();
+            $enumStmt->closeCursor(); // 必须关闭游标
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             if (strpos($colType, 'varchar(20)') !== false) {
                 $pdo->exec("ALTER TABLE `novel_characters` MODIFY COLUMN `gender` VARCHAR(10) DEFAULT NULL COMMENT '性别'");
@@ -778,12 +884,14 @@ class DB {
 
         // [v14] novel_worldbuilding 字段对齐线上：name VARCHAR(200), importance DEFAULT 3
         try {
-            $row = $pdo->query(
+            $enumStmt = $pdo->query(
                 "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
                  WHERE TABLE_SCHEMA = DATABASE()
                    AND TABLE_NAME   = 'novel_worldbuilding'
                    AND COLUMN_NAME  = 'name'"
-            )->fetch();
+            );
+            $row = $enumStmt->fetch();
+            $enumStmt->closeCursor(); // 必须关闭游标
             $colType = is_array($row) ? (string)($row['COLUMN_TYPE'] ?? '') : '';
             if (strpos($colType, 'varchar(100)') !== false) {
                 $pdo->exec("ALTER TABLE `novel_worldbuilding` MODIFY COLUMN `name` VARCHAR(200) NOT NULL COMMENT '名称'");
@@ -908,15 +1016,23 @@ class DB {
 
     public static function execute(string $sql, array $params = []): int {
         $stmt = self::query($sql, $params);
-        return $stmt->rowCount();
+        $count = $stmt->rowCount();
+        $stmt->closeCursor();
+        return $count;
     }
 
     public static function fetchAll(string $sql, array $params = []): array {
-        return self::query($sql, $params)->fetchAll();
+        $stmt = self::query($sql, $params);
+        $result = $stmt->fetchAll();
+        $stmt->closeCursor();
+        return $result;
     }
 
     public static function fetch(string $sql, array $params = []) {
-        return self::query($sql, $params)->fetch();
+        $stmt = self::query($sql, $params);
+        $result = $stmt->fetch();
+        $stmt->closeCursor();  // v1.11.8: 关闭游标，避免"unbuffered queries"错误
+        return $result;
     }
 
     /**
@@ -924,7 +1040,10 @@ class DB {
      * 找不到行时返回 false，与 PDOStatement::fetchColumn() 行为一致。
      */
     public static function fetchColumn(string $sql, array $params = []) {
-        return self::query($sql, $params)->fetchColumn();
+        $stmt = self::query($sql, $params);
+        $result = $stmt->fetchColumn();
+        $stmt->closeCursor();  // v1.11.8: 关闭游标，避免"unbuffered queries"错误
+        return $result;
     }
 
     public static function insert(string $table, array $data): string {
@@ -964,5 +1083,17 @@ class DB {
 
     public static function getPdo(): PDO {
         return self::connect();
+    }
+
+    public static function beginTransaction(): bool {
+        return self::connect()->beginTransaction();
+    }
+
+    public static function commit(): bool {
+        return self::connect()->commit();
+    }
+
+    public static function rollBack(): bool {
+        return self::connect()->rollBack();
     }
 }

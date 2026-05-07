@@ -165,9 +165,7 @@ class OptimizationAgent extends BaseAgent
         $templates = [
             'write_speed' => [
                 'actions' => [
-                    ['name' => 'enable_parallel_processing', 'improvement' => 0.25, 'cost' => 'medium'],
-                    ['name' => 'optimize_cache', 'improvement' => 0.15, 'cost' => 'low'],
-                    ['name' => 'reduce_memory_overhead', 'improvement' => 0.10, 'cost' => 'low'],
+                    ['name' => 'smart_truncation', 'improvement' => 0.15, 'cost' => 'low'],
                 ],
             ],
             'token_usage' => [
@@ -248,47 +246,25 @@ class OptimizationAgent extends BaseAgent
     {
         try {
             switch ($action['name']) {
-                case 'enable_parallel_processing':
-                    ConfigCenter::set('enable_parallel_write', true, 'bool');
-                    $this->logAction($this->novelId, $action['name'], 'success');
-                    $improvement = $action['improvement'] ?? 0.25;
-                    $this->writeDirective('optimization', "本章启用并行处理，预计提升{$improvement}倍写作效率。优化策略：将写作任务拆分为多个并行子任务，同时处理角色描写、环境描写、对话生成等模块。");
-                    return ['action' => $action['name'], 'status' => 'success', 'message' => '已启用并行处理'];
-                
-                case 'optimize_cache':
-                    ConfigCenter::set('prompt_cache_ttl', 7200, 'int');
-                    $this->logAction($this->novelId, $action['name'], 'success');
-                    $improvement = $action['improvement'] ?? 0.15;
-                    $this->writeDirective('optimization', "本章优化缓存策略，缓存TTL设为7200秒，预计减少{$improvement}倍重复计算。优化策略：缓存常用Prompt模板、角色设定、世界观数据，减少API调用次数。");
-                    return ['action' => $action['name'], 'status' => 'success', 'message' => '已优化缓存策略'];
-                
                 case 'compress_context':
-                    ConfigCenter::set('context_compression_enabled', true, 'bool');
                     $this->logAction($this->novelId, $action['name'], 'success');
-                    $improvement = $action['improvement'] ?? 0.30;
-                    $this->writeDirective('optimization', "本章启用上下文压缩，预计减少{$improvement}倍Token使用。优化策略：压缩历史章节摘要、精简角色信息、去除冗余描述，保留核心剧情要素。");
-                    return ['action' => $action['name'], 'status' => 'success', 'message' => '已启用上下文压缩'];
-                
+                    $this->writeDirective('optimization', '本章上下文精简：前情提要控制在300字以内，去除重复的角色描述和世界观说明，只保留与本章情节直接相关的核心信息。如果上下文接近超限，优先裁剪"近章大纲"和"故事线回顾"的长度。');
+                    return ['action' => $action['name'], 'status' => 'success', 'message' => '已注入上下文精简指令'];
+
                 case 'smart_truncation':
-                    ConfigCenter::set('smart_truncation_enabled', true, 'bool');
                     $this->logAction($this->novelId, $action['name'], 'success');
-                    $improvement = $action['improvement'] ?? 0.20;
-                    $this->writeDirective('optimization', "本章启用智能裁剪，预计减少{$improvement}倍冗余内容。优化策略：智能识别并裁剪重复描写、过渡性文字、次要细节，保持剧情连贯性和节奏感。");
-                    return ['action' => $action['name'], 'status' => 'success', 'message' => '已启用智能裁剪'];
-                
+                    $this->writeDirective('optimization', '本章要求精简表达：删除重复的形容词堆砌、不推动剧情的过渡段落、过多的环境描写。用简洁有力的短句代替长句铺陈，保持叙事紧凑感。');
+                    return ['action' => $action['name'], 'status' => 'success', 'message' => '已注入精简表达指令'];
+
                 case 'enhance_prompt':
-                    ConfigCenter::set('prompt_enhancement_level', 'high', 'string');
                     $this->logAction($this->novelId, $action['name'], 'success');
-                    $improvement = $action['improvement'] ?? 0.15;
-                    $this->writeDirective('optimization', "本章增强Prompt模板，预计提升{$improvement}倍生成质量。优化策略：使用更详细的写作指令、增加示例片段、强化风格约束，提升内容专业度和可读性。");
-                    return ['action' => $action['name'], 'status' => 'success', 'message' => '已增强Prompt模板'];
-                
+                    $this->writeDirective('optimization', '本章要求提升文笔质量：对话必须有言外之意或潜台词，动作描写使用具体动词代替笼统表述，心理描写用身体反应代替直接陈述。每段对话后至少附带一个微表情或肢体动作描写。');
+                    return ['action' => $action['name'], 'status' => 'success', 'message' => '已注入文笔提升指令'];
+
                 case 'strengthen_check':
-                    ConfigCenter::set('quality_check_depth', 'deep', 'string');
                     $this->logAction($this->novelId, $action['name'], 'success');
-                    $improvement = $action['improvement'] ?? 0.20;
-                    $this->writeDirective('optimization', "本章加强质量检查，检查深度设为deep，预计提升{$improvement}倍质量。优化策略：深度检查剧情逻辑、角色一致性、描写质量、语法错误，确保内容专业度。");
-                    return ['action' => $action['name'], 'status' => 'success', 'message' => '已加强质量检查'];
+                    $this->writeDirective('quality', '本章执行严格逻辑检查：每个事件必须有明确的因果动机，角色做出重要决定前必须有心理铺垫，不得出现"突然就""莫名其妙"式的剧情转折。所有伏笔变化必须与前文伏笔描写一致。');
+                    return ['action' => $action['name'], 'status' => 'success', 'message' => '已注入逻辑检查指令'];
                 
                 default:
                     return ['action' => $action['name'], 'status' => 'skipped', 'message' => '未实现的操作'];
@@ -515,49 +491,6 @@ class OptimizationAgent extends BaseAgent
             return round(max(-0.3, min(0.3, ($avgChange / 10) * $improvementRate)), 2);
         } catch (\Throwable $e) {
             return 0;
-        }
-    }
-    
-    /**
-     * 写入Agent指令
-     */
-    private function writeDirective(string $type, string $directive): void
-    {
-        try {
-            require_once __DIR__ . '/AgentDirectives.php';
-            
-            // 获取下一个要写的章节号（getCurrentChapterNumber() 已返回 COUNT(*) + 1）
-            $nextChapter = $this->getCurrentChapterNumber();
-            
-            AgentDirectives::add(
-                $this->novelId,
-                $nextChapter,
-                $type,
-                $directive,
-                3, // 生效3章
-                24 // 24小时后过期
-            );
-        } catch (\Throwable $e) {
-            error_log("写入Agent指令失败: " . $e->getMessage());
-        }
-    }
-    
-    /**
-     * 获取当前章节号
-     */
-    private function getCurrentChapterNumber(): int
-    {
-        try {
-            $result = DB::fetch(
-                'SELECT COUNT(*) + 1 as next_chapter 
-                 FROM chapters 
-                 WHERE novel_id = ? AND status = "completed"',
-                [$this->novelId]
-            );
-            
-            return (int)($result['next_chapter'] ?? 1);
-        } catch (\Throwable $e) {
-            return 1;
         }
     }
 }

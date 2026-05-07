@@ -72,15 +72,17 @@ class EndingEnforcer
     {
         $this->novelId = $novelId;
         $this->currentChapter = $currentChapter;
-        
+
         // 获取目标章节数
         $novel = DB::fetch('SELECT target_chapters FROM novels WHERE id=?', [$novelId]);
-        $this->targetChapters = (int)($novel['target_chapters'] ?? 100);
-        
-        // 计算进度
-        $this->progressPct = $this->targetChapters > 0 
-            ? $currentChapter / $this->targetChapters 
-            : 0;
+        $this->targetChapters = (int)($novel['target_chapters'] ?? 0);
+
+        if ($this->targetChapters <= 0) {
+            $this->progressPct = 0;
+            return;
+        }
+
+        $this->progressPct = $this->currentChapter / $this->targetChapters;
     }
     
     /**
@@ -101,39 +103,50 @@ class EndingEnforcer
      */
     public function needsEndingEnforcement(): bool
     {
+        if ($this->targetChapters <= 0) return false;
         return $this->progressPct >= 0.8;
     }
     
     /**
-     * 获取待回收的伏笔（按优先级排序）
+     * 获取待回收的伏笔（按优先级和截止章排序）
+     * priority 字段：critical（核心）、major（重要）、minor（次要）
      */
     public function getPendingForeshadowing(): array
     {
         $pending = DB::fetchAll(
-            'SELECT planted_chapter as chapter, description, deadline_chapter as deadline
-             FROM foreshadowing_items 
-             WHERE novel_id=? AND resolved_chapter IS NULL 
-             ORDER BY deadline_chapter ASC',
+            'SELECT planted_chapter as chapter, description, deadline_chapter as deadline,
+                    COALESCE(priority, "minor") as priority
+             FROM foreshadowing_items
+             WHERE novel_id=? AND resolved_chapter IS NULL
+             ORDER BY
+                CASE COALESCE(priority, "minor")
+                    WHEN "critical" THEN 1
+                    WHEN "major" THEN 2
+                    WHEN "minor" THEN 3
+                END,
+                deadline_chapter ASC',
             [$this->novelId]
         );
-        
+
         return $pending ?: [];
     }
     
     /**
      * 获取未解决的主要矛盾
+     * 实际数据存储在 memory_atoms 表，通过 metadata.is_key_event=1 标记
      */
     public function getUnresolvedConflicts(): array
     {
-        // 从记忆引擎获取未解决的矛盾
         $conflicts = DB::fetchAll(
-            'SELECT chapter, event, importance 
-             FROM key_events 
-             WHERE novel_id=? AND resolved=0 AND importance >= 7
-             ORDER BY importance DESC, chapter ASC',
+            'SELECT source_chapter as chapter, content as event,
+                    COALESCE(JSON_EXTRACT(metadata, "$.importance"), 5) + 0.0 as importance
+             FROM memory_atoms
+             WHERE novel_id=? AND atom_type="plot_detail"
+               AND JSON_EXTRACT(metadata, "$.is_key_event") = 1
+             ORDER BY importance DESC, source_chapter ASC',
             [$this->novelId]
         );
-        
+
         return $conflicts ?: [];
     }
     
@@ -173,13 +186,29 @@ class EndingEnforcer
             // 获取待回收伏笔
             $pending = $this->getPendingForeshadowing();
             if (!empty($pending)) {
-                $lines[] = "   待回收伏笔列表（按优先级排序）：";
+                $lines[] = "   待回收伏笔列表（按优先级分组）：";
+                $priorityGroups = ['critical' => [], 'major' => [], 'minor' => []];
                 foreach ($pending as $p) {
                     $priority = $p['priority'] ?? 'minor';
-                    $priorityText = $priority === 'critical' ? '🔴核心' : ($priority === 'major' ? '🟠重要' : '🟢次要');
+                    if (!isset($priorityGroups[$priority])) {
+                        $priority = 'minor';
+                    }
                     $deadline = (int)($p['deadline'] ?? 0);
                     $deadlineText = $deadline > 0 ? "（建议第{$deadline}章前回收）" : "";
-                    $lines[] = "   · [{$priorityText}] 第{$p['chapter']}章埋：{$p['description']}{$deadlineText}";
+                    $priorityGroups[$priority][] = "      第{$p['chapter']}章埋：{$p['description']}{$deadlineText}";
+                }
+
+                if (!empty($priorityGroups['critical'])) {
+                    $lines[] = "   🔴 核心伏笔（必须回收）：";
+                    $lines = array_merge($lines, $priorityGroups['critical']);
+                }
+                if (!empty($priorityGroups['major'])) {
+                    $lines[] = "   🟠 重要伏笔（建议回收）：";
+                    $lines = array_merge($lines, $priorityGroups['major']);
+                }
+                if (!empty($priorityGroups['minor'])) {
+                    $lines[] = "   🟢 次要伏笔（可选回收）：";
+                    $lines = array_merge($lines, $priorityGroups['minor']);
                 }
             } else {
                 $lines[] = "   · 暂无待回收伏笔";

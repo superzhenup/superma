@@ -199,7 +199,7 @@ class RhythmAdjuster
         
         if ($coolPointDensity < $targetDensity * 0.6) {
             // 爽点饥饿：建议安排爽点
-            $result['cool_point_type'] = $this->selectCoolPointType($coolPointHistory);
+            $result['cool_point_type'] = $this->selectCoolPointType($coolPointHistory, $currentChapter);
             $result['require_cool_point'] = true;
             $result['cool_point_urgency'] = 'critical';
             $result['warnings'][] = "💥 爽点饥饿：近5章爽点密度过低（{$coolPointDensity}），本章必须安排爽点";
@@ -277,45 +277,44 @@ class RhythmAdjuster
     }
     
     /**
-     * 选择爽点类型（避免重复）
+     * 选择爽点类型（根据进度阶段和历史使用情况）
      */
-    private function selectCoolPointType(array $coolPointHistory): string
+    private function selectCoolPointType(array $coolPointHistory, int $currentChapter): string
     {
         $recentTypes = array_column(array_slice($coolPointHistory, -5), 'type');
-        $allTypes = [
-            'underdog_win', 
-            'face_slap', 
-            'treasure_find', 
-            'breakthrough', 
-            'power_expand', 
-            'romance_win',
-            'truth_reveal',
-            'last_stand',
-        ];
-        
-        // 选择最近未使用的类型
-        foreach ($allTypes as $type) {
+
+        $progressPct = $this->targetChapters > 0
+            ? $currentChapter / $this->targetChapters
+            : 0;
+
+        $stageAppropriateTypes = match(true) {
+            $progressPct >= 0.95 => ['truth_reveal', 'last_stand', 'romance_win', 'face_slap', 'underdog_win'],
+            $progressPct >= 0.80 => ['power_expand', 'truth_reveal', 'breakthrough', 'face_slap', 'underdog_win'],
+            $progressPct >= 0.50 => ['face_slap', 'treasure_find', 'breakthrough', 'underdog_win', 'power_expand'],
+            default => ['underdog_win', 'treasure_find', 'face_slap', 'breakthrough', 'romance_win'],
+        };
+
+        foreach ($stageAppropriateTypes as $type) {
             if (!in_array($type, $recentTypes)) {
                 return $type;
             }
         }
-        
-        // 全部用过了，选择最久未用的
+
         $typeLastUsed = [];
         foreach (array_reverse($coolPointHistory) as $cp) {
             $type = $cp['type'] ?? '';
-            if ($type && !isset($typeLastUsed[$type])) {
-                $typeLastUsed[$type] = $cp['chapter'] ?? 0;
+            $ch = $cp['chapter'] ?? 0;
+            if ($type && $ch && !isset($typeLastUsed[$type])) {
+                $typeLastUsed[$type] = $ch;
             }
         }
-        
+
         if (!empty($typeLastUsed)) {
             asort($typeLastUsed);
             return array_key_first($typeLastUsed);
         }
-        
-        // 默认返回第一个
-        return $allTypes[0];
+
+        return $stageAppropriateTypes[0] ?? 'underdog_win';
     }
     
     /**

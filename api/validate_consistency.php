@@ -120,8 +120,8 @@ function checkGate1_Structure(array $ch, string $content): array
     $issues = [];
     $score  = 100;
 
-    // v11: 从系统设置读取质量最低分阈值
-    $minScoreThreshold = (float)getSystemSetting('ws_quality_min_score', 6.0, 'float');
+    // v11: 从系统设置读取质量最低分阈值（百分制，如60表示60分）
+    $minScoreThreshold = (float)getSystemSetting('ws_quality_min_score', 60.0, 'float');
 
     // 1.1 字数检查：容差优先读 ws_chapter_word_tolerance，兜底用 3% 动态容差（最小80字）
     $len             = mb_strlen($content);
@@ -134,16 +134,23 @@ function checkGate1_Structure(array $ch, string $content): array
         $score -= 30;
     }
 
-    // 1.2 黄金三行检测 — 取正文前150字符≈3行
+// v1.5.3 增强：黄金三行检测 — 取正文前200字符≈4行，使用短语模式匹配
     $cleanContent = str_replace(["\r\n", "\n", "\r", "\t", ' '], '', $content);
-    $firstLines   = mb_substr($cleanContent, 0, 150);
-    
-    $hasAction   = preg_match('/[动手|冲|喊|突然|猛地|一把|瞬间|立刻|拔|挥|闪|跃|扑]/u', $firstLines);
-    $hasDialogue = preg_match('/[「『"\"].*[」』""]/u', $firstLines);
-    $hasAbnormal = preg_match('/[怪|异|惊|恐|震|不|竟|怎|难道|谁|为何|怎么|竟|居然|竟然|不料]/u', $firstLines);
-    
-    if (!$hasAction && !$hasDialogue && !$hasAbnormal) {
-        $issues[] = "⚠️ 黄金三行未达标：前三行缺乏动作/对话/异常要素";
+    $firstLines   = mb_substr($cleanContent, 0, 200);
+
+    // 动作类：动词短语模式
+    $hasAction = preg_match('/(动手|冲出|冲向|大喊|吼道|突然|猛地|一把|瞬间|立刻|拔出|挥动|闪身|跃起|扑向|一拳|一脚|拔腿|转身|扑倒)/u', $firstLines);
+    // 感官类：五感描写模式
+    $hasSensory = preg_match('/(看到|听见|闻到|感觉到|触到|瞥见|隐约|依稀|猛然|赫然|竟|赫然发现)/u', $firstLines);
+    // 对话类：引号包裹的对话
+    $hasDialogue = preg_match('/[「『""].*[」』""]/u', $firstLines);
+    // 异常类：异常/悬念关键词
+    $hasAbnormal = preg_match('/(奇怪|异常|惊恐|震惊|不敢相信|居然|竟然|不料|没想到|怎么回事|为何|难道|谁|怎么)/u', $firstLines);
+    // 危机类：紧迫/危险信号
+    $hasCrisis = preg_match('/(危险|快跑|小心|救命|不好|糟了|完蛋|死定了|来不及|命悬一线)/u', $firstLines);
+
+    if (!$hasAction && !$hasSensory && !$hasDialogue && !$hasAbnormal && !$hasCrisis) {
+        $issues[] = "⚠️ 黄金三行未达标：前三行缺乏动作/感官/对话/异常/危机要素";
         $score -= 15;
     }
 
@@ -163,7 +170,7 @@ function checkGate1_Structure(array $ch, string $content): array
 
     return [
         'name'   => '🏗 结构检查',
-        'status' => $score >= ($minScoreThreshold * 10), // 阈值映射到百分制
+        'status' => $score >= $minScoreThreshold,
         'score'  => max(0, $score),
         'issues' => $issues,
     ];

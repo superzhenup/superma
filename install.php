@@ -5,6 +5,7 @@
  *       + v10 深度思考(Thinking)开关 + chapter_versions + consistency_logs
  *       + v16 封面图片功能（cover_image 字段 + 图片生成 API 配置）
  *       + v17 Agent决策机制（智能写作策略、质量监控、系统优化）
+ *       + v17.1 作者画像系统（写作习惯/叙事手法/思想情感/创作个性分析）
  */
 
 // install.php 是安装向导，不依赖 config.php（它是被安装程序创建的）
@@ -25,7 +26,7 @@ if (file_exists(LOCK_FILE)) {
 $alreadyInstalled = false;
 
 $host       = 'localhost';
-$user       = 'root';
+$user       = 'ai_novel';
 $pass       = '';
 $dbname     = 'ai_novel';
 $adminUser  = 'admin';
@@ -36,7 +37,7 @@ $success    = '';
 
 if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $host       = trim($_POST['db_host']     ?? 'localhost');
-    $user       = trim($_POST['db_user']     ?? 'root');
+    $user       = trim($_POST['db_user']     ?? 'ai_novel');
     $pass       = $_POST['db_pass']          ?? '';
     $dbname     = trim($_POST['db_name']     ?? 'ai_novel');
     $adminUser  = trim($_POST['admin_user']  ?? 'admin');
@@ -55,6 +56,7 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
             $pdo = new PDO("mysql:host=$host;charset=utf8mb4", $user, $pass, [
                 PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => true,
             ]);
             $pdo->exec("CREATE DATABASE IF NOT EXISTS `$dbname` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
             $pdo->exec("USE `$dbname`");
@@ -108,6 +110,8 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `cover_image`           VARCHAR(500) DEFAULT NULL COMMENT '封面图片路径',
                     `style_vector`          TEXT COMMENT '四维风格向量(JSON)',
                     `ref_author`            VARCHAR(200) DEFAULT NULL COMMENT '参考作者',
+                    `author_profile_id`     INT UNSIGNED DEFAULT NULL COMMENT '绑定的作者画像ID',
+                    `target_reader`         VARCHAR(30) NOT NULL DEFAULT 'general' COMMENT '目标读者画像(qidian_male/qidian_female/jjwxc/fanqie/physical_book/general)',
                     `created_at`            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     `updated_at`            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     KEY `idx_status`  (`status`),
@@ -126,9 +130,20 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `hook_type`       VARCHAR(30)  DEFAULT NULL COMMENT '钩子六式类型',
                     `cool_point_type` VARCHAR(30)  DEFAULT NULL COMMENT '爽点类型',
                     `opening_type`    VARCHAR(30)  DEFAULT NULL COMMENT '开篇五式类型',
+                    `actual_opening_type` VARCHAR(30) DEFAULT NULL COMMENT '实际检测到的开篇类型',
                     `pacing`          VARCHAR(10)  NOT NULL DEFAULT '中' COMMENT '节奏：快/中/慢',
                     `suspense`        VARCHAR(10)  NOT NULL DEFAULT '无' COMMENT '悬念：有/无',
                     `quality_score`   DECIMAL(3,1) DEFAULT NULL COMMENT '质量评分(0-100)',
+                    `rewritten`      TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否被RewriteAgent重写过',
+                    `critic_scores`  JSON DEFAULT NULL COMMENT 'CriticAgent读者视角评分',
+                    `human_critic_scores` JSON DEFAULT NULL COMMENT '人工读者视角评分(5维)',
+                    `calibrated_critic_scores` JSON DEFAULT NULL COMMENT '校准后的Critic评分',
+                    `ai_pattern_issues` JSON DEFAULT NULL COMMENT 'StyleGuard AI痕迹检测结果',
+                    `iterations_used` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '迭代改进轮数',
+                    `total_improvement` DECIMAL(5,2) NOT NULL DEFAULT 0.00 COMMENT '总质量提升分数',
+                    `iterative_history` JSON DEFAULT NULL COMMENT '迭代历史详情',
+                    `iteration_evaluation` JSON DEFAULT NULL COMMENT '迭代效果评估',
+                    `rewrite_time` DATETIME DEFAULT NULL COMMENT '最后一次重写时间',
                     `gate_results`    JSON         DEFAULT NULL COMMENT '五关检测结果',
                     `tokens_used`     INT          NOT NULL DEFAULT 0 COMMENT 'AI生成本章消耗的token总数',
                     `duration_ms`     INT          NOT NULL DEFAULT 0 COMMENT '本章生成耗时(毫秒)',
@@ -169,6 +184,7 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `major_turning_points`  JSON COMMENT '重大转折点',
                     `character_arcs`        JSON COMMENT '人物成长轨迹',
                     `character_endpoints`   TEXT COMMENT '人物弧线终点',
+                    `character_progression` JSON DEFAULT NULL COMMENT '角色等级/境界发展轨迹',
                     `world_evolution`       TEXT COMMENT '世界观演变',
                     `recurring_motifs`      JSON COMMENT '全书重复意象',
                     `created_at`            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -362,6 +378,7 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `title`                 VARCHAR(100) DEFAULT NULL COMMENT '当前职务/称号',
                     `status`                VARCHAR(200) DEFAULT NULL COMMENT '当前处境一句话',
                     `alive`                 TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否存活',
+                    `voice_profile`         JSON DEFAULT NULL COMMENT '语音指纹(称呼/语气词/句式/口头禅等)',
                     `attributes`            JSON DEFAULT NULL COMMENT '扩展属性:等级/能力/关系等',
                     `last_updated_chapter`  INT UNSIGNED DEFAULT NULL COMMENT '最近一次被哪一章更新',
                     `created_at`            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -383,24 +400,82 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     KEY `idx_field` (`card_id`, `field_name`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='人物卡片变更历史表'",
 
+                // v1.11.2: 角色情绪状态历史表（CharacterEmotionRepo 数据源）
+                // 跨章跟踪角色情绪状态、检测异常跳变
+                "CREATE TABLE IF NOT EXISTS `character_emotion_history` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id` INT UNSIGNED NOT NULL,
+                    `character_name` VARCHAR(100) NOT NULL COMMENT '角色名',
+                    `chapter_number` INT UNSIGNED NOT NULL COMMENT '章节号',
+                    `emotion_state` ENUM('happy','angry','sad','tense','neutral','fearful','determined','melancholy','excited','confused','hopeful','desperate','calm','anxious','proud') NOT NULL COMMENT '情绪状态',
+                    `intensity` TINYINT UNSIGNED NOT NULL COMMENT '强度0-100',
+                    `cause` TEXT DEFAULT NULL COMMENT '导致此情绪的原因',
+                    `expected_decay_chapters` TINYINT UNSIGNED DEFAULT 3 COMMENT '预期持续章节数',
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX `idx_novel_chapter` (`novel_id`, `chapter_number`),
+                    INDEX `idx_character` (`novel_id`, `character_name`),
+                    INDEX `idx_character_chapter` (`novel_id`, `character_name`, `chapter_number`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='角色情绪状态历史'",
+
                 // 伏笔独立表（取代 novels.pending_foreshadowing JSON）
                 "CREATE TABLE IF NOT EXISTS `foreshadowing_items` (
                     `id`                    INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     `novel_id`              INT UNSIGNED NOT NULL,
                     `description`           TEXT NOT NULL COMMENT '伏笔内容',
+                    `priority`              ENUM('critical','major','minor') NOT NULL DEFAULT 'minor' COMMENT '伏笔优先级',
                     `planted_chapter`       INT UNSIGNED NOT NULL COMMENT '埋设章节',
                     `deadline_chapter`      INT UNSIGNED DEFAULT NULL COMMENT '建议回收章节,NULL=无期限',
                     `resolved_chapter`      INT UNSIGNED DEFAULT NULL COMMENT 'NULL=未回收',
                     `resolved_at`           TIMESTAMP NULL DEFAULT NULL,
+                    `last_mentioned_chapter` INT UNSIGNED DEFAULT NULL COMMENT '最近提及章节',
+                    `mention_count`         INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '提及次数',
                     `embedding`             BLOB DEFAULT NULL COMMENT '向量(用于语义匹配回收)',
                     `embedding_model`       VARCHAR(100) DEFAULT NULL,
                     `embedding_updated_at`  TIMESTAMP NULL DEFAULT NULL,
                     `created_at`            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     KEY `idx_novel_unresolved` (`novel_id`, `resolved_chapter`),
                     KEY `idx_deadline`         (`novel_id`, `deadline_chapter`),
+                    KEY `idx_priority`         (`novel_id`, `priority`),
                     KEY `idx_embedding_null`   (`novel_id`, `embedding_updated_at`),
                     FULLTEXT KEY `ft_description` (`description`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='伏笔独立表'",
+
+                // v1.11.5: 伏笔提及日志表（支持重写后回滚）
+                "CREATE TABLE IF NOT EXISTS `foreshadowing_mention_log` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `foreshadowing_id` INT UNSIGNED NOT NULL COMMENT '伏笔ID',
+                    `novel_id` INT UNSIGNED NOT NULL,
+                    `chapter_number` INT UNSIGNED NOT NULL COMMENT '提及章节',
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    KEY `idx_foreshadowing` (`foreshadowing_id`),
+                    KEY `idx_novel_ch` (`novel_id`, `chapter_number`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='伏笔提及日志表（v1.11.5：支持重写回滚）'",
+
+                // 金句表（v1.10.3: 金句调度系统）
+                "CREATE TABLE IF NOT EXISTS `novel_catchphrases` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id` INT UNSIGNED NOT NULL,
+                    `phrase` VARCHAR(500) NOT NULL COMMENT '金句内容',
+                    `speaker` VARCHAR(100) DEFAULT NULL COMMENT '说话角色',
+                    `first_chapter` INT UNSIGNED DEFAULT NULL COMMENT '首次出现章节',
+                    `callback_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '回调次数',
+                    `last_callback_chapter` INT UNSIGNED DEFAULT NULL COMMENT '最近回调章节',
+                    `importance` ENUM('iconic','normal','minor') NOT NULL DEFAULT 'normal' COMMENT '重要等级',
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    KEY `idx_novel` (`novel_id`),
+                    KEY `idx_callback` (`novel_id`, `callback_count`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='金句表'",
+
+                // v1.11.5: 金句回调日志表（支持重写后回滚）
+                "CREATE TABLE IF NOT EXISTS `catchphrase_callback_log` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `catchphrase_id` INT UNSIGNED NOT NULL COMMENT '金句ID',
+                    `novel_id` INT UNSIGNED NOT NULL,
+                    `chapter_number` INT UNSIGNED NOT NULL COMMENT '回调章节',
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    KEY `idx_catchphrase` (`catchphrase_id`),
+                    KEY `idx_novel_ch` (`novel_id`, `chapter_number`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='金句回调日志表（v1.11.5：支持重写回滚）'",
 
                 // 小说状态表（取代 novels.story_momentum）
                 "CREATE TABLE IF NOT EXISTS `novel_state` (
@@ -410,6 +485,19 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `last_ingested_chapter` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '最近成功记忆化的章节号',
                     `updated_at`            TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='小说状态表'",
+
+                // 场景模板使用记录（语义级防重复）
+                "CREATE TABLE IF NOT EXISTS `novel_scene_templates` (
+                    `id`                    INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id`              INT UNSIGNED NOT NULL,
+                    `chapter_number`        INT UNSIGNED NOT NULL COMMENT '章节号',
+                    `template_id`           VARCHAR(60) NOT NULL COMMENT '场景模板ID',
+                    `cool_point_type`       VARCHAR(30) NOT NULL COMMENT '所属爽点类型',
+                    `created_at`            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    KEY `idx_novel`         (`novel_id`),
+                    KEY `idx_novel_tpl`     (`novel_id`, `template_id`),
+                    KEY `idx_novel_ch`      (`novel_id`, `chapter_number`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='场景模板使用记录'",
 
                 // 原子记忆表（长尾知识存储）
                 "CREATE TABLE IF NOT EXISTS `memory_atoms` (
@@ -478,6 +566,169 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     KEY `idx_created_at` (`created_at`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='一致性检测日志表'",
 
+                // 全局约束状态库（约束框架 Phase 1）
+                "CREATE TABLE IF NOT EXISTS `constraint_state` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id` INT NOT NULL COMMENT '小说ID',
+                    `state_type` VARCHAR(32) NOT NULL COMMENT '状态类型: character/plot/information/pacing/style',
+                    `state_key` VARCHAR(64) NOT NULL COMMENT '状态键: protagonist_power/conflict_history/active_foreshadowing等',
+                    `state_value` JSON NOT NULL COMMENT '结构化状态数据',
+                    `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uk_novel_type_key` (`novel_id`, `state_type`, `state_key`),
+                    INDEX `idx_novel` (`novel_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='全局约束状态库'",
+
+                // 约束校验日志表（约束框架 Phase 1）
+                "CREATE TABLE IF NOT EXISTS `constraint_logs` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id` INT NOT NULL COMMENT '小说ID',
+                    `chapter_id` INT DEFAULT NULL COMMENT '章节ID',
+                    `chapter_number` INT COMMENT '章节号',
+                    `check_phase` VARCHAR(16) DEFAULT 'post_write' COMMENT '检查阶段: pre_write/post_write/agent',
+                    `dimension` VARCHAR(16) NOT NULL COMMENT '约束维度: structure/character/plot/information/pacing/language/world',
+                    `level` VARCHAR(8) NOT NULL COMMENT '级别: P0/P1/P2',
+                    `issue_type` VARCHAR(32) NOT NULL COMMENT '问题类型',
+                    `issue_desc` TEXT COMMENT '问题描述',
+                    `auto_fixed` TINYINT DEFAULT 0 COMMENT '是否自动修正',
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX `idx_novel_chapter` (`novel_id`, `chapter_number`),
+                    INDEX `idx_level` (`level`),
+                    INDEX `idx_dimension` (`dimension`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='约束校验日志表'",
+
+                // ================================================================
+                // 作者画像系统表（v1.7 新增）
+                // ================================================================
+
+                // 作者画像主表
+                "CREATE TABLE IF NOT EXISTS `author_profiles` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `user_id` INT UNSIGNED DEFAULT NULL COMMENT '关联用户ID',
+                    `profile_name` VARCHAR(100) NOT NULL COMMENT '画像名称',
+                    `avatar_url` VARCHAR(500) DEFAULT NULL COMMENT '头像',
+                    `gender` ENUM('male','female','other') DEFAULT NULL,
+                    `age_range` VARCHAR(20) DEFAULT NULL,
+                    `mbti` VARCHAR(10) DEFAULT NULL,
+                    `constellation` VARCHAR(20) DEFAULT NULL,
+                    `occupation` VARCHAR(100) DEFAULT NULL,
+                    `education_bg` TEXT DEFAULT NULL,
+                    `writing_experience` TEXT DEFAULT NULL,
+                    `influences` TEXT DEFAULT NULL,
+                    `writing_habits_prompt` TEXT DEFAULT NULL COMMENT '写作习惯提示词',
+                    `narrative_style_prompt` TEXT DEFAULT NULL COMMENT '叙事手法提示词',
+                    `sentiment_prompt` TEXT DEFAULT NULL COMMENT '思想情感提示词',
+                    `creative_identity_prompt` TEXT DEFAULT NULL COMMENT '创作个性提示词',
+                    `analysis_status` ENUM('pending','analyzing','completed','failed') DEFAULT 'pending',
+                    `source_work_id` INT UNSIGNED DEFAULT NULL,
+                    `is_default` TINYINT(1) DEFAULT 0,
+                    `usage_count` INT UNSIGNED DEFAULT 0,
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX `idx_user` (`user_id`),
+                    INDEX `idx_status` (`analysis_status`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='作者画像主表'",
+
+                // 写作习惯分析表
+                "CREATE TABLE IF NOT EXISTS `author_writing_habits` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `profile_id` INT UNSIGNED NOT NULL,
+                    `vocabulary_preference` JSON DEFAULT NULL,
+                    `word_complexity` ENUM('simple','moderate','complex') DEFAULT 'moderate',
+                    `sentence_length_avg` INT DEFAULT 0,
+                    `paragraph_length_avg` INT DEFAULT 0,
+                    `sentence_patterns` JSON DEFAULT NULL,
+                    `use_passive` DECIMAL(3,2) DEFAULT 0,
+                    `use_dialogue` DECIMAL(3,2) DEFAULT 0,
+                    `rhetorical_devices` JSON DEFAULT NULL,
+                    `metaphor_frequency` ENUM('low','medium','high') DEFAULT 'medium',
+                    `uniqueness_score` DECIMAL(3,2) DEFAULT 0,
+                    `confidence` DECIMAL(3,2) DEFAULT 0,
+                    `source_chapter_count` INT DEFAULT 0,
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (`profile_id`) REFERENCES `author_profiles`(`id`) ON DELETE CASCADE,
+                    INDEX `idx_profile` (`profile_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='写作习惯分析表'",
+
+                // 叙事手法分析表
+                "CREATE TABLE IF NOT EXISTS `author_narrative_styles` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `profile_id` INT UNSIGNED NOT NULL,
+                    `narrative_pov` ENUM('first_person','second_person','third_limited','third_omniscient','multiple') DEFAULT 'third_limited',
+                    `pov_switch_frequency` ENUM('never','rare','occasional','frequent') DEFAULT 'rare',
+                    `pacing_type` ENUM('fast','medium','slow','variable') DEFAULT 'medium',
+                    `scene_transition_style` VARCHAR(100) DEFAULT NULL,
+                    `tension_curve` JSON DEFAULT NULL,
+                    `chapter_structure` ENUM('linear','parallel','alternating','circular') DEFAULT 'linear',
+                    `arc_pattern` VARCHAR(100) DEFAULT NULL,
+                    `cliffhanger_usage` DECIMAL(3,2) DEFAULT 0,
+                    `interior_monologue` DECIMAL(3,2) DEFAULT 0,
+                    `description_density` ENUM('sparse','moderate','detailed') DEFAULT 'moderate',
+                    `confidence` DECIMAL(3,2) DEFAULT 0,
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (`profile_id`) REFERENCES `author_profiles`(`id`) ON DELETE CASCADE,
+                    INDEX `idx_profile` (`profile_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='叙事手法分析表'",
+
+                // 思想情感分析表
+                "CREATE TABLE IF NOT EXISTS `author_sentiment_analysis` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `profile_id` INT UNSIGNED NOT NULL,
+                    `overall_tone` ENUM('optimistic','pessimistic','neutral','bittersweet','dark','uplifting') DEFAULT 'neutral',
+                    `emotional_range` JSON DEFAULT NULL,
+                    `emotion_intensity` ENUM('subtle','moderate','intense') DEFAULT 'moderate',
+                    `depth_level` ENUM('surface','entertaining','thoughtful','philosophical') DEFAULT 'entertaining',
+                    `thematic_complexity` DECIMAL(3,2) DEFAULT 0,
+                    `themes` JSON DEFAULT NULL,
+                    `aesthetic_style` VARCHAR(100) DEFAULT NULL,
+                    `beauty_description_focus` JSON DEFAULT NULL,
+                    `violence_level` ENUM('none','mild','moderate','graphic') DEFAULT 'moderate',
+                    `moral_framework` VARCHAR(200) DEFAULT NULL,
+                    `values_tendency` JSON DEFAULT NULL,
+                    `confidence` DECIMAL(3,2) DEFAULT 0,
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (`profile_id`) REFERENCES `author_profiles`(`id`) ON DELETE CASCADE,
+                    INDEX `idx_profile` (`profile_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='思想情感分析表'",
+
+                // 创作个性分析表
+                "CREATE TABLE IF NOT EXISTS `author_creative_identity` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `profile_id` INT UNSIGNED NOT NULL,
+                    `signature_phrases` JSON DEFAULT NULL,
+                    `unique_techniques` JSON DEFAULT NULL,
+                    `trademark_elements` JSON DEFAULT NULL,
+                    `genre_preferences` JSON DEFAULT NULL,
+                    `character_archetype_favorites` JSON DEFAULT NULL,
+                    `plot_preferences` JSON DEFAULT NULL,
+                    `style_tags` JSON DEFAULT NULL,
+                    `influence_sources` JSON DEFAULT NULL,
+                    `writing_voice` TEXT DEFAULT NULL,
+                    `writing_schedule` VARCHAR(100) DEFAULT NULL,
+                    `editing_style` ENUM('minimal','moderate','extensive') DEFAULT 'moderate',
+                    `planning_style` ENUM('pantser','plotter','hybrid') DEFAULT 'hybrid',
+                    `confidence` DECIMAL(3,2) DEFAULT 0,
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (`profile_id`) REFERENCES `author_profiles`(`id`) ON DELETE CASCADE,
+                    INDEX `idx_profile` (`profile_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='创作个性分析表'",
+
+                // 上传作品记录表
+                "CREATE TABLE IF NOT EXISTS `author_uploaded_works` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `profile_id` INT UNSIGNED DEFAULT NULL,
+                    `file_name` VARCHAR(300) NOT NULL,
+                    `file_path` VARCHAR(500) NOT NULL,
+                    `file_size` INT UNSIGNED DEFAULT 0,
+                    `file_type` VARCHAR(20) NOT NULL,
+                    `upload_status` ENUM('pending','processing','completed','failed') DEFAULT 'pending',
+                    `chapter_count` INT UNSIGNED DEFAULT 0,
+                    `total_characters` INT UNSIGNED DEFAULT 0,
+                    `error_message` TEXT DEFAULT NULL,
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX `idx_profile` (`profile_id`),
+                    INDEX `idx_status` (`upload_status`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='上传作品记录表'",
+
                 // 系统设置表
                 "CREATE TABLE IF NOT EXISTS `system_settings` (
                     `setting_key`   VARCHAR(100) PRIMARY KEY,
@@ -490,7 +741,7 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                   ('global_embedding_model_id', ''),
                   ('ws_chapter_words',              '2000'),
                   ('ws_chapter_word_tolerance',     '150'),
-                  ('ws_outline_batch',              '20'),
+                  ('ws_outline_batch',              '5'),
                   ('ws_auto_write_interval',        '2'),
                   ('ws_cool_point_density_target',  '0.88'),
                   ('ws_cool_point_hunger_threshold','0.6'),
@@ -541,9 +792,76 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 "ALTER TABLE `volume_outlines` ADD COLUMN `volume_goals` JSON COMMENT '本卷写作目标' AFTER `foreshadowing`",
                 "ALTER TABLE `volume_outlines` ADD COLUMN `must_resolve_foreshadowing` JSON COMMENT '本卷必须回收的伏笔描述列表' AFTER `volume_goals`",
 
+                // foreshadowing_items priority 字段（老库升级兜底，新安装已包含在 CREATE TABLE 中）
+                "ALTER TABLE `foreshadowing_items` ADD COLUMN `priority` ENUM('critical','major','minor') NOT NULL DEFAULT 'minor' COMMENT '伏笔优先级' AFTER `description`",
+                "CREATE INDEX idx_priority ON foreshadowing_items(`novel_id`, `priority`)",
+
                 // P1#7: ai_models capabilities 字段（模型能力标签，老库升级兜底）
                 // 用于智能模型选择，按任务类型(creative/structured/synopsis)排序模型
                 "ALTER TABLE `ai_models` ADD COLUMN `capabilities` JSON DEFAULT NULL COMMENT '模型能力标签' AFTER `embedding_dim`",
+
+                // v1.6: chapters actual_opening_type 字段（开篇类型实际检测，老库升级兜底）
+                "ALTER TABLE `chapters` ADD COLUMN `actual_opening_type` VARCHAR(30) DEFAULT NULL COMMENT '实际检测到的开篇类型' AFTER `opening_type`",
+
+                // v1.7: novels.author_profile_id 字段（绑定作者画像，老库升级兜底）
+                "ALTER TABLE `novels` ADD COLUMN `author_profile_id` INT UNSIGNED DEFAULT NULL COMMENT '绑定的作者画像ID' AFTER `ref_author`",
+
+                // author_profiles 四个风格提示词字段（老库升级兜底）
+                "ALTER TABLE `author_profiles` ADD COLUMN `writing_habits_prompt` TEXT DEFAULT NULL COMMENT '写作习惯提示词' AFTER `influences`",
+                "ALTER TABLE `author_profiles` ADD COLUMN `narrative_style_prompt` TEXT DEFAULT NULL COMMENT '叙事手法提示词' AFTER `writing_habits_prompt`",
+                "ALTER TABLE `author_profiles` ADD COLUMN `sentiment_prompt` TEXT DEFAULT NULL COMMENT '思想情感提示词' AFTER `narrative_style_prompt`",
+                "ALTER TABLE `author_profiles` ADD COLUMN `creative_identity_prompt` TEXT DEFAULT NULL COMMENT '创作个性提示词' AFTER `sentiment_prompt`",
+
+                // v5: story_outlines.character_progression 字段（角色等级发展轨迹，老库升级兜底）
+                "ALTER TABLE `story_outlines` ADD COLUMN `character_progression` JSON DEFAULT NULL COMMENT '角色等级/境界发展轨迹' AFTER `character_endpoints`",
+
+                // v31: chapters 表新增 v1.9 盲点修复字段（老库升级兜底）
+                "ALTER TABLE `chapters` ADD COLUMN `rewritten` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否被RewriteAgent重写过' AFTER `quality_score`",
+                "ALTER TABLE `chapters` ADD COLUMN `critic_scores` JSON DEFAULT NULL COMMENT 'CriticAgent读者视角评分' AFTER `rewritten`",
+                "ALTER TABLE `chapters` ADD COLUMN `ai_pattern_issues` JSON DEFAULT NULL COMMENT 'StyleGuard AI痕迹检测结果' AFTER `critic_scores`",
+
+                // v32: chapters 表新增 v1.10 迭代精炼系统字段（之前在独立 update 脚本，现纳入主流程）
+                "ALTER TABLE `chapters` ADD COLUMN `iterations_used` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '迭代改进轮数' AFTER `ai_pattern_issues`",
+                "ALTER TABLE `chapters` ADD COLUMN `total_improvement` DECIMAL(5,2) NOT NULL DEFAULT 0.00 COMMENT '总质量提升分数' AFTER `iterations_used`",
+                "ALTER TABLE `chapters` ADD COLUMN `iterative_history` JSON DEFAULT NULL COMMENT '迭代历史详情' AFTER `total_improvement`",
+                "ALTER TABLE `chapters` ADD COLUMN `iteration_evaluation` JSON DEFAULT NULL COMMENT '迭代效果评估' AFTER `iterative_history`",
+                "ALTER TABLE `chapters` ADD COLUMN `rewrite_time` DATETIME DEFAULT NULL COMMENT '最后一次重写时间' AFTER `iteration_evaluation`",
+
+                // v32: 迭代精炼配置表（CREATE 新表，幂等）
+                "CREATE TABLE IF NOT EXISTS `iterative_settings` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id` INT UNSIGNED DEFAULT 0 COMMENT '小说ID，0表示全局设置',
+                    `setting_key` VARCHAR(100) NOT NULL COMMENT '设置键',
+                    `setting_value` TEXT COMMENT '设置值（JSON格式）',
+                    `description` VARCHAR(255) COMMENT '设置描述',
+                    `is_system` TINYINT(1) DEFAULT 0 COMMENT '是否系统设置',
+                    `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uk_novel_key` (`novel_id`, `setting_key`),
+                    INDEX `idx_setting_key` (`setting_key`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='迭代改进设置表'",
+
+                // v1.10.3 工程控制论：PID 控制器状态表
+                "CREATE TABLE IF NOT EXISTS `pid_states` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id` INT UNSIGNED NOT NULL,
+                    `var_name` VARCHAR(50) NOT NULL COMMENT '控制变量名: emotion_score/cool_point_density/word_count_accuracy/quality_score',
+                    `state_data` JSON NOT NULL COMMENT 'PID内部状态(error_integral/last_error/last_value/sample_count)',
+                    `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uk_novel_var` (`novel_id`, `var_name`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='PID控制器状态持久化表'",
+
+                // v1.11.1: 使用统计表（StatsTracker 远程上报数据源）
+                "CREATE TABLE IF NOT EXISTS `usage_stats` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `stat_date` DATE NOT NULL COMMENT '统计日期',
+                    `words_added` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '新增字数',
+                    `chapters_added` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '新增章节数',
+                    `novels_active` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '活跃小说数',
+                    `reported_at` DATETIME DEFAULT NULL COMMENT '上报时间',
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uk_stat_date` (`stat_date`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='使用统计表'",
 
                 // ==================== Agent决策机制表 ====================
                 
@@ -582,7 +900,7 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `novel_id` INT NOT NULL COMMENT '小说ID',
                     `apply_from` INT NOT NULL COMMENT '起始章节号（从第几章开始生效）',
                     `apply_to` INT NOT NULL COMMENT '失效章节号（到第几章失效）',
-                    `type` VARCHAR(30) NOT NULL COMMENT '指令类型: quality/strategy/optimization',
+                    `type` VARCHAR(30) NOT NULL COMMENT '指令类型: urgent/quality/strategy/optimization/global',
                     `directive` TEXT NOT NULL COMMENT '自然语言指令内容',
                     `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                     `expires_at` DATETIME COMMENT '过期时间（可选）',
@@ -609,7 +927,36 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     INDEX `idx_evaluated_at` (`evaluated_at`),
                     INDEX `idx_quality_change` (`quality_change`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent指令效果反馈表'",
-                
+
+                // Agent性能统计表
+                "CREATE TABLE IF NOT EXISTS `agent_performance_stats` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `agent_type` VARCHAR(50) NOT NULL COMMENT 'Agent类型',
+                    `stat_date` DATE NOT NULL COMMENT '统计日期',
+                    `decision_count` INT DEFAULT 0 COMMENT '决策次数',
+                    `action_count` INT DEFAULT 0 COMMENT '动作次数',
+                    `success_count` INT DEFAULT 0 COMMENT '成功次数',
+                    `failed_count` INT DEFAULT 0 COMMENT '失败次数',
+                    `avg_decision_time_ms` FLOAT DEFAULT 0 COMMENT '平均决策时间(毫秒)',
+                    `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    UNIQUE KEY `uk_agent_date` (`agent_type`, `stat_date`),
+                    INDEX `idx_stat_date` (`stat_date`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent性能统计表'",
+
+                // v1.11.2: 角色情绪历史表（情绪连续性）
+                "CREATE TABLE IF NOT EXISTS `character_emotion_history` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id` INT UNSIGNED NOT NULL,
+                    `character_name` VARCHAR(100) NOT NULL COMMENT '角色名',
+                    `chapter_number` INT UNSIGNED NOT NULL COMMENT '章节号',
+                    `emotion_state` JSON NOT NULL COMMENT '情绪状态JSON',
+                    `emotion_change` TEXT DEFAULT NULL COMMENT '情绪变化描述',
+                    `trigger_event` TEXT DEFAULT NULL COMMENT '触发事件',
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    KEY `idx_novel_chapter` (`novel_id`, `chapter_number`),
+                    KEY `idx_character` (`novel_id`, `character_name`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='角色情绪历史表'",
+
                 // Agent默认配置
                 "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES 
                     ('agent.enabled', '1'),
@@ -620,6 +967,16 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     ('agent.quality_agent.auto_fix', '1'),
                     ('agent.optimization_agent.enabled', '1'),
                     ('agent.optimization_agent.optimization_interval', '20')",
+
+                // v1.9 重写/迭代改进默认配置（AdaptiveParameterTuner 动态调参基线）
+                "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES
+                    ('ws_rewrite_enabled',          '0'),
+                    ('ws_rewrite_threshold',        '70'),
+                    ('ws_rewrite_min_gain',         '10'),
+                    ('ir_max_iterations',           '3'),
+                    ('ir_target_score',             '80'),
+                    ('ir_min_improvement',          '5.0'),
+                    ('ir_quality_decline_threshold','3.0')",
 
                 // 约束框架默认配置（Phase 1）
                 "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES 
@@ -637,6 +994,14 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     ('cf_direct_emotion_limit', '3'),
                     ('cf_banned_word_strict', '0'),
                     ('cf_protagonist_voice_ratio', '60')",
+
+                // v1.10.3: 写作能力优化字段（老库升级兜底）
+                "ALTER TABLE `novels` ADD COLUMN `target_reader` VARCHAR(30) NOT NULL DEFAULT 'general' COMMENT '目标读者画像' AFTER `author_profile_id`",
+                "ALTER TABLE `chapters` ADD COLUMN `human_critic_scores` JSON DEFAULT NULL COMMENT '人工读者视角评分(5维)' AFTER `critic_scores`",
+                "ALTER TABLE `chapters` ADD COLUMN `calibrated_critic_scores` JSON DEFAULT NULL COMMENT '校准后的Critic评分' AFTER `human_critic_scores`",
+                "ALTER TABLE `character_cards` ADD COLUMN `voice_profile` JSON DEFAULT NULL COMMENT '语音指纹' AFTER `alive`",
+                "ALTER TABLE `foreshadowing_items` ADD COLUMN `last_mentioned_chapter` INT UNSIGNED DEFAULT NULL COMMENT '最近提及章节' AFTER `resolved_at`",
+                "ALTER TABLE `foreshadowing_items` ADD COLUMN `mention_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '提及次数' AFTER `last_mentioned_chapter`",
             ];
 
             foreach ($statements as $sql) {
@@ -702,6 +1067,13 @@ define('BASE_PATH', __DIR__);
 define('DEFAULT_CHAPTER_WORDS',   2000);
 define('DEFAULT_OUTLINE_BATCH',   20);
 define('AUTO_WRITE_INTERVAL',     2);
+
+// ============================================================
+// 文字数据统计 隐私化统计 仅统计文字数量 可以关闭
+// ============================================================
+define('STATS_REPORT_ENABLED',    true);                                        // 是否启用统计上报（true/false）
+define('STATS_SERVER_URL',        'https://www.itzo.cn/api/stats_receiver.php'); // 上报服务器地址
+define('STATS_SITE_ID',           '');                                          // 站点唯一标识（留空则自动生成）
 
 // ---- 禁止直接访问 includes/api 文件（由各入口文件定义） ----
 defined('APP_LOADED') or define('APP_LOADED', true);
@@ -769,11 +1141,14 @@ PHP;
                     "DB Host: $host\n" .
                     "DB Name: $dbname\n" .
                     "Admin: $adminUser\n" .
-                    "Version: v1.2 (Thinking + KnowledgeBase + CoverImage + Agent)\n"
+                    "Version: v1.5 (Thinking + KnowledgeBase + CoverImage + Agent)\n"
                 );
 
                 $success = "安装成功！管理员账号：<strong>" . htmlspecialchars($adminUser) . "</strong>，数据库已就绪。";
             }
+
+            // 关闭安装时的 PDO 连接，避免后续请求冲突
+            $pdo = null;
 
         } catch (PDOException $e) {
             $error = '数据库连接失败：' . htmlspecialchars($e->getMessage());
@@ -796,7 +1171,7 @@ PHP;
     --bg-card:  #1a1a2e;
     --border:   #2d2d4e;
     --text:     #e0e0f0;
-    --muted:    #8888aa;
+    --muted:    #c8c8e0;
     --input-bg: #12122a;
 }
 [data-theme="light"] {
@@ -834,7 +1209,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
   <div class="card-install p-4 p-md-5 shadow-lg">
     <div class="text-center mb-4">
       <div class="logo">✦ Super Ma AI创作系统</div>
-      <p class="text-muted mt-1 mb-0" style="font-size:.8rem">安装向导 · v1.3.5</p>
+      <p class="text-muted mt-1 mb-0" style="font-size:.8rem">安装向导 · v1.5</p>
     </div>
 
     <?php if ($success): ?>
@@ -842,7 +1217,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
       <i class="bi bi-check-circle me-1"></i><?= $success ?>
     </div>
       <div class="mb-3 p-3" style="background:rgba(16,185,129,.05);border:1px solid rgba(16,185,129,.2);border-radius:8px">
-      <div style="font-size:.78rem;color:var(--muted);margin-bottom:6px;font-weight:600;">已创建数据库结构 (v1.2)</div>
+      <div style="font-size:.78rem;color:var(--muted);margin-bottom:6px;font-weight:600;">已创建数据库结构 (v1.5)</div>
       <ul class="feature-list">
         <li>ai_models · novels · chapters · writing_logs</li>
         <li>story_outlines — 全书故事大纲</li>
@@ -858,6 +1233,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
         <li><strong style="color:#10b981">character_card_history — 人物变更历史</strong></li>
         <li><strong style="color:#10b981">foreshadowing_items — 伏笔独立表</strong></li>
         <li><strong style="color:#10b981">novel_state — 小说状态表</strong></li>
+        <li><strong style="color:#10b981">novel_scene_templates — 场景模板使用记录（防套路化）</strong></li>
         <li><strong style="color:#10b981">memory_atoms — 原子记忆表</strong></li>
         <li><strong style="color:#10b981">book_analyses — 拆书分析表</strong></li>
         <li><strong style="color:#10b981">chapter_versions — 章节版本快照表</strong></li>
@@ -869,6 +1245,9 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
 
         <li><strong style="color:#10b981">agent_directives — Agent自然语言指令表（指令注入机制）</strong></li>
         <li><strong style="color:#10b981">agent_directive_outcomes — Agent指令效果反馈表（决策闭环）</strong></li>
+        <li><strong style="color:#10b981">iterative_settings — 迭代改进设置表</strong></li>
+        <li><strong style="color:#10b981">novel_catchphrases — 金句调度表（v1.3.5）</strong></li>
+        <li><strong style="color:#10b981">pid_states — PID控制器状态表（v1.5）</strong></li>
       </ul>
     </div>
     <a href="login.php" class="btn btn-primary btn-install w-100">
@@ -1265,7 +1644,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
 
       <!-- 将创建的数据库结构预览 -->
       <div class="mb-3 p-3" style="background:rgba(99,102,241,.05);border:1px solid rgba(99,102,241,.15);border-radius:8px">
-        <div style="font-size:.75rem;color:#6366f1;font-weight:600;margin-bottom:6px;">安装后将创建以下数据库结构 (v1.2)</div>
+        <div style="font-size:.75rem;color:#6366f1;font-weight:600;margin-bottom:6px;">安装后将创建以下数据库结构 (v1.5)</div>
         <ul class="feature-list">
           <li>ai_models / novels / chapters / writing_logs（基础表）</li>
           <li>story_outlines — 全书故事大纲表</li>
@@ -1281,6 +1660,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           <li>character_card_history — 人物变更历史表</li>
           <li>foreshadowing_items — 伏笔独立表</li>
           <li>novel_state — 小说状态表</li>
+          <li>novel_scene_templates — 场景模板使用记录（防套路化）</li>
           <li>memory_atoms — 原子记忆表</li>
           <li>book_analyses — 拆书分析表</li>
           <li><strong>chapter_versions — 章节版本快照表</strong></li>
@@ -1292,10 +1672,13 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
 
           <li><strong>agent_directives — Agent自然语言指令表（指令注入机制）</strong></li>
           <li><strong>agent_directive_outcomes — Agent指令效果反馈表（决策闭环）</strong></li>
-        </ul>
-      </div>
+        <li><strong>iterative_settings — 迭代改进设置表</strong></li>
+        <li><strong>novel_catchphrases — 金句调度表（v1.10.3）</strong></li>
+        <li><strong>pid_states — PID控制器状态表（v1.10.3）</strong></li>
+      </ul>
+    </div>
 
-      <button type="submit" class="btn btn-primary btn-install w-100 mt-1">
+    <button type="submit" class="btn btn-primary btn-install w-100 mt-1">
         <i class="bi bi-lightning-charge me-1"></i>一键安装
       </button>
     </form>

@@ -167,6 +167,8 @@ try {
                     'agent_action_logs',
                     'agent_directives',
                     'agent_directive_outcomes',
+                    'constraint_state',
+                    'constraint_logs',
                 ];
                 foreach ($novelTables as $table) {
                     DB::delete($table, 'novel_id=?', [$novelId]);
@@ -200,6 +202,46 @@ try {
             }
             DB::update('novels', ['status' => $status], 'id=?', [$novelId]);
             jsonResponse(true, ['status' => $status]);
+            break;
+
+        // -----------------------------------------------------------
+        // v1.11.8: 更新小说设置（target_chapters 等）
+        case 'update_novel_settings':
+            $novelId = (int)($input['novel_id'] ?? 0);
+            if (!$novelId) throw new RuntimeException('缺少小说ID');
+
+            $updates = [];
+
+            // 目标章节数
+            if (isset($input['target_chapters'])) {
+                $targetChapters = (int)$input['target_chapters'];
+                if ($targetChapters < 1 || $targetChapters > 10000) {
+                    throw new RuntimeException('目标章节数必须在 1-10000 之间');
+                }
+                $updates['target_chapters'] = $targetChapters;
+            }
+
+            // 每章字数
+            if (isset($input['chapter_words'])) {
+                $chapterWords = (int)$input['chapter_words'];
+                if ($chapterWords < 500 || $chapterWords > 20000) {
+                    throw new RuntimeException('每章字数必须在 500-20000 之间');
+                }
+                $updates['chapter_words'] = $chapterWords;
+            }
+
+            if (empty($updates)) {
+                throw new RuntimeException('没有需要更新的字段');
+            }
+
+            DB::update('novels', $updates, 'id=?', [$novelId]);
+
+            // 返回更新后的数据
+            $novel = getNovel($novelId);
+            jsonResponse(true, [
+                'target_chapters' => $novel['target_chapters'],
+                'chapter_words'   => $novel['chapter_words'],
+            ], '设置已更新');
             break;
 
         // -----------------------------------------------------------
@@ -417,10 +459,24 @@ try {
                 [$novelId]
             );
             $lastOutlined = (int)($lastRow['max_ch'] ?? 0);
+
+            // 检测当前使用的模型是否支持 1M 上下文
+            $is1MModel = false;
+            $modelName = '';
+            try {
+                $aiClient = getAIClient($novel['model_id'] ? (int)$novel['model_id'] : null);
+                $is1MModel = $aiClient->is1MContext();
+                $modelName = $aiClient->modelLabel;
+            } catch (Throwable $e) {
+                // 忽略
+            }
+
             jsonResponse(true, [
                 'outlined'     => $outlinedCount,
                 'total'        => (int)$novel['target_chapters'],
                 'last_outlined' => $lastOutlined,
+                'is_1m_model'  => $is1MModel,
+                'model_name'   => $modelName,
             ]);
             break;
 
@@ -504,7 +560,6 @@ try {
                     'chapters',
                     'chapter_synopses',
                     'writing_logs',
-                    'story_outlines',
                     'volume_outlines',
                     'arc_summaries',
                     'novel_characters',
@@ -521,6 +576,8 @@ try {
                     'agent_action_logs',
                     'agent_directives',
                     'agent_directive_outcomes',
+                    'constraint_state',
+                    'constraint_logs',
                 ];
                 foreach ($novelTables as $table) {
                     DB::delete($table, 'novel_id=?', [$novelId]);
@@ -531,7 +588,6 @@ try {
                     'status'            => 'draft',
                     'current_chapter'   => 0,
                     'total_words'       => 0,
-                    'has_story_outline' => 0,
                     'optimized_chapter' => 0,
                 ], 'id=?', [$novelId]);
 
@@ -562,6 +618,54 @@ try {
                 $stmt->execute(['announcement_url', $url, $url]);
             }
             jsonResponse(true, ['url' => $url], '公告地址已保存');
+            break;
+
+        // -----------------------------------------------------------
+        case 'add_chapters':
+            $novelId = (int)($input['novel_id'] ?? 0);
+            $count   = (int)($input['count'] ?? 0);
+            $mode    = trim($input['mode'] ?? 'empty');
+            $novel   = getNovel($novelId);
+            if (!$novel) throw new RuntimeException('小说不存在');
+            if ($count < 1 || $count > 200) throw new RuntimeException('章节数量需在 1-200 之间');
+
+            $maxCh = (int)(DB::fetch(
+                'SELECT COALESCE(MAX(chapter_number), 0) AS m FROM chapters WHERE novel_id=?',
+                [$novelId]
+            )['m'] ?? 0);
+
+            if ($mode === 'empty') {
+                $pdo = DB::getPdo();
+                $pdo->beginTransaction();
+                try {
+                    $stmt = $pdo->prepare(
+                        'INSERT INTO chapters (novel_id, chapter_number, title, status) VALUES (?, ?, ?, ?)'
+                    );
+                    $startNum = $maxCh + 1;
+                    for ($i = 0; $i < $count; $i++) {
+                        $stmt->execute([$novelId, $startNum + $i, '', 'outlined']);
+                    }
+                    $pdo->commit();
+                    updateNovelStats($novelId);
+                    $endNum = $startNum + $count - 1;
+                    jsonResponse(true, [
+                        'added'         => $count,
+                        'start_chapter' => $startNum,
+                        'end_chapter'   => $endNum,
+                    ], "已添加 {$count} 个空章节（第{$startNum}-{$endNum}章）");
+                } catch (Exception $e) {
+                    $pdo->rollBack();
+                    throw new RuntimeException('添加失败：' . $e->getMessage());
+                }
+            } else {
+                jsonResponse(true, [
+                    'added'       => 0,
+                    'mode'        => 'outline',
+                    'start_chapter' => $maxCh + 1,
+                    'end_chapter'   => $maxCh + $count,
+                    'novel_id'      => $novelId,
+                ], 'outline');
+            }
             break;
 
         // -----------------------------------------------------------

@@ -51,6 +51,7 @@ if ($_SESSION['lockout_until'] > time()) {
                 $_SESSION['lockout_until'] = 0;
                 $_SESSION['logged_in']  = true;
                 $_SESSION['username']   = $user;
+                $_SESSION['user_id']    = 1;
                 session_regenerate_id(true);
                 header('Location: index.php');
                 exit;

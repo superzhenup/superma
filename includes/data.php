@@ -66,6 +66,71 @@ function addLog(int $novelId, string $action, string $message, ?int $chapterId =
 }
 
 // ----------------------------------------------------------------
+// 迭代改进设置读取（iterative_settings 表）
+// ----------------------------------------------------------------
+
+/**
+ * 从 iterative_settings 表读取设置值（支持点号分隔的嵌套键）
+ *
+ * 用法：
+ *   getSetting('iterative_refinement.max_iterations', 3)
+ *   → 查询 setting_key='iterative_refinement'，取 JSON 中 max_iterations 字段
+ *
+ *   getSetting('rewrite.threshold', 70)
+ *   → 查询 setting_key='rewrite'，取 JSON 中 threshold 字段
+ *
+ * @param string $key   点号分隔的键（setting_key.sub_key）
+ * @param mixed  $default 默认值
+ * @param int    $novelId 小说ID，0=全局
+ * @return mixed
+ */
+function getSetting(string $key, $default = null, int $novelId = 0) {
+    try {
+        if (!class_exists('DB', false)) {
+            return $default;
+        }
+
+        $parts = explode('.', $key, 2);
+        $settingKey = $parts[0];
+        $subKey = $parts[1] ?? null;
+
+        // 优先读取小说级设置，再读全局
+        $row = DB::fetch(
+            'SELECT setting_value FROM iterative_settings WHERE novel_id = ? AND setting_key = ?',
+            [$novelId, $settingKey]
+        );
+
+        if (!$row && $novelId > 0) {
+            $row = DB::fetch(
+                'SELECT setting_value FROM iterative_settings WHERE novel_id = 0 AND setting_key = ?',
+                [$settingKey]
+            );
+        }
+
+        if (!$row) {
+            return $default;
+        }
+
+        $values = json_decode($row['setting_value'], true, 512);
+        if (!is_array($values)) {
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                error_log('getSetting JSON解析失败: ' . json_last_error_msg() . ' - key: ' . $key);
+            }
+            return $default;
+        }
+
+        if ($subKey !== null) {
+            return array_key_exists($subKey, $values) ? $values[$subKey] : $default;
+        }
+
+        return $values;
+    } catch (\Throwable $e) {
+        error_log('getSetting 失败：' . $e->getMessage());
+        return $default;
+    }
+}
+
+// ----------------------------------------------------------------
 // 章节意象（from chapters.used_tropes）
 //
 // 历史说明：人物状态 / 关键事件 / 待回收伏笔 / 故事势能 这 4 类记忆
@@ -89,7 +154,7 @@ function getPreviousUsedTropes(int $novelId, int $currentChapterNumber, int $loo
     );
     $all = [];
     foreach ($rows as $r) {
-        $tropes = json_decode($r['used_tropes'] ?? '[]', true) ?: [];
+        $tropes = json_decode($r['used_tropes'] ?? '[]', true, 128) ?: [];
         $all    = array_merge($all, $tropes);
     }
     return array_values(array_unique($all));

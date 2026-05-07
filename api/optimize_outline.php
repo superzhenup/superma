@@ -109,19 +109,21 @@ sse('progress', ['msg' => "开始优化 {$totalChapters} 章大纲逻辑...", 't
 $truncate = fn(string $t, int $l) => safe_strlen($t) > $l ? safe_substr($t, 0, $l) . '…' : $t;
 $settingsSummary = implode("\n", array_filter([
     "书名：{$novel['title']}  类型：{$novel['genre']}  风格：{$novel['writing_style']}",
-    $novel['protagonist_info'] ? "主角：" . $truncate($novel['protagonist_info'], 200) : '',
-    $novel['plot_settings']    ? "情节：" . $truncate($novel['plot_settings'], 200)    : '',
-    $novel['world_settings']   ? "世界观：" . $truncate($novel['world_settings'], 200)  : '',
-    $novel['extra_settings']   ? "其他：" . $truncate($novel['extra_settings'], 150)    : '',
+    $novel['protagonist_info'] ? "主角：" . $truncate($novel['protagonist_info'], 400) : '',
+    $novel['plot_settings']    ? "情节：" . $truncate($novel['plot_settings'], 400)    : '',
+    $novel['world_settings']   ? "世界观：" . $truncate($novel['world_settings'], 400)  : '',
+    $novel['extra_settings']   ? "其他：" . $truncate($novel['extra_settings'], 200)    : '',
 ]));
 
 $storyArcText     = $truncate($storyOutline['story_arc'] ?? '', 400);
-$actDivision      = is_string($storyOutline['act_division']) 
-    ? json_decode($storyOutline['act_division'], true) 
-    : ($storyOutline['act_division'] ?? []);
-$turningPoints    = is_string($storyOutline['major_turning_points'])
-    ? json_decode($storyOutline['major_turning_points'], true)
-    : ($storyOutline['major_turning_points'] ?? []);
+$actDivisionRaw   = $storyOutline['act_division'] ?? null;
+$actDivision      = is_string($actDivisionRaw)
+    ? (json_decode($actDivisionRaw, true) ?: [])
+    : (is_array($actDivisionRaw) ? $actDivisionRaw : []);
+$turningPointsRaw = $storyOutline['major_turning_points'] ?? null;
+$turningPoints    = is_string($turningPointsRaw)
+    ? (json_decode($turningPointsRaw, true) ?: [])
+    : (is_array($turningPointsRaw) ? $turningPointsRaw : []);
 
 // 整理幕信息
 $actText = '';
@@ -139,6 +141,10 @@ if (!empty($turningPoints)) {
         $turningText .= "第{$tp['chapter']}章：{$tp['event']}\n";
     }
 }
+
+// 初始化记忆引擎（优化时也注入记忆上下文）
+require_once dirname(__DIR__) . '/includes/memory/MemoryEngine.php';
+$engine = new MemoryEngine($novelId);
 
 // ---- 分批优化，每批10章 ----
 $batchSize   = 10;
@@ -176,13 +182,52 @@ for ($i = $startBatchIndex; $i < $totalChapters; $i += $batchSize) {
         $batchText .= "\n";
     }
 
-    // 前批大纲作为上下文（最多前2批）
+    // 获取记忆上下文（人物状态 + 关键事件 + 伏笔）
+    $queryText = trim(($novel['genre'] ?? '') . '：' . ($novel['plot_settings'] ?? ''));
+    try {
+        $memoryCtx = $engine->getPromptContext($batchTo, $queryText !== '：' ? $queryText : null, 4000, 15, 6);
+    } catch (Throwable $e) {
+        error_log("optimize_outline: MemoryEngine.getPromptContext failed: {$e->getMessage()}");
+        $memoryCtx = null;
+    }
+
+    $memorySection = '';
+    if ($memoryCtx) {
+        // 人物状态
+        $charStates = $memoryCtx['character_states'] ?? [];
+        if (!empty($charStates)) {
+            $lines = [];
+            foreach ($charStates as $name => $state) {
+                if (isset($state['alive']) && !$state['alive']) continue;
+                $parts = [];
+                if (!empty($state['title']))  $parts[] = "职：{$state['title']}";
+                if (!empty($state['status'])) $parts[] = "境：{$state['status']}";
+                if (!empty($parts)) $lines[] = "{$name}——" . implode('，', $parts);
+            }
+            if (!empty($lines)) {
+                $memorySection .= "【人物状态】\n" . implode("\n", $lines) . "\n";
+            }
+        }
+
+        // 伏笔
+        $pendingFs = $memoryCtx['pending_foreshadowing'] ?? [];
+        if (!empty($pendingFs)) {
+            $lines = [];
+            foreach ($pendingFs as $f) {
+                $deadline = !empty($f['deadline']) ? "（{$f['deadline']}章前回收）" : '';
+                $lines[] = "第{$f['chapter']}章埋：{$f['desc']}{$deadline}";
+            }
+            $memorySection .= "【待回收伏笔】\n" . implode("\n", $lines) . "\n";
+        }
+    }
+
+    // 前批大纲作为上下文（最多前2批，增强长距离连贯性）
     $prevContext = '';
     if ($i > 0) {
-        $prevStart = max(0, $i - $batchSize);
-        $prevBatch = array_slice($chapters, $prevStart, $batchSize);
         $prevLines = [];
-        foreach ($prevBatch as $ch) {
+        $prev2Start = max(0, $i - $batchSize * 2);
+        $prev2Batch = array_slice($chapters, $prev2Start, $batchSize * 2);
+        foreach ($prev2Batch as $ch) {
             $prevLines[] = "第{$ch['chapter_number']}章《{$ch['title']}》：{$ch['outline']}";
         }
         $prevContext = "【前批章节参考】\n" . implode("\n", $prevLines) . "\n\n";
@@ -200,7 +245,10 @@ for ($i = $startBatchIndex; $i < $totalChapters; $i += $batchSize) {
 
     $messages = [
         ['role' => 'system', 'content' => <<<EOT
-你是一位资深小说编辑，专门负责审查和优化章节大纲的逻辑性与连贯性。
+你是一位资深小说编辑，专门负责审查和优化章节大纲的逻辑性合理性与连贯性。
+
+【设定锚定——优化后的大纲必须严格依据以下设定，禁止偏离、凭空编造与设定矛盾的内容】
+{$settingsSummary}
 
 【优化原则】
 1. 严格遵守全书故事大纲的主线走向、幕划分和重大转折点，不得改变整体方向
@@ -208,6 +256,10 @@ for ($i = $startBatchIndex; $i < $totalChapters; $i += $batchSize) {
 3. 修复逻辑断裂：确保相邻章节之间有清晰的因果关系，前章钩子与后章开头衔接
 4. 强化故事张力：在符合主线的前提下，增加冲突、悬念、人物反差
 5. 禁止改变章节数量，必须输出与输入完全相同数量的章节
+6. 优化后的大纲情节走向必须与【全书故事主线】严格对齐，不得自行发明新主线或改变故事方向
+7. 禁止重复剧情，例如【背水一战】、【孤掷一注】、【命悬一线】这类只能出现一次不能重复出现
+
+
 
 【输出规则——严格遵守】
 1. 只输出纯 JSON 数组，不得有任何前缀、后缀或 markdown 代码块
@@ -227,6 +279,7 @@ EOT
 {$actText}
 【重大转折点】
 {$turningText}
+{$memorySection}
 {$prevContext}【待优化章节（第{$batchFrom}至第{$batchTo}章）】
 {$batchText}
 

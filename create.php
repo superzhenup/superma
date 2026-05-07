@@ -6,12 +6,16 @@ requireLogin();
 require_once __DIR__ . '/includes/db.php';
 require_once __DIR__ . '/includes/functions.php';
 require_once __DIR__ . '/includes/layout.php';
+require_once __DIR__ . '/includes/author/AuthorProfile.php';
 
 $models   = DB::fetchAll('SELECT * FROM ai_models ORDER BY is_default DESC, id ASC');
 $error    = '';
 $editId   = (int)($_GET['edit'] ?? 0);
 $novel    = $editId ? getNovel($editId) : false;
 $isEdit   = $editId && $novel;
+
+$userId = $_SESSION['user_id'] ?? $_SESSION['uid'] ?? null;
+$profiles = AuthorProfile::findByUser($userId);
 
 if ($editId && !$novel) {
     header('Location: index.php');
@@ -99,11 +103,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $vecEmotion       = trim($_POST['vec_emotion']       ?? '');
     $vecIntellect     = trim($_POST['vec_intellect']     ?? '');
     $refAuthor        = trim($_POST['ref_author']        ?? '');
+    $authorProfileId  = (int)($_POST['author_profile_id'] ?? 0);
     $protagonist_name = trim($_POST['protagonist_name'] ?? '');
     $protagonist_info = trim($_POST['protagonist_info'] ?? '');
     $plot_settings    = trim($_POST['plot_settings']    ?? '');
     $world_settings   = trim($_POST['world_settings']   ?? '');
     $extra_settings   = trim($_POST['extra_settings']   ?? '');
+    $target_reader    = trim($_POST['target_reader']    ?? 'general');
     $target_chapters  = max(1, (int)($_POST['target_chapters'] ?? 100));
     $chapter_words    = max(500, (int)($_POST['chapter_words']  ?? getSystemSetting('ws_chapter_words', 2000, 'int')));
     $model_id         = (int)($_POST['model_id'] ?? 0) ?: null;
@@ -164,7 +170,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if (!$title) {
         $error = '请输入书名。';
-    } elseif ($postEditId) {
+    }
+
+    if (!$error && $genre === '同人小说') {
+        $forbiddenKeywords = ['超能力','修仙','修真','渡劫','飞升','金丹','元婴','灵力','仙界','仙人','异世界','异界','传送门','召唤','魔法','魔法师','斗气','灵根','筑基','结丹','练气','御剑','仙术','法术','仙侠'];
+        $checkFields = [
+            '主角信息' => $protagonist_info,
+            '情节设定' => $plot_settings,
+            '世界观设定' => $world_settings,
+            '额外设定' => $extra_settings,
+        ];
+        $found = [];
+        foreach ($checkFields as $label => $text) {
+            if (!$text) continue;
+            foreach ($forbiddenKeywords as $kw) {
+                if (mb_strpos($text, $kw) !== false) {
+                    $found[] = "「{$kw}」（{$label}）";
+                }
+            }
+        }
+        if ($found) {
+            $error = '同人小说内容验证失败：检测到以下违规关键词——' . implode('、', array_slice($found, 0, 5)) . '。同人小说禁止包含超能力元素、修仙题材内容、异世界设定，请修改后重新提交。';
+        }
+    }
+
+    if (!$error && $postEditId) {
         // 编辑模式：更新现有小说
         $existNovel = getNovel($postEditId);
         if (!$existNovel) {
@@ -179,6 +209,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'plot_settings'    => $plot_settings,
                 'world_settings'   => $world_settings,
                 'extra_settings'   => $extra_settings,
+                'target_reader'    => $target_reader,
                 'target_chapters'  => $target_chapters,
                 'chapter_words'    => $chapter_words,
                 'model_id'         => $model_id,
@@ -190,6 +221,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // 参考作者单独存储
             if ($refAuthor) {
                 $updateData['ref_author'] = $refAuthor;
+            }
+            if ($authorProfileId) {
+                $updateData['author_profile_id'] = $authorProfileId;
             }
             // 处理封面颜色
             $coverColor = trim($_POST['cover_color'] ?? '#6366f1');
@@ -206,7 +240,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             header("Location: novel.php?id={$postEditId}&saved=1");
             exit;
         }
-    } else {
+    } elseif (!$error) {
         // 新建模式
         $coverColor = trim($_POST['cover_color'] ?? '#6366f1');
         $insertData = [
@@ -218,6 +252,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'plot_settings'    => $plot_settings,
             'world_settings'   => $world_settings,
             'extra_settings'   => $extra_settings,
+            'target_reader'    => $target_reader,
             'target_chapters'  => $target_chapters,
             'chapter_words'    => $chapter_words,
             'model_id'         => $model_id,
@@ -230,6 +265,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // 参考作者单独存储
         if ($refAuthor) {
             $insertData['ref_author'] = $refAuthor;
+        }
+        if ($authorProfileId) {
+            $insertData['author_profile_id'] = $authorProfileId;
         }
         $id = DB::insert('novels', $insertData);
 
@@ -301,7 +339,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
   <div class="alert alert-danger m-3"><?= h($error) ?></div>
   <?php endif; ?>
 
-  <form method="post" enctype="multipart/form-data" class="p-4">
+  <form method="post" enctype="multipart/form-data" class="p-4" onsubmit="return validateGenreConstraints()">
     <input type="hidden" name="_token" value="<?= csrf_token() ?>">
     <?php if ($isEdit): ?>
     <input type="hidden" name="edit_id" value="<?= $editId ?>">
@@ -318,7 +356,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
         </div>
         <div class="col-md-3">
           <label class="form-label">小说类型</label>
-          <select name="genre" id="genre-select" class="form-select" onchange="toggleCustomInput('genre')">
+          <select name="genre" id="genre-select" class="form-select" onchange="toggleCustomInput('genre'); toggleGenreConstraints()">
             <option value="">选择类型</option>
             <?php 
             $genreValue = $v['genre'] ?? '';
@@ -333,6 +371,14 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
           <input type="text" name="genre_custom" id="genre-custom" class="form-control mt-2" 
                  placeholder="输入自定义类型" style="display:none"
                  value="<?= $isCustomGenre && $genreValue ? h($genreValue) : '' ?>">
+          <div id="genre-constraints-notice" class="alert alert-warning py-2 px-3 mt-2 mb-0 small" style="display:none">
+            <i class="bi bi-exclamation-triangle me-1"></i><strong>同人小说内容限制：</strong>
+            <ul class="mb-0 mt-1 ps-3">
+              <li>禁止包含超能力元素</li>
+              <li>禁止包含修仙题材内容</li>
+              <li>禁止包含异世界设定</li>
+            </ul>
+          </div>
         </div>
         <div class="col-md-3">
           <label class="form-label">写作风格（预设）</label>
@@ -378,10 +424,13 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
                 <i class="bi bi-trash me-1"></i>移除封面
               </button>
             </div>
-            <div class="form-text">推荐分辨率 1086×1448，支持 JPG/PNG/WebP，最大 10MB</div>
+            <div class="form-text">推荐分辨率 1086×1448，支持 JPG/PNG/WebP，最大 10MB，PRO版本支持一键生成</div>
+          </div>
+            <div class="form-text">需要先在模型设置中配置图片生成 API。生成尺寸约 1024×1536，会自动缩放。</div>
+            <div id="cover-generate-status" class="small mt-1" style="display:none"></div>
           </div>
           <div class="mb-3">
-            <label class="form-label small text-muted">封面颜色（无封面图时显示，Pro版本支持一键生成封面）</label>
+            <label class="form-label small text-muted">封面颜色（无封面图时显示）</label>
             <input type="color" name="cover_color" class="form-control form-control-sm" style="width:60px;height:36px;padding:2px" value="<?= h($v['cover_color'] ?? '#6366f1') ?>">
           </div>
         </div>
@@ -495,6 +544,29 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
         </div>
       </div>
 
+      <!-- 作者画像绑定 -->
+      <div class="mb-3">
+        <label class="form-label small text-muted">🎨 绑定作者画像</label>
+        <select name="author_profile_id" class="form-select form-select-sm">
+          <option value="0">不绑定（使用默认风格）</option>
+          <?php foreach ($profiles as $p): 
+            $pId = $p['id'] ?? 0;
+            $pName = $p['profile_name'] ?? '未命名';
+            $pStatus = $p['analysis_status'] ?? 'pending';
+            $statusBadge = match($pStatus) {
+                'completed' => '✅',
+                'analyzing' => '⏳',
+                'failed' => '❌',
+                default => '📋',
+            };
+            $selected = ($v['author_profile_id'] ?? 0) == $pId ? 'selected' : '';
+          ?>
+            <option value="<?= $pId ?>" <?= $selected ?>><?= $statusBadge ?> <?= h($pName) ?></option>
+          <?php endforeach; ?>
+        </select>
+        <div class="form-text">选择已分析的作者画像，AI 写作时将自动参考该画像的写作风格、叙事手法、情感基调等特征。在 <a href="writing_settings.php?tab=profile" target="_blank">写作设置 → 作者画像</a> 中上传作品即可生成。</div>
+      </div>
+
       <!-- 参考作者 -->
       <div class="mb-2">
         <?php
@@ -557,6 +629,17 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
           <input type="number" name="chapter_words" class="form-control" min="500" max="10000" step="100"
                  value="<?= (int)($v['chapter_words'] ?? getSystemSetting('ws_chapter_words', 2000, 'int')) ?>">
           <div class="form-text">每章目标字数</div>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">目标读者 <small class="text-muted">（v1.10.3）</small></label>
+          <select name="target_reader" class="form-select">
+            <?php foreach (readerProfileOptions() as $rk => $rl): ?>
+            <option value="<?= h($rk) ?>" <?= (($v['target_reader'] ?? 'general') === $rk) ? 'selected' : '' ?>><?= h($rl) ?></option>
+            <?php endforeach; ?>
+          </select>
+          <div class="form-text" id="target-reader-hint">
+            <?= h(getReaderProfile($v['target_reader'] ?? 'general')['prompt_hint']) ?>
+          </div>
         </div>
         <div class="col-md-4">
           <label class="form-label">AI 模型</label>
@@ -714,6 +797,40 @@ function toggleCustomInput(fieldKey) {
     }
 }
 
+var FORBIDDEN_GENRE_KEYWORDS = ['超能力','修仙','修真','渡劫','飞升','金丹','元婴','灵力','仙界','仙人','异世界','异界','传送门','召唤','魔法','魔法师','斗气','灵根','筑基','结丹','练气','御剑','仙术','法术','仙侠'];
+var FORBIDDEN_HINT = '同人小说禁止包含：超能力元素、修仙题材内容、异世界设定';
+
+function toggleGenreConstraints() {
+    var genre = document.getElementById('genre-select').value;
+    var notice = document.getElementById('genre-constraints-notice');
+    if (notice) {
+        notice.style.display = genre === '同人小说' ? 'block' : 'none';
+    }
+}
+
+function validateGenreConstraints() {
+    var genre = document.getElementById('genre-select').value;
+    if (genre !== '同人小说') return true;
+
+    var fields = ['protagonist_info', 'plot_settings', 'world_settings', 'extra_settings'];
+    var found = [];
+    for (var i = 0; i < fields.length; i++) {
+        var el = document.querySelector('[name="' + fields[i] + '"]');
+        if (!el) continue;
+        var val = el.value || '';
+        for (var j = 0; j < FORBIDDEN_GENRE_KEYWORDS.length; j++) {
+            if (val.indexOf(FORBIDDEN_GENRE_KEYWORDS[j]) !== -1) {
+                found.push('「' + FORBIDDEN_GENRE_KEYWORDS[j] + '」');
+            }
+        }
+    }
+    if (found.length > 0) {
+        alert('⚠️ 同人小说内容验证失败！\n\n检测到以下违规关键词：' + found.join('、') + '\n\n' + FORBIDDEN_HINT + '\n\n请修改相关内容后重新提交。');
+        return false;
+    }
+    return true;
+}
+
 // ── 卷结构管理 ────────────────────────────────────────────────────
 var volumes = [];
 
@@ -808,6 +925,9 @@ document.addEventListener('DOMContentLoaded', function() {
         genreSelect.value = '__custom__';
     }
 
+    // 初始化同人小说限制提示
+    toggleGenreConstraints();
+
     // 初始化卷列表（仅新建页面有 #volume-list）
     if (document.getElementById('volume-list')) {
         volumes = calcDefaultVolumes(getTargetChapters());
@@ -822,6 +942,7 @@ document.querySelector('form').addEventListener('submit', function(e) {
     if (genreSelect && genreSelect.value==='__custom__' && !genreCustom.value.trim()) {
         e.preventDefault(); alert('请输入自定义类型'); genreCustom.focus(); return false;
     }
+    if (!validateGenreConstraints()) { e.preventDefault(); return false; }
     var customFields = [
         {key:'vec_style',name:'文风'},{key:'vec_pacing',name:'节奏'},
         {key:'vec_emotion',name:'情感基调'},{key:'vec_intellect',name:'智慧感'},

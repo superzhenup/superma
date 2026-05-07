@@ -96,16 +96,6 @@ try {
             echo json_encode(['ok' => $result, 'msg' => $result ? '删除成功' : '删除失败'], JSON_UNESCAPED_UNICODE);
             break;
 
-        case 'get_card_history':
-            $cardId = (int)($input['card_id'] ?? 0);
-            if (!$cardId) {
-                echo json_encode(['ok' => false, 'msg' => '缺少卡片ID'], JSON_UNESCAPED_UNICODE);
-                exit;
-            }
-            $history = $engine->cards()->getHistoryById($cardId);
-            echo json_encode(['ok' => true, 'data' => $history], JSON_UNESCAPED_UNICODE);
-            break;
-
         // ================================================================
         // 伏笔操作 (ForeshadowingRepo)
         // ================================================================
@@ -470,7 +460,7 @@ try {
                 echo json_encode(['ok' => false, 'msg' => '章节不存在'], JSON_UNESCAPED_UNICODE);
                 exit;
             }
-            // 若有 chapter_summary（JSON），用 ingestChapter 走完整摘要流程
+            // 尝试从 chapter_summary 重建记忆（老版本可能是JSON，新版本是纯文本）
             if (!empty($chapter['chapter_summary'])) {
                 $summary = json_decode($chapter['chapter_summary'], true);
                 if (is_array($summary)) {
@@ -479,7 +469,7 @@ try {
                     break;
                 }
             }
-            // 无 summary：仅将 chapter_summary 文本作为 plot_detail 原子写入
+            // chapter_summary 是纯文本（新版格式），或无 summary：作为情节记忆写入
             $content = trim((string)($chapter['chapter_summary'] ?: $chapter['content'] ?? ''));
             if ($content === '') {
                 echo json_encode(['ok' => false, 'msg' => '章节暂无内容，无法提取'], JSON_UNESCAPED_UNICODE);

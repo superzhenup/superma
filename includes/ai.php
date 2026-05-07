@@ -17,6 +17,7 @@ class AIClient {
     private int    $maxTokens;
     private float  $temperature;
     private bool   $thinkingEnabled;
+    private bool   $is1MContext = false;  // 是否支持 1M 上下文
 
     /**
      * v1.4: 心跳回调（替代 $GLOBALS['sendHeartbeat']）
@@ -68,6 +69,8 @@ class AIClient {
         $this->maxTokens       = (int)($cfg['max_tokens']   ?? 4096);
         $this->temperature     = (float)($cfg['temperature'] ?? 0.8);
         $this->thinkingEnabled = !empty($cfg['thinking_enabled']);
+        // 检测是否支持 1M 上下文（模型名称包含 [1m] 或 [1M]）
+        $this->is1MContext = (bool)preg_match('/\[1m\]/i', $cfg['name'] ?? '');
     }
 
     /**
@@ -86,6 +89,22 @@ class AIClient {
      */
     public function getMaxTokens(): int {
         return $this->maxTokens;
+    }
+
+    /**
+     * 检测模型是否支持 1M 上下文
+     * 通过模型名称中的 [1m] 标记识别
+     */
+    public function is1MContext(): bool {
+        return $this->is1MContext;
+    }
+
+    /**
+     * 获取模型上下文上限（估算）
+     * @return int 上下文 token 上限
+     */
+    public function getContextLimit(): int {
+        return $this->is1MContext ? 1000000 : 128000;
     }
 
     /**

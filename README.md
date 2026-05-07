@@ -1,4 +1,4 @@
-# ✦ Super-Ma AI 智能小说创作辅助系统（平台）
+# ✦ Super Ma Ahents v1.5 — AI 智能小说创作辅助系统（平台）
 ## UI预览
 <img width="1921" height="906" alt="局部截取_20260427_204024" src="https://github.com/user-attachments/assets/5951459d-bada-4d90-b443-1ad7127c53e1" />
 <p> <p>
@@ -51,6 +51,12 @@
 | ✅ 质量检测 | 章节完成后自动质检（结构/人物/描写/爽点/一致性） |
 | 📊 知识库 | 角色/世界观/情节自动提取，章节完成即入库 |
 | 🎯 动态字数控制 | 基于目标字数的动态容差机制 + 多级预警系统，精准控制章节篇幅 |
+| 🎨 作者画像系统 | 上传作品分析风格，绑定小说后自动注入写作Prompt，让AI模仿目标作者 |
+| 📈 角色等级管理 | 自动提取境界/技能/法宝，跳级检测+过渡章自动修复，等级发展全程可追踪 |
+| 🔄 智能重写 | 低分章节AI自评重写，提升>10分采纳，默认关闭按需开启 |
+| 👁️ 读者视角评分 | 5维读者体验评估（爽感/代入/节奏/新鲜/追读），弱项自动反馈下章 |
+| 🛡️ 风格守护 | AI痕迹检测+风格漂移监测，每20章对比基线防止越写越垮 |
+| 📊 使用统计上报 | 自动统计每日生成字数，定期上报到远程服务器（可配置开关）
 
 ---
 
@@ -120,18 +126,19 @@ http://你的域名/install.php
 ├── workshop.php         # 章节工坊（需登录）
 ├── settings.php         # AI 模型配置（需登录）
 ├── writing_settings.php # 写作参数全局设置（需登录）
+├── analyze.php          # 拆书分析（需登录）
 ├── login.php            # 登录页面
 ├── logout.php           # 退出登录
 ├── install.php          # 一键安装向导
 ├── config.php           # 系统配置（由安装向导自动生成）
 │
-├── api/                 # 后端 API（42 个文件）
+├── api/                 # 后端 API（50+ 个文件）
 │   ├── write_start.php          # 启动异步写作任务
 │   ├── write_chapter_worker.php # CLI 写作入口（后台进程）
 │   ├── write_chapter.php        # SSE 流式写作（核心）
 │   ├── write_poll.php           # 异步写作进度轮询
 │   ├── cancel_write.php         # 取消/重置写作
-│   ├── generate_outline.php      # 大纲生成 SSE
+│   ├── generate_outline.php      # 大纲生成 SSE（支持1M上下文）
 │   ├── generate_story_outline.php # 全书故事大纲生成
 │   ├── get_story_outline.php     # 获取故事大纲
 │   ├── update_story_outline.php  # 更新故事大纲
@@ -149,13 +156,19 @@ http://你的域名/install.php
 │   ├── rebuild_embeddings.php    # 重建向量索引
 │   ├── export_novel.php          # 小说导出
 │   ├── novel_import.php          # 小说导入
+│   ├── analyze_book.php          # 拆书分析 API（支持1M上下文）
+│   ├── author_profile.php        # 作者画像 API
+│   ├── human_critic.php          # 人工评分 API
 │   └── ...
+│
+├── config/              # 配置文件目录
+│   └── writing_params.php        # 写作参数定义（含1M模式配置）
 │
 ├── includes/
 │   ├── auth.php         # 登录鉴权 + CSRF
 │   ├── db.php           # PDO 数据库封装（单例 + 自动迁移）
 │   ├── schema.php       # 数据库表结构定义（单一真理源）
-│   ├── ai.php           # AI 客户端（OpenAI 兼容协议）
+│   ├── ai.php           # AI 客户端（OpenAI 兼容协议，支持1M上下文检测）
 │   ├── write_engine.php # 写作引擎（6 阶段：解析→记忆→Prompt→流式→落盘→后处理）
 │   ├── prompt.php       # Prompt 构建
 │   ├── memory.php       # 章节摘要生成
@@ -164,7 +177,7 @@ http://你的域名/install.php
 │   ├── helpers.php      # 纯工具函数
 │   ├── functions.php    # 入口加载器
 │   ├── error_handler.php # 错误处理
-│   ├── config_constants.php # 集中配置常量
+│   ├── config_constants.php # 集中配置常量（含1M超时常量）
 │   ├── heartbeat_helper.php # SSE 心跳辅助
 │   ├── layout.php       # 页面布局
 │   ├── constraints/     # 约束框架（v1.3.5）
@@ -172,13 +185,32 @@ http://你的域名/install.php
 │   │   ├── ConstraintStateDB.php     # 约束状态存储
 │   │   ├── PostWriteValidator.php    # 后置校验器
 │   │   └── ConstraintStateUpdater.php # 约束状态更新
-│   └── memory/          # MemoryEngine 核心
-│       ├── MemoryEngine.php      # 门面类：ingest/getPromptContext/ensureEmbeddings
-│       ├── CharacterCardRepo.php # 人物卡片仓储
-│       ├── ForeshadowingRepo.php # 伏笔仓储
-│       ├── AtomRepo.php          # 原子记忆仓储
-│       ├── EmbeddingProvider.php # Embedding 客户端
-│       └── Vector.php            # 向量运算工具
+│   ├── memory/          # MemoryEngine 核心
+│   │   ├── MemoryEngine.php      # 门面类（支持1M完整上下文模式）
+│   │   ├── CharacterCardRepo.php # 人物卡片仓储
+│   │   ├── ForeshadowingRepo.php # 伏笔仓储
+│   │   ├── AtomRepo.php          # 原子记忆仓储
+│   │   ├── EmbeddingProvider.php # Embedding 客户端
+│   │   └── Vector.php            # 向量运算工具
+│   ├── agents/          # 智能Agent（v1.5 新增3个）
+│   │   ├── BaseAgent.php            # Agent 基类
+│   │   ├── AgentCoordinator.php     # Agent 调度器
+│   │   ├── AgentDirectives.php      # 指令注入引擎
+│   │   ├── WritingStrategyAgent.php # 写作策略
+│   │   ├── QualityMonitorAgent.php  # 质量监控
+│   │   ├── OptimizationAgent.php    # 系统优化
+│   │   ├── RewriteAgent.php         # 低分章节自动重写
+│   │   ├── CriticAgent.php          # 读者视角评分
+│   │   └── StyleGuard.php           # 风格漂移+AI痕迹检测
+│   └── author/          # 作者画像系统（v1.5）
+│       ├── AuthorProfile.php        # 画像数据模型
+│       ├── AuthorAnalyzer.php       # 画像分析引擎
+│       ├── ProfileIntegrator.php    # 画像集成器
+│       ├── NarrativeAnalyzer.php    # 叙事手法分析
+│       ├── SentimentAnalyzer.php    # 情感分析
+│       ├── WritingHabitAnalyzer.php # 写作习惯分析
+│       ├── WorkParser.php           # 作品解析器
+│       └── TextProcessor.php        # 文本处理器
 │
 ├── assets/              # 前端静态资源（Bootstrap 5 + 原生 JS）
 ├── migrations/          # SQL 迁移脚本
@@ -216,8 +248,9 @@ http://你的域名/install.php
 
 **便宜服务器（服务器部署更稳定）：**
 
-<p>腾讯云 99元良心云 | https://curl.qcloud.com/CK0gNnTC <p>
-<p>阿里云 一流大牌云 | https://www.aliyun.com/minisite/goods?userCode=null<p>
+|------|---------|
+| 腾讯云 99元良心云 | `https://curl.qcloud.com/CK0gNnTC` |
+| 腾讯云 一流大牌云 | `https://www.aliyun.com/minisite/goods?userCode=null` |
 
 **大模型特性（网络资料 仅供参考）：**
 
@@ -426,6 +459,58 @@ http://你的域名/install.php
 ---
 
 ## 更新日志
+
+### v1.5（2026-05-06）
+
+**支持大模型1M 专项优化**
+- 模型名称包含 `[1m]` 标签自动识别为 1M 上下文模型（openai协议）
+- 大纲生成：批量数从 5 章提升至 30 章，PHP 超时从 600s 提升至 1200s
+- 章节写作：自动启用完整上下文模式，注入所有章节大纲和全文内容
+- 拆书分析：内容限制从6万字提升至20万字
+- 自动写作：前端心跳检测超时从 2 分钟提升至 5 分钟
+- 作用：充分利用 1M 上下文能力，一次性生成更多内容，减少上下文断裂
+
+**作者画像系统**
+- 上传作品自动分析写作习惯/叙事手法/思想情感/创作个性四维风格
+- 新建/编辑小说时可绑定画像，绑定后章节Prompt HEAD区自动注入风格指导
+- 画像风格数据落盘到 author_profiles 四个 prompt 字段，写作时实时读取
+- 作用：让 AI 模仿特定作者的写作风格，解决"AI 写的没个人特色"问题
+
+**角色等级/境界/技能管理**
+- 章节摘要 Prompt 新增境界/等级/技能/装备/血脉/法宝/感悟提取字段
+- MemoryEngine 显式映射并存储到 character_cards.attributes JSON
+- 境界跳级自动检测（如筑基→元婴跳过金丹），生成过渡章指令写入下章 outline 和 Prompt
+- 全书故事大纲新增 character_progression 角色等级发展轨迹，细纲和章节 Prompt 同步约束
+- 章节 Prompt HEAD 区新增【主角境界锚定】强约束，禁止无理由跳级
+- 作用：解决主角境界晋升跳级、技能凭空出现等逻辑矛盾
+
+**全书故事大纲约束**
+- 故事大纲生成支持反向推导：已有章节时基于实际内容反推主线/三幕/等级轨迹
+- character_progression 按章节号段匹配当前应处境界，注入细纲和章节 Prompt
+- 作用：故事框架对细纲和自动写作形成闭环约束，长篇逻辑更一致
+
+**智能重写 Agent**
+- 五关检测总分 < 阈值(70分) → 提取问题清单 → AI 自评重写 → 再测 → 提升>10分采纳
+- 可配置阈值和最低增益，默认关闭，writing_logs 可审计
+- 作用：当章质量不过关时立即修复，不等下章补救，读者流失率下降
+
+**读者视角评分 Agent**
+- 每章写完后 AI 从5个读者维度评分（爽感/代入/节奏/新鲜/追读），1-10分
+- 弱项（<6分）通过 AgentDirectives 写入下章改进指令
+- 评分数据存入 chapters.critic_scores，可做评分曲线 Dashboard
+- 作用：从"按规则写"升级为"读者读得爽"，直击网文核心
+
+**风格守护 Guard**
+- AI痕迹检测：纯正则扫描段首副词过度/转折词/情绪三件套/对话标签单一，零成本
+- 风格漂移监测：每20章取开篇5章为基线，对比近5章的句长/对话密度/感官比例/段落长度
+- 风格漂移监测：每20章取开篇5章为基线，对比近5章的句长/对话密度/感官比例/段落长度
+- 问题写入 chapters.ai_pattern_issues，严重时 Agent 指令回归早期风格
+- 作用：消除"AI味"，防止长篇越写越垮
+
+**体验优化**
+- 清空章节时保留全书故事大纲，不影响已有故事框架
+- 导入章节概要弹窗提醒"旧大纲可能不匹配，建议重新生成"
+- 导出/导入/清空三按钮始终显示，不受章节列表清空影响
 
 ### v1.3.5（2026-04-29）
 

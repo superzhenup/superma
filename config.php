@@ -7,19 +7,19 @@ if (version_compare(PHP_VERSION, '8.0.0', '<')) {
 }
 
 // ============================================================
-// 数据库配置
+// 数据库配置U2FsdGVkX1/JF1AwCx1RG7WVHCeT1XOOxqDjoFoPhAZOHGJycN8SMHlC/ZxOaYdB
 // ============================================================
 define('DB_HOST',    'localhost');
 define('DB_NAME',    'ai_novel');
 define('DB_USER',    'ai_novel');
-define('DB_PASS',    'Ln4k8TRGDjZpTYz8');
+define('DB_PASS',    '');
 define('DB_CHARSET', 'utf8mb4');
 
 // ============================================================
 // 后台账号（由安装向导写入，请勿手动修改密码明文）
 // ============================================================
 define('ADMIN_USER', 'admin');
-define('ADMIN_PASS', '$2y$10$DHFFJeTvYaAPkhbNNeg75u5PeMiufw.HJC1BLQla.WU.s0MiKVNX2');   // password_hash 散列值，由 install.php 生成
+define('ADMIN_PASS', '');   // password_hash 散列值，由 install.php 生成
 
 // ============================================================
 // 站点配置
@@ -33,6 +33,25 @@ define('BASE_PATH', __DIR__);
 define('DEFAULT_CHAPTER_WORDS',   2000);   // 每章目标字数
 define('DEFAULT_OUTLINE_BATCH',   20);     // 每次生成大纲章节数
 define('AUTO_WRITE_INTERVAL',     2);      // 自动写作间隔(秒)
+
+// ============================================================
+// 文字数据统计 隐私化统计 仅统计文字数量 可以关闭
+// ============================================================
+define('STATS_REPORT_ENABLED',    true);                                        // 是否启用统计上报（true/false）
+define('STATS_SERVER_URL',        'https://www.itzo.cn/api/stats_receiver.php'); // 上报服务器地址
+define('STATS_SITE_ID',           '');                                          // 站点唯一标识（留空则自动生成）
+
+// ============================================================
+// 细纲/大纲生成时显示模型思考过程（reasoning_content）
+// 0=关闭  1=开启  开启后前端会实时展示AI的推理内容，缓解等待焦虑
+// ============================================================
+define('CFG_SHOW_OUTLINE_THINKING', 1);
+
+// ============================================================
+// 细纲/大纲生成时模型思考过程的静默超时（秒）
+// 深度思考模型在生成细纲前会先推理较长时间，默认600秒（10分钟）
+// ============================================================
+define('CFG_OUTLINE_THINKING_TIMEOUT', 600);
 
 // ---- 禁止直接访问 includes/api 文件（由各入口文件定义） ----
 defined('APP_LOADED') or define('APP_LOADED', true);
@@ -74,7 +93,7 @@ function getSystemSetting(string $key, $default = null, string $type = 'string')
             'bool'   => in_array(strtolower((string)$val), ['1', 'true', 'yes', 'on']),
             default  => (string)$val,
         };
-    } catch (\Throwable $e) {
+    } catch (\Throwable) {
         return $default;
     }
 }

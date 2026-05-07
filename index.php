@@ -6,6 +6,16 @@ requireLogin();
 require_once __DIR__ . '/includes/db.php';
 require_once __DIR__ . '/includes/functions.php';
 require_once __DIR__ . '/includes/layout.php';
+require_once __DIR__ . '/includes/stats_tracker.php';
+
+// 每日统计上报检查（异步触发，不阻塞页面加载）
+if (StatsTracker::shouldReport()) {
+    $protocol = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https' : 'http';
+    $appUrl = $protocol . '://' . ($_SERVER['HTTP_HOST'] ?? 'localhost');
+    @file_get_contents($appUrl . '/api/stats_report.php?action=report', false, stream_context_create([
+        'http' => ['timeout' => 3, 'method' => 'GET']
+    ]));
+}
 
 $novels = DB::fetchAll(
     'SELECT n.*, m.name AS model_name

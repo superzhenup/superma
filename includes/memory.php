@@ -18,7 +18,9 @@ defined('APP_LOADED') or die('Direct access denied.');
  *   used_tropes: array,
  *   new_foreshadowing: array,
  *   resolved_foreshadowing: array,
- *   story_momentum: string
+ *   story_momentum: string,
+ *   cool_point_type: string,
+ *   character_emotions: array
  * }
  */
 function generateChapterSummary(array $novel, array $chapter, string $content): array {
@@ -30,27 +32,24 @@ function generateChapterSummary(array $novel, array $chapter, string $content): 
         $paragraphs = preg_split('/\n\s*\n/', $content);
         $paragraphs = array_values(array_filter($paragraphs, fn($p) => mb_strlen(trim($p)) > 10));
 
-        if (count($paragraphs) >= 5) {
+        $minParagraphs = 3;
+        if (count($paragraphs) >= $minParagraphs) {
             $scored = [];
-            // 信息密度关键词：对话标记 + 动作词 + 情绪关键词
             $densityKeywords = [
-                '[「」""\'\'""]', '打', '杀', '战', '破', '怒', '惊', '突破',
-                '反转', '爆发', '终于', '逆转', '对抗', '决定', '发现',
-                '死', '偷袭', '突破', '晋级', '获得', '失去',
+                '「', '」', '"', '"', '"', '"', '打', '杀', '战', '破', '怒', '惊',
+                '突破', '反转', '爆发', '终于', '逆转', '对抗', '决定', '发现',
+                '死', '偷袭', '晋级', '获得', '失去',
             ];
 
             foreach ($paragraphs as $idx => $p) {
                 $score = 0;
-                // 对话密度加权
                 $dialogueChars = mb_substr_count($p, '「') + mb_substr_count($p, '」')
                                + mb_substr_count($p, '"') + mb_substr_count($p, '"')
                                + mb_substr_count($p, '"') + mb_substr_count($p, '"');
                 $score += $dialogueChars * 2;
-                // 关键词命中
                 foreach ($densityKeywords as $kw) {
                     if (mb_strpos($p, $kw) !== false) $score++;
                 }
-                // 位置加权：首 20% 和末 20% 段落加权 1.5x（开篇和收尾最重要）
                 $totalParas = count($paragraphs);
                 if ($idx < $totalParas * 0.2 || $idx > $totalParas * 0.8) {
                     $score = (int)($score * 1.5);
@@ -58,12 +57,9 @@ function generateChapterSummary(array $novel, array $chapter, string $content): 
                 $scored[] = ['idx' => $idx, 'score' => $score, 'text' => $p];
             }
 
-            // 按分数降序排列，取前 60% 的段落（高密度优先）
             usort($scored, fn($a, $b) => $b['score'] - $a['score']);
-            $keepCount = max(3, (int)(count($paragraphs) * 0.6));
+            $keepCount = max($minParagraphs, (int)(count($paragraphs) * 0.6));
             $selected = array_slice($scored, 0, $keepCount);
-
-            // 恢复原始顺序
             usort($selected, fn($a, $b) => $a['idx'] - $b['idx']);
 
             $truncated = '';
@@ -76,50 +72,100 @@ function generateChapterSummary(array $novel, array $chapter, string $content): 
                 $prevIdx = $sel['idx'];
             }
         } else {
-            // 段落太少，直接用旧策略
-            $head      = safe_substr($content, 0, 1500);
-            $mid       = safe_substr($content, (int)($len / 2) - 500, 1000);
-            $tail      = safe_substr($content, $len - 1000);
-            $truncated = $head . "\n……（中间段节选）……\n" . $mid . "\n……（后段节选）……\n" . $tail;
+            $truncated = implode("\n\n", $paragraphs);
         }
     } else {
         $truncated = $content;
     }
 
     $chNum = (int)($chapter['chapter_number'] ?? $chapter['chapter'] ?? 0);
+    $protagonistName = $novel['protagonist_name'] ?? '';
+    $protagonistConstraint = $protagonistName
+        ? "\n重要约束：本小说主角固定为「{$protagonistName}」，角色数据中必须使用此名字，不可使用其他称呼。"
+        : '';
+
+    $pendingForeshadowings = '';
+    try {
+        $pending = DB::fetchAll(
+            'SELECT id, description, priority, planted_chapter
+             FROM foreshadowing_items
+             WHERE novel_id=? AND resolved_chapter IS NULL
+             ORDER BY priority ASC, planted_chapter ASC
+             LIMIT 20',
+            [$novel['id']]
+        );
+        if (!empty($pending)) {
+            $lines = [];
+            foreach ($pending as $fs) {
+                $pLabel = ['critical'=>'🔴','major'=>'🟡','minor'=>'🟢'][$fs['priority']] ?? '🟢';
+                $lines[] = "{$pLabel}[ID:{$fs['id']}] 第{$fs['planted_chapter']}章埋：{$fs['description']}";
+            }
+            $pendingForeshadowings = "\n【当前未回收的伏笔列表（请据此判断本章是否回收了其中某条）】\n"
+                . implode("\n", $lines) . "\n"
+                . "\n重要：如果本章确实回收了以上某条伏笔，请在 resolved_foreshadowing 中使用该伏笔的精确原始描述文本（直接复制上面的描述），不要改写。"
+                . "\n注意回收判定：完整的揭晓算回收，角色获得关键线索/真相的部分揭露也算。如果本章只是角色想起/提到伏笔但未推进，则不算回收。"
+                . "\n如果没有明确回收任何伏笔，resolved_foreshadowing 必须输出空数组 []。\n";
+        }
+    } catch (\Throwable $e) {
+        // 查询伏笔列表失败不影响主流程
+    }
+
     $messages = [
-        ['role' => 'system', 'content' => '你是一位小说编辑助手。分析刚写完的章节，只输出纯JSON，不要有任何解释、前缀或markdown代码块。'],
+        ['role' => 'system', 'content' => '你是一位小说编辑助手，负责分析刚写完的章节并输出摘要。'],
         ['role' => 'user',   'content' => <<<EOT
 小说《{$novel['title']}》第{$chNum}章《{$chapter['title']}》
-
+{$protagonistConstraint}
 章节大纲：{$chapter['outline']}
 
 章节正文（可能节选）：
 {$truncated}
+{$pendingForeshadowings}
+请分两部分输出：
 
-请输出以下格式的JSON（只输出JSON，不要有其他文字）：
-{
-  "narrative_summary": "200-300字的叙事摘要，包含情节要点、未解伏笔、章末氛围",
-  "character_updates": {
-    "人物名": {"职务": "当前职务", "处境": "当前处境简述", "关键变化": "本章发生的最重要变化"}
-  },
-  "key_event": "本章最重要的一件事，20字以内一句话概括",
-  "used_tropes": ["意象或场景关键词1", "意象或场景关键词2"],
-  "new_foreshadowing": [{"desc": "新埋伏笔描述", "suggested_payoff_chapter": 预计回收章节号}],
-  "resolved_foreshadowing": ["已回收的伏笔描述（与pending_foreshadowing中的desc匹配）"],
-  "story_momentum": "当前故事的悬念/冲突状态简述，30字以内，供后续章节保持张力",
-  "cool_point_type": "本章核心爽点类型（六选一）：underdog_win / face_slap / treasure_find / breakthrough / power_expand / romance_win。若无明确爽点则留空"
-}
+第一部分：用一段200-300字的自然段落总结本章内容，包含情节要点、人物行动与变化、未解伏笔、章末氛围。直接写摘要正文，不要加标题或前缀。
 
-used_tropes 只提取本章实际出现的意象，最多8个。
-new_foreshadowing 和 resolved_foreshadowing 若无则输出空数组[]。
+第二部分：在摘要之后，另起一行写 ---（三个减号分隔符），再另起一行输出以下JSON（用于系统数据记录）：
+{{
+  "character_updates": {{"人物名": {{
+    "title": "职务/称号",
+    "status": "处境",
+    "关键变化": "本章重要变化",
+    "境界": "当前修炼境界（如筑基初期、金丹中期等，修真/玄幻类必填）",
+    "等级": "当前等级（如LV.30、三阶魔法师等，非修真体系用此项）",
+    "战力": "战力描述（如金丹级、S级等）",
+    "技能": ["本章新获得/升级的技能"],
+    "装备": ["本章新获得的装备"],
+    "血脉": "血脉/体质名称及变化",
+    "法宝": ["本章新获得的法宝"],
+    "感悟": "对修炼/人生的感悟"
+  }}}},
+  "key_event": "本章最重要的事，20字以内",
+  "used_tropes": ["意象1", "意象2"],
+  "new_foreshadowing": [{{"desc": "新埋伏笔", "suggested_payoff_chapter": 章节号}}],
+  "resolved_foreshadowing": ["已回收伏笔描述"],
+  "story_momentum": "当前故事悬念/冲突状态，30字以内",
+  "cool_point_type": "爽点类型九选一：underdog_win/face_slap/treasure_find/breakthrough/power_expand/romance_win/truth_reveal/last_stand/sacrifice，无则留空",
+  "character_emotions": [{{"name": "角色名", "state": "情绪状态", "intensity": 80, "cause": "导致此情绪的原因", "expected_decay": 3}}]
+}}
+
+used_tropes 最多8个。new_foreshadowing 和 resolved_foreshadowing 若无则输出空数组[]。
+character_emotions 只记录本章有明显情绪表现的核心角色（主角+重要配角），情绪状态从以下选择：
+happy/angry/sad/tense/neutral/fearful/determined/melancholy/excited/confused/hopeful/desperate/calm/anxious/proud
+intensity 为0-100的整数，expected_decay 为预期持续章节数（默认3）。
 cool_point_type 判断规则：
-- underdog_win = 主角以弱胜强，击败比自己强的对手
-- face_slap = 打脸反转，之前轻视主角的人被打脸
-- treasure_find = 获得宝物/奇遇/天材地宝
-- breakthrough = 修为突破/晋级/境界提升
-- power_expand = 势力扩张/收服手下/获得地盘
-- romance_win = 红颜倾心/情感突破/关系进展
+- underdog_win = 主角以弱胜强
+- face_slap = 打脸反转
+- treasure_find = 获得宝物/奇遇
+- breakthrough = 修为突破/晋级
+- power_expand = 势力扩张/收服手下
+- romance_win = 红颜倾心/情感突破
+
+【人物状态提取规则】：
+1. 仅本章有明显变化的角色才写入 character_updates，没有变化的角色不要写
+2. 境界/等级如果没有变化则不要输出，反之如果本章有突破必须写清楚前后变化
+3. 境界填修真/玄幻体系（如炼气→筑基→金丹→元婴→化神），等级填通用体系（如LV体系、阶级体系），二者选其一即可
+4. 技能/装备/法宝若无新增则输出空数组[]，不要编造
+5. 血脉/感悟若无变化则不要输出此项
 EOT
         ],
     ];
@@ -128,22 +174,45 @@ EOT
         $ai  = getAIClient($novel['model_id'] ?: null);
         $raw = trim($ai->chat($messages, 'structured'));
 
-        if (preg_match('/```(?:json)?\s*([\s\S]*?)```/i', $raw, $m)) {
-            $raw = trim($m[1]);
+        $narrativeSummary = '';
+        $result = [];
+
+        if (str_contains($raw, '---')) {
+            [$summaryPart, $jsonPart] = explode('---', $raw, 2);
+            $narrativeSummary = trim($summaryPart);
+            $jsonPart = trim($jsonPart);
+            if (preg_match('/```(?:json)?\s*([\s\S]*?)```/i', $jsonPart, $m)) {
+                $jsonPart = trim($m[1]);
+            }
+            $result = json_decode($jsonPart, true) ?? [];
+        } else {
+            $fallback = $raw;
+            if (preg_match('/```(?:json)?\s*([\s\S]*?)```/i', $fallback, $m)) {
+                $fallback = trim($m[1]);
+            }
+            $result = json_decode($fallback, true);
+            if (is_array($result)) {
+                $narrativeSummary = (string)($result['narrative_summary'] ?? '');
+            } else {
+                $narrativeSummary = trim($raw);
+                $result = [];
+            }
         }
 
-        $result = json_decode($raw, true);
-        if (!is_array($result)) return [];
+        if (empty($narrativeSummary) && !empty($result['narrative_summary'])) {
+            $narrativeSummary = (string)$result['narrative_summary'];
+        }
 
         return [
-            'narrative_summary'      => (string)($result['narrative_summary']      ?? ''),
-            'character_updates'      => (array)($result['character_updates']       ?? []),
-            'key_event'              => (string)($result['key_event']              ?? ''),
-            'used_tropes'            => (array)($result['used_tropes']             ?? []),
-            'new_foreshadowing'      => (array)($result['new_foreshadowing']       ?? []),
+            'narrative_summary'      => $narrativeSummary,
+            'character_updates'      => (array)($result['character_updates']      ?? []),
+            'key_event'              => (string)($result['key_event']             ?? ''),
+            'used_tropes'            => (array)($result['used_tropes']            ?? []),
+            'new_foreshadowing'      => (array)($result['new_foreshadowing']      ?? []),
             'resolved_foreshadowing' => (array)($result['resolved_foreshadowing'] ?? []),
-            'story_momentum'         => (string)($result['story_momentum']         ?? ''),
-            'cool_point_type'        => (string)($result['cool_point_type']        ?? ''),
+            'story_momentum'         => (string)($result['story_momentum']        ?? ''),
+            'cool_point_type'        => (string)($result['cool_point_type']       ?? ''),
+            'character_emotions'     => (array)($result['character_emotions']     ?? []),
         ];
     } catch (Throwable $e) {
         return [];

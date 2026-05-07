@@ -28,6 +28,49 @@ class QualityMonitorAgent extends BaseAgent
         'acceptable' => 60,
         'poor' => 50,
     ];
+
+    private static $QUANTIFIABLE_DIRECTIVES = [
+        'coolpoint_density' => [
+            'template' => '本章每{interval}字必须包含至少{min_count}个爽点元素，建议类型：{examples}',
+            'default_params' => [
+                'interval' => 1000,
+                'min_count' => 3,
+                'examples' => '打脸、越级战斗、获得宝物/传承/能力之一',
+            ],
+        ],
+        'emotion_intensity' => [
+            'template' => '本章情绪词密度不低于{ratio}，每{interval}字至少{count}个情绪词',
+            'default_params' => [
+                'ratio' => 0.02,
+                'interval' => 1000,
+                'count' => 20,
+            ],
+        ],
+        'pacing_accelerate' => [
+            'template' => '节奏加速：本章场景切换不超过{scene_count}次，每段不超过{para_words}字',
+            'default_params' => [
+                'scene_count' => 5,
+                'para_words' => 150,
+            ],
+        ],
+        'quality_strict' => [
+            'template' => '严格质量检查：禁止OOC，每段对话必须符合角色性格设定',
+            'default_params' => [],
+        ],
+        'character_consistency' => [
+            'template' => '角色一致性检查：{char_reminder}',
+            'default_params' => [
+                'char_reminder' => '主角对话风格必须与其成长阶段一致，禁止出现超越当前境界的认知',
+            ],
+        ],
+        'description_richness' => [
+            'template' => '感官描写要求：每{interval}字至少{count}处感官细节（视觉/听觉/触觉/嗅觉/味觉）',
+            'default_params' => [
+                'interval' => 500,
+                'count' => 2,
+            ],
+        ],
+    ];
     
     /**
      * 构造函数
@@ -332,6 +375,47 @@ class QualityMonitorAgent extends BaseAgent
      * @param array $rec 建议
      * @return array 执行结果
      */
+    private function classifyIssueType(string $action): string
+    {
+        $typeMap = [
+            'enhance_quality_check' => 'quality_strict',
+            'strengthen_character_tracking' => 'character_consistency',
+            'adjust_coolpoint_strategy' => 'coolpoint_density',
+            'enrich_description' => 'description_richness',
+        ];
+        return $typeMap[$action] ?? 'generic';
+    }
+
+    private function generateQuantifiableDirective(string $action, array $rec): string
+    {
+        $type = $this->classifyIssueType($action);
+
+        if (!isset(self::$QUANTIFIABLE_DIRECTIVES[$type])) {
+            return null;
+        }
+
+        $template = self::$QUANTIFIABLE_DIRECTIVES[$type];
+        $params = $template['default_params'];
+        $issueMetric = $rec['issue']['metric'] ?? 0;
+        $severity = is_numeric($issueMetric) ? (float)$issueMetric : 50;
+
+        if ($type === 'coolpoint_density') {
+            $params['min_count'] = $severity < 40 ? 4 : ($severity < 60 ? 3 : 2);
+        } elseif ($type === 'emotion_intensity') {
+            $params['count'] = $severity < 40 ? 25 : ($severity < 60 ? 20 : 15);
+        } elseif ($type === 'description_richness') {
+            $params['count'] = $severity < 40 ? 3 : 2;
+        }
+
+        $directive = str_replace(
+            array_map(fn($k) => '{' . $k . '}', array_keys($params)),
+            array_values($params),
+            $template['template']
+        );
+
+        return $directive;
+    }
+
     private function executeRecommendation(array $rec): array
     {
         try {
@@ -339,33 +423,36 @@ class QualityMonitorAgent extends BaseAgent
                 case 'enhance_quality_check':
                     ConfigCenter::set('ws_quality_strictness', 'high', 'string');
                     $this->logAction($this->novelId, $rec['action'], 'success', $rec['params']);
-                    $issueMetric = $rec['issue']['metric'] ?? 'N/A';
-                    $issueThreshold = $rec['issue']['threshold'] ?? 'N/A';
-                    $this->writeDirective('quality', "本章启用严格质量检查。触发原因：整体质量评分{$issueMetric}分，低于可接受阈值{$issueThreshold}分。重点检查：结构完整性、角色一致性、剧情连贯性。");
+                    $quantitative = $this->generateQuantifiableDirective($rec['action'], $rec);
+                    $directive = $quantitative ?? "本章启用严格质量检查。触发原因：整体质量评分{$rec['issue']['metric']}分，低于可接受阈值{$rec['issue']['threshold']}分。重点检查：结构完整性、角色一致性、剧情连贯性。";
+                    $this->writeDirective('quality', $directive);
                     return ['action' => $rec['action'], 'status' => 'success', 'message' => '已启用严格质量检查'];
-                
+
                 case 'strengthen_character_tracking':
                     ConfigCenter::set('character_check_frequency', 'every_paragraph', 'string');
                     $this->logAction($this->novelId, $rec['action'], 'success', $rec['params']);
-                    $issueMetric = $rec['issue']['metric'] ?? 'N/A';
-                    $this->writeDirective('quality', "本章加强角色一致性检查。触发原因：角色一致性{$issueMetric}，存在OOC风险。重点检查：角色对话风格、行为逻辑、性格特征是否与设定一致。");
+                    $quantitative = $this->generateQuantifiableDirective($rec['action'], $rec);
+                    $directive = $quantitative ?? "本章加强角色一致性检查。触发原因：角色一致性{$rec['issue']['metric']}，存在OOC风险。重点检查：角色对话风格、行为逻辑、性格特征是否与设定一致。";
+                    $this->writeDirective('quality', $directive);
                     return ['action' => $rec['action'], 'status' => 'success', 'message' => '已加强角色追踪'];
-                
+
                 case 'adjust_coolpoint_strategy':
                     $currentIntensity = ConfigCenter::get('cool_point_intensity', 1.0);
                     ConfigCenter::set('cool_point_intensity', $currentIntensity + 0.2, 'float');
                     $this->logAction($this->novelId, $rec['action'], 'success', $rec['params']);
-                    $issueMetric = $rec['issue']['metric'] ?? 'N/A';
-                    $this->writeDirective('quality', "本章增加爽点强度，从{$currentIntensity}提升至" . ($currentIntensity + 0.2) . "。触发原因：爽点有效性{$issueMetric}，低于0.7阈值。重点：增强冲突张力、加快剧情节奏、强化情感冲击。");
+                    $quantitative = $this->generateQuantifiableDirective($rec['action'], $rec);
+                    $directive = $quantitative ?? "本章增加爽点强度，从{$currentIntensity}提升至" . ($currentIntensity + 0.2) . "。触发原因：爽点有效性{$rec['issue']['metric']}，低于0.7阈值。重点：增强冲突张力、加快剧情节奏、强化情感冲击。";
+                    $this->writeDirective('quality', $directive);
                     return ['action' => $rec['action'], 'status' => 'success', 'message' => '已调整爽点强度'];
-                
+
                 case 'enrich_description':
                     ConfigCenter::set('enable_sensory_details', true, 'bool');
                     $this->logAction($this->novelId, $rec['action'], 'success', $rec['params']);
-                    $issueMetric = $rec['issue']['metric'] ?? 'N/A';
-                    $this->writeDirective('quality', "本章启用感官描写。触发原因：描写丰富度{$issueMetric}，低于0.6阈值。重点：增加视觉、听觉、触觉、嗅觉、味觉描写，丰富场景细节和氛围营造。");
+                    $quantitative = $this->generateQuantifiableDirective($rec['action'], $rec);
+                    $directive = $quantitative ?? "本章启用感官描写。触发原因：描写丰富度{$rec['issue']['metric']}，低于0.6阈值。重点：增加视觉、听觉、触觉、嗅觉、味觉描写，丰富场景细节和氛围营造。";
+                    $this->writeDirective('quality', $directive);
                     return ['action' => $rec['action'], 'status' => 'success', 'message' => '已启用感官描写'];
-                
+
                 default:
                     return ['action' => $rec['action'], 'status' => 'skipped', 'message' => '未实现的操作'];
             }
@@ -373,7 +460,7 @@ class QualityMonitorAgent extends BaseAgent
             $this->logAction($this->novelId, $rec['action'], 'failed', [
                 'error' => $e->getMessage(),
             ]);
-            
+
             return [
                 'action' => $rec['action'],
                 'status' => 'failed',
@@ -485,7 +572,52 @@ class QualityMonitorAgent extends BaseAgent
             // 确保得分在合理范围内
             return max(0.0, min(1.0, $consistency));
         } catch (\Throwable $e) {
-            // 如果查询失败（比如表不存在），返回中性分数
+            if (str_contains($e->getMessage(), 'character_card_history')
+                || str_contains($e->getMessage(), "doesn't exist")
+                || str_contains($e->getMessage(), 'Unknown column')) {
+                error_log("character_card_history 表不存在或字段缺失，使用备用一致性检查: " . $e->getMessage());
+                return $this->fallbackCharacterConsistencyCheck($chapters);
+            }
+            error_log('Character consistency check failed: ' . $e->getMessage());
+            return 0.8;
+        }
+    }
+
+    private function fallbackCharacterConsistencyCheck(array $chapters): float
+    {
+        if (empty($chapters) || count($chapters) < 2) {
+            return 1.0;
+        }
+
+        try {
+            $engine = new MemoryEngine($this->novelId);
+            $cards = $engine->cards()->listAll();
+
+            if (empty($cards)) {
+                return 1.0;
+            }
+
+            $cardNames = array_column($cards, 'name');
+            $chapterCount = count($chapters);
+
+            $presenceCount = 0;
+            foreach ($chapters as $ch) {
+                $content = $ch['content'] ?? '';
+                if (empty($content)) continue;
+
+                foreach ($cardNames as $name) {
+                    if (mb_strpos($content, $name) !== false) {
+                        $presenceCount++;
+                        break;
+                    }
+                }
+            }
+
+            // 角色出场是正面信号：出场率越高，一致性越好
+            $consistency = min($presenceCount, $chapterCount) / $chapterCount;
+            return max(0.5, min(1.0, $consistency));
+        } catch (\Throwable $e) {
+            error_log('Fallback character consistency check failed: ' . $e->getMessage());
             return 0.8;
         }
     }
@@ -665,49 +797,6 @@ class QualityMonitorAgent extends BaseAgent
             return 'within_24h';
         } else {
             return 'within_week';
-        }
-    }
-    
-    /**
-     * 写入Agent指令
-     */
-    private function writeDirective(string $type, string $directive): void
-    {
-        try {
-            require_once __DIR__ . '/AgentDirectives.php';
-            
-            // 获取下一个要写的章节号（getCurrentChapterNumber() 已返回 COUNT(*) + 1）
-            $nextChapter = $this->getCurrentChapterNumber();
-            
-            AgentDirectives::add(
-                $this->novelId,
-                $nextChapter,
-                $type,
-                $directive,
-                3, // 生效3章
-                24 // 24小时后过期
-            );
-        } catch (\Throwable $e) {
-            error_log("写入Agent指令失败: " . $e->getMessage());
-        }
-    }
-    
-    /**
-     * 获取当前章节号
-     */
-    private function getCurrentChapterNumber(): int
-    {
-        try {
-            $result = DB::fetch(
-                'SELECT COUNT(*) + 1 as next_chapter 
-                 FROM chapters 
-                 WHERE novel_id = ? AND status = "completed"',
-                [$this->novelId]
-            );
-            
-            return (int)($result['next_chapter'] ?? 1);
-        } catch (\Throwable $e) {
-            return 1;
         }
     }
 }

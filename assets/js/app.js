@@ -35,10 +35,46 @@
 // 工具函数
 // ============================================================
 
+// 全局变量：1M上下文模型检测（由 generateOutline 初始化，其他函数复用）
+let _is1MModelCached = null;
+
+/**
+ * 检测当前模型是否支持 1M 上下文（从后端获取，带缓存）
+ * @returns {Promise<boolean>}
+ */
+async function checkIs1MModel() {
+    if (_is1MModelCached !== null) return _is1MModelCached;
+
+    try {
+        const r = await apiPost('api/actions.php', {
+            action: 'get_outline_progress',
+            novel_id: NOVEL_ID,
+        });
+        if (r.ok && r.data) {
+            _is1MModelCached = r.data.is_1m_model || false;
+            return _is1MModelCached;
+        }
+    } catch {}
+    return false;
+}
+
+/**
+ * 获取1M模式对应的超时时间
+ * @param {number} normalTimeout 普通模式超时（毫秒）
+ * @returns {number} 实际超时时间
+ */
+function getTimeoutFor1M(normalTimeout) {
+    if (_is1MModelCached === true) {
+        return normalTimeout * 2.5; // 1M模式超时时间翻倍
+    }
+    return normalTimeout;
+}
+
 async function apiPost(url, data) {
+    const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
     const res  = await fetch(url, {
         method:  'POST',
-        headers: {'Content-Type': 'application/json'},
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
         body:    JSON.stringify(data),
     });
     // 检查 HTTP 状态码
@@ -247,8 +283,42 @@ document.addEventListener('DOMContentLoaded', () => {
 let outlineController = null;
 let outlineRunning    = false;
 
-// 每次 SSE 调用生成的章节数（与后端批次大小一致，短连接不超时）
-const OUTLINE_CHUNK    = 5;
+/**
+ * 检测当前选择的模型是否支持 1M 上下文
+ * 通过模型名称中的 [1m] 标记识别
+ */
+function is1MModel() {
+    const modelSelect = document.getElementById('model-select');
+    if (!modelSelect) return false;
+
+    const selectedOption = modelSelect.options[modelSelect.selectedIndex];
+    if (!selectedOption || !selectedOption.text) return false;
+
+    return /\[1m\]/i.test(selectedOption.text);
+}
+
+/**
+ * 获取当前应使用的大纲批量大小
+ * 1M模型使用更大的批量，提升全书连贯性
+ */
+function getOutlineBatchSize() {
+    if (is1MModel()) {
+        // 1M模型：使用更大的批量（默认30章）
+        return (typeof OUTLINE_BATCH_SIZE_1M !== 'undefined' && OUTLINE_BATCH_SIZE_1M > 0)
+            ? OUTLINE_BATCH_SIZE_1M
+            : 30;
+    }
+    // 普通模型：使用标准批量
+    return (typeof OUTLINE_BATCH_SIZE !== 'undefined' && OUTLINE_BATCH_SIZE > 0)
+        ? OUTLINE_BATCH_SIZE
+        : 5;
+}
+
+// 每次 SSE 调用生成的章节数（动态检测，根据模型选择）
+// 注意：这是一个函数而非常量，需要在实际调用时获取
+const OUTLINE_CHUNK_DEFAULT = (typeof OUTLINE_BATCH_SIZE !== 'undefined' && OUTLINE_BATCH_SIZE > 0)
+    ? OUTLINE_BATCH_SIZE
+    : 5;
 // 断线后最多自动重连次数
 const MAX_RECONNECTS   = 5;
 // 断线后等待服务端完成当前批次的时间（ms）
@@ -262,9 +332,42 @@ async function generateOutline() {
     }
 
     const btnOutline = document.getElementById('btn-outline');
-    const outlined   = parseInt(btnOutline.dataset.outlined);
     const target     = parseInt(btnOutline.dataset.target);
     const novelId    = parseInt(btnOutline.dataset.novel);
+
+    // 先从数据库查询实际已生成的大纲数（避免页面缓存导致从头开始）
+    // 同时获取模型信息，决定批量大小
+    let outlined = 0;
+    let is1MModelFromBackend = false;
+    try {
+        const r = await apiPost('api/actions.php', {
+            action:   'get_outline_progress',
+            novel_id: novelId,
+        });
+        if (r.ok && r.data) {
+            outlined = r.data.last_outlined || 0;
+            is1MModelFromBackend = r.data.is_1m_model || false;
+            _is1MModelCached = is1MModelFromBackend; // 缓存供其他函数使用
+        }
+    } catch { /* ignore */ }
+
+    // 更新按钮上的 data-outlined 属性
+    if (btnOutline) {
+        btnOutline.dataset.outlined = outlined;
+    }
+
+    // 根据后端返回的模型信息决定批量大小（优先级高于前端下拉框检测）
+    let outlineChunk;
+    if (is1MModelFromBackend) {
+        outlineChunk = (typeof OUTLINE_BATCH_SIZE_1M !== 'undefined' && OUTLINE_BATCH_SIZE_1M > 0)
+            ? OUTLINE_BATCH_SIZE_1M
+            : 30;
+        console.log('检测到1M上下文模型，批量大小:', outlineChunk);
+    } else {
+        outlineChunk = (typeof OUTLINE_BATCH_SIZE !== 'undefined' && OUTLINE_BATCH_SIZE > 0)
+            ? OUTLINE_BATCH_SIZE
+            : 5;
+    }
 
     let startCh = 1;
     let endCh   = target;
@@ -372,13 +475,13 @@ async function generateOutline() {
         const decoder = new TextDecoder();
         let   buf = '', currentEvent = '';
 
-        // 心跳检测
+        // 心跳检测 - 深度思考模型涉及长时间推理+间歇输出，使用更长超时
         let lastHeartbeat = Date.now();
-        const HEARTBEAT_TIMEOUT = 120000; // 120秒无心跳视为断开（思考模型可能长时间无输出）
+        const HEARTBEAT_TIMEOUT = is1MModelFromBackend ? 600000 : 600000; // 统一10分钟，适配长思考
 
         // 更新顶部标签
         const totalRange = endCh - startCh + 1;
-        if (totalRange > OUTLINE_CHUNK) {
+        if (totalRange > outlineChunk) {
             label.textContent =
                 `生成第 ${chStart}～${chEnd} 章（共 ${totalRange} 章，` +
                 `已完成 ${chStart - startCh}）...`;
@@ -391,7 +494,8 @@ async function generateOutline() {
             // 在读取数据前检查心跳超时
             if (Date.now() - lastHeartbeat > HEARTBEAT_TIMEOUT) {
                 reader.cancel();
-                showToast('连接超时（120秒无响应），请检查网络或重试', 'error');
+                const timeoutMin = Math.round(HEARTBEAT_TIMEOUT / 60000);
+                showToast(`连接超时（${timeoutMin}分钟无响应），请检查网络或重试`, 'error');
                 return 'dropped';
             }
 
@@ -475,12 +579,43 @@ async function generateOutline() {
 
                     case 'chunk':
                         if (d.t) {
+                            lastHeartbeat = Date.now();
                             // 确保 cursor 在 streamBox 中，避免 insertBefore 错误
                             if (!streamBox.contains(cursor)) {
                                 streamBox.appendChild(cursor);
                             }
                             streamBox.insertBefore(document.createTextNode(d.t), cursor);
                             streamBox.scrollTop = streamBox.scrollHeight;
+                        }
+                        break;
+
+                    case 'thinking':
+                        if (d.thinking) {
+                            lastHeartbeat = Date.now();
+                            let thinkBox = document.getElementById('outline-thinking-box');
+                            if (!thinkBox) {
+                                const details = document.createElement('details');
+                                details.id = 'outline-thinking-details';
+                                details.className = 'mb-2';
+                                details.open = true;
+                                details.innerHTML =
+                                    '<summary class="text-muted small cursor-pointer">' +
+                                    '<i class="bi bi-lightbulb me-1"></i>AI 思考过程 <span id="outline-thinking-len" class="text-muted">0字</span>' +
+                                    '</summary>' +
+                                    '<div id="outline-thinking-box" class="outline-thinking-content p-2 small text-muted"' +
+                                    ' style="max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;background:rgba(99,102,241,0.04);border-radius:6px">' +
+                                    '</div>';
+                                streamBox.parentNode.insertBefore(details, streamBox);
+                                thinkBox = document.getElementById('outline-thinking-box');
+                            }
+                            thinkBox.textContent += d.thinking;
+                            thinkBox.scrollTop = thinkBox.scrollHeight;
+                            const lenEl = document.getElementById('outline-thinking-len');
+                            if (lenEl) {
+                                lenEl.textContent = (thinkBox.textContent.length > 500
+                                    ? (thinkBox.textContent.length / 1000).toFixed(1) + 'k'
+                                    : thinkBox.textContent.length) + '字';
+                            }
                         }
                         break;
 
@@ -527,14 +662,17 @@ async function generateOutline() {
                         
                         // 双重验证机制：检查是否完全生成
                         if (d.is_complete === false || d.saved < d.expected) {
-                            // 查询数据库获取实际保存的最大章节号
-                            const actualLast = await fetchLastOutlined();
-                            if (actualLast >= chStart) {
-                                // 更新 currentStart 为实际保存的下一章
-                                currentStart = actualLast + 1;
-                                showToast(`部分完成（${d.saved}/${d.expected}章），从第 ${currentStart} 章继续...`, 'warning');
+                            // 优先使用 SSE 事件中的 actual_end，避免额外 HTTP 请求
+                            const actualEnd = d.actual_end || (chStart + d.saved - 1);
+                            if (d.saved > 0 && actualEnd >= chStart) {
+                                currentStart = actualEnd + 1;
+                                const gaps = d.gaps || [];
+                                if (gaps.length > 0) {
+                                    showToast(`部分完成：第 ${gaps.join('、')} 章缺失，后续可通过「补写大纲」补齐`, 'warning');
+                                } else {
+                                    showToast(`部分完成（${d.saved}/${d.expected}章），从第 ${currentStart} 章继续...`, 'warning');
+                                }
                             } else {
-                                // 如果数据库也没有保存成功，保持当前位置重试
                                 showToast(`生成不完整，将重试第 ${chStart}～${chEnd} 章`, 'warning');
                             }
                         }
@@ -580,7 +718,7 @@ async function generateOutline() {
     // ================================================================
     try {
         while (currentStart <= endCh && outlineRunning) {
-            const currentEnd = Math.min(endCh, currentStart + OUTLINE_CHUNK - 1);
+            const currentEnd = Math.min(endCh, currentStart + outlineChunk - 1);
 
             const result = await runChunk(currentStart, currentEnd);
 
@@ -591,21 +729,17 @@ async function generateOutline() {
                 reconnects = 0;
                 
                 // 检查是否已经在 batch_done 事件中更新过 currentStart
-                // 如果 currentStart 已经大于 currentEnd，说明已经更新过了
+                // 如果 currentStart 已经大于 currentEnd，说明 batch_done 中已处理部分完成
                 if (currentStart <= currentEnd) {
-                    // 查询数据库获取实际保存的最大章节号
-                    const lastSaved = await fetchLastOutlined();
-                    if (lastSaved >= currentEnd) {
-                        currentStart = currentEnd + 1;
-                    } else if (lastSaved >= currentStart) {
-                        currentStart = lastSaved + 1;
-                    }
-                    // 否则保持 currentStart 不变，重试本批
+                    // 正常完成：batch_done 中未触发部分完成逻辑，直接推进
+                    currentStart = currentEnd + 1;
                 }
 
                 if (currentStart <= endCh && outlineRunning) {
                     label.textContent = `第 ${currentStart}～${currentEnd} 章已完成，稍后继续...`;
-                    await new Promise(r => setTimeout(r, 500));
+                    // 1M模型批量更大，后端弧段压缩需要更长时间，动态调整间隔
+                    const batchDelay = is1MModelFromBackend ? 1500 : 500;
+                    await new Promise(r => setTimeout(r, batchDelay));
                     streamBox.textContent = '';
                     streamBox.appendChild(cursor);
                 }
@@ -1025,6 +1159,9 @@ async function startAutoWrite() {
     // 如果正在运行 → 暂停
     if (autoWriteRunning) { stopAutoWrite(); return; }
 
+    // 检测是否为1M上下文模型（用于调整超时时间）
+    await checkIs1MModel();
+
     autoWriteRunning = true;
     autoWriteStop    = false;
     const myGen      = ++autoWriteGen;   // 本次运行的代号
@@ -1117,8 +1254,9 @@ async function startAutoWrite() {
             if (writeResult && writeResult.length > 50) {
                 ui.label.textContent = `第${next_chapter.chapter_number}章连接中断，等待后端完成...`;
                 let chapterDone = false;
-                // 等待后端完成落盘（最多等 180 秒，大模型输出+摘要+记忆引擎可能很慢）
-                for (let wait = 0; wait < 36; wait++) {
+                // 等待后端完成落盘（普通模式180秒，1M模式450秒）
+                const maxWaits = _is1MModelCached ? 90 : 36;  // 1M: 7.5分钟 / 普通: 3分钟
+                for (let wait = 0; wait < maxWaits; wait++) {
                     await new Promise(r => setTimeout(r, 5000));
                     try {
                         const statusRes = await apiPost('api/actions.php', {
@@ -1654,8 +1792,12 @@ async function streamWriteChapterAsync(novelId, chapterId, onComplete, displayEl
     let lastContentLength = 0;
     let lastMsgIndex = 0;  // 跟踪已处理的消息索引，避免重复显示
     let gotData = false;
+    let lastPollStatus = '';       // 最后轮询到的状态
+    let lastPollUpdatedAt = 0;     // 最后轮询到的 updated_at（秒）
+    let workerDeadDetected = false; // 是否检测到 worker 已死
     const POLL_INTERVAL = 150; // 0.15秒轮询一次
     const MAX_POLL_TIME = 600000; // 最多轮询 10 分钟
+    const WORKER_STALE_THRESHOLD = 120; // worker 2分钟无更新视为可能已死
     const startTime = Date.now();
     
     // 调试：每 3 秒打印一次轮询状态（仅首次 45 秒内）
@@ -1677,10 +1819,21 @@ async function streamWriteChapterAsync(novelId, chapterId, onComplete, displayEl
             continue;
         }
         
-        const { status, content, thinking_content, messages, words, model_used, error, chapter_id } = pollRes;
+        const { status, content, thinking_content, messages, words, model_used, error, chapter_id, updated_at } = pollRes;
+        lastPollStatus = status;
+        lastPollUpdatedAt = updated_at || 0;
+        
+        const nowTs = Date.now();
+        if (lastPollUpdatedAt > 0 && !workerDeadDetected) {
+            const staleSec = Math.round(nowTs / 1000) - lastPollUpdatedAt;
+            if (staleSec > WORKER_STALE_THRESHOLD && !gotData) {
+                workerDeadDetected = true;
+                console.error(`[write_chapter_async] Worker可能已死亡：${staleSec}秒未更新，status=${status}`);
+                break;
+            }
+        }
         
         // 调试：定期打印轮询状态
-        const nowTs = Date.now();
         if (nowTs - lastDebugLog > 3000 && nowTs - startTime < DEBUG_LOG_WINDOW) {
             console.log(`[write_chapter_async poll] status=${status} | content_len=${(content||'').length} | msgs_len=${(messages||[]).length} | elapsed=${Math.round((nowTs - startTime)/1000)}s`);
             lastDebugLog = nowTs;
@@ -1788,7 +1941,18 @@ async function streamWriteChapterAsync(novelId, chapterId, onComplete, displayEl
         console.warn(`[write_chapter_async] 轮询超时，保留已有${fullText.length}字`);
         return fullText;
     }
-    throw new Error('写作超时（10分钟无结果）');
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    const staleSec = lastPollUpdatedAt > 0 ? (Math.round(Date.now()/1000) - lastPollUpdatedAt) : '?';
+    const workerDead = lastPollUpdatedAt > 0 && staleSec > WORKER_STALE_THRESHOLD;
+    let diagMsg = `写作超时（${Math.round(elapsed/60)}分钟无结果）`;
+    if (workerDead) {
+        diagMsg += `，Worker可能已崩溃（进度${staleSec}秒未更新，最后状态：${lastPollStatus}）`;
+    } else if (lastPollStatus === 'starting') {
+        diagMsg += '，Worker卡在启动阶段，请检查PHP CLI和模型API配置';
+    } else if (lastPollStatus === 'waiting') {
+        diagMsg += '，AI模型长时间无响应，请检查API密钥和网络连通性';
+    }
+    throw new Error(diagMsg);
 }
 
 // ============================================================
@@ -2010,12 +2174,12 @@ async function streamWriteChapterSSE(novelId, chapterId, onComplete, displayEl, 
     }
 
     // 网络中断导致流提前结束，且未收到 onComplete 信号
-    // 说明内容不完整，应切换到异步模式重新发起写作
-    // （后端虽有 ignore_user_abort，但 Nginx 截断后 PHP 输出写会失败，
-    //   摘要生成/落盘可能中断，导致章节卡在 writing 状态）
     if (interruptedByNetwork && fullText.length > 0) {
-        console.warn(`[write_chapter] 网络中断，SSE 内容不完整（${fullText.length}字），切换到异步模式`);
-        throw new Error(`network error: SSE 连接被截断，已有${fullText.length}字不完整，需异步重试`);
+        // 后端设置了 ignore_user_abort(true)，即使前端断开也会继续写完并落盘
+        // 返回已有内容，让上层 autoWrite 循环的 waitForBackendComplete 逻辑接管
+        // （它会轮询章节状态，确认后端是否完成落盘）
+        console.warn(`[write_chapter] 网络中断，已有${fullText.length}字，返回已有内容等待后端完成`);
+        return fullText;
     }
 
     return fullText;
@@ -2062,9 +2226,10 @@ async function cancelWriting() {
     }
     
     try {
+        const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
         const res = await fetch('api/cancel_write.php', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
             body: JSON.stringify({
                 action: 'cancel',
                 novel_id: NOVEL_ID
@@ -2099,9 +2264,10 @@ async function resetChapters() {
     }
     
     try {
+        const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
         const res = await fetch('api/cancel_write.php', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
             body: JSON.stringify({
                 action: 'reset',
                 novel_id: NOVEL_ID
@@ -2137,9 +2303,10 @@ async function runConsistencyCheck() {
     btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 检查中...';
     
     try {
+        const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
         const res = await fetch('api/validate_consistency.php', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
             body: JSON.stringify({
                 novel_id: novelId,
                 chapter_number: chapterNumber || 0
@@ -2238,9 +2405,10 @@ window.resetSingleChapter = async function(chapterId) {
     }
     
     try {
+        const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
         const res = await fetch('api/cancel_write.php', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
             body: JSON.stringify({
                 action: 'reset_chapter',
                 novel_id: NOVEL_ID,
@@ -2354,6 +2522,35 @@ async function supplementOutline() {
                     try { d = JSON.parse(raw); } catch { continue; }
 
                     switch (currentEvent) {
+                        case 'thinking':
+                            if (d.thinking) {
+                                let tBox = document.getElementById('outline-thinking-box');
+                                if (!tBox) {
+                                    const tDetails = document.createElement('details');
+                                    tDetails.id = 'outline-thinking-details';
+                                    tDetails.className = 'mb-2';
+                                    tDetails.open = true;
+                                    tDetails.innerHTML =
+                                        '<summary class="text-muted small cursor-pointer">' +
+                                        '<i class="bi bi-lightbulb me-1"></i>AI 思考过程 <span id="outline-thinking-len" class="text-muted">0字</span>' +
+                                        '</summary>' +
+                                        '<div id="outline-thinking-box" class="outline-thinking-content p-2 small text-muted"' +
+                                        ' style="max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;background:rgba(99,102,241,0.04);border-radius:6px">' +
+                                        '</div>';
+                                    streamBox.parentNode.insertBefore(tDetails, streamBox);
+                                    tBox = document.getElementById('outline-thinking-box');
+                                }
+                                tBox.textContent += d.thinking;
+                                tBox.scrollTop = tBox.scrollHeight;
+                                const tLenEl = document.getElementById('outline-thinking-len');
+                                if (tLenEl) {
+                                    tLenEl.textContent = (tBox.textContent.length > 500
+                                        ? (tBox.textContent.length / 1000).toFixed(1) + 'k'
+                                        : tBox.textContent.length) + '字';
+                                }
+                            }
+                            break;
+
                         case 'scan_result':
                             label.textContent = d.msg || '扫描完成';
                             break;
@@ -2409,7 +2606,13 @@ async function supplementOutline() {
                             batchLog.appendChild(item);
                             batchLog.scrollTop = batchLog.scrollHeight;
                             label.textContent = d.msg;
-                            
+
+                            // 显示截断缺口信息
+                            const gaps = d.gaps || [];
+                            if (gaps.length > 0) {
+                                showToast(`有 ${gaps.length} 章缺失（第 ${gaps.join('、')} 章），可再次「补写大纲」补齐`, 'warning');
+                            }
+
                             // 有进展时重置重试次数
                             retries = 0;
                             break;
@@ -2471,8 +2674,16 @@ async function generateStoryOutline() {
     const btn = document.getElementById('btn-story-outline');
     if (!btn) return;
     const novelId = parseInt(btn.dataset.novel);
+    const hasChapters = (parseInt(btn.dataset.completed) || 0) > 0;
 
-    if (!confirm('确定要生成全书故事大纲吗？\n\n这将建立全局故事框架，帮助后续章节生成更加连贯。\n生成后可以在"小说设定"标签页查看。')) {
+    let confirmMsg = '确定要生成全书故事大纲吗？\n\n';
+    if (hasChapters) {
+        confirmMsg += '检测到已有章节内容，将基于现有章节反向推导故事框架（故事主线、三幕结构、角色成长轨迹、等级发展等）。\n\n生成后可以在"小说设定"标签页查看。';
+    } else {
+        confirmMsg += '这将建立全局故事框架，帮助后续章节生成更加连贯。\n生成后可以在"小说设定"标签页查看。';
+    }
+
+    if (!confirm(confirmMsg)) {
         return;
     }
 
@@ -2531,6 +2742,35 @@ async function generateStoryOutline() {
                 switch (currentEvent) {
                     case 'progress':
                         label.textContent = d.msg || '生成中...';
+                        break;
+
+                    case 'thinking':
+                        if (d.thinking) {
+                            let sThinkBox = document.getElementById('story-outline-thinking-box');
+                            if (!sThinkBox) {
+                                const sDetails = document.createElement('details');
+                                sDetails.id = 'story-outline-thinking-details';
+                                sDetails.className = 'mb-2';
+                                sDetails.open = true;
+                                sDetails.innerHTML =
+                                    '<summary class="text-muted small cursor-pointer">' +
+                                    '<i class="bi bi-lightbulb me-1"></i>AI 思考过程 <span id="story-outline-thinking-len" class="text-muted">0字</span>' +
+                                    '</summary>' +
+                                    '<div id="story-outline-thinking-box" class="outline-thinking-content p-2 small text-muted"' +
+                                    ' style="max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;background:rgba(99,102,241,0.04);border-radius:6px">' +
+                                    '</div>';
+                                streamBox.parentNode.insertBefore(sDetails, streamBox);
+                                sThinkBox = document.getElementById('story-outline-thinking-box');
+                            }
+                            sThinkBox.textContent += d.thinking;
+                            sThinkBox.scrollTop = sThinkBox.scrollHeight;
+                            const sLenEl = document.getElementById('story-outline-thinking-len');
+                            if (sLenEl) {
+                                sLenEl.textContent = (sThinkBox.textContent.length > 500
+                                    ? (sThinkBox.textContent.length / 1000).toFixed(1) + 'k'
+                                    : sThinkBox.textContent.length) + '字';
+                            }
+                        }
                         break;
 
                     case 'chunk':
@@ -2791,9 +3031,10 @@ async function optimizeOutlineLogic() {
 
         let response;
         try {
+            const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
             response = await fetch('api/optimize_outline.php', {
                 method:  'POST',
-                headers: {'Content-Type': 'application/json'},
+                headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
                 body:    JSON.stringify({
                     novel_id:   novelId,
                     start_from: fromChapter,

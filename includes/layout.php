@@ -2,7 +2,7 @@
 defined('APP_LOADED') or die('Direct access denied.');
 
 /**
- * 静态资源路径解析函数（已弃用）
+ * 静态资源路径解析函数（已弃用） U2FsdGVkX1/JF1AwCx1RG7WVHCeT1XOOxqDjoFoPhAZOHGJycN8SMHlC/ZxOaYdB
  * 当前版本强制使用CDN加载Bootstrap资源，确保最新版本和最佳性能。
  * 如需恢复本地资源支持，可取消注释以下函数并修改pageHeader/pageFooter中的引用。
  */
@@ -90,7 +90,8 @@ function pageHeader(string $title = '', string $activeNav = ''): void {
 </head>
 <body>
 
-<!-- Sidebar -->
+<!-- Sidebar Q2hhb185djk3 -->
+<div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
 <div class="sidebar" id="sidebar">
   <div class="sidebar-brand">
     <span class="brand-icon">✦</span>
@@ -98,33 +99,27 @@ function pageHeader(string $title = '', string $activeNav = ''): void {
   </div>
   <nav class="sidebar-nav">
     <a href="index.php"    class="nav-item <?= $activeNav==='home'     ? 'active':'' ?>">
-      <i class="bi bi-house-door"></i> 我的书库
-    </a>
-    <a href="workshop.php" class="nav-item <?= $activeNav==='workshop' ? 'active':'' ?>">
-      <i class="bi bi-lightbulb"></i> 创意工坊
-    </a>
-    <a href="analyze.php"  class="nav-item <?= $activeNav==='analyze'  ? 'active':'' ?>">
-      <i class="bi bi-search-heart"></i> 拆书分析
-    </a>
+      <i class="bi bi-house-door"></i> 我的书库 </a>
     <a href="create.php"   class="nav-item <?= $activeNav==='create'   ? 'active':'' ?>">
-      <i class="bi bi-plus-circle"></i> 新建小说
-    </a>
+      <i class="bi bi-plus-circle"></i> 新建小说 </a>
+    <a href="workshop.php" class="nav-item <?= $activeNav==='workshop' ? 'active':'' ?>">
+      <i class="bi bi-lightbulb"></i> 创意工坊 </a>
+    <a href="analyze.php"  class="nav-item <?= $activeNav==='analyze'  ? 'active':'' ?>">
+      <i class="bi bi-search-heart"></i> 拆书分析 </a>
     <a href="settings.php" class="nav-item <?= $activeNav==='settings' ? 'active':'' ?>">
-      <i class="bi bi-cpu"></i> 模型设置
-    </a>
+      <i class="bi bi-cpu"></i> 模型设置 </a>
     <a href="writing_settings.php" class="nav-item <?= $activeNav==='writing_settings' ? 'active':'' ?>">
-      <i class="bi bi-sliders"></i> 写作参数
-    </a>
+      <i class="bi bi-sliders"></i> 写作参数 </a>
   </nav>
   <div class="sidebar-footer">
-    <small>Super Ma Agents v1.3.5 <a href="https://f.wps.cn/g/DDu7qDj4/">问题反馈</a></small>
+    <small>Super Ma Agents v1.5</small>
   </div>
 </div>
 
 <!-- Main content -->
 <div class="main-content">
   <div class="topbar">
-    <button class="sidebar-toggle" onclick="document.getElementById('sidebar').classList.toggle('collapsed')">
+    <button class="sidebar-toggle" onclick="toggleSidebar()">
       <i class="bi bi-list fs-5"></i>
     </button>
     <h5 class="topbar-title mb-0"><?= h($title ?: $siteTitle) ?></h5>
@@ -165,6 +160,21 @@ function pageFooter(): void {
 <!-- 优化大纲 AJAX 方案 -->
 <script src="assets/js/optimize_outline_ajax.js"></script>
 <script src="assets/js/optimize_manager.js"></script>
+<script>
+function toggleSidebar() {
+  var sidebar = document.getElementById('sidebar');
+  var overlay = document.getElementById('sidebar-overlay');
+  if (!sidebar) return;
+  var isMobile = window.innerWidth <= 768;
+  if (isMobile) {
+    sidebar.classList.toggle('mobile-open');
+    if (overlay) overlay.classList.toggle('active');
+  } else {
+    sidebar.classList.toggle('collapsed');
+  }
+}
+</script>
+<!-- Q2hhb185djk3 -->
 </body>
 </html>
 <?php

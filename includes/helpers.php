@@ -87,12 +87,14 @@ function truncateToWordLimit(string $content, int $maxWords): string
 {
     if (mb_strlen($content) <= $maxWords) return $content;
 
-    // 从 92% 处往前找最近的双换行（段落边界）
-    $searchEnd = min((int)($maxWords * 1.05), mb_strlen($content));
-    $searchStart = (int)($maxWords * 0.88);
+    // v1.5.3 修复：searchEnd 严格限制在 maxWords，与 Prompt 铁律一致
+    // 不允许超字，在 maxWords 以内寻找最佳截断点
+    $searchEnd = $maxWords;  // 严格限制，不再 * 1.05
+    $searchStart = (int)($maxWords * 0.85);  // 从 85% 处开始寻找边界
 
     $sub = mb_substr($content, 0, $searchEnd);
-    // 优先找双换行（段落）
+
+    // 优先找双换行（段落边界）
     $pos = mb_strrpos($sub, "\n\n");
     if ($pos !== false && $pos >= $searchStart) {
         return mb_substr($content, 0, $pos);
@@ -102,14 +104,21 @@ function truncateToWordLimit(string $content, int $maxWords): string
     if ($pos !== false && $pos >= $searchStart) {
         return mb_substr($content, 0, $pos);
     }
-    // 最后找句号/叹号/问号
-    foreach (['。', '！', '？', '!', '?'] as $punct) {
-        $pos = mb_strrpos(mb_substr($content, 0, $maxWords + 50), $punct);
+    // 找句号/叹号/问号（句末边界）
+    foreach (['。', '！', '？', '」', '』', '!', '?'] as $punct) {
+        $pos = mb_strrpos($sub, $punct);
         if ($pos !== false && $pos >= $searchStart) {
             return mb_substr($content, 0, $pos + 1);
         }
     }
-    // 实在找不到边界，硬截
+    // 找对话结束标记
+    foreach (['……', '——'] as $marker) {
+        $pos = mb_strrpos($sub, $marker);
+        if ($pos !== false && $pos >= $searchStart) {
+            return mb_substr($content, 0, $pos + mb_strlen($marker));
+        }
+    }
+    // 实在找不到边界，硬截（严格限制在 maxWords）
     return mb_substr($content, 0, $maxWords);
 }
 
@@ -193,7 +202,7 @@ function statusBadge(string $status): string {
 function genreOptions(): array {
     return [
         '玄幻修仙', '都市言情', '科幻末世', '历史穿越', '武侠仙侠',
-        '悬疑推理', '奇幻冒险', '军事战争', '游戏竞技', '其他',
+        '悬疑推理', '奇幻冒险', '军事战争', '游戏竞技', '同人小说', '其他',
         '__custom__' => '自定义',
     ];
 }
@@ -297,7 +306,8 @@ function extractOutlineObjects(string $raw): array {
  * 修复 JSON 字段内的未转义引号（AI 常见输出问题）
  */
 function fixJsonString(string $s): string {
-    return preg_replace_callback(
+    // Fix common fields with unescaped quotes
+    $s = preg_replace_callback(
         '/"(chapter_number|title|summary|hook|outline)":\s*"((?:[^"\\\\]|\\\\.)*)"$/mu',
         function ($m) {
             $val = str_replace('"', '\\"', $m[2]);
@@ -305,7 +315,18 @@ function fixJsonString(string $s): string {
             return '"' . $m[1] . '": "' . $val . '"';
         },
         $s
-    ) ?? $s;
+    );
+    // Fix hook_type with unescaped quotes (e.g., "hook_type": "info_bomb")
+    $s = preg_replace_callback(
+        '/"(hook_type|pacing|suspense|cool_point_type)":\s*"((?:[^"\\\\]|\\\\.)*)"$/mu',
+        function ($m) {
+            $val = str_replace('"', '\\"', $m[2]);
+            $val = str_replace('\\\\"', '\\"', $val);
+            return '"' . $m[1] . '": "' . $val . '"';
+        },
+        $s
+    );
+    return $s;
 }
 
 /**
@@ -454,4 +475,137 @@ function getActInfo(array $storyOutline, int $chapterNumber): array {
     }
 
     return ['theme' => '未知', 'key_events' => '未知'];
+}
+
+/**
+ * v1.10.3: 情绪曲线异常检测
+ * 检查近20章的情绪分数，识别异常模式
+ *
+ * @return array|null 异常信息（type/avg/variance/severity），无异常返回 null
+ */
+function detectEmotionCurveAnomaly(int $novelId): ?array
+{
+    $scores = DB::fetchAll(
+        'SELECT chapter_number, emotion_score FROM chapters
+         WHERE novel_id=? AND emotion_score IS NOT NULL AND status="completed"
+         ORDER BY chapter_number DESC LIMIT 20',
+        [$novelId]
+    );
+    if (count($scores) < 10) return null;
+
+    $recent10 = array_slice(array_map(fn($s) => (float)$s['emotion_score'], $scores), 0, 10);
+    $avgRecent = array_sum($recent10) / count($recent10);
+
+    // 方差计算
+    $variance = 0;
+    foreach ($recent10 as $v) {
+        $variance += ($v - $avgRecent) ** 2;
+    }
+    $variance /= count($recent10);
+
+    // 异常1：连续10章情绪低位（均值 < 50 且最高分 < 60）
+    if ($avgRecent < 50 && max($recent10) < 60) {
+        return [
+            'type'     => 'low_emotion_streak',
+            'severity' => 'high',
+            'avg'      => $avgRecent,
+            'variance' => $variance,
+            'max'      => max($recent10),
+        ];
+    }
+
+    // 异常2：方差过低（情绪持平，读者疲劳）
+    if ($variance < 100) {
+        return [
+            'type'     => 'flat_emotion_curve',
+            'severity' => 'medium',
+            'avg'      => $avgRecent,
+            'variance' => $variance,
+        ];
+    }
+
+    return null;
+}
+
+/**
+ * v1.10.3: 读者画像配置
+ * 为不同平台读者定制写作偏好
+ */
+const READER_PROFILES = [
+    'qidian_male' => [
+        'label'                    => '起点男频',
+        'cool_point_density'       => 'high',
+        'cool_point_types_priority'=> ['underdog_win', 'face_slap', 'breakthrough'],
+        'dialogue_density'         => 'medium',
+        'description_density'      => 'low',
+        'foreshadowing_complexity' => 'low',
+        'pace_preference'          => 'fast',
+        'prompt_hint'              => '节奏快、爽点密、每章必有爽感，读者追求即时满足',
+    ],
+    'qidian_female' => [
+        'label'                    => '起点女频',
+        'cool_point_density'       => 'medium',
+        'cool_point_types_priority'=> ['romance_win', 'truth_reveal', 'underdog_win'],
+        'dialogue_density'         => 'high',
+        'description_density'      => 'medium',
+        'foreshadowing_complexity' => 'medium',
+        'pace_preference'          => 'medium',
+        'prompt_hint'              => '偏感情线、人物深、设定细，注重情感共鸣',
+    ],
+    'jjwxc' => [
+        'label'                    => '晋江',
+        'cool_point_density'       => 'low',
+        'cool_point_types_priority'=> ['romance_win', 'sacrifice', 'truth_reveal'],
+        'character_inner_world'    => 'high',
+        'dialogue_density'         => 'high',
+        'description_density'      => 'high',
+        'sensory_richness'         => 'high',
+        'foreshadowing_complexity' => 'high',
+        'pace_preference'          => 'slow',
+        'prompt_hint'              => '注重文笔质感、人物心理描写、五感细节丰富，读者偏好沉浸式阅读',
+    ],
+    'fanqie' => [
+        'label'                    => '番茄',
+        'cool_point_density'       => 'high',
+        'cool_point_types_priority'=> ['underdog_win', 'face_slap', 'revenge'],
+        'dialogue_density'         => 'high',
+        'description_density'      => 'low',
+        'foreshadowing_complexity' => 'low',
+        'pace_preference'          => 'fast',
+        'prompt_hint'              => '节奏极快、章节短爽点足、语言直白，读者碎片化阅读',
+    ],
+    'physical_book' => [
+        'label'                    => '实体出版',
+        'cool_point_density'       => 'low',
+        'cool_point_types_priority'=> ['truth_reveal', 'sacrifice', 'breakthrough'],
+        'dialogue_density'         => 'medium',
+        'description_density'      => 'high',
+        'foreshadowing_complexity' => 'high',
+        'pace_preference'          => 'slow',
+        'prompt_hint'              => '偏文笔质感、世界观深、伏笔精密，读者注重文学性',
+    ],
+    'general' => [
+        'label'                    => '通用',
+        'cool_point_density'       => 'medium',
+        'cool_point_types_priority'=> ['underdog_win', 'breakthrough', 'truth_reveal'],
+        'dialogue_density'         => 'medium',
+        'description_density'      => 'medium',
+        'foreshadowing_complexity' => 'medium',
+        'pace_preference'          => 'medium',
+        'prompt_hint'              => '平衡各类要素，无特殊偏向',
+    ],
+];
+
+function readerProfileOptions(): array
+{
+    $options = [];
+    foreach (READER_PROFILES as $key => $profile) {
+        $options[$key] = $profile['label'];
+    }
+    return $options;
+}
+
+function getReaderProfile(string $targetReader): array
+{
+    return READER_PROFILES[$targetReader] ?? READER_PROFILES['general'];
 }

@@ -11,6 +11,15 @@
  */
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
+
+// v1.8: CLI 模式硬校验——防止 HTTP 直接访问绕过登录
+// 此脚本第 33 行会伪造 $_SESSION['logged_in']=true 跳过登录校验，
+// 必须确保仅 CLI 模式可入。HTTP 访问立刻 403 退出。
+if (PHP_SAPI !== 'cli') {
+    http_response_code(403);
+    exit('CLI mode only');
+}
+
 // output_buffering 是 PHP_INI_PERDIR 级别，ini_set() 无法修改
 // 改用 ob_end_clean() 在运行时清除缓冲区
 while (ob_get_level()) ob_end_clean();
@@ -63,10 +72,37 @@ if (!file_exists($asyncProgressFile)) {
     exit(1);
 }
 
+register_shutdown_function(function() {
+    global $asyncProgressFile, $asyncTaskId;
+    $err = error_get_last();
+    if ($err === null) return;
+    if (!in_array($err['type'] ?? 0, [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR])) return;
+    if (!$asyncProgressFile || !file_exists($asyncProgressFile)) return;
+    $fp = @fopen($asyncProgressFile, 'r+');
+    if (!$fp) return;
+    flock($fp, LOCK_EX);
+    $data = stream_get_contents($fp);
+    $progress = json_decode($data, true) ?: [];
+    if (in_array($progress['status'] ?? '', ['done', 'completed', 'error'])) {
+        flock($fp, LOCK_UN); fclose($fp); return;
+    }
+    $errMsg = ($err['message'] ?? 'unknown fatal error') . " in {$err['file']}:{$err['line']}";
+    $progress['status'] = 'error';
+    $progress['error']  = 'Worker致命错误：' . $errMsg;
+    $progress['updated_at'] = time();
+    fseek($fp, 0);
+    ftruncate($fp, 0);
+    fwrite($fp, json_encode($progress, JSON_UNESCAPED_UNICODE));
+    flock($fp, LOCK_UN);
+    fclose($fp);
+    error_log("[write_worker] 致命错误: {$errMsg}");
+});
+
 // ---- 引入 write_chapter.php 的核心逻辑 ----
 // 不能直接 require，因为 headers 已发。我们只复用函数定义。
 
 $lastHeartbeat = time();
+$_writingChapterId = null;
 
 // 写入缓冲：攒一批 token 再刷新进度文件，减少 I/O 压力
 $chunkBuffer = '';
@@ -120,13 +156,19 @@ function updateAsyncProgress(array $updates): void {
 }
 
 function sendHeartbeatWrite(): void {
-    global $lastHeartbeat, $asyncTaskId, $chunkBuffer, $chunkBufferCount, $lastFlushTime;
+    global $lastHeartbeat, $asyncTaskId, $chunkBuffer, $chunkBufferCount, $lastFlushTime, $_writingChapterId;
     $now = microtime(true);
     // 检查是否需要刷新缓冲（时间到了或数量够了）
     if ($chunkBuffer !== '' && ($now - $lastFlushTime >= CHUNK_FLUSH_INTERVAL || $chunkBufferCount >= CHUNK_FLUSH_COUNT)) {
         flushChunkBuffer();
     }
     if ($now - $lastHeartbeat < 10) return;
+    // 心跳时刷新章节 updated_at，防止 Watchdog 误杀正在写作的章节
+    if ($_writingChapterId > 0) {
+        try {
+            DB::query('UPDATE chapters SET updated_at = NOW() WHERE id = ? AND status = "writing"', [$_writingChapterId]);
+        } catch (\Throwable) {}
+    }
     updateAsyncProgress(['status' => 'writing', 'heartbeat' => $now]);
     $lastHeartbeat = $now;
 }
@@ -208,7 +250,13 @@ try {
     $resolved = WriteEngine::resolveChapter($novelId, $chapterId);
     $novel    = $resolved['n'];
     $ch       = $resolved['ch'];
+    $_writingChapterId = (int)$ch['id'];
+
+    // v1.11.5: 始终使用 writing_settings 全局目标字数，
+    // 否则 writing_settings.php 修改字数后对已有小说不生效
+    $novel['chapter_words'] = max(500, (int)getSystemSetting('ws_chapter_words', (int)$novel['chapter_words'], 'int'));
 } catch (RuntimeException $e) {
+    error_log("[write_worker] Phase1 resolveChapter 失败: {$e->getMessage()}");
     updateAsyncProgress(['status' => 'error', 'error' => $e->getMessage()]);
     exit(1);
 }
@@ -226,7 +274,16 @@ try {
     $memoryCtx = null;
 }
 
-$messages    = WriteEngine::buildPrompt($novel, $ch, $memoryCtx);
+try {
+    $messages = WriteEngine::buildPrompt($novel, $ch, $memoryCtx);
+} catch (Throwable $e) {
+    error_log("[write_worker] Phase3 buildPrompt 失败: {$e->getMessage()}");
+    addLog($novelId, 'error', 'buildPrompt 失败：' . $e->getMessage());
+    updateAsyncProgress(['status' => 'error', 'error' => 'Prompt构建失败：' . $e->getMessage()]);
+    DB::update('chapters', ['status' => 'outlined'], 'id=?', [$ch['id']]);
+    DB::update('novels', ['status' => 'paused'], 'id=?', [$novelId]);
+    exit(1);
+}
 $targetWords = (int)$novel['chapter_words'];
 $fullContent = '';
 $usedModel   = null;
@@ -240,7 +297,8 @@ try {
         function(string $token) { sseChunkWrite($token); },
         function(array $payload) { sseMsgWrite($payload); },
         function() { sendHeartbeatWrite(); },
-        function(string $reasoning) { sseThinkingWrite($reasoning); }
+        function(string $reasoning) { sseThinkingWrite($reasoning); },
+        $novel['model_id'] ? (int)$novel['model_id'] : null
     );
     $fullContent       = $result['content'];
     $usedModel         = $result['model'];
@@ -248,6 +306,7 @@ try {
     $streamDurationMs  = $result['duration_ms'] ?? null;
 } catch (Exception $e) {
     $msg = $e->getMessage();
+    error_log("[write_worker] Phase4 streamWrite 失败: {$msg}");
     $isCancel = strpos($msg, '取消') !== false;
     flushChunkBuffer();
     DB::update('chapters', ['status' => 'outlined'], 'id=?', [$ch['id']]);

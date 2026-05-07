@@ -21,6 +21,7 @@ try {
     $majorTurningPoints = $input['major_turning_points'] ?? null;
     $characterArcsStr = trim($input['character_arcs'] ?? '');
     $characterEndpoints = trim($input['character_endpoints'] ?? '');
+    $characterProgression = $input['character_progression'] ?? null;
     $worldEvolution = trim($input['world_evolution'] ?? '');
     $recurringMotifs = $input['recurring_motifs'] ?? null;
 
@@ -41,6 +42,14 @@ try {
     // 检查是否已存在
     $exists = DB::fetch('SELECT id FROM story_outlines WHERE novel_id = ?', [$novelId]);
 
+    // 兜底：确保 character_progression 列存在
+    try {
+        $hasCol = DB::fetch("SHOW COLUMNS FROM story_outlines LIKE 'character_progression'");
+        if (!$hasCol) {
+            DB::query("ALTER TABLE `story_outlines` ADD COLUMN `character_progression` JSON DEFAULT NULL COMMENT '角色等级/境界发展轨迹' AFTER `character_endpoints`");
+        }
+    } catch (\Throwable) {}
+
     if ($exists) {
         // 更新
         DB::update(
@@ -51,6 +60,7 @@ try {
                 'major_turning_points' => $majorTurningPoints ? json_encode($majorTurningPoints, JSON_UNESCAPED_UNICODE) : null,
                 'character_arcs' => $characterArcs,
                 'character_endpoints' => $characterEndpoints ?: null,
+                'character_progression' => $characterProgression ? json_encode($characterProgression, JSON_UNESCAPED_UNICODE) : null,
                 'world_evolution' => $worldEvolution,
                 'recurring_motifs' => $recurringMotifs ? json_encode($recurringMotifs, JSON_UNESCAPED_UNICODE) : null
             ],
@@ -66,6 +76,7 @@ try {
             'major_turning_points' => $majorTurningPoints ? json_encode($majorTurningPoints, JSON_UNESCAPED_UNICODE) : null,
             'character_arcs' => $characterArcs,
             'character_endpoints' => $characterEndpoints ?: null,
+            'character_progression' => $characterProgression ? json_encode($characterProgression, JSON_UNESCAPED_UNICODE) : null,
             'world_evolution' => $worldEvolution,
             'recurring_motifs' => $recurringMotifs ? json_encode($recurringMotifs, JSON_UNESCAPED_UNICODE) : null
         ]);

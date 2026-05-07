@@ -175,7 +175,7 @@ pageHeader('拆书分析', 'analyze');
                     <div class="text-center text-muted my-2" style="font-size:13px">—— 或者粘贴内容 ——</div>
                     <textarea class="form-control" id="bookChapters" rows="10"
                         placeholder="粘贴小说章节内容...&#10;建议粘贴前3-10章（约1-3万字）"></textarea>
-                    <div class="char-ct" id="charCounter">0 / 60,000 字</div>
+                    <div class="char-ct" id="charCounter">0 / 60,000 字（1M模型：200,000字）</div>
                     <div id="uploadedFileInfo" style="display:none" class="alert alert-success py-2 mt-2 mb-0">
                         <i class="bi bi-file-check me-1"></i><span id="uploadedFileName"></span>
                         <button type="button" class="btn-close float-end p-0" style="font-size:10px" onclick="clearUploadedFile()"></button>
@@ -364,11 +364,19 @@ function clearUploadedFile() {
 }
 
 document.getElementById('bookChapters').addEventListener('input', updateCharCounter);
+document.getElementById('bookModel').addEventListener('change', updateCharCounter);
+
 function updateCharCounter() {
     const len = (document.getElementById('bookChapters').value||'').length;
     const ct = document.getElementById('charCounter');
-    ct.textContent = `${len.toLocaleString()} / 60,000 字`;
-    ct.className = 'char-ct' + (len>60000?' over':len>45000?' warn':'');
+    const modelSelect = document.getElementById('bookModel');
+    const selectedOption = modelSelect.options[modelSelect.selectedIndex];
+    const is1MModel = selectedOption && /\[1m\]/i.test(selectedOption.text);
+    const maxChars = is1MModel ? 200000 : 60000;
+    const warnChars = maxChars * 0.75;
+
+    ct.textContent = `${len.toLocaleString()} / ${maxChars.toLocaleString()} 字${is1MModel ? '（1M模式）' : ''}`;
+    ct.className = 'char-ct' + (len > maxChars ? ' over' : len > warnChars ? ' warn' : '');
 }
 
 // ========== 分步分析 (SSE 流式) ==========

@@ -27,6 +27,7 @@ require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 require_once dirname(__DIR__) . '/includes/write_engine.php';
+require_once dirname(__DIR__) . '/includes/stats_tracker.php';
 requireLoginApi();
 session_write_close();
 
@@ -42,6 +43,7 @@ while (ob_get_level()) ob_end_clean();
 $asyncTaskId = null;
 $asyncProgressFile = null;
 $asyncMessages = [];
+$_writingChapterId = null;
 
 // 全局异常捕获，确保发生错误时正常结束SSE连接，避免触发 ERR_INCOMPLETE_CHUNKED_ENCODING
 set_exception_handler(function (Throwable $e) {
@@ -176,9 +178,16 @@ function updateAsyncProgress(array $updates): void {
 }
 
 function sendHeartbeatWrite(): void {
-    global $lastHeartbeat, $asyncTaskId;
+    global $lastHeartbeat, $asyncTaskId, $_writingChapterId;
     $now = time();
     if ($now - $lastHeartbeat < CFG_SSE_HEARTBEAT) return;
+    
+    // 心跳时刷新章节 updated_at，防止 Watchdog 误杀正在写作的章节
+    if ($_writingChapterId > 0) {
+        try {
+            DB::query('UPDATE chapters SET updated_at = NOW() WHERE id = ? AND status = "writing"', [$_writingChapterId]);
+        } catch (\Throwable) {}
+    }
     
     if ($asyncTaskId) {
         // 异步模式：更新进度文件的时间戳（保活）
@@ -233,7 +242,7 @@ function sseMsgWrite(array $payload): void {
         // 异步模式：将消息追加到进度文件的 messages 数组
         updateAsyncProgress([
             'messages' => $asyncMessages,
-            'status'   => $payload['status'] ?? ($payload['waiting'] ? 'waiting' : 'writing'),
+            'status'   => $payload['status'] ?? (($payload['waiting'] ?? false) ? 'waiting' : 'writing'),
         ]);
     } else {
         // SSE 模式
@@ -245,8 +254,9 @@ function sseMsgWrite(array $payload): void {
 
 function sseThinkingWrite(string $thinkingChunk): void {
     global $asyncTaskId;
-    // SSE 模式：发送 thinking 事件，前端可以据此展示深度思考过程
     // 异步模式：思考过程不写入进度文件（write_chapter_worker 有独立实现）
+    if ($asyncTaskId) return;
+    // SSE 模式：发送 thinking 事件，前端可以据此展示深度思考过程
     echo "event: thinking\n";
     echo 'data: ' . json_encode(['thinking' => $thinkingChunk], JSON_UNESCAPED_UNICODE) . "\n\n";
     if (ob_get_level()) ob_flush();
@@ -291,15 +301,35 @@ try {
     $resolved   = WriteEngine::resolveChapter($novelId, $chapterId);
     $novel      = $resolved['n'];
     $ch         = $resolved['ch'];
+    $_writingChapterId = (int)$ch['id'];
+
+    // v1.11.5: 始终使用 writing_settings 全局目标字数，
+    // 否则 writing_settings.php 修改字数后对已有小说不生效
+    $novel['chapter_words'] = max(500, (int)getSystemSetting('ws_chapter_words', (int)$novel['chapter_words'], 'int'));
 } catch (RuntimeException $e) {
     sseMsgWrite(['error' => $e->getMessage()]);
     sseDoneWrite(); exit;
 }
 
+// 提前检测模型是否支持 1M 上下文（用于决定上下文构建模式）
+$preAiClient = null;
+try {
+    $preAiClient = getAIClient($novel['model_id'] ? (int)$novel['model_id'] : null);
+    if ($preAiClient->is1MContext()) {
+        addLog($novelId, 'info', '检测到1M上下文模型，将使用完整上下文模式');
+        // 1M 模式需要更长的超时时间
+        if (defined('CFG_TIME_LONG_1M')) {
+            set_time_limit(CFG_TIME_LONG_1M);
+        }
+    }
+} catch (Throwable $e) {
+    // 忽略，后续会重试
+}
+
 sseMsgWrite(['waiting' => true, 'msg' => '正在加载记忆引擎...']);
 
 try {
-    $memResult  = WriteEngine::initMemory($novelId, $ch);
+    $memResult  = WriteEngine::initMemory($novelId, $ch, $preAiClient);
     $engine     = $memResult['engine'];
     $memoryCtx  = $memResult['memoryCtx'];
 } catch (Throwable $e) {
@@ -309,7 +339,7 @@ try {
     $memoryCtx = null;
 }
 
-sseMsgWrite(['waiting' => true, 'msg' => '正在组装写作提示词...']);
+sseMsgWrite(['waiting' => true, 'msg' => '正在构思中...']);
 
 $messages    = WriteEngine::buildPrompt($novel, $ch, $memoryCtx);
 $targetWords = (int)$novel['chapter_words'];
@@ -327,7 +357,8 @@ try {
         function(string $token) { sseChunkWrite($token); },
         function(array $payload) { sseMsgWrite($payload); },
         function() { sendHeartbeatWrite(); },
-        function(string $reasoning) { sseThinkingWrite($reasoning); }
+        function(string $reasoning) { sseThinkingWrite($reasoning); },
+        $novel['model_id'] ? (int)$novel['model_id'] : null
     );
     $fullContent       = $result['content'];
     $usedModel         = $result['model'];
@@ -375,6 +406,9 @@ try {
         'model_used' => $usedModel?->modelLabel,
         'postprocessing' => true,  // 告知前端后处理将在后台进行
     ]);
+
+    // ---- 记录使用统计 ----
+    StatsTracker::record($words, 1);
 
 } catch (Throwable $e) {
     $errMsg = $e->getMessage();

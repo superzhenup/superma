@@ -38,24 +38,35 @@ class PostWriteValidator
 
     /**
      * 执行全部校验
+     * @param bool $forceRun 强制执行（用于人工审核场景，忽略框架启用状态）
      * @return array{has_p0: bool, has_p1: bool, p0_issues: array, p1_issues: array, p2_issues: array, all_issues: array}
      */
-    public function run(): array
+    public function run(bool $forceRun = false): array
     {
-        if (!ConstraintConfig::isEnabled()) {
+        $isEnabled = ConstraintConfig::isEnabled();
+
+        if (!$isEnabled && !$forceRun) {
             return $this->emptyResult();
         }
 
         try {
             $this->stateDB = new ConstraintStateDB($this->novelId);
         } catch (\Throwable $e) {
-            return $this->emptyResult();
+            if (!$forceRun) {
+                return $this->emptyResult();
+            }
+            $this->stateDB = null;
         }
 
-        // 执行各维度校验（按 P0→P1→P2 顺序，P0 先短路）
         $this->checkStructure();
+
+        if (!$isEnabled) {
+            return $this->buildResult();
+        }
+
         $this->checkLanguage();
         $this->checkPlotBasics();
+        $this->checkBreathingRhythm();
 
         return $this->buildResult();
     }
@@ -72,35 +83,37 @@ class PostWriteValidator
 
     /**
      * P1: 字数是否严重偏离目标
+     * 与 saveChapter() 的容差计算保持一致：minOk = target - tolerance, maxOk = target + tolerance
+     * tolerance = max(80, target * 0.03)
      */
     private function checkWordCount(): void
     {
-        $words   = countWords($this->content);
-        $tolerance = max(CFG_TOLERANCE_MIN, (int)($this->targetWords * CFG_TOLERANCE_RATIO));
-        $minOk   = $this->targetWords - $tolerance;
-        $maxOk   = $this->targetWords + $tolerance;
+        $words     = countWords($this->content);
+        $tolResult = calculateDynamicTolerance($this->targetWords);
+        $minOk     = $tolResult['min'];
+        $maxOk     = $tolResult['max'];
 
-        if ($words < $minOk * 0.6) {
-            // 严重不足（<60%目标）
+        if ($words < $minOk) {
+            $deviation = $this->targetWords > 0
+                ? round((($this->targetWords - $words) / $this->targetWords) * 100, 1)
+                : 0;
+            $severity = $words < $minOk * 0.6 ? 'P1' : 'P2';
+            $type     = $words < $minOk * 0.6 ? 'word_count_too_low' : 'word_count_low';
+            $prefix   = $words < $minOk * 0.6 ? '字数严重不足' : '字数略低';
             $this->addIssue(
-                'P1', 'structure', 'word_count_too_low',
-                "字数严重不足：{$words}字（目标{$this->targetWords}字，下限{$minOk}字）"
-            );
-        } elseif ($words > $maxOk * 1.5) {
-            // 严重超标（>150%上限）
-            $this->addIssue(
-                'P1', 'structure', 'word_count_too_high',
-                "字数严重超标：{$words}字（目标{$this->targetWords}字，上限{$maxOk}字）"
-            );
-        } elseif ($words < $minOk) {
-            $this->addIssue(
-                'P2', 'structure', 'word_count_low',
-                "字数略低：{$words}字（目标{$this->targetWords}字）"
+                $severity, 'structure', $type,
+                "{$prefix}：{$words}字（目标{$this->targetWords}字，下限{$minOk}字，偏差{$deviation}%）"
             );
         } elseif ($words > $maxOk) {
+            $deviation = $this->targetWords > 0
+                ? round(($words - $this->targetWords) / $this->targetWords * 100, 1)
+                : 0;
+            $severity = $words > $maxOk * 1.5 ? 'P1' : 'P2';
+            $type     = $words > $maxOk * 1.5 ? 'word_count_too_high' : 'word_count_high';
+            $prefix   = $words > $maxOk * 1.5 ? '字数严重超标' : '字数略高';
             $this->addIssue(
-                'P2', 'structure', 'word_count_high',
-                "字数略高：{$words}字（目标{$this->targetWords}字）"
+                $severity, 'structure', $type,
+                "{$prefix}：{$words}字（目标{$this->targetWords}字，上限{$maxOk}字，偏差{$deviation}%）"
             );
         }
     }
@@ -229,6 +242,7 @@ class PostWriteValidator
     private function checkPlotBasics(): void
     {
         $this->checkCoincidenceKeywords();
+        $this->checkExhaustedSceneTemplates();
     }
 
     /**
@@ -247,6 +261,107 @@ class PostWriteValidator
             $this->addIssue(
                 'P2', 'plot', 'excessive_coincidence',
                 "本章巧合类描写{$count}次（全书上限{$maxCoincidences}次），可能导致情节可信度下降"
+            );
+        }
+    }
+
+    private function checkExhaustedSceneTemplates(): void
+    {
+        require_once __DIR__ . '/../memory/SceneTemplateRepo.php';
+        require_once __DIR__ . '/../prompt.php';
+
+        $detected = detectSceneTemplates($this->content);
+        if (empty($detected)) return;
+
+        $repo = new SceneTemplateRepo($this->novelId);
+        $exhausted = $repo->getExhaustedTemplates();
+        if (empty($exhausted)) return;
+
+        foreach ($detected as $tid) {
+            if (isset($exhausted[$tid])) {
+                $info = $exhausted[$tid];
+                $this->addIssue(
+                    'P2', 'plot', 'exhausted_scene_template',
+                    "场景模板「{$info['name']}」(第{$info['last_chapter']}章)已使用{$info['use_count']}/{$info['max_uses']}次已达上限，本章仍命中该模板"
+                );
+            }
+        }
+    }
+
+    // ============================================================
+    //  段落级呼吸节奏检测 (v1.10.3)
+    // ============================================================
+
+    /**
+     * P2: 检测段落级呼吸节奏异常
+     *
+     * 检测维度：
+     * 1. 短段比例 > 60% → 太碎
+     * 2. 长段比例 > 30% → 太闷
+     * 3. 场景切换 > 8 → 太杂乱
+     * 4. 对话密度 > 70% → 缺描写
+     * 5. 对话密度 < 10% → 缺互动
+     */
+    private function checkBreathingRhythm(): void
+    {
+        $paragraphs = preg_split('/\n\s*\n|\n/', $this->content, -1, PREG_SPLIT_NO_EMPTY);
+        if (count($paragraphs) < 3) return;
+
+        $totalParagraphs = count($paragraphs);
+        $shortCount = 0;
+        $longCount = 0;
+        $totalLen = 0;
+        $sceneChanges = 0;
+        $dialogueChars = 0;
+        $totalChars = mb_strlen($this->content);
+
+        foreach ($paragraphs as $i => $para) {
+            $len = mb_strlen($para);
+            $totalLen += $len;
+
+            if ($len < 50) $shortCount++;
+            if ($len > 500) $longCount++;
+
+            if ($i > 0 && mb_strlen($para) > 10) {
+                $firstChar = mb_substr($para, 0, 1);
+                if (preg_match('/[「『""\'\'""（（]/u', $firstChar)) {
+                    // 段落以引号开头可能是场景切换
+                }
+            }
+
+            preg_match_all('/[「『""\'\'""].*?[」』""\'\'""]/u', $para, $dm);
+            foreach ($dm[0] as $d) {
+                $dialogueChars += mb_strlen($d);
+            }
+        }
+
+        $shortRatio = $shortCount / $totalParagraphs;
+        $longRatio = $longCount / $totalParagraphs;
+        $dialogueDensity = $totalChars > 0 ? $dialogueChars / $totalChars : 0;
+
+        if ($shortRatio > 0.6) {
+            $this->addIssue(
+                'P2', 'rhythm', 'too_many_short_paragraphs',
+                "短段比例" . round($shortRatio * 100) . "%（{$shortCount}/{$totalParagraphs}段），章节读起来碎（建议<50%）"
+            );
+        }
+
+        if ($longRatio > 0.3) {
+            $this->addIssue(
+                'P2', 'rhythm', 'too_many_long_paragraphs',
+                "长段比例" . round($longRatio * 100) . "%（{$longCount}/{$totalParagraphs}段），节奏偏闷（建议<20%）"
+            );
+        }
+
+        if ($dialogueDensity > 0.7) {
+            $this->addIssue(
+                'P2', 'rhythm', 'dialogue_too_dense',
+                "对话密度" . round($dialogueDensity * 100) . "%，缺乏描写/心理/动作段落"
+            );
+        } elseif ($dialogueDensity < 0.1 && $totalChars > 1000) {
+            $this->addIssue(
+                'P2', 'rhythm', 'dialogue_too_sparse',
+                "对话密度仅" . round($dialogueDensity * 100) . "%，缺乏互动和对话推进"
             );
         }
     }

@@ -99,15 +99,27 @@ function analyzeStep() {
     if (empty($chapters)) { sseSend('error', ['message' => '请粘贴或上传章节内容']); return; }
     if (empty($step))     { sseSend('error', ['message' => '缺少 step 参数']); return; }
 
+    // 获取模型并检测是否支持 1M 上下文
+    $ai = getAIClient($modelId);
+    $is1MModel = $ai->is1MContext();
+
+    // 根据模型能力设置内容长度限制和超时时间
+    if ($is1MModel) {
+        $maxChars = 200000;  // 1M模型：20万字
+        if (defined('CFG_TIME_LONG_1M')) {
+            set_time_limit(CFG_TIME_LONG_1M);
+        }
+    } else {
+        $maxChars = 60000;   // 普通模型：6万字
+    }
+
     // 截取过长内容
-    $maxChars = 60000;
     if (mb_strlen($chapters) > $maxChars) {
         $chapters = mb_substr($chapters, 0, $maxChars) . "\n\n[内容过长，已截取前 {$maxChars} 字]";
         sseSend('warning', ['message' => "内容已截取前 {$maxChars} 字"]);
     }
 
     try {
-        $ai = getAIClient($modelId);
 
         sseSend('model', ['name' => $ai->modelLabel, 'model_name' => $ai->modelName]);
         sseSend('status', ['message' => '正在分析...']);

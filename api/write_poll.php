@@ -51,10 +51,18 @@ try {
 
     $finalStatus = $progress['status'] ?? 'unknown';
 
-    // 任务已终态（done/completed/error）：返回结果后立即删除进度文件
-    // 防止残留文件在下次 write_start 时被误判为"正在运行"
+    // 任务已终态（done/completed/error）：延迟删除进度文件
+    // 不再首次读取即删——若客户端网络丢包将永久丢失结果
+    // 改为：终态文件保留至下次 write_start 的僵死检测清理，或超时后自动清理
+    // 仅在终态超过 60 秒后才删除，确保客户端有足够时间轮询获取结果
     if (in_array($finalStatus, ['done', 'completed', 'error'])) {
-        @unlink($progressFile);
+        $updatedAt = (int)($progress['updated_at'] ?? 0);
+        $startedAt = (int)($progress['started_at'] ?? 0);
+        $refTime = $updatedAt > 0 ? $updatedAt : $startedAt;
+        // 终态超过 60 秒才删除
+        if ($refTime > 0 && (time() - $refTime) > 60) {
+            @unlink($progressFile);
+        }
     } else {
         // 非终态：清理超过 5 分钟的过期进度文件（原30分钟太长）
         $now = time();

@@ -65,11 +65,7 @@ class WriteEngine
         if (!$ch) throw new RuntimeException('没有待写章节，请先生成大纲。');
 
         // 事务包裹：取消标志清零 + 章节置 writing + 小说置 writing 必须原子执行
-        // 注意：unlink 文件清理不在事务内——文件不存在不应对事务产生影响
         $flagFile = BASE_PATH . "/storage/write_cancel_{$novelId}.flag";
-        if (file_exists($flagFile)) {
-            @unlink($flagFile);
-        }
 
         $pdo = DB::connect();
         $pdo->beginTransaction();
@@ -78,6 +74,10 @@ class WriteEngine
             DB::update('chapters', ['status' => 'writing'], 'id=?', [$ch['id']]);
             DB::update('novels',   ['status' => 'writing'], 'id=?', [$novelId]);
             $pdo->commit();
+            // 事务成功后再清除取消标志文件，确保状态一致性
+            if (file_exists($flagFile)) {
+                @unlink($flagFile);
+            }
         } catch (\Throwable $e) {
             $pdo->rollBack();
             throw $e;
@@ -88,9 +88,12 @@ class WriteEngine
 
     /**
      * Phase 2: 初始化记忆引擎 + 语义召回
+     * @param int $novelId 小说ID
+     * @param array $chapter 章节数据
+     * @param ?AIClient $aiClient AI客户端（用于检测1M上下文支持）
      * @return array{engine: MemoryEngine, memoryCtx: ?array}
      */
-    public static function initMemory(int $novelId, array $chapter): array
+    public static function initMemory(int $novelId, array $chapter, ?AIClient $aiClient = null): array
     {
         require_once __DIR__ . '/memory/MemoryEngine.php';
         $engine = new MemoryEngine($novelId);
@@ -101,10 +104,35 @@ class WriteEngine
         $queryText = trim(($chapter['title'] ?? '') . '：' . ($chapter['outline'] ?? ''));
         $semanticTopK = max(1, min(20, (int)getSystemSetting('ws_embedding_top_k', 5, 'int')));
 
+        // 检测是否应该使用1M完整上下文模式
+        $contextMode = getSystemSetting('ws_context_mode', 'auto', 'string');
+        $is1MSupported = $aiClient ? $aiClient->is1MContext() : false;
+        $useFullContext = false;
+
+        if ($contextMode === 'full' && $is1MSupported) {
+            $useFullContext = true;
+        } elseif ($contextMode === 'auto' && $is1MSupported) {
+            // 自动模式：模型支持1M时使用完整上下文
+            $useFullContext = true;
+        }
+
         try {
-            $memoryCtx = $engine->getPromptContext((int)$chapter['chapter_number'], $queryText, CFG_MEMORY_TOKEN_BUDGET, 20, $semanticTopK);
+            if ($useFullContext) {
+                // 1M上下文模式：注入完整历史，不做token裁剪
+                $memoryCtx = $engine->getFullPromptContext((int)$chapter['chapter_number'], 100);
+                addLog($novelId, 'info', sprintf(
+                    '使用1M完整上下文模式：大纲%d章 / 正文%d章 / 伏笔%d条 / 角色%d个',
+                    $memoryCtx['full_context_stats']['total_outlines'] ?? 0,
+                    $memoryCtx['full_context_stats']['full_content_chapters'] ?? 0,
+                    $memoryCtx['full_context_stats']['foreshadowing_count'] ?? 0,
+                    $memoryCtx['full_context_stats']['character_count'] ?? 0
+                ));
+            } else {
+                // 标准压缩模式
+                $memoryCtx = $engine->getPromptContext((int)$chapter['chapter_number'], $queryText, CFG_MEMORY_TOKEN_BUDGET, 20, $semanticTopK);
+            }
         } catch (Throwable $e) {
-            addLog($novelId, 'error', 'MemoryEngine.getPromptContext 失败：' . $e->getMessage());
+            addLog($novelId, 'error', 'MemoryEngine 上下文构建失败：' . $e->getMessage());
             $memoryCtx = null;
         }
 
@@ -130,7 +158,71 @@ class WriteEngine
         // v1.4: 使用 ChapterPromptBuilder 替代 497 行函数，段落独立可测试
         require_once __DIR__ . '/ChapterPromptBuilder.php';
         $builder = new ChapterPromptBuilder($novel, $chapter, $previousSummary, $previousTail, $memoryCtx);
+
+        $resolverResult = null;
+        try {
+            $resolverResult = self::runForeshadowingResolver($novel, $chapter);
+        } catch (\Throwable $e) {
+            addLog((int)$novel['id'], 'warn', 'ForeshadowingResolver 失败：' . $e->getMessage());
+        }
+        if ($resolverResult) {
+            $builder->setResolverResult($resolverResult);
+        }
+
         return $builder->build();
+    }
+
+    /**
+     * Phase 2.5: 主动伏笔回收规划
+     *
+     * 根据当前章节大纲和全书进度，从待回收伏笔中挑选最合适的伏笔，
+     * 生成具体的回收指令，注入到 Prompt 中引导 AI 回收。
+     */
+    private static function runForeshadowingResolver(array $novel, array $chapter): ?array
+    {
+        $novelId = (int)$novel['id'];
+        $chNum = (int)($chapter['chapter_number'] ?? $chapter['chapter'] ?? 0);
+        $targetChapters = (int)($novel['target_chapters'] ?? 0);
+
+        // 调试日志：检查前置条件
+        addLog($novelId, 'debug', sprintf(
+            '伏笔回收检查：章节=%d, target_chapters=%d',
+            $chNum,
+            $targetChapters
+        ));
+
+        if ($targetChapters <= 0) {
+            addLog($novelId, 'warn', '伏笔回收跳过：target_chapters 未设置或为0');
+            return null;
+        }
+
+        require_once __DIR__ . '/memory/ForeshadowingResolver.php';
+        $resolver = new ForeshadowingResolver($novelId, $chNum, $targetChapters);
+        $outline = trim((string)($chapter['outline'] ?? ''));
+        $result = $resolver->planResolution($outline);
+
+        // 调试日志：输出规划结果统计
+        addLog($novelId, 'debug', sprintf(
+            '伏笔回收规划结果：should_resolve=%s, pending=%d, phase=%s, pressure=%.2f',
+            $result['should_resolve'] ? 'true' : 'false',
+            $result['stats']['pending_count'] ?? 0,
+            $result['stats']['plan']['phase'] ?? 'unknown',
+            $result['stats']['pressure'] ?? 0
+        ));
+
+        if (!empty($result['should_resolve'])) {
+            $itemDescs = array_map(
+                fn($it) => "第{$it['planted_chapter']}章:{$it['description']}",
+                $result['items']
+            );
+            addLog($novelId, 'info', sprintf(
+                '伏笔回收规划：选中%d条 → %s',
+                count($result['items']),
+                implode(' | ', $itemDescs)
+            ));
+        }
+
+        return $result;
     }
 
     /**
@@ -149,9 +241,10 @@ class WriteEngine
         callable $onChunk,
         callable $onMsg,
         callable $onHeartbeat,
-        ?callable $onThinking = null
+        ?callable $onThinking = null,
+        ?int $preferredModelId = null
     ): array {
-        $modelList   = getModelFallbackList(null);
+        $modelList   = getModelFallbackList($preferredModelId);
         $modelErrors = [];
         $fullContent = '';
         $usedModel   = null;
@@ -199,14 +292,13 @@ class WriteEngine
                 $onMsg([
                     'model' => $modelLabel, 'attempt' => $sameModelRetries + 1,
                     'timeout' => $timeoutSec, 'thinking' => $isThinking,
-                    'info' => ($isThinking ? '🔄 ' : '📡 ') . "{$modelLabel} 第" . ($sameModelRetries + 1) . "次尝试，超时{$timeoutSec}秒",
                 ]);
 
                 $canceled = false; $cancelCount = 0;
+                $cancelCheckInterval = 10;
                 try {
-                    $usage = $ai->chatStream($messages, function(string $token) use (&$fullContent, $novelId, &$canceled, &$cancelCount, $onChunk) {
-                        if (!$canceled && ++$cancelCount % 50 === 0) {
-                            // v1.4 文件系统检查替代 DB 查询，file_exists() 比 PDO prepare+execute 快 100+ 倍
+                    $usage = $ai->chatStream($messages, function(string $token) use (&$fullContent, $novelId, &$canceled, &$cancelCount, $cancelCheckInterval, $onChunk) {
+                        if (!$canceled && ++$cancelCount % $cancelCheckInterval === 0) {
                             if (file_exists(BASE_PATH . "/storage/write_cancel_{$novelId}.flag")) $canceled = true;
                         }
                         if ($canceled) throw new Exception('用户取消了写作');
@@ -244,8 +336,8 @@ class WriteEngine
 
                 if ($ai->lastFinishReason === 'length') {
                     $actualWords = countWords($fullContent);
-                    $lenTol = max(CFG_TOLERANCE_MIN, (int)($targetWords * CFG_TOLERANCE_RATIO));
-                    $lenMax = $targetWords + $lenTol;
+                    $lenTol = calculateDynamicTolerance($targetWords);
+                    $lenMax = $lenTol['max'];
                     if ($actualWords > $lenMax) {
                         $fullContent = truncateToWordLimit($fullContent, $lenMax);
                         $onMsg(['warning' => "⚠️ max_tokens截断后超字（{$actualWords}字），已修剪至 " . countWords($fullContent) . " 字"]);
@@ -255,6 +347,14 @@ class WriteEngine
                 }
                 break 2;
             }
+        }
+
+        if (empty($fullContent)) {
+            $errorSummary = [];
+            foreach ($modelErrors as $mid => $cnt) {
+                $errorSummary[] = "模型#{$mid}失败{$cnt}次";
+            }
+            throw new RuntimeException('所有模型均未产出内容：' . implode('；', $errorSummary ?: ['无可用模型']));
         }
 
         return ['content' => $fullContent, 'model' => $usedModel, 'usage' => $usage, 'duration_ms' => $durationMs];
@@ -299,21 +399,55 @@ class WriteEngine
         // 过滤AI误生成的段落标记
         $fullContent = stripSegmentMarkers($fullContent);
 
-        // === 约束框架后置校验（Phase 1）===
+        // === 约束框架后置校验 ===
+        $p0StrictBlock = false;
         try {
             require_once __DIR__ . '/constraints/ConstraintConfig.php';
             require_once __DIR__ . '/constraints/ConstraintStateDB.php';
             require_once __DIR__ . '/constraints/PostWriteValidator.php';
             $validator = new PostWriteValidator($novelId, $ch, $fullContent, $targetWords);
             $validationResult = $validator->run();
+
+            // === 紧急响应通道（工程控制论：缩短响应延迟）===
+            // P0 严重问题不管是否严格模式，都立即写紧急指令到下一章
+            if ($validationResult['has_p0']) {
+                $urgentIssues = [];
+                foreach ($validationResult['p0_issues'] as $p0) {
+                    $urgentIssues[] = $p0['issue_desc'];
+                }
+                $urgentMsg = "【紧急修复】上章发生严重问题：" . implode('；', $urgentIssues) .
+                    "。本章必须立即修正，避免问题延续。";
+                try {
+                    require_once __DIR__ . '/agents/AgentDirectives.php';
+                    AgentDirectives::add(
+                        $novelId,
+                        (int)$ch['chapter_number'] + 1,
+                        'urgent',
+                        $urgentMsg,
+                        1,    // 只影响下一章
+                        24    // 24小时过期
+                    );
+                    addLog($novelId, 'warn', sprintf(
+                        '紧急通道触发：第%d章P0问题已写紧急指令',
+                        (int)$ch['chapter_number']
+                    ));
+                } catch (\Throwable $e) {
+                    addLog($novelId, 'warn', '紧急指令写入失败：' . $e->getMessage());
+                }
+            }
+
             if ($validationResult['has_p0'] && ConstraintConfig::isStrictMode()) {
-                addLog($novelId, 'warn', "第{$ch['chapter_number']}章触发P0约束：{$validationResult['p0_issues'][0]['issue_desc']}");
+                $issue = $validationResult['p0_issues'][0]['issue_desc'];
+                $p0StrictBlock = "严格模式：第{$ch['chapter_number']}章 P0 违规阻止落盘 — {$issue}";
             } elseif ($validationResult['has_p1']) {
                 $p1Count = count($validationResult['p1_issues']);
                 addLog($novelId, 'warn', "第{$ch['chapter_number']}章触发{$p1Count}项P1约束");
             }
         } catch (\Throwable $e) {
             addLog($novelId, 'warn', '约束后置校验跳过：' . $e->getMessage());
+        }
+        if ($p0StrictBlock !== false) {
+            throw new RuntimeException($p0StrictBlock);
         }
 
         $words = countWords($fullContent);
@@ -337,7 +471,40 @@ class WriteEngine
         } catch (Throwable $e) {
             // 钩子类型推荐失败不影响落盘
         }
+        // v1.7: 落盘 opening_type，与 hook_type 同模式
+        try {
+            $openingSuggestion = suggestOpeningType($ch);
+            if (!empty($openingSuggestion['type'])) {
+                $updates['opening_type'] = $openingSuggestion['type'];
+            }
+        } catch (Throwable $e) {
+            // 开篇类型推荐失败不影响落盘
+        }
         $affected = DB::update('chapters', $updates, 'id=? AND status="writing"', [$chId]);
+
+        // v1.5.3: 落盘异常保底逻辑 — 若主更新失败，尝试最小化保存
+        if ($affected === 0) {
+            // 检查章节是否仍存在且状态为writing
+            $currentStatus = DB::fetchColumn('SELECT status FROM chapters WHERE id=?', [$chId]);
+            if ($currentStatus === 'writing') {
+                // 状态未变但更新失败，尝试最小化保存
+                // 仍需 AND status="writing" 防止与外部状态变更（如用户取消）竞态
+                try {
+                    $minimalAffected = DB::update(
+                        'chapters',
+                        ['content' => $fullContent, 'words' => $words, 'status' => 'completed'],
+                        'id=? AND status="writing"',
+                        [$chId]
+                    );
+                    if ($minimalAffected > 0) {
+                        addLog($novelId, 'warn', "第{$ch['chapter_number']}章通过保底逻辑落盘（主更新失败）");
+                        $affected = $minimalAffected;
+                    }
+                } catch (\Throwable $fallbackError) {
+                    addLog($novelId, 'error', "第{$ch['chapter_number']}章保底落盘也失败：" . $fallbackError->getMessage());
+                }
+            }
+        }
 
         if ($affected === 0) {
             addLog($novelId, 'warn', "第{$ch['chapter_number']}章落盘被阻止：状态已被外部修改");
@@ -362,52 +529,150 @@ class WriteEngine
 
         return ['words' => $words, 'chapter' => $ch, 'all_done' => $pendingCount === 0, 'model_info' => $modelInfo];
     }
-
-    /**
-     * Phase 6: 后处理（摘要/记忆引擎/知识库/质检）
-     * 所有异常内部捕获，保证正文不受影响
-     */
     public static function postProcess(int $novelId, array $chapter, string $fullContent, MemoryEngine $engine): void
     {
         $chId = $chapter['id'];
 
         // --- 摘要 + 记忆引擎 ---
+        $summaryData = null;
+        $novelData = ['id' => $novelId];
         try {
-            $summaryData = generateChapterSummary(
-                ['id' => $novelId], $chapter, $fullContent
+            $fetched = DB::fetch(
+                'SELECT id, title, protagonist_name, protagonist_info, model_id FROM novels WHERE id=?',
+                [$novelId]
             );
-            if (!empty($summaryData)) {
-                $updates = [];
-                if (!empty($summaryData['narrative_summary'])) {
-                    $updates['chapter_summary'] = $summaryData['narrative_summary'];
-                }
-                if (!empty($summaryData['used_tropes'])) {
-                    $updates['used_tropes'] = json_encode($summaryData['used_tropes'], JSON_UNESCAPED_UNICODE);
-                }
-                if (!empty($summaryData['cool_point_type'])) {
-                    $cpt = trim($summaryData['cool_point_type']);
-                    $validCoolTypes = array_keys(COOL_POINT_TYPES);
-                    if (in_array($cpt, $validCoolTypes)) $updates['cool_point_type'] = $cpt;
-                }
-                if (!empty($updates)) DB::update('chapters', $updates, 'id=?', [$chId]);
+            if ($fetched) $novelData = $fetched;
+            $summaryData = generateChapterSummary(
+                $novelData, $chapter, $fullContent
+            );
+        } catch (Throwable $e) {
+            addLog($novelId, 'error', '摘要生成失败：' . $e->getMessage());
+        }
 
-                try {
-                    $ingest = $engine->ingestChapter((int)$chapter['chapter_number'], $summaryData);
-                    if (!empty($ingest['errors'])) {
-                        addLog($novelId, 'warn', 'MemoryEngine.ingestChapter 部分失败：' . implode('; ', $ingest['errors']));
-                    }
-                    addLog($novelId, 'info', sprintf(
-                        '记忆入库：人物%d / 特征%d / 事件%d / 伏笔+%d / 回收%d',
-                        $ingest['cards_upserted'] ?? 0, $ingest['traits_added'] ?? 0,
-                        $ingest['events_added'] ?? 0, $ingest['foreshadowing_added'] ?? 0,
-                        $ingest['foreshadowing_resolved'] ?? 0
-                    ));
-                } catch (Throwable $e) {
-                    addLog($novelId, 'error', 'MemoryEngine.ingestChapter 失败：' . $e->getMessage());
+        if (empty($summaryData)) {
+            $summaryData = self::buildFallbackSummary($chapter, $fullContent);
+            addLog($novelId, 'warn', 'AI摘要失败，使用降级摘要（仅大纲+关键事件），记忆引擎仅写入基本数据');
+        }
+
+        $updates = [];
+        if (!empty($summaryData['narrative_summary'])) {
+            $updates['chapter_summary'] = $summaryData['narrative_summary'];
+        }
+        if (!empty($summaryData['used_tropes'])) {
+            $updates['used_tropes'] = json_encode($summaryData['used_tropes'], JSON_UNESCAPED_UNICODE);
+        }
+        if (!empty($summaryData['cool_point_type'])) {
+            $cpt = trim($summaryData['cool_point_type']);
+            $validCoolTypes = array_keys(COOL_POINT_TYPES);
+            if (in_array($cpt, $validCoolTypes)) $updates['cool_point_type'] = $cpt;
+        }
+        if (!empty($updates)) DB::update('chapters', $updates, 'id=?', [$chId]);
+
+        try {
+            $ingest = $engine->ingestChapter((int)$chapter['chapter_number'], $summaryData);
+            if (!empty($ingest['errors'])) {
+                addLog($novelId, 'warn', 'MemoryEngine.ingestChapter 部分失败：' . implode('; ', $ingest['errors']));
+            }
+
+            // v1.11.8: 详细日志
+            $resolvedDetails = $ingest['resolved_details'] ?? [];
+            $resolvedLog = '';
+            if (!empty($resolvedDetails)) {
+                $resolvedLog = ' → ' . implode(' | ', array_map(fn($r) => "ID:{$r['id']}「{$r['desc']}」", $resolvedDetails));
+            }
+            addLog($novelId, 'info', sprintf(
+                '记忆入库：人物%d / 特征%d / 事件%d / 伏笔+%d / 回收%d%s',
+                $ingest['cards_upserted'] ?? 0, $ingest['traits_added'] ?? 0,
+                $ingest['events_added'] ?? 0, $ingest['foreshadowing_added'] ?? 0,
+                $ingest['foreshadowing_resolved'] ?? 0,
+                $resolvedLog
+            ));
+        } catch (Throwable $e) {
+            addLog($novelId, 'error', 'MemoryEngine.ingestChapter 失败：' . $e->getMessage());
+        }
+
+        // --- v1.11.2 认知负荷检测（信息密度管理）---
+        try {
+            require_once __DIR__ . '/CognitiveLoadMonitor.php';
+            $loadMonitor = new CognitiveLoadMonitor($novelId);
+            $chNum = (int)($chapter['chapter_number'] ?? 0);
+            $loadResult = $loadMonitor->analyze($chNum, $ingest ?? []);
+            $loadMonitor->persistMetrics($chId, $loadResult);
+
+            // 认知负荷超标时写 Agent 指令
+            if (isset($loadResult['severity']) && in_array($loadResult['severity'], ['high', 'medium'])) {
+                require_once __DIR__ . '/agents/AgentDirectives.php';
+                $existingCL = DB::fetch(
+                    "SELECT id FROM agent_directives 
+                     WHERE novel_id=? AND type='strategy' AND is_active=1
+                       AND apply_from <= ? AND apply_to >= ?
+                       AND directive LIKE '%认知负荷%'
+                     LIMIT 1",
+                    [$novelId, $chNum + 1, $chNum + 1]
+                );
+                if (!$existingCL) {
+                    AgentDirectives::add(
+                        $novelId,
+                        $chNum + 1,
+                        'strategy',
+                        $loadResult['directive'],
+                        2,
+                        48
+                    );
                 }
+                addLog($novelId, 'warn', sprintf(
+                    '认知负荷警告：本章引入 %d 个新元素（近5章累计 %d 个）',
+                    $loadResult['total_new'] ?? 0,
+                    $loadResult['recent_5_sum'] ?? 0
+                ));
             }
         } catch (Throwable $e) {
-            addLog($novelId, 'error', '摘要/记忆引擎失败：' . $e->getMessage());
+            addLog($novelId, 'warn', '认知负荷检测跳过：' . $e->getMessage());
+        }
+
+        // --- 伏笔提及追踪 (v1.10.3) ---
+        try {
+            require_once __DIR__ . '/memory/ForeshadowingRepo.php';
+            $foreshadowRepo = new ForeshadowingRepo($novelId);
+            $chNum = (int)($chapter['chapter_number'] ?? 0);
+            $mentionCount = $foreshadowRepo->trackMentionsInContent($fullContent, $chNum);
+            if ($mentionCount > 0) {
+                addLog($novelId, 'info', "伏笔提及追踪：本章提及{$mentionCount}条伏笔");
+            }
+            $foreshadowAlerts = $foreshadowRepo->checkHealth($chNum);
+            if (!empty($foreshadowAlerts)) {
+                require_once __DIR__ . '/agents/AgentDirectives.php';
+                $highAlerts = array_filter($foreshadowAlerts, fn($a) => $a['severity'] === 'high');
+                if ($highAlerts) {
+                    $msg = implode('；', array_map(fn($a) => $a['message'], array_slice($highAlerts, 0, 2)));
+                    $sug = implode('；', array_map(fn($a) => $a['suggestion'], array_slice($highAlerts, 0, 2)));
+                    AgentDirectives::add(
+                        $novelId, $chNum + 1, 'quality',
+                        "伏笔健康告警：{$msg}。{$sug}",
+                        2, 48
+                    );
+                }
+                addLog($novelId, 'info', sprintf(
+                    '伏笔健康检测：%d条告警（高危%d）',
+                    count($foreshadowAlerts),
+                    count($highAlerts)
+                ));
+            }
+        } catch (Throwable $e) {
+            addLog($novelId, 'warn', '伏笔提及追踪跳过：' . $e->getMessage());
+        }
+
+        // --- 金句回调追踪 (v1.10.3) ---
+        try {
+            require_once __DIR__ . '/memory/CatchphraseRepo.php';
+            $catchRepo = new CatchphraseRepo($novelId);
+            $chNum = (int)($chapter['chapter_number'] ?? 0);
+            $cbCount = $catchRepo->trackCallbacksInContent($fullContent, $chNum);
+            if ($cbCount > 0) {
+                addLog($novelId, 'info', "金句回调追踪：本章callback {$cbCount}条金句");
+            }
+        } catch (Throwable $e) {
+            addLog($novelId, 'warn', '金句回调追踪跳过：' . $e->getMessage());
         }
 
         // --- 知识库提取 ---
@@ -458,6 +723,148 @@ class WriteEngine
             addLog($novelId, 'warn', '质量检测跳过：' . $e->getMessage());
         }
 
+        // --- v1.9 RewriteAgent — 低分章节自动重写（盲点1修复）---
+        $rewriteEnabled = (bool)getSystemSetting('ws_rewrite_enabled', false, 'bool');
+        if ($rewriteEnabled) {
+            try {
+                require_once __DIR__ . '/agents/RewriteAgent.php';
+                $gates = json_decode(
+                    DB::fetch("SELECT gate_results FROM chapters WHERE id=?", [$chId])['gate_results'] ?? '[]',
+                    true
+                ) ?: [];
+                $qScore = (float)(DB::fetch("SELECT quality_score FROM chapters WHERE id=?", [$chId])['quality_score'] ?? 100);
+
+                $rewriter = new RewriteAgent($novelId);
+                $threshold = (int)getSystemSetting('ws_rewrite_threshold', 70, 'int');
+                $minGain   = (int)getSystemSetting('ws_rewrite_min_gain', 10, 'int');
+                $rewriteResult = $rewriter->rewriteIfNeeded(
+                    $chapter, $fullContent, $gates, $qScore,
+                    $novelData['model_id'] ?? null, $threshold, $minGain
+                );
+                if ($rewriteResult['rewritten']) {
+                    $fullContent = $rewriteResult['content'];
+                    $novelRow = DB::fetch('SELECT chapter_words FROM novels WHERE id=?', [$novelId]);
+                    $rwTarget = (int)($novelRow['chapter_words'] ?? 2000);
+                    $rwWords = countWords($fullContent);
+
+                    // 统一使用动态容忍度计算（与 IterativeRefinementController 保持一致）
+                    $rwTol = calculateDynamicTolerance($rwTarget);
+                    $rwMax = $rwTol['max'];
+
+                    if ($rwWords > $rwMax) {
+                        $fullContent = truncateToWordLimit($fullContent, $rwMax);
+                        addLog($novelId, 'info', sprintf(
+                            'RewriteAgent结果超字（%d字 > %d字，容忍度±%d），已压缩至 %d 字',
+                            $rwWords, $rwMax, $rwTol['tolerance'], countWords($fullContent)
+                        ));
+                    }
+                    $newWords = countWords($fullContent);
+                    DB::update('chapters', [
+                        'content' => $fullContent,
+                        'words'   => $newWords,
+                    ], 'id=?', [$chId]);
+                    addLog($novelId, 'info', sprintf(
+                        'RewriteAgent重写已落盘：%d字 → %d字',
+                        (int)($chapter['words'] ?? 0), $newWords
+                    ));
+
+                    // v1.11.2 Bug #1 修复：重写后重新跑 ingestChapter，
+                    // 否则原始内容抽取的 character_card / emotion_history / foreshadowing_items
+                    // 与 chapters.content 不一致，导致后续章节 prompt 引用幻象数据。
+                    //
+                    // v1.11.5 修复：重写前先回滚伏笔提及和金句回调的追踪记录，
+                    // 防止 last_mentioned_chapter / last_callback_chapter 指向已删除的内容。
+                    // ingestChapter 是幂等的（按章节号 update 而非 insert），重新跑安全。
+                    $chNum = (int)($chapter['chapter_number'] ?? 0);
+                    try {
+                        require_once __DIR__ . '/memory/ForeshadowingRepo.php';
+                        $foreshadowRepo = new ForeshadowingRepo($novelId);
+                        $revF = $foreshadowRepo->revertMentionsForChapter($chNum);
+
+                        require_once __DIR__ . '/memory/CatchphraseRepo.php';
+                        $catchRepo = new CatchphraseRepo($novelId);
+                        $revC = $catchRepo->revertCallbacksForChapter($chNum);
+
+                        if ($revF > 0 || $revC > 0) {
+                            addLog($novelId, 'info', "重写后回滚追踪：伏笔提及{$revF}条、金句回调{$revC}条");
+                        }
+                    } catch (Throwable $e) {
+                        addLog($novelId, 'warn', '重写后回滚追踪失败：' . $e->getMessage());
+                    }
+                    try {
+                        $newSummary = generateChapterSummary($novelData, $chapter, $fullContent);
+                        if (!empty($newSummary)) {
+                            // 重新落盘 chapters.chapter_summary / used_tropes / cool_point_type
+                            $reUpdates = [];
+                            if (!empty($newSummary['narrative_summary'])) {
+                                $reUpdates['chapter_summary'] = $newSummary['narrative_summary'];
+                            }
+                            if (!empty($newSummary['used_tropes'])) {
+                                $reUpdates['used_tropes'] = json_encode($newSummary['used_tropes'], JSON_UNESCAPED_UNICODE);
+                            }
+                            if (!empty($newSummary['cool_point_type'])) {
+                                $cpt = trim($newSummary['cool_point_type']);
+                                $validCoolTypes = array_keys(COOL_POINT_TYPES);
+                                if (in_array($cpt, $validCoolTypes)) {
+                                    $reUpdates['cool_point_type'] = $cpt;
+                                }
+                            }
+                            if (!empty($reUpdates)) DB::update('chapters', $reUpdates, 'id=?', [$chId]);
+
+                            // 重新跑记忆引擎入库（人物卡/情绪/伏笔/事件全量同步）
+                            $reIngest = $engine->ingestChapter((int)$chapter['chapter_number'], $newSummary);
+                            addLog($novelId, 'info', sprintf(
+                                '重写后重新入库：人物新增%d/更新%d / 情绪%d / 事件%d / 伏笔+%d/回收%d',
+                                $reIngest['cards_inserted'] ?? 0,
+                                $reIngest['cards_updated'] ?? 0,
+                                $reIngest['emotions_added'] ?? 0,
+                                $reIngest['events_added'] ?? 0,
+                                $reIngest['foreshadowing_added'] ?? 0,
+                                $reIngest['foreshadowing_resolved'] ?? 0
+                            ));
+
+                            // 同步刷新 $summaryData 供下文（伏笔追踪/金句/KB）使用
+                            $summaryData = $newSummary;
+
+                            // v1.11.5: 重写后基于新内容重新跑伏笔提及和金句回调追踪
+                            try {
+                                require_once __DIR__ . '/memory/ForeshadowingRepo.php';
+                                require_once __DIR__ . '/memory/CatchphraseRepo.php';
+                                $reForeshadowRepo = new ForeshadowingRepo($novelId);
+                                $reCatchRepo = new CatchphraseRepo($novelId);
+                                $reMention = $reForeshadowRepo->trackMentionsInContent($fullContent, $chNum);
+                                $reCallback = $reCatchRepo->trackCallbacksInContent($fullContent, $chNum);
+                                if ($reMention > 0 || $reCallback > 0) {
+                                    addLog($novelId, 'info', "重写后重跑追踪：伏笔提及{$reMention}条、金句回调{$reCallback}条");
+                                }
+                            } catch (Throwable $et) {
+                                addLog($novelId, 'warn', '重写后重跑追踪失败：' . $et->getMessage());
+                            }
+                        } else {
+                            addLog($novelId, 'warn', '重写后摘要生成失败，数据库可能不一致');
+                        }
+                    } catch (Throwable $e) {
+                        addLog($novelId, 'warn', '重写后重新入库失败：' . $e->getMessage());
+                    }
+                }
+            } catch (Throwable $e) {
+                addLog($novelId, 'warn', 'RewriteAgent跳过：' . $e->getMessage());
+            }
+        }
+
+        // --- v1.9 CriticAgent + StyleGuard — 统一纳入 AgentCoordinator ---
+        try {
+            require_once __DIR__ . '/agents/AgentCoordinator.php';
+            AgentCoordinator::postWriteAgents($novelId, $chapter, $fullContent, [
+                'title'            => $novelData['title'] ?? '',
+                'genre'            => $novelData['genre'] ?? '',
+                'protagonist_name' => $novelData['protagonist_name'] ?? '',
+                'model_id'         => $novelData['model_id'] ?? null,
+            ]);
+        } catch (Throwable $e) {
+            addLog($novelId, 'warn', '后置Agent协调器跳过：' . $e->getMessage());
+        }
+
         // --- v1.5 情绪密度检测（激活 EmotionDictionary）---
         // 之前 EmotionDictionary 模块完全是死代码，prompt 里教 AI 满足情绪密度
         // 但写完后从未验证。本节将统计落盘，并在偏低时让 Agent 写指令影响下一章
@@ -494,6 +901,60 @@ class WriteEngine
             addLog($novelId, 'warn', '情绪密度检测跳过：' . $e->getMessage());
         }
 
+        // --- v1.10.3 情绪曲线异常检测（每10章触发）---
+        try {
+            $chNum = (int)($chapter['chapter_number'] ?? 0);
+            if ($chNum > 0 && $chNum % 10 === 0) {
+                $emotionAnomaly = detectEmotionCurveAnomaly($novelId);
+                if ($emotionAnomaly) {
+                    require_once __DIR__ . '/agents/AgentDirectives.php';
+                    $msg = match ($emotionAnomaly['type']) {
+                        'low_emotion_streak' => "近10章情绪均值仅" . round($emotionAnomaly['avg']) . "分，持续低位（建议<50分需干预）。请在本章安排高强度情绪事件（冲突/反转/危机），打破低潮。",
+                        'flat_emotion_curve' => "近10章情绪方差仅" . round($emotionAnomaly['variance']) . "，起伏极小，读者疲劳。本章必须有明显的情绪高低峰落差。",
+                        default => '情绪曲线异常，请注意情绪节奏。',
+                    };
+                    AgentDirectives::add(
+                        $novelId, $chNum + 1, 'quality',
+                        "情绪曲线告警：{$msg}",
+                        3, 48
+                    );
+                    addLog($novelId, 'info', sprintf(
+                        '情绪曲线异常检测：%s（均值%.1f，方差%.1f）',
+                        $emotionAnomaly['type'], $emotionAnomaly['avg'], $emotionAnomaly['variance']
+                    ));
+                }
+            }
+        } catch (Throwable $e) {
+            addLog($novelId, 'warn', '情绪曲线异常检测跳过：' . $e->getMessage());
+        }
+
+        // --- v1.11.5 角色情绪异常跳变检测（事后检测）---
+        try {
+            $chNum = (int)($chapter['chapter_number'] ?? 0);
+            require_once __DIR__ . '/memory/CharacterEmotionRepo.php';
+            $emotionRepo = new CharacterEmotionRepo($novelId);
+            $emotionAnomalies = $emotionRepo->detectEmotionAnomalies($chNum);
+            if (!empty($emotionAnomalies)) {
+                $highAnomalies = array_filter($emotionAnomalies, fn($a) => $a['severity'] === 'high');
+                if (!empty($highAnomalies)) {
+                    require_once __DIR__ . '/agents/AgentDirectives.php';
+                    $msg = implode('；', array_map(fn($a) => $a['message'], array_slice($highAnomalies, 0, 2)));
+                    AgentDirectives::add(
+                        $novelId, $chNum + 1, 'quality',
+                        "情绪断裂告警：{$msg}。下章请安排合理的情绪过渡或回调。",
+                        2, 24
+                    );
+                }
+                addLog($novelId, 'info', sprintf(
+                    '情绪异常跳变检测：%d项异常（高危%d）',
+                    count($emotionAnomalies),
+                    count($highAnomalies)
+                ));
+            }
+        } catch (Throwable $e) {
+            addLog($novelId, 'warn', '情绪异常跳变检测跳过：' . $e->getMessage());
+        }
+
         // --- v1.6 爽点实际类型检测（P1#7: 反馈闭环）---
         // 之前 calculateCoolPointSchedule 的 lastUsed 记录的是"计划排期"
         // 而非 AI 实际写到的类型。本节用关键词匹配检测正文中实际出现的爽点类型
@@ -519,6 +980,44 @@ class WriteEngine
             }
         } catch (Throwable $e) {
             addLog($novelId, 'warn', '爽点检测跳过：' . $e->getMessage());
+        }
+
+        // --- v1.6 开篇类型实际检测（P1#7: 反馈闭环）---
+        // 检测正文实际使用的开篇类型，与 suggestOpeningType 建议的 opening_type 对比
+        // 可发现 AI 写作时是否偏离了推荐的开篇策略
+        try {
+            $actualOpening = detectOpeningType($fullContent);
+            if (!empty($actualOpening['type'])) {
+                DB::update('chapters', [
+                    'actual_opening_type' => $actualOpening['type']
+                ], 'id=?', [$chId]);
+                addLog($novelId, 'info', sprintf(
+                    '开篇检测：识别为 %s（%s）',
+                    $actualOpening['type'],
+                    OPENING_TYPES[$actualOpening['type']]['name'] ?? $actualOpening['type']
+                ));
+            }
+        } catch (Throwable $e) {
+            addLog($novelId, 'warn', '开篇检测跳过：' . $e->getMessage());
+        }
+
+        // --- v1.11 场景模板检测（语义级防套路化）---
+        try {
+            require_once __DIR__ . '/memory/SceneTemplateRepo.php';
+            $sceneTemplates = detectSceneTemplates($fullContent);
+            if (!empty($sceneTemplates)) {
+                $stRepo = new SceneTemplateRepo($novelId);
+                $saved = $stRepo->batchAdd($sceneTemplates, (int)$chapter['chapter_number']);
+                $tplNames = array_map(fn($t) => SCENE_TEMPLATES[$t]['name'] ?? $t, $sceneTemplates);
+                addLog($novelId, 'info', sprintf(
+                    '场景模板检测：识别到 %d 种 —— %s（入库%d条）',
+                    count($sceneTemplates),
+                    implode('、', $tplNames),
+                    $saved
+                ));
+            }
+        } catch (Throwable $e) {
+            addLog($novelId, 'warn', '场景模板检测跳过：' . $e->getMessage());
         }
 
         // --- v1.5 收尾期合规检查（激活 EndingEnforcer.checkEndingCompliance）---
@@ -579,6 +1078,140 @@ class WriteEngine
             addLog($novelId, 'warn', '约束状态更新失败：' . $e->getMessage());
         }
 
+        // === PID控制器（工程控制论：P/I/D整定）===
+        // 每章写完后对4个核心控制变量做PID评估，产生智能调控建议
+        try {
+            require_once __DIR__ . '/PIDController.php';
+            $chNum = (int)($chapter['chapter_number'] ?? 0);
+            $pid = new PIDController($novelId);
+
+            $recentScores = DB::fetchAll(
+                'SELECT quality_score, emotion_score FROM chapters
+                 WHERE novel_id=? AND chapter_number <= ? AND (quality_score IS NOT NULL OR emotion_score IS NOT NULL)
+                 ORDER BY chapter_number DESC LIMIT 1',
+                [$novelId, $chNum]
+            );
+            $currentQuality = $recentScores[0]['quality_score'] ?? null;
+            $currentEmotion = $recentScores[0]['emotion_score'] ?? null;
+
+            $targetWords = (int)($chapter['words'] ?? 0) > 0
+                ? (int)(DB::fetch('SELECT chapter_words FROM novels WHERE id=?', [$novelId])['chapter_words'] ?? 2000)
+                : 0;
+            $actualWords = (int)($chapter['words'] ?? 0);
+            $wordAccuracy = ($targetWords > 0 && $actualWords > 0)
+                ? round(min(1.0, $actualWords / $targetWords), 3)
+                : null;
+
+            $recentCool = DB::fetchAll(
+                'SELECT cool_point_type FROM chapters
+                 WHERE novel_id=? AND chapter_number BETWEEN ? AND ? AND status="completed"
+                 ORDER BY chapter_number DESC LIMIT 10',
+                [$novelId, max(1, $chNum - 9), $chNum]
+            );
+            $coolCount = 0;
+            foreach ($recentCool as $rc) {
+                if (!empty($rc['cool_point_type'])) $coolCount++;
+            }
+            $coolDensity = count($recentCool) > 0
+                ? round($coolCount / count($recentCool), 3)
+                : null;
+
+            $pidResults = $pid->evaluateAll([
+                'quality_score'  => $currentQuality,
+                'emotion_score'  => $currentEmotion,
+                'word_count_accuracy' => $wordAccuracy,
+                'cool_point_density'  => $coolDensity,
+            ]);
+
+            $criticalIssues = array_filter($pidResults, fn($r) => $r['severity'] === 'critical');
+            if (!empty($criticalIssues)) {
+                $vars = array_keys($criticalIssues);
+                $msgs = array_map(fn($v, $r) => $r['recommendation'], $vars, $criticalIssues);
+                require_once __DIR__ . '/agents/AgentDirectives.php';
+                AgentDirectives::add(
+                    $novelId, $chNum + 1, 'quality',
+                    implode('；', $msgs),
+                    2, 24
+                );
+                addLog($novelId, 'info', sprintf(
+                    'PID控制器：%d项严重偏差，已写入指令',
+                    count($criticalIssues)
+                ));
+            }
+        } catch (\Throwable $e) {
+            addLog($novelId, 'warn', 'PID控制器跳过：' . $e->getMessage());
+        }
+
+        // === 参数自适应调优（工程控制论：自适应控制）===
+        // 每 10 章分析历史数据，自动调整迭代参数
+        if ($chNum > 0 && $chNum % 10 === 0) {
+            try {
+                require_once __DIR__ . '/AdaptiveParameterTuner.php';
+                $tuner = new AdaptiveParameterTuner($novelId);
+                $tuner->tune($chNum);
+            } catch (\Throwable $e) {
+                addLog($novelId, 'warn', '参数自适应调优跳过：' . $e->getMessage());
+            }
+        }
+
+        // === 全书级控制器（工程控制论：层级控制）===
+        // 每 20 章触发一次，做全书级5项检查
+        try {
+            require_once __DIR__ . '/GlobalNovelController.php';
+            $chNum = (int)($chapter['chapter_number'] ?? 0);
+            $globalResult = GlobalNovelController::regulate(
+                $novelId,
+                $chNum,
+                $novelData['model_id'] ?? null
+            );
+            if ($globalResult['triggered']) {
+                $directivesWritten = $globalResult['directives'];
+                $checkSummary = [];
+                foreach ($globalResult['checks'] as $name => $check) {
+                    if (!empty($check['issue'])) {
+                        $checkSummary[] = $name . ':有问题';
+                    } elseif ($check['checked'] ?? false) {
+                        $checkSummary[] = $name . ':正常';
+                    }
+                }
+                addLog($novelId, 'info', sprintf(
+                    '全书级控制器执行：%d项检查，%d条全局指令（%s）',
+                    count($globalResult['checks']),
+                    $directivesWritten,
+                    implode(', ', $checkSummary)
+                ));
+            }
+        } catch (\Throwable $e) {
+            addLog($novelId, 'warn', '全书级控制器跳过：' . $e->getMessage());
+        }
+
+        // === 系统健康监控（工程控制论：鲁棒性）===
+        // 每 20 章执行一次系统体检
+        if ($chNum > 0 && $chNum % 20 === 0) {
+            try {
+                require_once __DIR__ . '/SystemHealthMonitor.php';
+                $healthMonitor = new SystemHealthMonitor($novelId);
+                $healthResult = $healthMonitor->check();
+                if ($healthResult['score'] < 70) {
+                    foreach ($healthResult['alerts'] as $alert) {
+                        addLog($novelId, 'warn', sprintf(
+                            '系统健康告警[%s]：%s',
+                            $alert['level'] ?? 'warning',
+                            $alert['message']
+                        ));
+                    }
+                }
+                if (!empty($healthResult['alerts'])) {
+                    addLog($novelId, 'info', sprintf(
+                        '系统健康分：%d/100，%d条告警',
+                        $healthResult['score'], count($healthResult['alerts'])
+                    ));
+                }
+            } catch (\Throwable $e) {
+                addLog($novelId, 'warn', '系统健康监控跳过：' . $e->getMessage());
+            }
+        }
+
         addLog($novelId, 'info', "第{$chapter['chapter_number']}章后处理完成（摘要/记忆/知识库/质检）");
     }
     
@@ -591,28 +1224,41 @@ class WriteEngine
     private static function runPreWriteAgents(int $novelId): void
     {
         try {
-            // 检查是否启用Agent
             if (!ConfigCenter::get('agent.enabled', true)) {
                 return;
             }
-            
-            // 加载Agent协调器
+
+            $chNum = self::getCurrentChapterNumber($novelId);
+
+            if ($chNum <= 5) {
+                return;
+            }
+
+            $anyTrigger = false;
+            $baseIntervals = [5, 10, 20];
+            foreach ($baseIntervals as $interval) {
+                if ($chNum % $interval === 0) {
+                    $anyTrigger = true;
+                    break;
+                }
+            }
+            if (!$anyTrigger) {
+                return;
+            }
+
             require_once __DIR__ . '/agents/AgentCoordinator.php';
-            
+
             $coordinator = new AgentCoordinator($novelId);
-            
-            // 收集决策上下文
+
             $context = [
                 'pending_foreshadowing_count' => self::countPendingForeshadowings($novelId),
                 'recent_chapters' => self::getRecentChapters($novelId, 5),
                 'current_progress' => self::getCurrentProgress($novelId),
-                'current_chapter_number' => self::getCurrentChapterNumber($novelId),
+                'current_chapter_number' => $chNum,
             ];
-            
-            // 运行Agent决策
+
             $decisionResult = $coordinator->runDecisionCycle($context);
-            
-            // 记录决策结果
+
             if (!empty($decisionResult['execution_summary'])) {
                 $summary = $decisionResult['execution_summary'];
                 addLog($novelId, 'info', sprintf(
@@ -622,9 +1268,8 @@ class WriteEngine
                     $summary['successful_actions']
                 ));
             }
-            
+
         } catch (Throwable $e) {
-            // Agent决策失败不影响主流程
             addLog($novelId, 'warn', 'Agent决策失败：' . $e->getMessage());
         }
     }
@@ -688,8 +1333,10 @@ class WriteEngine
     private static function getCurrentChapterNumber(int $novelId): int
     {
         try {
+            // 使用 MAX(chapter_number)+1 而非 COUNT(completed)+1
+            // 避免存在 skipped/failed 章节时章节号错位
             $chapter = DB::fetch(
-                'SELECT COUNT(*) + 1 as next_chapter FROM chapters WHERE novel_id = ? AND status = "completed"',
+                'SELECT COALESCE(MAX(chapter_number), 0) + 1 as next_chapter FROM chapters WHERE novel_id = ?',
                 [$novelId]
             );
             
@@ -697,5 +1344,42 @@ class WriteEngine
         } catch (\Throwable $e) {
             return 1;
         }
+    }
+
+    /**
+     * 降级摘要：AI摘要失败时，从大纲和正文提取最基本的记忆数据
+     *
+     * 保证 ingestChapter 至少拿到 key_event + narrative_summary + story_momentum，
+     * 避免整条记忆链断裂。人物更新/伏笔/爽点等深度分析字段留空。
+     */
+    private static function buildFallbackSummary(array $chapter, string $fullContent): array
+    {
+        $outline = trim((string)($chapter['outline'] ?? ''));
+        $title = trim((string)($chapter['title'] ?? ''));
+        $chNum = (int)($chapter['chapter_number'] ?? 0);
+
+        $narrativeSummary = $outline ?: safe_substr(trim($fullContent), 0, 200) . '…';
+
+        $keyEvent = $outline ?: $title;
+        if (mb_strlen($keyEvent) > 20) {
+            $keyEvent = safe_substr($keyEvent, 0, 20);
+        }
+
+        $momentum = '';
+        if (!empty($outline)) {
+            $momentum = safe_substr($outline, 0, 30);
+        }
+
+        return [
+            'narrative_summary'      => $narrativeSummary,
+            'character_updates'      => [],
+            'character_traits'       => [],
+            'key_event'              => $keyEvent,
+            'used_tropes'            => [],
+            'new_foreshadowing'      => [],
+            'resolved_foreshadowing' => [],
+            'story_momentum'         => $momentum,
+            'cool_point_type'        => '',
+        ];
     }
 }

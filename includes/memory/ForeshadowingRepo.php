@@ -28,17 +28,23 @@ final class ForeshadowingRepo
      * @param string $description         一句话描述
      * @param int    $plantedChapter      埋设章节
      * @param int|null $deadlineChapter   建议回收截止章节
+     * @param string $priority            优先级: critical/major/minor (默认 minor)
      * @return int  item_id
      */
-    public function plant(string $description, int $plantedChapter, ?int $deadlineChapter = null): int
+    public function plant(string $description, int $plantedChapter, ?int $deadlineChapter = null, string $priority = 'minor'): int
     {
         $desc = trim($description);
         if ($desc === '') {
             throw new \InvalidArgumentException('foreshadowing description is empty');
         }
+        $validPriorities = ['critical', 'major', 'minor'];
+        if (!in_array($priority, $validPriorities, true)) {
+            $priority = 'minor';
+        }
         return (int)DB::insert('foreshadowing_items', [
             'novel_id'         => $this->novelId,
             'description'      => $desc,
+            'priority'         => $priority,
             'planted_chapter'  => $plantedChapter,
             'deadline_chapter' => $deadlineChapter,
         ]);
@@ -47,8 +53,9 @@ final class ForeshadowingRepo
     /**
      * 尝试把"已回收描述"匹配到具体的未回收伏笔并标记为已回收。
      *
-     * 匹配策略（改进版）:
-     *   1) 先用 LIKE 获取多条候选（最多 5 条）
+     * 匹配策略（v1.1改进版）:
+     *   0) 先尝试关键词重叠匹配（最宽松，AI改写后也能匹配）
+     *   1) 再用 LIKE 获取多条候选（最多 5 条）
      *   2) 若候选有 embedding → 计算余弦相似度，选最相似的（阈值 0.8）
      *   3) 若无 embedding → 使用更严格的文本匹配（完整描述或更长前缀 30 字符）
      *
@@ -61,19 +68,24 @@ final class ForeshadowingRepo
         $desc = trim($resolvedDesc);
         if ($desc === '') return 0;
 
-        // 第一步：用前 30 字符（而非 15）获取候选列表
-        $kw = mb_substr($desc, 0, 30);
-        $candidates = DB::fetchAll(
-            'SELECT id, description, embedding, embedding_model
-             FROM foreshadowing_items
-             WHERE novel_id=? AND resolved_chapter IS NULL
-               AND description LIKE ?
-             ORDER BY planted_chapter ASC LIMIT 5',
-            [$this->novelId, '%' . $kw . '%']
-        );
+        // v1.1: 优先使用关键词重叠匹配（AI改写后也能匹配）
+        $candidates = $this->keywordMatchCandidates($desc);
 
+        // 第二步：用前 30 字符获取候选列表（作为补充）
         if (empty($candidates)) {
-            // 降级：尝试完整描述匹配
+            $kw = mb_substr($desc, 0, 30);
+            $candidates = DB::fetchAll(
+                'SELECT id, description, embedding, embedding_model
+                 FROM foreshadowing_items
+                 WHERE novel_id=? AND resolved_chapter IS NULL
+                   AND description LIKE ?
+                 ORDER BY planted_chapter ASC LIMIT 5',
+                [$this->novelId, '%' . $kw . '%']
+            );
+        }
+
+        // 第三步：降级——精确完整匹配
+        if (empty($candidates)) {
             $candidates = DB::fetchAll(
                 'SELECT id, description, embedding, embedding_model
                  FROM foreshadowing_items
@@ -84,11 +96,23 @@ final class ForeshadowingRepo
             );
         }
 
-        if (empty($candidates)) return 0;
+        if (empty($candidates)) {
+            // v1.11.8: 记录匹配失败
+            addLog($this->novelId, 'debug', sprintf(
+                '伏笔回收匹配失败：AI返回「%s」，但数据库无匹配',
+                mb_substr($desc, 0, 50)
+            ));
+            return 0;
+        }
 
         // 单条候选直接返回
         if (count($candidates) === 1) {
             $this->markResolved((int)$candidates[0]['id'], $resolvedChapter);
+            addLog($this->novelId, 'debug', sprintf(
+                '伏笔回收成功(ID:%d)：「%s」',
+                $candidates[0]['id'],
+                mb_substr($candidates[0]['description'], 0, 40)
+            ));
             return (int)$candidates[0]['id'];
         }
 
@@ -96,12 +120,97 @@ final class ForeshadowingRepo
         $bestId = $this->selectBestCandidate($desc, $candidates);
         if ($bestId > 0) {
             $this->markResolved($bestId, $resolvedChapter);
+            addLog($this->novelId, 'debug', sprintf(
+                '伏笔回收成功(embedding匹配 ID:%d)',
+                $bestId
+            ));
             return $bestId;
         }
 
-        // 无 embedding 或语义匹配失败：选第一条（最老的）
+        // 多条候选无 embedding：用关键词重叠选最佳
+        $bestId = $this->selectByKeywordOverlap($desc, $candidates);
+        if ($bestId > 0) {
+            $this->markResolved($bestId, $resolvedChapter);
+            addLog($this->novelId, 'debug', sprintf(
+                '伏笔回收成功(关键词匹配 ID:%d)',
+                $bestId
+            ));
+            return $bestId;
+        }
+
+        // 最终降级：选第一条（最老的）
         $this->markResolved((int)$candidates[0]['id'], $resolvedChapter);
+        addLog($this->novelId, 'debug', sprintf(
+            '伏笔回收成功(降级匹配 ID:%d)',
+            $candidates[0]['id']
+        ));
         return (int)$candidates[0]['id'];
+    }
+
+    /**
+     * 关键词重叠匹配：当文本模糊匹配失败时，用分词关键词找候选
+     *
+     * @param string $desc 回收描述
+     * @return array 候选列表
+     */
+    private function keywordMatchCandidates(string $desc): array
+    {
+        // 提取关键词：2字以上中文词组 + 3字以上英文/数字
+        preg_match_all('/[\x{4e00}-\x{9fa5}]{2,}|[a-zA-Z0-9_]{3,}/u', $desc, $m);
+        $keywords = $m[0] ?? [];
+        if (empty($keywords)) return [];
+
+        // 用任意关键词做 LIKE 匹配
+        $params = [$this->novelId];
+        $clauses = [];
+        foreach (array_slice($keywords, 0, 5) as $kw) {
+            if (mb_strlen($kw) < 2) continue;
+            $clauses[] = 'description LIKE ?';
+            $params[] = '%' . $kw . '%';
+        }
+        if (empty($clauses)) return [];
+
+        $sql = 'SELECT id, description, embedding, embedding_model
+                FROM foreshadowing_items
+                WHERE novel_id=? AND resolved_chapter IS NULL
+                  AND (' . implode(' OR ', $clauses) . ')
+                ORDER BY planted_chapter ASC LIMIT 5';
+
+        return DB::fetchAll($sql, $params);
+    }
+
+    /**
+     * 多条候选时用关键词重叠率选最佳
+     *
+     * @param string $desc       回收描述
+     * @param array  $candidates 候选列表
+     * @return int 最佳候选 ID，失败返回 0
+     */
+    private function selectByKeywordOverlap(string $desc, array $candidates): int
+    {
+        preg_match_all('/[\x{4e00}-\x{9fa5}]{2,}|[a-zA-Z0-9_]{3,}/u', $desc, $m);
+        $queryKeywords = array_unique($m[0] ?? []);
+        if (empty($queryKeywords)) return 0;
+
+        $bestId = 0;
+        $bestScore = 0;
+
+        foreach ($candidates as $c) {
+            preg_match_all('/[\x{4e00}-\x{9fa5}]{2,}|[a-zA-Z0-9_]{3,}/u', $c['description'], $m2);
+            $candKeywords = array_unique($m2[0] ?? []);
+            if (empty($candKeywords)) continue;
+
+            $intersect = count(array_intersect($queryKeywords, $candKeywords));
+            $union = count(array_unique(array_merge($queryKeywords, $candKeywords)));
+            $score = $union > 0 ? $intersect / $union : 0;
+
+            if ($score > $bestScore && $score >= 0.3) {
+                $bestScore = $score;
+                $bestId = (int)$c['id'];
+            }
+        }
+
+        return $bestId;
     }
 
     /**
@@ -155,13 +264,27 @@ final class ForeshadowingRepo
      */
     private function parseEmbeddingBlob(string $blob): ?array
     {
-        // 尝试 JSON 解析（如果是 JSON 格式存储）
+        // 优先尝试 Vector::pack 的二进制格式（float32 小端序）— 这是当前实际存储格式
+        $len = strlen($blob);
+        if ($len > 0 && $len % 4 === 0) {
+            try {
+                require_once __DIR__ . '/Vector.php';
+                $vec = Vector::unpack($blob);
+                if (!empty($vec) && is_array($vec)) {
+                    return $vec;
+                }
+            } catch (\Throwable $e) {
+                // 二进制解析失败，继续尝试其他格式
+            }
+        }
+
+        // 兼容旧格式：JSON
         $decoded = json_decode($blob, true);
         if (is_array($decoded) && !empty($decoded)) {
             return array_map('floatval', $decoded);
         }
 
-        // 尝试二进制解析（如果是 serialize 格式）
+        // 兼容旧格式：serialize
         $unserialized = @unserialize($blob);
         if (is_array($unserialized) && !empty($unserialized)) {
             return array_map('floatval', $unserialized);
@@ -250,6 +373,21 @@ final class ForeshadowingRepo
     }
 
     /**
+     * 所有未回收的伏笔（含完整字段，供 ForeshadowingResolver 评分使用）
+     */
+    public function listPendingWithDetails(): array
+    {
+        return DB::fetchAll(
+            'SELECT id, description, priority, planted_chapter, deadline_chapter,
+                    last_mentioned_chapter, mention_count, created_at
+             FROM foreshadowing_items
+             WHERE novel_id=? AND resolved_chapter IS NULL
+             ORDER BY planted_chapter ASC',
+            [$this->novelId]
+        );
+    }
+
+    /**
      * 已逾期(过了 deadline 还没回收)的伏笔
      */
     public function listOverdue(int $currentChapter, int $buffer = 3): array
@@ -318,5 +456,154 @@ final class ForeshadowingRepo
             $n++;
         }
         return $n;
+    }
+
+    // ============================================================
+    //  伏笔生命周期监控 (v1.10.3)
+    // ============================================================
+
+    /**
+     * 记录某伏笔在当前章节被提及
+     */
+    public function recordMention(int $itemId, int $chapterNum): void
+    {
+        DB::execute(
+            'UPDATE foreshadowing_items SET last_mentioned_chapter=?, mention_count=mention_count+1 WHERE id=? AND novel_id=?',
+            [$chapterNum, $itemId, $this->novelId]
+        );
+        try {
+            DB::insert('foreshadowing_mention_log', [
+                'foreshadowing_id' => $itemId,
+                'novel_id'         => $this->novelId,
+                'chapter_number'   => $chapterNum,
+            ]);
+        } catch (\Throwable $e) {}
+    }
+
+    /**
+     * 扫描章节内容，自动更新伏笔的提及记录
+     * 匹配策略：伏笔描述的前20字符出现在正文中即视为提及
+     */
+    public function trackMentionsInContent(string $content, int $chapterNum): int
+    {
+        $pending = DB::fetchAll(
+            'SELECT id, description FROM foreshadowing_items
+             WHERE novel_id=? AND resolved_chapter IS NULL',
+            [$this->novelId]
+        );
+        if (empty($pending)) return 0;
+
+        $matched = 0;
+        foreach ($pending as $item) {
+            $kw = mb_substr($item['description'], 0, 20);
+            if (mb_strlen($kw) < 4) continue;
+            if (mb_strpos($content, $kw) !== false) {
+                $this->recordMention((int)$item['id'], $chapterNum);
+                $matched++;
+            }
+        }
+        return $matched;
+    }
+
+    /**
+     * 伏笔健康度检测 — 每5章触发
+     * 检查长期未提及的伏笔，返回告警列表
+     *
+     * @return array 告警列表，每个元素包含 foreshadow/age/since_last_mention/severity/message/suggestion
+     */
+    public function checkHealth(int $currentChapter): array
+    {
+        if ($currentChapter % 5 !== 0 || $currentChapter < 10) return [];
+
+        $items = DB::fetchAll(
+            'SELECT id, description, priority, planted_chapter, deadline_chapter,
+                    last_mentioned_chapter, mention_count
+             FROM foreshadowing_items
+             WHERE novel_id=? AND resolved_chapter IS NULL',
+            [$this->novelId]
+        );
+        if (empty($items)) return [];
+
+        $alerts = [];
+        foreach ($items as $item) {
+            $planted = (int)$item['planted_chapter'];
+            $age = $currentChapter - $planted;
+            $lastMention = $item['last_mentioned_chapter'] !== null
+                ? (int)$item['last_mentioned_chapter']
+                : $planted;
+            $sinceLastMention = $currentChapter - $lastMention;
+
+            $severity = null;
+            $message = '';
+            $suggestion = '';
+
+            if ($age > 20 && $sinceLastMention > 15) {
+                $severity = 'high';
+                $message = "伏笔「{$item['description']}」已埋{$age}章，{$sinceLastMention}章未触动，读者将遗忘";
+                $suggestion = "本章可让角色偶然提及/想起该伏笔，1-2句话即可唤醒读者记忆";
+            } elseif ($age > 10 && $sinceLastMention > 10 && ($item['priority'] === 'critical' || $item['priority'] === 'major')) {
+                $severity = 'medium';
+                $message = "重要伏笔「{$item['description']}」已埋{$age}章，{$sinceLastMention}章未提及";
+                $suggestion = "适当安排一次轻提醒，保持伏笔热度";
+            }
+
+            if ($severity) {
+                $alerts[] = [
+                    'foreshadow_id'      => (int)$item['id'],
+                    'foreshadow'         => $item['description'],
+                    'priority'           => $item['priority'],
+                    'age'                => $age,
+                    'since_last_mention' => $sinceLastMention,
+                    'mention_count'      => (int)($item['mention_count'] ?? 0),
+                    'severity'           => $severity,
+                    'message'            => $message,
+                    'suggestion'         => $suggestion,
+                ];
+            }
+        }
+
+        return $alerts;
+    }
+
+    /**
+     * 回滚指定章节的伏笔提及记录（重写后数据清理用）
+     *
+     * 1. 从 foreshadowing_mention_log 查找该章节的提及记录
+     * 2. 对每个受影响的伏笔：mention_count-1，last_mentioned_chapter 回退到上一条日志
+     * 3. 删除该章节的 mention_log 记录
+     */
+    public function revertMentionsForChapter(int $chapterNumber): int
+    {
+        try {
+            $logs = DB::fetchAll(
+                'SELECT foreshadowing_id FROM foreshadowing_mention_log WHERE novel_id=? AND chapter_number=?',
+                [$this->novelId, $chapterNumber]
+            );
+            if (empty($logs)) return 0;
+
+            $affected = 0;
+            foreach ($logs as $log) {
+                $fid = (int)$log['foreshadowing_id'];
+
+                $prevLog = DB::fetch(
+                    'SELECT chapter_number FROM foreshadowing_mention_log WHERE foreshadowing_id=? AND novel_id=? AND chapter_number<? ORDER BY chapter_number DESC LIMIT 1',
+                    [$fid, $this->novelId, $chapterNumber]
+                );
+
+                $newLastMention = $prevLog ? (int)$prevLog['chapter_number'] : null;
+
+                DB::execute(
+                    'UPDATE foreshadowing_items SET mention_count=GREATEST(mention_count-1, 0), last_mentioned_chapter=? WHERE id=? AND novel_id=?',
+                    [$newLastMention, $fid, $this->novelId]
+                );
+                $affected++;
+            }
+
+            DB::delete('foreshadowing_mention_log', 'novel_id=? AND chapter_number=?', [$this->novelId, $chapterNumber]);
+
+            return $affected;
+        } catch (\Throwable $e) {
+            return 0;
+        }
     }
 }

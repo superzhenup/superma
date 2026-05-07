@@ -22,13 +22,27 @@ try {
         exit;
     }
 
-    $outline = DB::fetch('
-        SELECT id, story_arc, act_division, major_turning_points, 
-               character_arcs, character_endpoints, world_evolution, recurring_motifs,
-               created_at, updated_at
-        FROM story_outlines 
-        WHERE novel_id = ?
-    ', [$novelId]);
+    $outline = null;
+    try {
+        $outline = DB::fetch('
+            SELECT id, story_arc, act_division, major_turning_points, 
+                   character_arcs, character_endpoints, character_progression,
+                   world_evolution, recurring_motifs,
+                   created_at, updated_at
+            FROM story_outlines 
+            WHERE novel_id = ?
+        ', [$novelId]);
+    } catch (\Throwable) {
+        // character_progression 列可能不存在，降级查询
+        $outline = DB::fetch('
+            SELECT id, story_arc, act_division, major_turning_points, 
+                   character_arcs, character_endpoints,
+                   world_evolution, recurring_motifs,
+                   created_at, updated_at
+            FROM story_outlines 
+            WHERE novel_id = ?
+        ', [$novelId]);
+    }
 
     if (!$outline) {
         echo json_encode(['success' => false, 'message' => '暂无故事大纲']);
@@ -51,6 +65,7 @@ try {
     }
     
     $outline['recurring_motifs'] = json_decode($outline['recurring_motifs'], true);
+    $outline['character_progression'] = json_decode($outline['character_progression'] ?? 'null', true);
 
     echo json_encode(['success' => true, 'data' => $outline]);
 

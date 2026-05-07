@@ -30,6 +30,39 @@ echo "========================================\n\n";
 $checks = [];
 $allPassed = true;
 
+// ==================== 检查-1: SCHEMA_VERSION 与 db.php 注释版本一致性 ====================
+// 防止"加新 ALTER 忘记升 SCHEMA_VERSION"的反复犯错（v1.2-v1.8 共发生 7 次）
+// 工作原理：扫 db.php 注释里所有 [vN] 标记，对比 SCHEMA_VERSION 常量。
+// 注释版本超过常量 → 升级用户的 ALTER 不会被执行 → 字段缺失类 bug。
+echo "【检查-1】SCHEMA_VERSION 与 db.php 注释版本一致性\n";
+echo "----------------------------------------\n";
+
+try {
+    $ref = new ReflectionClass('DB');
+    $schemaVer = (int)$ref->getConstant('SCHEMA_VERSION');
+
+    $dbCode = file_get_contents(__DIR__ . '/includes/db.php');
+    preg_match_all('/\[v(\d+)\]/', $dbCode, $m);
+    $maxVer = $m[1] ? max(array_map('intval', $m[1])) : 0;
+
+    if ($maxVer > $schemaVer) {
+        echo "✗ db.php 注释里有 [v{$maxVer}] 但 SCHEMA_VERSION = {$schemaVer}\n";
+        echo "  请把 SCHEMA_VERSION 升到 {$maxVer}，否则升级用户的 ALTER 不会执行！\n";
+        echo "  受影响：从更老版本升级（schema_version_migrated < {$maxVer}）的所有用户\n";
+        $checks['schema_version'] = false;
+        $allPassed = false;
+    } else {
+        echo "✓ SCHEMA_VERSION ({$schemaVer}) 与注释最高版本 ({$maxVer}) 一致\n";
+        $checks['schema_version'] = true;
+    }
+} catch (Throwable $e) {
+    echo "✗ SCHEMA_VERSION 检查失败: {$e->getMessage()}\n";
+    $checks['schema_version'] = false;
+    $allPassed = false;
+}
+
+echo "\n";
+
 // ==================== 检查0: DB白名单与实际表名一致性 ====================
 echo "【检查0】DB白名单与实际表名一致性\n";
 echo "----------------------------------------\n";

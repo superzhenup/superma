@@ -29,6 +29,8 @@ final class MemoryEngine
     private ForeshadowingRepo $foreshadowing;
     private AtomRepo $atoms;
 
+    private const MEMORY_ARC_SUMMARY_LIMIT = 5;
+
     public function __construct(int $novelId)
     {
         $this->novelId       = $novelId;
@@ -67,25 +69,61 @@ final class MemoryEngine
     {
         $report = [
             'cards_upserted'      => 0,
+            'cards_inserted'      => 0,  // v1.11.2: 区分新增和更新
+            'cards_updated'       => 0,  // v1.11.2: 区分新增和更新
             'traits_added'        => 0,
             'events_added'        => 0,
+            'new_atom_ids'        => [], // v1.11.2: 新增的 atom IDs，供 CognitiveLoadMonitor 精确查询
             'foreshadowing_added' => 0,
             'foreshadowing_resolved' => 0,
             'momentum_updated'    => false,
             'errors'              => [],
+            'warnings'            => [],
         ];
+
+        // 0) 主角名锚定：读取 novels.protagonist_name，防止 AI 在摘要中使用变体名
+        $canonicalProtagonist = '';
+        try {
+            $novelRow = DB::fetch('SELECT protagonist_name FROM novels WHERE id=?', [$this->novelId]);
+            $canonicalProtagonist = trim($novelRow['protagonist_name'] ?? '');
+        } catch (\Throwable) {}
 
         // 1) 人物状态 → character_cards
         $charUpdates = $summary['character_updates'] ?? [];
         if (is_array($charUpdates)) {
+            $charUpdates = $this->normalizeProtagonistKeys($charUpdates, $canonicalProtagonist);
             foreach ($charUpdates as $name => $update) {
                 if (!is_string($name) || !is_array($update)) continue;
                 try {
                     // 旧 summary 格式用中文 key('职务'/'处境'/'关键变化'),映射到新 schema
                     $mapped = $this->mapLegacyCharacterUpdate($update);
                     if (!empty($mapped)) {
+                        $oldCard = $this->cards->getByName($name);
+                        $isNewCard = ($oldCard === null);  // v1.11.2: 区分新增和更新
                         $this->cards->upsert($name, $mapped, $chapterNumber);
                         $report['cards_upserted']++;
+                        if ($isNewCard) {
+                            $report['cards_inserted']++;  // v1.11.2 Bug #4 修复
+                        } else {
+                            $report['cards_updated']++;   // v1.11.2 Bug #4 修复
+                        }
+
+                        // 境界跳级检测
+                        $realmWarning = $this->detectRealmSkip($name, $oldCard, $mapped, $chapterNumber);
+                        if ($realmWarning) {
+                            $report['warnings'][] = $realmWarning;
+
+                            // 将跳级修复指引写入人物卡片，供下章 Prompt 自动过渡
+                            $bridgeSuggestion = $this->buildRealmBridgeSuggestion($name, $oldCard, $mapped, $chapterNumber);
+                            if ($bridgeSuggestion) {
+                                try {
+                                    $this->cards->upsert($name, ['attributes' => $bridgeSuggestion], $chapterNumber);
+                                } catch (\Throwable) {}
+                            }
+
+                            // 自动更新下一章的 outline，注入过渡章标记
+                            $this->injectBridgeOutlineToNextChapter($name, $chapterNumber, $bridgeSuggestion);
+                        }
                     }
                 } catch (\Throwable $e) {
                     $report['errors'][] = "card[$name]: " . $e->getMessage();
@@ -100,6 +138,12 @@ final class MemoryEngine
         if (is_array($charTraits)) {
             foreach ($charTraits as $trait) {
                 if (empty($trait['name']) || empty($trait['trait'])) continue;
+                if ($canonicalProtagonist && $trait['name'] !== $canonicalProtagonist) {
+                    if (mb_strpos($trait['name'], $canonicalProtagonist) !== false
+                        || mb_strpos($canonicalProtagonist, $trait['name']) !== false) {
+                        $trait['name'] = $canonicalProtagonist;
+                    }
+                }
                 try {
                     $traitKey = trim((string)$trait['trait']);
                     // 组合内容：角色名 + 特征 + 证据
@@ -110,16 +154,34 @@ final class MemoryEngine
 
                     // 去重：同一小说里，相同 character_name + 相同 trait 只保留最新一条。
                     // 证据（evidence）允许不同，只要 trait 关键字一致就合并。
-                    $dup = DB::fetch(
-                        "SELECT id FROM memory_atoms
-                         WHERE novel_id=? AND atom_type='character_trait'
-                           AND JSON_EXTRACT(metadata, '$.character_name') = ?
-                           AND JSON_EXTRACT(metadata, '$.trait_key')      = ?
-                         LIMIT 1",
-                        [$this->novelId, $trait['name'], $traitKey]
-                    );
+                    $dup = null;
+                    try {
+                        $dup = DB::fetch(
+                            "SELECT id FROM memory_atoms
+                             WHERE novel_id=? AND atom_type='character_trait'
+                               AND JSON_VALID(metadata) = 1
+                               AND JSON_EXTRACT(metadata, '$.character_name') = ?
+                               AND JSON_EXTRACT(metadata, '$.trait_key')      = ?
+                             LIMIT 1",
+                            [$this->novelId, $trait['name'], $traitKey]
+                        );
+                    } catch (\Throwable $e) {
+                        $allTraits = DB::fetchAll(
+                            "SELECT id, metadata FROM memory_atoms
+                             WHERE novel_id=? AND atom_type='character_trait'",
+                            [$this->novelId]
+                        );
+                        foreach ($allTraits as $t) {
+                            $meta = is_string($t['metadata']) ? json_decode($t['metadata'], true) : ($t['metadata'] ?? []);
+                            if (($meta['character_name'] ?? '') === $trait['name']
+                                && ($meta['trait_key'] ?? '') === $traitKey) {
+                                $dup = ['id' => $t['id']];
+                                break;
+                            }
+                        }
+                    }
+
                     if ($dup) {
-                        // 旧条目已存在：用新内容覆盖（保留最新证据），并清 embedding 触发重建
                         DB::update('memory_atoms', [
                             'content'              => $content,
                             'source_chapter'       => $chapterNumber,
@@ -138,8 +200,9 @@ final class MemoryEngine
                         $metadata['evidence'] = $trait['evidence'];
                     }
 
-                    $this->atoms->add('character_trait', $content, $chapterNumber, 0.8, $metadata);
+                    $atomId = $this->atoms->add('character_trait', $content, $chapterNumber, 0.8, $metadata);
                     $report['traits_added']++;
+                    $report['new_atom_ids'][] = $atomId;  // v1.11.2 Bug #5 修复
                 } catch (\Throwable $e) {
                     $report['errors'][] = "trait[{$trait['name']}]: " . $e->getMessage();
                 }
@@ -150,10 +213,11 @@ final class MemoryEngine
         $keyEvent = trim((string)($summary['key_event'] ?? ''));
         if ($keyEvent !== '') {
             try {
-                $this->atoms->add('plot_detail', $keyEvent, $chapterNumber, 1.0, [
+                $atomId = $this->atoms->add('plot_detail', $keyEvent, $chapterNumber, 1.0, [
                     'is_key_event' => 1,
                 ]);
                 $report['events_added'] = 1;
+                $report['new_atom_ids'][] = $atomId;  // v1.11.2 Bug #5 修复
             } catch (\Throwable $e) {
                 $report['errors'][] = 'key_event: ' . $e->getMessage();
             }
@@ -175,15 +239,21 @@ final class MemoryEngine
         }
 
         // 5) 已回收伏笔
+        $resolvedList = [];
         foreach ((array)($summary['resolved_foreshadowing'] ?? []) as $resolved) {
             if (!is_string($resolved) || trim($resolved) === '') continue;
             try {
                 $id = $this->foreshadowing->tryResolve($resolved, $chapterNumber);
-                if ($id > 0) $report['foreshadowing_resolved']++;
+                if ($id > 0) {
+                    $report['foreshadowing_resolved']++;
+                    $resolvedList[] = ['id' => $id, 'desc' => mb_substr($resolved, 0, 50)];
+                }
             } catch (\Throwable $e) {
                 $report['errors'][] = 'foreshadowing.resolve: ' . $e->getMessage();
             }
         }
+        // v1.11.8: 记录回收详情
+        $report['resolved_details'] = $resolvedList;
 
         // 6) 故事势能 → novel_state
         $momentum = trim((string)($summary['story_momentum'] ?? ''));
@@ -219,6 +289,32 @@ final class MemoryEngine
                 $report['cool_points_added'] = ($report['cool_points_added'] ?? 0) + 1;
             } catch (\Throwable $e) {
                 $report['errors'][] = "cool_point: " . $e->getMessage();
+            }
+        }
+
+        // 8) 角色情绪状态 → character_emotion_history
+        // v1.11.2 新增：记录角色跨章节情绪状态，确保情绪连续性
+        // v1.11.5 修复：先删后插，防止重写后同章重复记录
+        // 始终先清理本章旧记录（即使新 summary 无情绪数据，也需清除重写前的残留）
+        try {
+            require_once __DIR__ . '/CharacterEmotionRepo.php';
+            $emotionRepo = new CharacterEmotionRepo($this->novelId);
+            $emotionRepo->deleteByChapter($chapterNumber);
+        } catch (\Throwable $e) { }
+
+        $characterEmotions = $summary['character_emotions'] ?? [];
+        if (is_array($characterEmotions) && !empty($characterEmotions)) {
+            // v1.11.2 Bug #9 修复：规范化主角变体名
+            $characterEmotions = $this->normalizeProtagonistInEmotions($characterEmotions, $canonicalProtagonist);
+            try {
+                require_once __DIR__ . '/CharacterEmotionRepo.php';
+                $emotionRepo = new CharacterEmotionRepo($this->novelId);
+                $emotionCount = $emotionRepo->insertBatch($chapterNumber, $characterEmotions);
+                if ($emotionCount > 0) {
+                    $report['emotions_added'] = $emotionCount;
+                }
+            } catch (\Throwable $e) {
+                $report['errors'][] = 'character_emotions: ' . $e->getMessage();
             }
         }
 
@@ -273,7 +369,7 @@ final class MemoryEngine
             'SELECT arc_index, chapter_from, chapter_to, summary
              FROM arc_summaries
              WHERE novel_id=? AND chapter_to < ?
-             ORDER BY chapter_to DESC LIMIT 2',
+             ORDER BY chapter_to DESC LIMIT ' . self::MEMORY_ARC_SUMMARY_LIMIT,
             [$this->novelId, $currentChapter]
         );
 
@@ -371,8 +467,9 @@ final class MemoryEngine
             if ($r['atom_type'] === 'plot_detail') {
                 $meta = json_decode($r['metadata'] ?? '{}', true) ?: [];
                 if (!empty($meta['is_key_event'])) {
-                    $keyEventRows[] = $r;
-                    if (count($keyEventRows) >= $keyEventLimit) break;
+                    if (count($keyEventRows) < $keyEventLimit) {
+                        $keyEventRows[] = $r;
+                    }
                 }
             } elseif ($r['atom_type'] === 'cool_point') {
                 $coolPointRows[] = $r;
@@ -543,12 +640,195 @@ final class MemoryEngine
             }
         }
 
+        // ── 全书进度上下文（注入后 ChapterPromptBuilder::getProgress() 可直接命中）──
+        try {
+            $ctx['progress_context'] = $this->getProgressContext($currentChapter);
+        } catch (\Throwable $e) {
+            $ctx['progress_context'] = null;
+        }
+
         // ── token budget 裁剪 ────────────────────────────────────────
         $this->applyBudget($ctx, $tokenBudget);
 
         return $ctx;
     }
-    
+
+    // =================================================================
+    // 1M 上下文模式：完整上下文构建（无压缩）
+    // =================================================================
+
+    /**
+     * 1M 上下文模式专用：构建完整上下文，不进行 token 裁剪
+     *
+     * 适用于 DeepSeek V4 [1m] 等支持超长上下文的模型
+     * 特点：
+     * - 注入所有已写章节的大纲和正文（而非仅最近5章摘要）
+     * - 注入所有未回收伏笔的完整信息
+     * - 注入角色完整历史轨迹
+     * - 不进行 token budget 裁剪
+     *
+     * @param int $currentChapter 当前章节号
+     * @param int $maxChapters 最大回溯章节数（防止极端情况，默认100）
+     * @return array 完整上下文数据
+     */
+    public function getFullPromptContext(int $currentChapter, int $maxChapters = 100): array
+    {
+        // 先获取压缩模式的上下文作为基础
+        $ctx = $this->getPromptContext($currentChapter, null, 1000000, 50, 20);
+
+        // 移除 budget 裁剪的影响
+        $ctx['debug']['mode'] = 'full_1m';
+        $ctx['debug']['budget_used'] = 0;
+        $ctx['debug']['budget_total'] = 1000000;
+        $ctx['debug']['dropped'] = [];
+
+        // ── 1. 完整章节大纲历史（而非仅最近5章）──
+        $allOutlines = DB::fetchAll(
+            "SELECT chapter_number, title, outline, hook, key_points, opening_type, emotion_score
+             FROM chapters
+             WHERE novel_id=? AND chapter_number < ? AND status IN ('outlined','writing','completed')
+             ORDER BY chapter_number ASC
+             LIMIT ?",
+            [$this->novelId, $currentChapter, $maxChapters]
+        );
+
+        $ctx['full_outlines'] = [];
+        foreach ($allOutlines as $ch) {
+            $ctx['full_outlines'][] = [
+                'chapter'  => (int)$ch['chapter_number'],
+                'title'    => $ch['title'] ?? '',
+                'outline'  => $ch['outline'] ?? '',
+                'hook'     => $ch['hook'] ?? '',
+                'key_points' => json_decode($ch['key_points'] ?? '[]', true),
+            ];
+        }
+
+        // ── 2. 完整章节正文（而非仅前章尾部）──
+        // 注：为避免 token 过多，只取最近 N 章的完整正文，更早的取摘要
+        $fullContentChapters = min(20, (int)($currentChapter * 0.3));  // 最近 20 章或 30%
+        $fullContentChapters = max(5, $fullContentChapters);
+
+        $recentContents = DB::fetchAll(
+            "SELECT chapter_number, title, content, chapter_summary
+             FROM chapters
+             WHERE novel_id=? AND chapter_number < ? AND status='completed'
+             ORDER BY chapter_number DESC
+             LIMIT ?",
+            [$this->novelId, $currentChapter, $fullContentChapters]
+        );
+
+        $ctx['full_contents'] = [];
+        foreach (array_reverse($recentContents) as $ch) {
+            $ctx['full_contents'][] = [
+                'chapter'  => (int)$ch['chapter_number'],
+                'title'    => $ch['title'] ?? '',
+                'content'  => $ch['content'] ?? '',
+                'summary'  => $ch['chapter_summary'] ?? '',
+            ];
+        }
+
+        // 更早章节只取摘要
+        $olderSummaries = DB::fetchAll(
+            "SELECT chapter_number, title, chapter_summary
+             FROM chapters
+             WHERE novel_id=? AND chapter_number < ? AND chapter_number >= ? AND status='completed'
+             ORDER BY chapter_number ASC",
+            [$this->novelId, $currentChapter - $fullContentChapters, max(1, $currentChapter - $maxChapters)]
+        );
+
+        $ctx['older_summaries'] = [];
+        foreach ($olderSummaries as $ch) {
+            if (!empty($ch['chapter_summary'])) {
+                $ctx['older_summaries'][] = [
+                    'chapter' => (int)$ch['chapter_number'],
+                    'title'   => $ch['title'] ?? '',
+                    'summary' => $ch['chapter_summary'],
+                ];
+            }
+        }
+
+        // ── 3. 所有未回收伏笔（完整信息，不截断）──
+        $allForeshadowing = DB::fetchAll(
+            "SELECT id, description, priority, planted_chapter, deadline_chapter,
+                    last_mentioned_chapter, mention_count
+             FROM foreshadowing_items
+             WHERE novel_id=? AND resolved_chapter IS NULL
+             ORDER BY
+                CASE priority WHEN 'critical' THEN 1 WHEN 'major' THEN 2 ELSE 3 END,
+                planted_chapter ASC",
+            [$this->novelId]
+        );
+
+        $ctx['all_foreshadowing'] = [];
+        foreach ($allForeshadowing as $f) {
+            $ctx['all_foreshadowing'][] = [
+                'id'          => (int)$f['id'],
+                'description' => $f['description'],
+                'priority'    => $f['priority'],
+                'planted_at'  => (int)$f['planted_chapter'],
+                'deadline'    => $f['deadline_chapter'] ? (int)$f['deadline_chapter'] : null,
+                'last_mention'=> $f['last_mentioned_chapter'] ? (int)$f['last_mentioned_chapter'] : null,
+                'mention_count' => (int)$f['mention_count'],
+            ];
+        }
+
+        // ── 4. 角色完整历史轨迹 ──
+        $cardsWithHistory = DB::fetchAll(
+            "SELECT cc.id, cc.name, cc.title, cc.status, cc.alive, cc.attributes, cc.last_updated_chapter,
+                    (SELECT JSON_ARRAYAGG(JSON_OBJECT('chapter', cch.chapter_number, 'field', cch.field_name, 'old', cch.old_value, 'new', cch.new_value))
+                     FROM character_card_history cch WHERE cch.card_id = cc.id ORDER BY cch.chapter_number ASC) as history
+             FROM character_cards cc
+             WHERE cc.novel_id=?
+             ORDER BY cc.last_updated_chapter DESC",
+            [$this->novelId]
+        );
+
+        $ctx['characters_full'] = [];
+        foreach ($cardsWithHistory as $card) {
+            $attrs = is_string($card['attributes']) ? json_decode($card['attributes'], true) : $card['attributes'];
+            $history = is_string($card['history']) ? json_decode($card['history'], true) : $card['history'];
+            $ctx['characters_full'][] = [
+                'name'      => $card['name'],
+                'title'     => $card['title'],
+                'status'    => $card['status'],
+                'alive'     => (bool)$card['alive'],
+                'attributes' => $attrs ?? [],
+                'last_chapter' => (int)$card['last_updated_chapter'],
+                'history'   => $history ?? [],
+            ];
+        }
+
+        // ── 5. 所有关键事件（按章节排列）──
+        $allKeyEvents = DB::fetchAll(
+            "SELECT source_chapter, content, atom_type
+             FROM memory_atoms
+             WHERE novel_id=? AND atom_type='plot_detail' AND source_chapter < ?
+             ORDER BY source_chapter ASC
+             LIMIT 200",
+            [$this->novelId, $currentChapter]
+        );
+
+        $ctx['all_key_events'] = [];
+        foreach ($allKeyEvents as $e) {
+            $ctx['all_key_events'][] = [
+                'chapter' => (int)$e['source_chapter'],
+                'event'   => $e['content'],
+            ];
+        }
+
+        // ── 6. 统计信息 ──
+        $ctx['full_context_stats'] = [
+            'total_outlines'    => count($ctx['full_outlines']),
+            'full_content_chapters' => count($ctx['full_contents']),
+            'older_summaries'   => count($ctx['older_summaries']),
+            'foreshadowing_count' => count($ctx['all_foreshadowing']),
+            'character_count'   => count($ctx['characters_full']),
+            'key_events_count'  => count($ctx['all_key_events']),
+        ];
+
+        return $ctx;
+    }
+
     // =================================================================
     // 四层记忆架构获取方法
     // =================================================================
@@ -586,12 +866,12 @@ final class MemoryEngine
      */
     private function getArcSummaries(int $currentChapter): array
     {
-        // 只取当前弧段的前 2 段,避免膨胀
+        // 只取当前弧段的前 N 段,避免膨胀
         $summaries = DB::fetchAll(
             'SELECT arc_index, chapter_from, chapter_to, summary
              FROM arc_summaries
              WHERE novel_id=? AND chapter_to < ?
-             ORDER BY chapter_to DESC LIMIT 2',
+             ORDER BY chapter_to DESC LIMIT ' . self::MEMORY_ARC_SUMMARY_LIMIT,
             [$this->novelId, $currentChapter]
         );
         
@@ -1118,10 +1398,25 @@ final class MemoryEngine
                     $mapped['status'] = $v; break;
                 case '存活': case 'alive':
                     $mapped['alive'] = (bool)$v; break;
-                case '关键变化':  // 旧的"关键变化"没有独立字段,丢进 attributes
+                case '关键变化':
                     $attrs['recent_change'] = $v; break;
+                case '境界': case 'realm':
+                    $attrs['realm'] = $v; break;
+                case '等级': case 'level':
+                    $attrs['level'] = $v; break;
+                case '战力': case 'power':
+                    $attrs['power'] = $v; break;
+                case '技能': case 'skills':
+                    $attrs['skills'] = is_array($v) ? $v : [$v]; break;
+                case '装备': case 'equipment':
+                    $attrs['equipment'] = is_array($v) ? $v : [$v]; break;
+                case '血脉': case 'bloodline':
+                    $attrs['bloodline'] = $v; break;
+                case '法宝': case 'treasure':
+                    $attrs['treasure'] = is_array($v) ? $v : [$v]; break;
+                case '感悟': case 'insight':
+                    $attrs['insight'] = $v; break;
                 default:
-                    // 未知 key 一律塞进 attributes,保证零信息丢失
                     $attrs[$k] = $v;
             }
         }
@@ -1129,6 +1424,186 @@ final class MemoryEngine
             $mapped['attributes'] = $attrs;
         }
         return $mapped;
+    }
+
+    /**
+     * 检测境界跳级（如筑基→元婴跳过金丹）
+     * 基于常见修真/玄幻境界体系的关键词匹配
+     *
+     * @return string|null 警告消息，无跳级返回 null
+     */
+    private function detectRealmSkip(string $name, ?array $oldCard, array $mapped, int $chapterNumber): ?string
+    {
+        $newAttrs = $mapped['attributes'] ?? [];
+        $newRealm = $newAttrs['realm'] ?? null;
+        if (!$newRealm) return null;
+
+        $oldAttrs = null;
+        if ($oldCard && !empty($oldCard['attributes'])) {
+            $oldAttrs = is_string($oldCard['attributes'])
+                ? json_decode($oldCard['attributes'], true)
+                : $oldCard['attributes'];
+        }
+        $oldRealm = $oldAttrs['realm'] ?? null;
+        if (!$oldRealm || $oldRealm === $newRealm) return null;
+
+        $realmOrder = ['炼气', '筑基', '金丹', '元婴', '化神', '炼虚', '合体', '大乘', '渡劫',
+            '凡人', '武者', '武师', '武王', '武皇', '武宗', '武尊', '武圣', '武帝',
+            '见习', '初级', '中级', '高级', '特级', 'S级', 'SS级', 'SSS级',
+            '一阶', '二阶', '三阶', '四阶', '五阶', '六阶', '七阶', '八阶', '九阶',
+            '斗者', '斗师', '大斗师', '斗灵', '斗王', '斗皇', '斗宗', '斗尊', '斗圣', '斗帝',
+        ];
+
+        $oldIdx = -1;
+        $newIdx = -1;
+        foreach ($realmOrder as $i => $label) {
+            if (mb_strpos($oldRealm, $label) !== false) $oldIdx = $i;
+            if (mb_strpos($newRealm, $label) !== false) $newIdx = $i;
+        }
+
+        if ($oldIdx >= 0 && $newIdx >= 0 && $newIdx > $oldIdx + 1) {
+            $skipped = [];
+            for ($i = $oldIdx + 1; $i < $newIdx; $i++) {
+                $skipped[] = $realmOrder[$i];
+            }
+            $warning = "⚠️ 境界跳级警告：{$name} 由「{$oldRealm}」直接晋升「{$newRealm}」，跳过了 " . implode('→', $skipped) . "（第{$chapterNumber}章）";
+            try {
+                addLog($this->novelId, 'realm_skip', $warning);
+            } catch (\Throwable) {}
+            return $warning;
+        }
+
+        return null;
+    }
+
+    /**
+     * 境界跳级后，生成修复指引存入人物卡片
+     * 为每个跳过的境界生成过渡事件，引导 AI 在下章中完整过渡
+     */
+    private function buildRealmBridgeSuggestion(string $name, ?array $oldCard, array $mapped, int $chapterNumber): array
+    {
+        $newAttrs = $mapped['attributes'] ?? [];
+        $newRealm = $newAttrs['realm'] ?? '';
+        if (!$newRealm) return [];
+
+        $oldAttrs = null;
+        if ($oldCard && !empty($oldCard['attributes'])) {
+            $oldAttrs = is_string($oldCard['attributes'])
+                ? json_decode($oldCard['attributes'], true)
+                : $oldCard['attributes'];
+        }
+        $oldRealm = $oldAttrs['realm'] ?? '';
+        if (!$oldRealm || $oldRealm === $newRealm) return [];
+
+        $realmOrder = ['炼气', '筑基', '金丹', '元婴', '化神', '炼虚', '合体', '大乘', '渡劫',
+            '凡人', '武者', '武师', '武王', '武皇', '武宗', '武尊', '武圣', '武帝',
+            '一阶', '二阶', '三阶', '四阶', '五阶', '六阶', '七阶', '八阶', '九阶',
+            '斗者', '斗师', '大斗师', '斗灵', '斗王', '斗皇', '斗宗', '斗尊', '斗圣', '斗帝',
+        ];
+
+        $oldIdx = -1;
+        $newIdx = -1;
+        foreach ($realmOrder as $i => $label) {
+            if (mb_strpos($oldRealm, $label) !== false) $oldIdx = $i;
+            if (mb_strpos($newRealm, $label) !== false) $newIdx = $i;
+        }
+
+        $skipped = [];
+        $bridgeRealm = '';
+        for ($i = $oldIdx + 1; $i < $newIdx; $i++) {
+            $skipped[] = $realmOrder[$i];
+        }
+        if (!empty($skipped)) {
+            $bridgeRealm = implode('→', $skipped);
+        }
+
+        if ($oldIdx < 0 || $newIdx < 0 || $newIdx <= $oldIdx + 1) return [];
+
+        // 为每个跳过的境界生成过渡事件
+        $bridgeEvents = [];
+        $eventTemplates = [
+            "{$name}在修炼中领悟了%s境界的核心奥义，修为稳步提升",
+            "一次意外遭遇中，{$name}被迫以%s级的实力应战，在生死间摸到了%s的门槛",
+            "{$name}闭关三日，将之前积累的战斗经验转化为%s境界的突破",
+            "借助某件机缘/丹药，{$name}快速跨越了%s阶段，根基却并不稳固",
+            "{$name}在探索秘境时，发现了一处蕴含%s力量的遗迹，由此突破了%s的瓶颈",
+        ];
+
+        foreach ($skipped as $i => $sRealm) {
+            $nextRealm = ($i + 1 < count($skipped)) ? $skipped[$i + 1] : $newRealm;
+            $tpl = $eventTemplates[$i % count($eventTemplates)];
+            $event = sprintf($tpl, $sRealm, $nextRealm);
+            $bridgeEvents[] = "· {$sRealm}期：{$event}";
+        }
+
+        $eventList = implode("\n", $bridgeEvents);
+        $skippedCount = count($skipped);
+        $chapterLabel = $skippedCount === 1 ? "跳过了一个境界" : "跳过了{$skippedCount}个境界";
+
+        // 生成完整过渡章指令
+        $bridgeChapter = <<<EOT
+【过渡章指令 — 必须在本章中完整执行】
+问题：{$name}在第{$chapterNumber}章从「{$oldRealm}」直接跃升至「{$newRealm}」，{$chapterLabel}「{$bridgeRealm}」。
+本章需要作为过渡章，通过倒叙/回忆/修炼回溯的方式，将上述被跳过的境界发展过程完整补上。
+
+具体写法：
+1. 本章开头或中段，{$name}进入修炼/冥想/回忆状态
+2. 通过一段连续叙事（500-800字），描述{$name}依次经历了以下阶段的修炼：
+
+{$eventList}
+
+3. 每个阶段用1-2个段落概括，包含关键事件、瓶颈突破、获得的感悟
+4. 过渡完成后，{$name}的境界保持在当前的「{$newRealm}」不变
+5. 过渡章节结束后正常衔接本章剩余情节
+
+注意：
+- 不要改成纯修炼章节，过渡部分控制在800字以内
+- 用回忆/闪回/内心独白等方式自然过渡，不要让角色突然停下来"回忆"
+- 过渡段要有事件和冲突，不要写成枯燥的"XX修炼突破到XX"
+- 过渡完成后，{$name}的境界仍为「{$newRealm}」
+EOT;
+
+        return [
+            'realm_skip_warning' => "⚠️ {$name}在第{$chapterNumber}章从「{$oldRealm}」跳至「{$newRealm}」，跳过了「{$bridgeRealm}」",
+            'realm_skip_bridge' => $bridgeChapter,
+            'realm_skip_skipped' => $bridgeRealm,
+            'realm_skip_chapter' => $chapterNumber,
+            'realm_skip_old' => $oldRealm,
+            'realm_skip_new' => $newRealm,
+            'realm_skip_events' => $eventList,
+        ];
+    }
+
+    /**
+     * 将境界跳级修复指引写入下一章的 outline
+     * 确保下一章 Prompt 生成时，AI 能看到过渡章标记
+     */
+    private function injectBridgeOutlineToNextChapter(string $name, int $chapterNumber, array $bridgeSuggestion): void
+    {
+        if (empty($bridgeSuggestion)) return;
+        try {
+            $nextChapter = DB::fetch(
+                'SELECT id, chapter_number, outline FROM chapters
+                 WHERE novel_id=? AND chapter_number=? AND status IN ("outlined","pending")
+                 ORDER BY chapter_number ASC LIMIT 1',
+                [$this->novelId, $chapterNumber + 1]
+            );
+            if (!$nextChapter) return;
+
+            $outline = $nextChapter['outline'] ?? '';
+            $oldR = $bridgeSuggestion['realm_skip_old'] ?? '';
+            $newR = $bridgeSuggestion['realm_skip_new'] ?? '';
+            $skipped = $bridgeSuggestion['realm_skip_skipped'] ?? '';
+            $events  = $bridgeSuggestion['realm_skip_events'] ?? '';
+
+            $tag = "\n\n【过渡章·境界回溯】上章{$name}境界从「{$oldR}」跳至「{$newR}」跳过了「{$skipped}」。本章需用500-800字回忆/闪回补上中间历程：\n{$events}";
+
+            $newOutline = $outline . $tag;
+            DB::update('chapters', ['outline' => $newOutline], 'id=?', [$nextChapter['id']]);
+            addLog($this->novelId, 'bridge_outline', "第{$nextChapter['chapter_number']}章大纲已注入境界过渡标记（{$name}：{$oldR}→{$skipped}→{$newR}）");
+        } catch (\Throwable $e) {
+            error_log('injectBridgeOutlineToNextChapter failed: ' . $e->getMessage());
+        }
     }
 
     /**
@@ -1224,8 +1699,8 @@ final class MemoryEngine
         while ($sumUsed() > $budget && count($ctx['L3_recent_chapters']) > 4) {
             array_shift($ctx['L3_recent_chapters']);
         }
-        // L2 弧段摘要:只保留最近 1 段
-        while ($sumUsed() > $budget && count($ctx['L2_arc_summaries']) > 1) {
+        // L2 弧段摘要:逐步裁剪,至少保留 3 段（覆盖近 30 章历史）
+        while ($sumUsed() > $budget && count($ctx['L2_arc_summaries']) > 3) {
             array_shift($ctx['L2_arc_summaries']);
         }
         $ctx['arc_summaries'] = $ctx['L2_arc_summaries']; // 同步兼容字段
@@ -1238,7 +1713,7 @@ final class MemoryEngine
         while ($sumUsed() > $budget && count($ctx['L3_recent_chapters']) > 2) {
             array_shift($ctx['L3_recent_chapters']);
         }
-        while ($sumUsed() > $budget && !empty($ctx['L2_arc_summaries'])) {
+        while ($sumUsed() > $budget && count($ctx['L2_arc_summaries']) > 2) {
             array_shift($ctx['L2_arc_summaries']);
         }
         $ctx['arc_summaries'] = $ctx['L2_arc_summaries'];
@@ -1270,5 +1745,91 @@ final class MemoryEngine
         if (empty($data)) return 0;
         if (is_string($data)) return mb_strlen($data);
         return mb_strlen(json_encode($data, JSON_UNESCAPED_UNICODE) ?: '');
+    }
+
+    /**
+     * 主角名归一化：当 AI 返回的 character_updates 中使用了主角的变体名
+     * （如少字、多字、别名），将其合并到 canonical name 下。
+     */
+    private function normalizeProtagonistKeys(array $updates, string $canonical): array
+    {
+        if ($canonical === '') return $updates;
+
+        $keys = array_keys($updates);
+
+        // 如果 canonical name 已经存在，只做变体合并
+        // 如果 canonical name 不存在，检查是否有变体需要替换
+        $hasCanonical = array_key_exists($canonical, $updates);
+        $merged = null;
+        $remove = [];
+
+        foreach ($keys as $k) {
+            if ($k === $canonical) {
+                $merged = $k;
+                continue;
+            }
+            // 子串匹配收紧：仅当一方是另一方的前缀或后缀时才视为变体
+            // 避免单字如"林"误匹配"林冲"、"林黛玉"等不同角色
+            $isVariant = false;
+            if (mb_strlen($k) >= 2 && mb_strlen($canonical) >= 2) {
+                // k 以 canonical 开头或结尾，或 canonical 以 k 开头或结尾
+                $isVariant = (mb_strpos($k, $canonical) === 0 || mb_strpos($canonical, $k) === 0)
+                          || (mb_substr($k, -mb_strlen($canonical)) === $canonical)
+                          || (mb_substr($canonical, -mb_strlen($k)) === $k);
+            }
+            if (!$isVariant) continue;
+
+            if ($merged === null) {
+                $merged = $canonical;
+            }
+            if ($k !== $merged) {
+                if (isset($updates[$merged])) {
+                    $updates[$merged] = array_merge($updates[$merged], $updates[$k]);
+                } else {
+                    $updates[$merged] = $updates[$k];
+                }
+                $remove[] = $k;
+            }
+        }
+
+        foreach ($remove as $k) {
+            unset($updates[$k]);
+        }
+
+        return $updates;
+    }
+
+    /**
+     * v1.11.2 Bug #9 修复：规范化情绪记录中的主角变体名
+     *
+     * 当 AI 返回的 character_emotions 中使用了主角的变体名
+     * （如少字、多字、别名），将其替换为 canonical name。
+     */
+    private function normalizeProtagonistInEmotions(array $emotions, string $canonical): array
+    {
+        if ($canonical === '' || empty($emotions)) {
+            return $emotions;
+        }
+
+        foreach ($emotions as &$emo) {
+            if (!isset($emo['name']) || !is_string($emo['name'])) {
+                continue;
+            }
+            $name = $emo['name'];
+            if ($name === $canonical) {
+                continue;
+            }
+            // 子串匹配：仅当一方是另一方的前缀或后缀时才视为变体
+            if (mb_strlen($name) >= 2 && mb_strlen($canonical) >= 2) {
+                $isVariant = (mb_strpos($name, $canonical) === 0 || mb_strpos($canonical, $name) === 0)
+                          || (mb_substr($name, -mb_strlen($canonical)) === $canonical)
+                          || (mb_substr($canonical, -mb_strlen($name)) === $name);
+                if ($isVariant) {
+                    $emo['name'] = $canonical;
+                }
+            }
+        }
+
+        return $emotions;
     }
 }

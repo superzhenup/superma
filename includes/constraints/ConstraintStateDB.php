@@ -88,12 +88,38 @@ class ConstraintStateDB
 
     /**
      * 批量更新状态
+     * 使用事务保证原子性，避免并发写入时丢失更新
      * @param array $entries [['type'=>'...', 'key'=>'...', 'value'=>...], ...]
      */
     public function setBatch(array $entries): void
     {
-        foreach ($entries as $entry) {
-            $this->set($entry['type'], $entry['key'], $entry['value']);
+        if (empty($entries)) return;
+
+        try {
+            $pdo = DB::connect();
+            $pdo->beginTransaction();
+
+            $stmt = $pdo->prepare(
+                'INSERT INTO constraint_state (novel_id, state_type, state_key, state_value)
+                 VALUES (?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE state_value = VALUES(state_value)'
+            );
+
+            foreach ($entries as $entry) {
+                $stmt->execute([
+                    $this->novelId,
+                    $entry['type'],
+                    $entry['key'],
+                    json_encode($entry['value'], JSON_UNESCAPED_UNICODE)
+                ]);
+            }
+
+            $pdo->commit();
+        } catch (\Throwable $e) {
+            if (isset($pdo) && $pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            error_log("ConstraintStateDB::setBatch failed: {$e->getMessage()}");
         }
     }
 

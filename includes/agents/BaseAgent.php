@@ -332,4 +332,39 @@ abstract class BaseAgent
             'message' => '子类未实现此动作',
         ];
     }
+
+    protected function writeDirective(string $type, string $directive, int $applyRange = 8, ?int $expiresInHours = 72): void
+    {
+        try {
+            require_once __DIR__ . '/AgentDirectives.php';
+            $nextChapter = $this->getCurrentChapterNumber();
+            AgentDirectives::add(
+                $this->novelId,
+                $nextChapter,
+                $type,
+                $directive,
+                $applyRange,
+                $expiresInHours
+            );
+        } catch (\Throwable $e) {
+            error_log("写入Agent指令失败: " . $e->getMessage());
+        }
+    }
+
+    protected function getCurrentChapterNumber(): int
+    {
+        try {
+            // 使用 MAX(chapter_number) + 1 而非 COUNT(completed)+1
+            // 避免存在 failed/draft/跳过章节时章节号错位
+            $result = DB::fetch(
+                'SELECT COALESCE(MAX(chapter_number), 0) + 1 as next_chapter
+                 FROM chapters
+                 WHERE novel_id = ?',
+                [$this->novelId]
+            );
+            return (int)($result['next_chapter'] ?? 1);
+        } catch (\Throwable $e) {
+            return 1;
+        }
+    }
 }

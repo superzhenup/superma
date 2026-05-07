@@ -47,6 +47,25 @@ final class CharacterCardRepo
     }
 
     /**
+     * 获取所有有 voice_profile 的角色卡片（用于写作时 prompt 注入）
+     */
+    public function listWithVoiceProfile(): array
+    {
+        $rows = DB::fetchAll(
+            'SELECT name, voice_profile FROM character_cards WHERE novel_id=? AND alive=1 AND voice_profile IS NOT NULL',
+            [$this->novelId]
+        );
+        $result = [];
+        foreach ($rows as $row) {
+            $vp = json_decode($row['voice_profile'], true);
+            if ($vp) {
+                $result[$row['name']] = $vp;
+            }
+        }
+        return $result;
+    }
+
+    /**
      * upsert:插入或更新一张卡片,并自动把变化写入 history。
      *
      * @param string $name        人物名(唯一键)
@@ -83,6 +102,7 @@ final class CharacterCardRepo
                 'status'               => self::normalizeString($updates['status'] ?? null),
                 'alive'                => isset($updates['alive']) ? (int)(bool)$updates['alive'] : 1,
                 'attributes'           => $newAttrs,
+                'voice_profile'        => isset($updates['voice_profile']) ? json_encode($updates['voice_profile'], JSON_UNESCAPED_UNICODE) : null,
                 'last_updated_chapter' => $chapterNum,
             ]);
 
@@ -132,6 +152,21 @@ final class CharacterCardRepo
                 $changes['attributes'] = [$oldJson, $newJson];
                 // 存储时也存排序后的，保证后续比对一致
                 $newData['attributes'] = $newJson;
+            }
+        }
+
+        if (array_key_exists('voice_profile', $updates) && is_array($updates['voice_profile'])) {
+            $oldVP = json_decode($existing['voice_profile'] ?? '{}', true) ?: [];
+            $mergedVP = array_merge($oldVP, $updates['voice_profile']);
+            $oldVPSorted = $oldVP;
+            $newVPSorted = $mergedVP;
+            ksort($oldVPSorted);
+            ksort($newVPSorted);
+            $oldVPJson = json_encode($oldVPSorted, JSON_UNESCAPED_UNICODE);
+            $newVPJson = json_encode($newVPSorted, JSON_UNESCAPED_UNICODE);
+            if ($oldVPJson !== $newVPJson) {
+                $changes['voice_profile'] = [$oldVPJson, $newVPJson];
+                $newData['voice_profile'] = $newVPJson;
             }
         }
 
@@ -269,6 +304,11 @@ final class CharacterCardRepo
             $row['attributes'] = json_decode($row['attributes'], true) ?: [];
         } else {
             $row['attributes'] = [];
+        }
+        if (!empty($row['voice_profile'])) {
+            $row['voice_profile'] = json_decode($row['voice_profile'], true) ?: [];
+        } else {
+            $row['voice_profile'] = [];
         }
         $row['alive'] = (int)$row['alive'] === 1;
         return $row;

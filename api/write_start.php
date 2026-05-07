@@ -249,8 +249,8 @@ try {
     // CLI worker 启动涉及 PHP 加载、DB 连接、配置读取等，冷启动可能需数秒
     $started = false;
     $progress = null;
-    $maxWait = 30;        // 最多轮询 30 次
-    $waitInterval = 500000; // 每次 0.5 秒，总计 15 秒
+    $maxWait = 40;        // 最多轮询 40 次（从30增加到40）
+    $waitInterval = 500000; // 每次 0.5 秒，总计 20 秒
     for ($i = 0; $i < $maxWait; $i++) {
         usleep($waitInterval);
         if (!file_exists($progressFile)) continue;
