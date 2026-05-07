@@ -13,15 +13,13 @@ config.php
 .vscode/
 *.sublime-*
 
-# 上传文件（如果有）
+# 上传文件
 uploads/
-storage/covers/
+
+# 运行时目录（不应分发）
+migrations/
+storage/
 
 # Word 临时文件
 ~$*
 *.tmp
-
-# Schema 版本锁文件（不应分发）
-storage/*.lock
-# 写作取消标志文件（运行时临时文件）
-storage/write_cancel_*.flag
