@@ -1,4 +1,4 @@
-# ✦ Super Ma Ahents v1.5 — AI 智能小说创作辅助系统（平台）
+# ✦ Super Ma Ahents v1.7 — AI 智能小说创作辅助系统（平台）
 ## UI预览
 <img width="1921" height="906" alt="局部截取_20260427_204024" src="https://github.com/user-attachments/assets/5951459d-bada-4d90-b443-1ad7127c53e1" />
 <p> <p>
@@ -13,6 +13,7 @@
 <p> 📊内置 | 深度定制：基于1500+本白金级网文深度学习，量化网文数据，构建小说创作专属知识图谱。章节生成完成后，系统自动解析并提取核心创作要素——角色档案卡、伏笔埋线追踪、世界观设定集，沉淀为可复用、可检索的结构化创作资产，助力长期连载的一致性与深度。<p>
 <p> 🧠创新 | 持久记忆：Pyramid MemoryEngine 记忆引擎 （L1全局设定 / L2弧段摘要 / L3近章大纲 / L4前章尾文），配合 Embedding 语义向量检索，越写越聪明，有效防止长篇创作中的情节失忆与人物漂移（灵感来源：TencentDB AI-Memory ）。<p>
 <p> 🖥️支持 | 可视化写作：支持SSE（流式写作）、CLI（异步后台写作）、Automatic offline（挂机全自动连续写作）三大写作模式，动态字数控制系统精确把控章节篇幅，模型 Fallback 机制保障写作连续性。<p>
+<p> 🎭突破 | 文学质感：意境营造系统（30种题材×情感组合）、因果链验证器（4项预防性校验拦截逻辑漏洞）、章节类型识别器（6种类型差异化节奏），Temperature 五维精细调度 + Prompt 三级优先级，让AI写出的每一章都像资深作者亲手打磨过一样。<p>
 
 <p>---<p>
 
@@ -56,6 +57,11 @@
 | 🔄 智能重写 | 低分章节AI自评重写，提升>10分采纳，默认关闭按需开启 |
 | 👁️ 读者视角评分 | 5维读者体验评估（爽感/代入/节奏/新鲜/追读），弱项自动反馈下章 |
 | 🛡️ 风格守护 | AI痕迹检测+风格漂移监测，每20章对比基线防止越写越垮 |
+| 🎭 意境营造系统 | 5大题材×6种情感基调=30种意境组合，场景描写防重复，告别"千篇一律"
+| 🔗 因果链验证器 | 写作前自动执行4项预防性校验（死亡角色/境界跳级/场景连续/世界矛盾），逻辑漏洞拦截于摇篮
+| 🏷️ 章节类型识别 | 6种章节类型（战斗/谋略/修炼/日常/揭秘/旅途）自动分类，差异化调整节奏比例
+| 🌡️ Temperature 五维调度 | 大纲语义×进度×卷末×节奏×爽点类型综合评分，精度达±0.02
+| 📋 Prompt 三级优先级 | P0铁律/P1强化/P2参考分层结构，AI不再"顾此失彼"
 | 📊 使用统计上报 | 自动统计每日生成字数，定期上报到远程服务器（可配置开关）
 
 ---
@@ -178,13 +184,18 @@ http://你的域名/install.php
 │   ├── functions.php    # 入口加载器
 │   ├── error_handler.php # 错误处理
 │   ├── config_constants.php # 集中配置常量（含1M超时常量）
+│   ├── SceneAtmosphereBuilder.php # 意境营造系统（v1.7）
+│   ├── CausalChainGuard.php      # 因果链验证器（v1.7）
+│   ├── ChapterTypeDetector.php   # 章节类型识别器（v1.7）
+│   ├── ChapterPromptBuilder.php  # Prompt 构建（含三级优先级）
 │   ├── heartbeat_helper.php # SSE 心跳辅助
 │   ├── layout.php       # 页面布局
-│   ├── constraints/     # 约束框架（v1.3.5）
+│   ├── constraints/     # 约束框架（v1.3.5 / v1.7）
 │   │   ├── ConstraintConfig.php      # 约束配置读取
 │   │   ├── ConstraintStateDB.php     # 约束状态存储
 │   │   ├── PostWriteValidator.php    # 后置校验器
-│   │   └── ConstraintStateUpdater.php # 约束状态更新
+│   │   ├── ConstraintStateUpdater.php # 约束状态更新
+│   │   └── TitleSanitizer.php        # 标题自动改写（v1.7）
 │   ├── memory/          # MemoryEngine 核心
 │   │   ├── MemoryEngine.php      # 门面类（支持1M完整上下文模式）
 │   │   ├── CharacterCardRepo.php # 人物卡片仓储
@@ -445,11 +456,14 @@ http://你的域名/install.php
 - **后端**：PHP 8.x，PDO/MySQL，原生 SSE 流式输出
 - **前端**：Bootstrap 5.3，Bootstrap Icons，原生 JS（无框架依赖）
 - **AI 接入**：OpenAI Chat Completions 协议，支持流式 / 非流式双模式
-- **安全**：bcrypt 密码哈希，PDO 预处理防注入，Session 登录鉴权，`APP_LOADED` 常量防直接访问
+- **安全**：bcrypt 密码哈希，PDO 预处理防注入，CSRF Token 全站校验，登录 IP 限速，Session 鉴权，`APP_LOADED` 常量防直接访问
 - **智能控制**：
   - 动态字数控制：线性插值算法 + 多级预警机制
   - Agent 决策系统：基于规则的参数优化引擎
-  - 记忆架构：四层分层记忆 + 语义召回
+  - 记忆架构：四层分层记忆 + 语义召回 + 情感共鸣加权
+  - 意境营造系统：30种题材×情感组合，场景描写防重复
+  - 因果链验证器：4项预防性校验，写作前拦截逻辑漏洞
+  - 章节类型识别：6种类型自动分类 + 差异化节奏调整
 - **数据存储**：
   - 系统配置：`system_settings` 表（键值对存储）
   - Agent 指令：`agent_directives` 表（自然语言指令）
@@ -459,6 +473,46 @@ http://你的域名/install.php
 ---
 
 ## 更新日志
+
+### v1.7（2026-06-09）
+
+**三大全新模块**
+
+- **意境营造系统（SceneAtmosphereBuilder）**：5大题材×6种情感基调=30种意境组合，场景描写防重复追踪，告别"千篇一律"的AI场景描写
+- **因果链验证器（CausalChainGuard）**：写作前自动执行4项预防性校验（死亡角色检测/境界跳级检测/场景连续性检测/世界设定矛盾检测），逻辑漏洞拦截于摇篮
+- **章节类型识别器（ChapterTypeDetector）**：6种章节类型（战斗/谋略/修炼/日常/揭秘/旅途）关键词自动分类，差异化调整四段式节奏比例
+
+**核心引擎升级**
+
+- **Temperature 五维精细调度**：从2维升级为5维（大纲语义×进度×卷末×节奏×爽点类型），精度达±0.02
+- **Prompt 三级优先级重构**：P0铁律/P1强化/P2参考分层结构，AI优先保证核心规则执行
+- **角色对话潜台词系统**：VoiceProfileGenerator 新增潜台词风格+隐情信号双维度，对话更有层次感
+- **情感共鸣加权召回**：记忆原子自动标注7种情感标签，召回时同类情感1.3倍权重提升
+
+**安全加固**
+
+- CSRF Token 全站统一校验 + `hash_equals` 防时序攻击
+- 登录暴力破解防护：按 IP 文件持久化限速，不可通过丢弃 Cookie 绕过
+- 内部异常信息泄露全量收口：`safe_api_error_payload` / `safe_sse_error_payload` 统一处理，客户端仅收友好文案+追踪号
+- XSS 防护：`innerHTML` 渲染点全量 `escHtml()` 转义
+- Nginx 部署保护示例：拒绝敏感目录/文件访问
+- 守护令牌请求头优先：`X-Daemon-Token` → `Authorization: Bearer` → URL 兜底（迁移期）
+- 缓存原子写：临时文件 + `rename()`，消除并发写残缺
+
+**Bug 修复**
+
+- 标题禁用词误判导致整本书暂停：新增 `TitleSanitizer` 落盘前自动改写，禁用词降级为 P1 不阻断写作
+- Windows 异步写作不可用：CLI worker 改用 `php.exe`，后台启动改 `start /B`
+- 自动写作章节列表不刷新：每章完成后立即调用 `refreshChapterList()`
+- 大纲生成循环重生成同一批：前端改为按 `batch_done` 的 `actual_end` 权威推进
+- 大纲生成连接中断/未落库：阻塞式 AI 调用加 `CURLOPT_PROGRESSFUNCTION` 心跳，先落库再增强
+- 靠后批次超时未落库：保存抽为幂等闭包，流式解析后立即落库，再做质量返修
+- 挂机写作面板复现：`daemon_write` 变更后 `clearNovelCache()` 失效缓存
+
+**体验优化**
+
+- CLI 环境自动接入自带 CA 证书（`cacert.pem`），解决 CLI 无 `curl.cainfo` 导致 HTTPS 调用失败
+- JS 静态资源加 `filemtime` 版本号，确保更新后立即加载新版
 
 ### v1.5（2026-05-06）
 
