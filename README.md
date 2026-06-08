@@ -1,10 +1,13 @@
 # ✦ Super Ma Ahents v1.7 — AI 智能小说创作辅助系统（平台）
+
+<img width="1055" height="1491" alt="ed465bef8d0dd0baf1c0b309d376214e" src="https://github.com/user-attachments/assets/351c8a95-414c-42bf-97e7-fd758c72ffbf" />
+
 ## UI预览
-<img width="1921" height="906" alt="局部截取_20260427_204024" src="https://github.com/user-attachments/assets/5951459d-bada-4d90-b443-1ad7127c53e1" />
+<img width="1122" height="1402" alt="9751309bfb84c9f2b74b8bfb385efdc9" src="https://github.com/user-attachments/assets/af89efef-65d2-4f0a-9e6f-2fa87f12d628" />
 <p> <p>
-<img width="1895" height="904" alt="局部截取_20260427_204121" src="https://github.com/user-attachments/assets/97c06eaf-12d1-4a89-a985-39d76f98e234" />
+<img width="1122" height="1402" alt="41c4ebb6767398e4edbb54688d3220be" src="https://github.com/user-attachments/assets/9bc76bd9-9310-4063-a3d1-3aa03afdcb0e" />
 <p> <p>
-<img width="1919" height="910" alt="局部截取_20260427_204252" src="https://github.com/user-attachments/assets/31c1d69a-350b-4586-988a-0eaf2e946524" />
+<img width="1122" height="1402" alt="25ca7792e8a66b6be8f125d395b1d377" src="https://github.com/user-attachments/assets/a9a1367c-dad3-40ec-8d35-e5b199ca5656" />
 
 
 ## 功能简介
