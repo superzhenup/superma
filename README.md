@@ -1,4 +1,4 @@
-# ✦ Super Ma Agents v1.7 — AI 智能小说创作辅助系统（平台）
+# ✦ Super Ma Agents v1.7 — AI 智能小说创作辅助系统
 
 <img width="1055" height="1491" alt="ed465bef8d0dd0baf1c0b309d376214e" src="https://github.com/user-attachments/assets/351c8a95-414c-42bf-97e7-fd758c72ffbf" />
 
