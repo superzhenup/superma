@@ -66,7 +66,11 @@ if (!defined('CFG_SSE_AI_CHECK'))              define('CFG_SSE_AI_CHECK', CFG_SS
 // ============================================================
 // 五、路径（原在 6+ 个文件中拼写相同字符串）
 // ============================================================
-if (!defined('CFG_PROGRESS_DIR'))        define('CFG_PROGRESS_DIR', sys_get_temp_dir() . '/novel_write_progress');
+if (!defined('CFG_PROGRESS_DIR'))        define('CFG_PROGRESS_DIR',
+    defined('BASE_PATH')
+        ? BASE_PATH . '/storage/write_progress'
+        : dirname(__DIR__) . '/storage/write_progress'
+);
 
 // ============================================================
 // 六、僵死/Lock 超时检测（原在各文件中不一致）
@@ -156,6 +160,28 @@ function getWritingDefaults(): array
         'ws_critic_enabled'              => ['default' => true,    'type' => 'bool'],
         'ws_style_guard_enabled'         => ['default' => true,    'type' => 'bool'],
         'ws_ai_patterns_check_enabled'   => ['default' => true,    'type' => 'bool'],
+
+        // ── Agent 决策系统 ──
+        'agent.enabled'                  => ['default' => true,    'type' => 'bool'],
+        'agent.strategy_agent.enabled'   => ['default' => true,    'type' => 'bool'],
+        'agent.strategy_agent.check_interval' => ['default' => 10, 'type' => 'int'],
+        'agent.quality_agent.enabled'    => ['default' => true,    'type' => 'bool'],
+        'agent.quality_agent.check_interval' => ['default' => 5,   'type' => 'int'],
+        'agent.quality_agent.auto_fix'   => ['default' => true,    'type' => 'bool'],
+        'agent.optimization_agent.enabled' => ['default' => true,  'type' => 'bool'],
+        'agent.optimization_agent.optimization_interval' => ['default' => 20, 'type' => 'int'],
+
+        // ── 迭代精炼系统 ──
+        'ir_max_iterations'              => ['default' => 3,       'type' => 'int'],
+        'ir_target_score'                => ['default' => 80,      'type' => 'int'],
+        'ir_min_improvement'             => ['default' => 5.0,     'type' => 'float'],
+        'ir_quality_decline_threshold'   => ['default' => 3.0,     'type' => 'float'],
+
+        // ── 短篇小说模块 ──
+        'short_story_default_words'      => ['default' => 3000,    'type' => 'int'],
+        'short_story_min_words'          => ['default' => 800,     'type' => 'int'],
+        'short_story_max_words'          => ['default' => 20000,   'type' => 'int'],
+        'short_story_quality_threshold'  => ['default' => 75,      'type' => 'int'],
     ];
 }
 

@@ -35,6 +35,7 @@ require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
+require_once dirname(__DIR__) . '/includes/cache.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 requireLoginApi();
 session_write_close();
@@ -88,7 +89,7 @@ if (empty($chapters)) {
 }
 
 try { getModelFallbackList($novel['model_id'] ?: null, 'structured'); }
-catch (RuntimeException $e) { sse('error', ['msg' => $e->getMessage()]); sseDone(); exit; }
+catch (RuntimeException $e) { sse('error', safe_sse_error_payload($e, '模型不可用，请稍后重试')); sseDone(); exit; }
 
 $totalChapters = count($chapters);
 sse('progress', ['msg' => "开始优化 {$totalChapters} 章大纲逻辑...", 'total' => $totalChapters]);
@@ -260,8 +261,8 @@ for ($i = $startBatchIndex; $i < $totalChapters; $i += $batchSize) {
         // AI API 调用完成后立即发送心跳
         sendHeartbeatOptimize();
     } catch (RuntimeException $e) {
-        sse('error', ['msg' => "第{$batchFrom}～{$batchTo}章优化失败：" . $e->getMessage()]);
-        continue;
+            sse('error', safe_sse_error_payload($e, "第{$batchFrom}～{$batchTo}章优化失败"));
+            continue;
     }
 
     // 解析并入库
@@ -319,6 +320,11 @@ for ($i = $startBatchIndex; $i < $totalChapters; $i += $batchSize) {
         ], 'id=?', [$existing['id']]);
 
         if ($changed) $changedCount++;
+    }
+
+    if ($changedCount > 0) {
+        Cache::delete("novel_chapters:{$novelId}:all");
+        Cache::delete("novel:{$novelId}");
     }
 
     $updatedTotal += $changedCount;

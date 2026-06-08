@@ -26,7 +26,7 @@ try {
     requireLoginApi();
     $novelId = intval($_GET['novel_id'] ?? 0);
     if (!$novelId) {
-        echo json_encode(['success' => false, 'message' => '缺少novel_id参数']);
+        echo json_encode(['success' => false, 'ok' => false, 'error' => '缺少novel_id参数', 'message' => '缺少novel_id参数', 'code' => 'MISSING_NOVEL_ID']);
         exit;
     }
 
@@ -99,6 +99,46 @@ try {
     }
     $data['hook_distribution'] = $hookDist;
 
+    // 3b. 钩子回收健康（hook_resolved：1=已回收/0=悬挂/NULL=未检测）
+    $data['hook_health'] = ['checked' => 0, 'resolved' => 0, 'dangling' => 0, 'rate' => null, 'dangling_list' => []];
+    try {
+        $hr = DB::fetch(
+            "SELECT
+                SUM(hook_resolved IS NOT NULL) AS checked,
+                SUM(hook_resolved = 1)         AS resolved,
+                SUM(hook_resolved = 0)         AS dangling
+             FROM chapters WHERE novel_id=?",
+            [$novelId]
+        );
+        $checked  = (int)($hr['checked'] ?? 0);
+        $resolved = (int)($hr['resolved'] ?? 0);
+        $dangling = (int)($hr['dangling'] ?? 0);
+        $data['hook_health']['checked']  = $checked;
+        $data['hook_health']['resolved'] = $resolved;
+        $data['hook_health']['dangling'] = $dangling;
+        $data['hook_health']['rate']     = $checked > 0 ? round($resolved / $checked * 100, 1) : null;
+
+        // 悬挂钩子清单：本章 hook_resolved=0 → 悬挂的是上一章(N-1)抛出的钩子
+        if ($dangling > 0) {
+            $rows = DB::fetchAll(
+                "SELECT c.chapter_number AS cur, p.chapter_number AS prev_num, p.hook
+                 FROM chapters c
+                 JOIN chapters p ON p.novel_id = c.novel_id AND p.chapter_number = c.chapter_number - 1
+                 WHERE c.novel_id=? AND c.hook_resolved = 0
+                 ORDER BY c.chapter_number DESC LIMIT 15",
+                [$novelId]
+            );
+            foreach ($rows as $r) {
+                $data['hook_health']['dangling_list'][] = [
+                    'chapter' => (int)$r['prev_num'],
+                    'hook'    => mb_substr(trim((string)($r['hook'] ?? '')), 0, 60),
+                ];
+            }
+        }
+    } catch (\Throwable $e) {
+        // hook_resolved 列未迁移或查询失败时静默降级
+    }
+
     // 4. 角色出场（从character_cards获取）
     $charRows = DB::fetchAll(
         'SELECT cc.name, COALESCE(nc.role_type, "minor") AS importance, cc.last_updated_chapter
@@ -161,11 +201,19 @@ try {
         $health = $monitor->check();
         $data['system_health'] = $health;
     } catch (\Throwable $e) {
-        $data['system_health'] = ['healthy' => true, 'score' => 100, 'alerts' => [], 'error' => $e->getMessage()];
+        error_log('health_dashboard.system_health: ' . $e->getMessage());
+        $data['system_health'] = ['healthy' => true, 'score' => 100, 'alerts' => []];
     }
 
-    echo json_encode(['success' => true, 'data' => $data], JSON_UNESCAPED_UNICODE);
+    echo json_encode(['success' => true, 'ok' => true, 'data' => $data], JSON_UNESCAPED_UNICODE);
 
 } catch (Exception $e) {
-    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+    echo json_encode([
+        'success' => false,
+        'ok' => false,
+        'error' => '系统健康检查失败，请稍后重试',
+        'message' => '系统健康检查失败，请稍后重试',
+        'code' => 'internal_error',
+        'request_id' => error_trace_id(),
+    ]);
 }

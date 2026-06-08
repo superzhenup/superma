@@ -66,12 +66,13 @@ try {
             throw new Exception('无效的操作');
     }
 } catch (Exception $e) {
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] analyze_book: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
     if ($isSSE) {
-        // SSE 模式下通过事件报错
-        sseSend('error', ['message' => $e->getMessage()]);
+        sseSend('error', safe_sse_error_payload($e, '拆书分析失败，请稍后重试'));
     } else {
         header('Content-Type: application/json; charset=utf-8');
-        echo json_encode(['success' => false, 'error' => $e->getMessage()], JSON_UNESCAPED_UNICODE);
+        echo json_encode(safe_api_error_payload($e, '拆书分析失败，请稍后重试'), JSON_UNESCAPED_UNICODE);
     }
 }
 
@@ -165,7 +166,8 @@ function analyzeStep() {
         sseSend('done', ['step' => $step, 'total_chars' => mb_strlen($fullContent)]);
 
     } catch (Exception $e) {
-        sseSend('error', ['message' => $e->getMessage()]);
+        error_log('analyze_book analyze: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        sseSend('error', safe_sse_error_payload($e, '分析失败，请稍后重试'));
     }
 }
 

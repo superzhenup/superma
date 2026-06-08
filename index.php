@@ -6,17 +6,6 @@ requireLogin();
 require_once __DIR__ . '/includes/db.php';
 require_once __DIR__ . '/includes/functions.php';
 require_once __DIR__ . '/includes/layout.php';
-require_once __DIR__ . '/includes/stats_tracker.php';
-
-// 每日统计上报检查（异步触发，不阻塞页面加载）
-if (StatsTracker::shouldReport()) {
-    $protocol = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https' : 'http';
-    $appUrl = $protocol . '://' . ($_SERVER['HTTP_HOST'] ?? 'localhost');
-    @file_get_contents($appUrl . '/api/stats_report.php?action=report', false, stream_context_create([
-        'http' => ['timeout' => 3, 'method' => 'GET']
-    ]));
-}
-
 $novels = DB::fetchAll(
     'SELECT n.*, m.name AS model_name
      FROM novels n LEFT JOIN ai_models m ON n.model_id = m.id
@@ -83,6 +72,9 @@ pageHeader('我的书库', 'home');
     <a href="workshop.php" class="btn btn-outline-primary btn-sm">
       <i class="bi bi-lightbulb me-1"></i>创意工坊
     </a>
+    <a href="start.php" class="btn btn-outline-info btn-sm">
+      <i class="bi bi-stars me-1"></i>开始创作
+    </a>
     <a href="create.php" class="btn btn-primary btn-sm">
       <i class="bi bi-plus-lg me-1"></i>新建小说
     </a>
@@ -97,6 +89,9 @@ pageHeader('我的书库', 'home');
   <div class="d-flex gap-2 justify-content-center">
     <a href="workshop.php" class="btn btn-outline-primary">
       <i class="bi bi-lightbulb me-1"></i>创意工坊
+    </a>
+    <a href="start.php" class="btn btn-outline-info">
+      <i class="bi bi-stars me-1"></i>开始创作
     </a>
     <a href="create.php" class="btn btn-primary">
       <i class="bi bi-plus-circle me-1"></i>创建小说

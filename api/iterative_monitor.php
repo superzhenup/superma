@@ -149,8 +149,8 @@ function getOverallStats(int $novelId): array
             'worst_chapter' => findWorstImprovement($chapters),
         ];
     } catch (Exception $e) {
-        error_log('获取总体统计失败：' . $e->getMessage());
-        return ['error' => $e->getMessage()];
+        error_log('获取总体统计失败：' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        return ['error' => '获取数据失败，请稍后重试'];
     }
 }
 
@@ -285,8 +285,8 @@ function analyzeCommonIssues(int $novelId): array
             'strongest_gate' => array_search(max($avgScores), $avgScores) ?: null,
         ];
     } catch (Exception $e) {
-        error_log('分析常见问题失败：' . $e->getMessage());
-        return ['error' => $e->getMessage()];
+        error_log('分析常见问题失败：' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        return ['error' => '分析失败，请稍后重试'];
     }
 }
 
@@ -358,8 +358,8 @@ function calculatePerformanceMetrics(int $novelId): array
             'total_ai_calls' => $totalIterations,
         ];
     } catch (Exception $e) {
-        error_log('计算性能指标失败：' . $e->getMessage());
-        return ['error' => $e->getMessage()];
+        error_log('计算性能指标失败：' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        return ['error' => '计算失败，请稍后重试'];
     }
 }
 
@@ -503,8 +503,8 @@ function getChapterIterationDetail(int $novelId, int $chapterId): array
             'evaluation' => $detailedAnalysis,
         ];
     } catch (Exception $e) {
-        error_log('获取章节详情失败：' . $e->getMessage());
-        return ['error' => $e->getMessage()];
+        error_log('获取章节详情失败：' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        return ['error' => '获取失败，请稍后重试'];
     }
 }
 
@@ -562,8 +562,8 @@ function getImprovementTrends(int $novelId, int $periodDays = 30): array
             ],
         ];
     } catch (Exception $e) {
-        error_log('获取改进趋势失败：' . $e->getMessage());
-        return ['error' => $e->getMessage()];
+        error_log('获取改进趋势失败：' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        return ['error' => '获取失败，请稍后重试'];
     }
 }
 
@@ -655,7 +655,8 @@ function diagnoseConfiguration(int $novelId): array
             'current_config' => array_merge($rewrite, $refinement),
         ];
     } catch (Exception $e) {
-        return ['status' => 'error', 'message' => $e->getMessage()];
+        error_log('生成告警失败：' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        return ['status' => 'error', 'message' => '生成告警失败，请稍后重试'];
     }
 }
 
@@ -804,7 +805,7 @@ function analyzeImprovementPatterns(int $novelId): array
 
         return $patterns;
     } catch (Exception $e) {
-        error_log('分析改进模式失败：' . $e->getMessage());
-        return ['error' => $e->getMessage()];
+        error_log('分析改进模式失败：' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        return ['error' => '分析失败，请稍后重试'];
     }
 }

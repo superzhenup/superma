@@ -68,10 +68,10 @@ function runTest(string $category, string $testName, callable $testFn, array &$d
             case 'critical': $diagnostic['summary']['critical']++; break;
         }
     } catch (Throwable $e) {
+        error_log('system_diagnostic test ' . $testName . ': ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
         $diagnostic['tests'][$category][$testName] = [
             'status'  => 'error',
-            'message' => '测试执行异常：' . $e->getMessage(),
-            'file'    => $e->getFile() . ':' . $e->getLine(),
+            'message' => '测试执行异常，请联系管理员',
         ];
         $diagnostic['summary']['failed']++;
     }

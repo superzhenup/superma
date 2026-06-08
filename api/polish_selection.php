@@ -130,10 +130,12 @@ try {
     ], JSON_UNESCAPED_UNICODE);
 
 } catch (\Throwable $e) {
-    error_log('polish_selection 失败：' . $e->getMessage());
+    error_log('polish_selection 失败：' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
     http_response_code(500);
     echo json_encode([
         'success' => false,
-        'error' => 'AI 调用失败：' . $e->getMessage(),
+        'error'   => 'AI 调用失败，请稍后重试',
+        'code'    => 'internal_error',
+        'request_id' => error_trace_id(),
     ], JSON_UNESCAPED_UNICODE);
 }

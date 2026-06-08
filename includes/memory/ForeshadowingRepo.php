@@ -285,7 +285,7 @@ final class ForeshadowingRepo
         }
 
         // 兼容旧格式：serialize
-        $unserialized = @unserialize($blob);
+        $unserialized = @unserialize($blob, ['allowed_classes' => false]);
         if (is_array($unserialized) && !empty($unserialized)) {
             return array_map('floatval', $unserialized);
         }

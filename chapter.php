@@ -23,6 +23,18 @@ $next = DB::fetch(
     [$novel['id'], $chapter['chapter_number'] + 1]
 );
 
+$gmModels = DB::fetchAll(
+    "SELECT id, name, model_name, is_default FROM ai_models ORDER BY is_default DESC, id ASC"
+);
+$gmModelsJson = json_encode(array_map(function($m) {
+    return [
+        'id'         => (int)$m['id'],
+        'name'       => $m['name'],
+        'model_name' => $m['model_name'] ?? '',
+        'is_default' => (int)($m['is_default'] ?? 0),
+    ];
+}, $gmModels), JSON_UNESCAPED_UNICODE);
+
 pageHeader("第{$chapter['chapter_number']}章 - {$novel['title']}", 'home');
 ?>
 
@@ -126,7 +138,16 @@ pageHeader("第{$chapter['chapter_number']}章 - {$novel['title']}", 'home');
       <!-- Edit mode -->
       <div id="edit-mode" class="p-4"<?php if (!isset($_GET['edit']) || $_GET['edit'] !== '1') echo ' style="display:none"'; ?>>
         <div class="mb-3">
-          <label class="form-label">章节标题</label>
+          <div class="d-flex justify-content-between align-items-center mb-1">
+            <label class="form-label mb-0" for="edit-title">章节标题</label>
+            <button type="button"
+                    class="btn btn-outline-info btn-sm"
+                    id="btn-optimize-title"
+                    onclick="optimizeChapterTitle(<?= $id ?>)"
+                    title="根据本章大纲概要、关键情节点、结尾钩子优化原来的标题">
+              <i class="bi bi-stars me-1"></i>AI标题优化
+            </button>
+          </div>
           <input type="text" id="edit-title" class="form-control" value="<?= h($chapter['title']) ?>">
         </div>
         <div class="mb-1" style="position:relative">
@@ -414,16 +435,17 @@ function escapeHtml(text) {
 // 最优先：直接在 window 上定义 toggleEdit/saveChapter
 // 确保即使后续代码出错，inline onclick 也能找到这两个函数
 // ================================================================
-window.toggleEdit = function toggleEdit() {
+window.toggleEdit = function toggleEdit(forceEdit) {
     var r = document.getElementById('read-mode');
     var e = document.getElementById('edit-mode');
     if (!r || !e) return;
-    if (r.style.display === 'none') {
-        r.style.display = '';
-        e.style.display = 'none';
-    } else {
+    var shouldEdit = forceEdit === true || r.style.display !== 'none';
+    if (shouldEdit) {
         r.style.display = 'none';
         e.style.display = '';
+    } else {
+        r.style.display = '';
+        e.style.display = 'none';
     }
 };
 
@@ -450,6 +472,70 @@ window.saveChapter = async function saveChapter(chapterId) {
         }
     } catch (err) {
         alert('保存失败：' + err.message);
+    }
+};
+
+window.optimizeChapterTitle = async function optimizeChapterTitle(chapterId) {
+    var titleEl = document.getElementById('edit-title');
+    var outlineEl = document.getElementById('outline-outline');
+    var keyPointsEl = document.getElementById('outline-keypoints');
+    var hookEl = document.getElementById('outline-hook');
+    var btn = document.getElementById('btn-optimize-title');
+
+    if (!titleEl) return;
+
+    var payload = {
+        chapter_id: chapterId,
+        current_title: titleEl.value || '',
+        outline: outlineEl ? outlineEl.value : '',
+        key_points: keyPointsEl ? keyPointsEl.value : '',
+        hook: hookEl ? hookEl.value : ''
+    };
+
+    if (!payload.current_title.trim() && !payload.outline.trim() && !payload.key_points.trim() && !payload.hook.trim()) {
+        alert('请先填写原标题或本章大纲信息');
+        return;
+    }
+
+    var originalHtml = btn ? btn.innerHTML : '';
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>优化中';
+    }
+
+    try {
+        var res = await fetch('api/optimize_chapter_title.php', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || ''
+            },
+            body: JSON.stringify(payload)
+        });
+        var data = await res.json();
+        if (!res.ok || !data.ok) {
+            throw new Error(data.msg || data.error || '标题优化失败');
+        }
+
+        var title = (data.data && data.data.title) ? data.data.title : '';
+        if (!title) {
+            throw new Error('AI没有返回可用标题');
+        }
+
+        titleEl.value = title;
+        var displayEl = document.getElementById('chapter-title-display');
+        if (displayEl) {
+            displayEl.textContent = title;
+        }
+        titleEl.focus();
+        titleEl.select();
+    } catch (err) {
+        alert('标题优化失败：' + err.message);
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = originalHtml;
+        }
     }
 };
 
@@ -482,6 +568,9 @@ window.saveChapter = async function saveChapter(chapterId) {
 // ================================================================
 const CHAPTER_ID = <?= $id ?>;
 const NOVEL_ID   = <?= $novel['id'] ?>;
+window.GM_CHAPTER_ID = <?= $id ?>;
+window.GM_NOVEL_ID = <?= $novel['id'] ?>;
+window.GM_MODELS = <?= $gmModelsJson ?>;
 let selectedVersionId = null;
 
 // ========== 版本历史功能 ==========
@@ -556,7 +645,11 @@ window.previewVersion     = previewVersion;
         if (!confirm('确定要回滚到此版本吗？当前内容将被备份为新版本。')) return;
 
         try {
-            const res = await fetch(`api/chapter_versions.php?chapter_id=${CHAPTER_ID}&action=rollback&version_id=${selectedVersionId}`);
+            const res = await fetch('api/chapter_versions.php', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json', 'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || ''},
+                body: JSON.stringify({ chapter_id: CHAPTER_ID, action: 'rollback', version_id: selectedVersionId })
+            });
             const data = await res.json();
             if (data.ok) {
                 alert('回滚成功');
@@ -586,79 +679,26 @@ window.previewVersion     = previewVersion;
             if (statsEl)   statsEl.textContent = '';
 
             try {
-                console.log('[SSE-写入] 开始连接 write_chapter.php');
-                const response = await fetch('api/write_chapter.php', {
-                    method: 'POST',
-                    headers: {'Content-Type':'application/json', 'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || ''},
-                    body: JSON.stringify({ novel_id: NOVEL_ID, chapter_id: CHAPTER_ID })
-                });
-                console.log('[SSE-写入] HTTP 状态:', response.status, response.ok);
-                if (!response.ok) {
-                    const errText = await response.text();
-                    throw new Error('HTTP ' + response.status + ': ' + errText.slice(0, 200));
+                if (typeof streamWriteChapter !== 'function') {
+                    throw new Error('写作客户端未加载，请刷新页面后重试');
                 }
-                const reader   = response.body.getReader();
-                const decoder  = new TextDecoder();
-                let   fullText = '';
-                let   sseBuf   = '';
-                let   hasError = false;
-                let   hasContent = false;
-                // 保持 spinner 显示直到收到第一个有效事件
-                let   firstEvent = false;
-
-                while (true) {
-                    const { value, done } = await reader.read();
-                    if (done) { console.log('[SSE-写入] 流结束'); break; }
-                    sseBuf += decoder.decode(value, { stream: true });
-                    const events = sseBuf.split('\n\n');
-                    sseBuf = events.pop();
-                    for (const eventBlock of events) {
-                        let dataLine = '';
-                        for (const ln of eventBlock.split('\n')) {
-                            if (ln.startsWith('data: ')) dataLine = ln;
-                            if (ln.startsWith('event: ')) console.log('[SSE-写入] 事件:', ln.slice(7));
-                        }
-                        if (!dataLine) continue;
-                        const payload = dataLine.slice(6).trim();
-                        if (payload === '[DONE]') {
-                            console.log('[SSE-写入] 收到 [DONE]');
-                            if (hasContent) { window._contentUpdated = true; }
-                            break;
-                        }
-                        try {
-                            const d = JSON.parse(payload);
-                            // 首个有效事件到达后隐藏 spinner
-                            if (!firstEvent) { if (spinnerEl) spinnerEl.style.display = 'none'; firstEvent = true; }
-                            if (d.error) {
-                                console.error('[SSE-写入] 服务端错误:', d.error);
-                                hasError = true;
-                                if (contentEl) contentEl.textContent = '❌ 写作失败：' + d.error;
-                                if (statsEl) statsEl.textContent = '写作出错，请关闭对话框后重试';
-                            }
-                            if (d.warning) {
-                                console.warn('[SSE-写入] 警告:', d.warning);
-                                if (statsEl) statsEl.textContent = '⚠️ ' + d.warning;
-                            }
-                            if (d.info) { console.log('[SSE-写入] 信息:', d.info); }
-                            if (d.chunk && contentEl && !hasError) {
-                                hasContent = true;
-                                fullText += d.chunk;
-                                contentEl.textContent = fullText;
-                                contentEl.scrollTop = contentEl.scrollHeight;
-                            }
-                            if (d.stats && statsEl && !hasError) {
-                                statsEl.textContent = d.stats;
-                            }
-                            if (d.waiting && d.msg && statsEl && !hasError) {
-                                statsEl.textContent = d.msg;
-                            }
-                            if (d.model && d.attempt) {
-                                if (statsEl) statsEl.textContent = '🔄 尝试模型 ' + d.model + ' (第' + d.attempt + '次)...';
-                            }
-                        } catch(e) { console.warn('[SSE-写入] JSON解析失败:', payload.slice(0, 100)); }
-                    }
-                }
-                if (!hasContent && !hasError && contentEl) {
+                if (contentEl) contentEl.textContent = '';
+                const cursorEl = document.createElement('span');
+                cursorEl.className = 'outline-stream-cursor';
+                if (contentEl) contentEl.appendChild(cursorEl);
+                const generated = await streamWriteChapter(
+                    NOVEL_ID,
+                    CHAPTER_ID,
+                    (statsText) => {
+                        if (statsEl) statsEl.textContent = statsText;
+                        if (spinnerEl) spinnerEl.style.display = 'none';
+                    },
+                    contentEl,
+                    cursorEl
+                );
+                if (generated && generated.length > 0) {
+                    window._contentUpdated = true;
+                } else if (contentEl) {
                     contentEl.textContent = '⚠️ 未收到生成内容，请检查 AI 模型配置和 API 连接，然后重试。';
                     if (statsEl) statsEl.textContent = '';
                 }
@@ -934,6 +974,13 @@ window.polishChapter = async function polishChapter(chapterId) {
                 quality_feedback: qualityFeedback
             })
         });
+        if (!response.ok) {
+            var errText = await response.text();
+            throw new Error('HTTP ' + response.status + ': ' + errText.slice(0, 200));
+        }
+        if (!response.body) {
+            throw new Error('浏览器不支持流式读取（ReadableStream）');
+        }
         var reader  = response.body.getReader();
         var decoder = new TextDecoder();
         var fullText = '';
@@ -1141,6 +1188,9 @@ window.compressChapter = async function compressChapter(chapterId) {
             var errText = await response.text();
             throw new Error('HTTP ' + response.status + ': ' + errText.slice(0, 200));
         }
+        if (!response.body) {
+            throw new Error('浏览器不支持流式读取（ReadableStream）');
+        }
         var reader  = response.body.getReader();
         var decoder = new TextDecoder();
         var fullText = '';
@@ -1257,7 +1307,7 @@ window.compressChapter = async function compressChapter(chapterId) {
 
         try {
             // 1. 先保存大纲并标记需要重新生成
-            console.log('[重新生成] 步骤1/3: 保存大纲 (chapter_id=' + CHAPTER_ID + ')');
+            console.log('[重新生成] 步骤1/2: 原子操作 (chapter_id=' + CHAPTER_ID + ')');
             var keyPoints = kpEl.value.split('\n')
                 .map(function(s) { return s.trim(); })
                 .filter(function(s) { return s.length > 0; });
@@ -1268,7 +1318,7 @@ window.compressChapter = async function compressChapter(chapterId) {
                 method: 'POST',
                 headers: {'Content-Type':'application/json', 'X-CSRF-Token': csrfToken},
                 body: JSON.stringify({
-                    action: 'regenerate_chapter',
+                    action: 'regenerate_and_reset',
                     chapter_id: CHAPTER_ID,
                     outline: outlineVal,
                     key_points: keyPoints,
@@ -1276,7 +1326,7 @@ window.compressChapter = async function compressChapter(chapterId) {
                 })
             });
             var data = await res.json();
-            console.log('[重新生成] 步骤1 结果:', data);
+            console.log('[重新生成] 原子操作结果:', data);
 
             if (!data.ok) {
                 alert('操作失败：' + (data.msg || '未知错误'));
@@ -1285,26 +1335,7 @@ window.compressChapter = async function compressChapter(chapterId) {
                 return;
             }
 
-            // 2. 重置章节状态为 outlined（让 write_chapter.php 能重新写入）
-            console.log('[重新生成] 步骤2/3: 重置章节状态');
-            var resetRes = await fetch('api/actions.php', {
-                method: 'POST',
-                headers: {'Content-Type':'application/json', 'X-CSRF-Token': csrfToken},
-                body: JSON.stringify({
-                    action: 'reset_chapter',
-                    chapter_id: CHAPTER_ID
-                })
-            });
-            var resetData = await resetRes.json();
-            console.log('[重新生成] 步骤2 结果:', resetData);
-            if (!resetData.ok) {
-                alert('重置失败：' + (resetData.msg || '未知错误'));
-                btn.innerHTML = origHtml;
-                btn.disabled = false;
-                return;
-            }
-
-            // 3. 调用流式写作 API
+            // 2. 调用流式写作 API
             btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>生成中...';
 
             var modalEl = document.getElementById('rewriteModal');
@@ -1318,86 +1349,27 @@ window.compressChapter = async function compressChapter(chapterId) {
             if (spinnerEl) spinnerEl.style.display = '';
             if (statsEl)   statsEl.textContent = '';
 
-            console.log('[SSE-重新生成] 开始连接 write_chapter.php (novel_id=' + NOVEL_ID + ', chapter_id=' + CHAPTER_ID + ')');
-            var response = await fetch('api/write_chapter.php', {
-                method: 'POST',
-                headers: {'Content-Type':'application/json', 'X-CSRF-Token': csrfToken},
-                body: JSON.stringify({ novel_id: NOVEL_ID, chapter_id: CHAPTER_ID })
-            });
-            console.log('[SSE-重新生成] HTTP 状态:', response.status, response.ok);
-            if (!response.ok) {
-                var errText = await response.text();
-                throw new Error('HTTP ' + response.status + ': ' + errText.slice(0, 200));
+            if (typeof streamWriteChapter !== 'function') {
+                throw new Error('写作客户端未加载，请刷新页面后重试');
             }
-            var reader  = response.body.getReader();
-            var decoder = new TextDecoder();
-            var fullText = '';
-            var sseBuf3 = '';
-            var hasError = false;
-            var hasContent = false;
-            var firstEvent = false;
+            if (contentEl) contentEl.textContent = '';
+            var cursorEl = document.createElement('span');
+            cursorEl.className = 'outline-stream-cursor';
+            if (contentEl) contentEl.appendChild(cursorEl);
+            var generated = await streamWriteChapter(
+                NOVEL_ID,
+                CHAPTER_ID,
+                function(statsText) {
+                    if (statsEl) statsEl.textContent = statsText;
+                    if (spinnerEl) spinnerEl.style.display = 'none';
+                },
+                contentEl,
+                cursorEl
+            );
 
-            while (true) {
-                var result = await reader.read();
-                if (result.done) { console.log('[SSE-重新生成] 流结束'); break; }
-                sseBuf3 += decoder.decode(result.value, { stream: true });
-                var events3 = sseBuf3.split('\n\n');
-                sseBuf3 = events3.pop();
-                for (var ei3 = 0; ei3 < events3.length; ei3++) {
-                    var dataLine3 = '';
-                    var elines3 = events3[ei3].split('\n');
-                    for (var li3 = 0; li3 < elines3.length; li3++) {
-                        if (elines3[li3].startsWith('data: ')) dataLine3 = elines3[li3];
-                        if (elines3[li3].startsWith('event: ')) console.log('[SSE-重新生成] 事件:', elines3[li3].slice(7));
-                    }
-                    if (!dataLine3) continue;
-                    var payload3 = dataLine3.slice(6).trim();
-                    if (payload3 === '[DONE]') {
-                        console.log('[SSE-重新生成] 收到 [DONE]');
-                        // 只有生成了实际内容才标记为需要刷新
-                        if (hasContent) { window._contentUpdated = true; }
-                        break;
-                    }
-                    try {
-                        var d = JSON.parse(payload3);
-                        if (!firstEvent) { if (spinnerEl) spinnerEl.style.display = 'none'; firstEvent = true; }
-                        // 优先展示错误信息
-                        if (d.error) {
-                            console.error('[SSE-重新生成] 服务端错误:', d.error);
-                            hasError = true;
-                            if (contentEl) contentEl.textContent = '❌ 生成失败：' + d.error;
-                            if (statsEl) statsEl.textContent = '生成出错，请关闭对话框后重试';
-                        }
-                        // 展示警告信息
-                        if (d.warning) {
-                            console.warn('[SSE-重新生成] 警告:', d.warning);
-                            if (statsEl) statsEl.textContent = '⚠️ ' + d.warning;
-                        }
-                        if (d.info) { console.log('[SSE-重新生成] 信息:', d.info); }
-                        // 流式内容
-                        if (d.chunk && contentEl && !hasError) {
-                            hasContent = true;
-                            fullText += d.chunk;
-                            contentEl.textContent = fullText;
-                            contentEl.scrollTop = contentEl.scrollHeight;
-                        }
-                        // 状态/统计信息
-                        if (d.stats && statsEl && !hasError) {
-                            statsEl.textContent = d.stats;
-                        }
-                        // 等待中消息
-                        if (d.waiting && d.msg && statsEl && !hasError) {
-                            statsEl.textContent = d.msg;
-                        }
-                        if (d.model && d.attempt) {
-                            if (statsEl) statsEl.textContent = '🔄 尝试模型 ' + d.model + ' (第' + d.attempt + '次)...';
-                        }
-                    } catch(e) { console.warn('[SSE-重新生成] JSON解析失败:', payload3.slice(0, 100)); }
-                }
-            }
-
-            // 如果没有收到任何内容也没有错误，提示用户
-            if (!hasContent && !hasError && contentEl) {
+            if (generated && generated.length > 0) {
+                window._contentUpdated = true;
+            } else if (contentEl) {
                 contentEl.textContent = '⚠️ 未收到生成内容，请检查 AI 模型配置和 API 连接，然后重试。';
                 if (statsEl) statsEl.textContent = '';
             }
@@ -1589,5 +1561,128 @@ window.compressChapter = async function compressChapter(chapterId) {
     });
 })();
 </script>
+
+<!-- Good Moling（墨灵）智能创作助手 -->
+<style>
+.gm-panel .offcanvas-body { display:flex; flex-direction:column; padding:0!important; min-height:0; }
+.gm-preset-bar { padding:10px 14px; border-bottom:1px solid #2d2d4e; background:#12122a; }
+.gm-preset-bar .btn { font-size:.75rem; padding:3px 8px; }
+.gm-chat-list { flex:1; overflow-y:auto; padding:12px 14px; background:#0f0f1a; }
+.gm-msg { margin-bottom:12px; }
+.gm-msg-user { text-align:right; }
+.gm-bubble { display:inline-block; max-width:90%; padding:8px 12px; border-radius:12px; font-size:.9rem; line-height:1.7; word-break:break-word; text-align:left; }
+.gm-bubble-user { background:#6366f1; color:#fff; border-bottom-right-radius:4px; }
+.gm-bubble-ai { background:#1e2230; color:#e8e8ff; border:1px solid #2d2d4e; border-bottom-left-radius:4px; }
+.gm-msg-actions { margin-top:4px; display:flex; gap:6px; }
+.gm-msg-actions .btn { font-size:.7rem; padding:2px 8px; }
+.gm-thinking { display:inline-flex; align-items:center; gap:8px; color:#adb5bd; }
+.gm-dots span { display:inline-block; width:6px; height:6px; border-radius:50%; background:#6366f1; animation:gm-blink 1.2s infinite; }
+.gm-dots span:nth-child(2) { animation-delay:.2s; }
+.gm-dots span:nth-child(3) { animation-delay:.4s; }
+@keyframes gm-blink { 0%,80%,100%{opacity:.3} 40%{opacity:1} }
+.gm-thinking-label { font-size:.85rem; }
+.gm-patch-start { background:#2d2440; border-left:3px solid #ffc107; padding:4px 10px; margin:6px 0; border-radius:0 6px 6px 0; font-weight:600; color:#ffc107; }
+.gm-input-bar { padding:10px 14px; border-top:1px solid #2d2d4e; background:#1a1a2e; }
+.gm-input-bar textarea { resize:none; }
+.gm-ctx-bar { padding:6px 14px; border-bottom:1px solid #2d2d4e; background:#12122a; font-size:.75rem; }
+.gm-ctx-bar label { color:#adb5bd; cursor:pointer; }
+.gm-fab { position:fixed; bottom:24px; right:24px; z-index:1040; width:80px; height:80px; border:none; background:transparent; cursor:pointer; padding:0; outline:none; }
+.gm-spirit { position:relative; width:80px; height:80px; display:flex; align-items:center; justify-content:center; }
+.gm-spirit-body { width:56px; height:56px; border-radius:50% 50% 50% 50% / 60% 60% 40% 40%; background:linear-gradient(135deg,#6366f1,#8b5cf6,#a78bfa); position:relative; box-shadow:0 0 20px rgba(99,102,241,.5),0 0 40px rgba(139,92,246,.3); animation:gm-float 3s ease-in-out infinite; }
+.gm-spirit-body::before { content:''; position:absolute; top:8px; left:10px; width:12px; height:14px; background:rgba(255,255,255,.9); border-radius:50%; box-shadow:20px 0 0 rgba(255,255,255,.9); }
+.gm-spirit-body::after { content:''; position:absolute; top:12px; left:14px; width:5px; height:6px; background:#1a1a2e; border-radius:50%; box-shadow:20px 0 0 #1a1a2e; }
+.gm-spirit-mouth { position:absolute; bottom:16px; left:50%; transform:translateX(-50%); width:10px; height:5px; border-bottom:2px solid rgba(255,255,255,.7); border-radius:0 0 50% 50%; }
+.gm-spirit-ink { position:absolute; bottom:-2px; left:50%; transform:translateX(-50%); width:8px; height:8px; background:radial-gradient(circle,#6366f1,transparent); border-radius:50%; animation:gm-ink-drip 2.5s ease-in-out infinite; opacity:.6; }
+.gm-spirit-glow { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:80px; height:80px; border-radius:50%; background:radial-gradient(circle,rgba(99,102,241,.25),transparent 70%); animation:gm-glow-pulse 3s ease-in-out infinite; pointer-events:none; }
+.gm-spirit-label { position:absolute; bottom:-20px; left:50%; transform:translateX(-50%); font-size:.7rem; color:#a78bfa; white-space:nowrap; text-shadow:0 0 8px rgba(99,102,241,.6); font-weight:600; letter-spacing:1px; }
+.gm-fab:hover .gm-spirit-body { box-shadow:0 0 28px rgba(99,102,241,.7),0 0 56px rgba(139,92,246,.4); animation:gm-float-hover 1.5s ease-in-out infinite; }
+.gm-fab:hover .gm-spirit-label { color:#c4b5fd; }
+@keyframes gm-float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-6px)} }
+@keyframes gm-float-hover { 0%,100%{transform:translateY(0) scale(1.05)} 50%{transform:translateY(-8px) scale(1.05)} }
+@keyframes gm-glow-pulse { 0%,100%{opacity:.5;transform:translate(-50%,-50%) scale(1)} 50%{opacity:1;transform:translate(-50%,-50%) scale(1.15)} }
+@keyframes gm-ink-drip { 0%,100%{transform:translateX(-50%) translateY(0);opacity:.6} 50%{transform:translateX(-50%) translateY(4px);opacity:.2} }
+</style>
+
+<button class="gm-fab" data-bs-toggle="offcanvas" data-bs-target="#gmPanel" title="Good Moling（墨灵）">
+  <div class="gm-spirit">
+    <div class="gm-spirit-glow"></div>
+    <div class="gm-spirit-body">
+      <div class="gm-spirit-mouth"></div>
+      <div class="gm-spirit-ink"></div>
+    </div>
+    <span class="gm-spirit-label">墨灵</span>
+  </div>
+</button>
+
+<div class="offcanvas offcanvas-end bg-dark text-light gm-panel" tabindex="-1" id="gmPanel" style="width:460px;max-width:100vw;">
+  <div class="offcanvas-header border-bottom border-secondary pb-0">
+    <div class="w-100">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h5 class="offcanvas-title mb-0"><i class="bi bi-stars me-2 text-primary"></i>Good Moling（墨灵）</h5>
+        <div class="d-flex gap-2">
+          <button class="btn btn-sm btn-outline-secondary" id="gm-clear-btn" title="清空对话">
+            <i class="bi bi-trash"></i>
+          </button>
+          <button class="btn btn-sm btn-outline-secondary" id="gm-stop-btn" title="停止生成" style="display:none">
+            <i class="bi bi-stop-circle"></i>
+          </button>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="offcanvas"></button>
+        </div>
+      </div>
+      <div class="d-flex align-items-center gap-2 mb-2">
+        <label class="small text-muted mb-0" style="min-width:36px;">模型</label>
+        <select id="gm-model-select" class="form-select form-select-sm bg-dark text-light border-secondary">
+          <option value="">加载中…</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <div class="gm-preset-bar">
+    <div class="d-flex flex-wrap gap-2">
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="analyze_chapter"><i class="bi bi-clipboard-check me-1"></i>分析章节</button>
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="polish_chapter"><i class="bi bi-magic me-1"></i>优化文风</button>
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="continue_write"><i class="bi bi-arrow-right-circle me-1"></i>续写一段</button>
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="generate_outline"><i class="bi bi-signpost-split me-1"></i>下章大纲</button>
+      <button class="btn btn-sm btn-outline-warning gm-preset-btn" data-preset="strengthen_conflict"><i class="bi bi-lightning me-1"></i>加强冲突</button>
+      <button class="btn btn-sm btn-outline-warning gm-preset-btn" data-preset="check_logic"><i class="bi bi-shield-check me-1"></i>检查逻辑</button>
+      <button class="btn btn-sm btn-outline-warning gm-preset-btn" data-preset="optimize_character"><i class="bi bi-person-lines-fill me-1"></i>优化角色</button>
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="extract_highlights"><i class="bi bi-star me-1"></i>提炼爽点</button>
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="generate_title"><i class="bi bi-type me-1"></i>生成标题</button>
+      <button class="btn btn-sm btn-outline-warning gm-preset-btn" data-preset="suggest_revision"><i class="bi bi-pencil-square me-1"></i>修改建议</button>
+      <button class="btn btn-sm btn-outline-warning gm-preset-btn" data-preset="rewrite"><i class="bi bi-highlighter me-1"></i>改写选段</button>
+    </div>
+  </div>
+
+  <div class="gm-ctx-bar">
+    <div class="d-flex flex-wrap gap-3">
+      <label><input type="checkbox" class="gm-ctx-cb" data-ctx="content" checked> 本章正文</label>
+      <label><input type="checkbox" class="gm-ctx-cb" data-ctx="outline" checked> 本章大纲</label>
+    </div>
+  </div>
+
+  <div class="gm-chat-list" id="gm-chat-list">
+    <div class="text-center text-muted small py-4" id="gm-chat-empty">
+      <i class="bi bi-chat-quote" style="font-size:32px;opacity:.4"></i>
+      <p class="mt-2 mb-0">提问、要求改写，或点上方快捷指令开始</p>
+    </div>
+  </div>
+
+  <div class="gm-input-bar">
+    <div class="position-relative">
+      <textarea id="gm-chat-input" class="form-control bg-dark text-light border-secondary" rows="3"
+                placeholder="问问题，或直接说"把开头改紧凑些"..." style="resize:none;padding-right:52px;"></textarea>
+      <button id="gm-send-btn" class="btn btn-primary btn-sm position-absolute" style="right:6px;bottom:6px;">
+        <i class="bi bi-send"></i>
+      </button>
+    </div>
+    <div class="d-flex justify-content-between align-items-center mt-1">
+      <span id="gm-status" class="small text-muted">就绪</span>
+      <span class="small text-muted"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> 发送</span>
+    </div>
+  </div>
+</div>
+
+<script src="assets/js/good_moling.js"></script>
 
 <?php pageFooter(); ?>

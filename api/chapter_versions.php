@@ -13,8 +13,9 @@ require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 requireLoginApi();
 
-$chapterId = (int)($_GET['chapter_id'] ?? 0);
-$action = $_GET['action'] ?? 'list';
+$input = json_decode(file_get_contents('php://input'), true) ?: [];
+$chapterId = (int)($input['chapter_id'] ?? $_GET['chapter_id'] ?? 0);
+$action = $input['action'] ?? $_GET['action'] ?? 'list';
 
 if (!$chapterId) {
     jsonResponse(false, null, '缺少章节ID');
@@ -67,8 +68,9 @@ if ($action === 'list') {
         'created_at' => $version['created_at']
     ]);
 } elseif ($action === 'rollback') {
+    requireHttpMethod('POST');
     // 回滚到指定版本
-    $versionId = (int)($_GET['version_id'] ?? 0);
+    $versionId = (int)($input['version_id'] ?? 0);
     $version = DB::fetch('SELECT * FROM chapter_versions WHERE id=? AND chapter_id=?', [$versionId, $chapterId]);
 
     if (!$version) {

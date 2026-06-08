@@ -64,10 +64,14 @@ $checks[] = [
 // ====== 检查3: EmbeddingProvider::getConfig() ======
 require_once dirname(__DIR__) . '/includes/memory/EmbeddingProvider.php';
 $cfg = EmbeddingProvider::getConfig();
+$safeCfg = $cfg;
+if (is_array($safeCfg)) {
+    unset($safeCfg['api_key']);
+}
 $checks[] = [
     'step' => '3. EmbeddingProvider::getConfig()',
     'status' => $cfg ? 'OK' : 'FAIL',
-    'value' => $cfg ? json_encode($cfg, JSON_UNESCAPED_UNICODE) : '返回 null',
+    'value' => $safeCfg ? json_encode($safeCfg, JSON_UNESCAPED_UNICODE) : '返回 null',
     'fix'   => $cfg ? null : '检查前两步是否通过',
 ];
 

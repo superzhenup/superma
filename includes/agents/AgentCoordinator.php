@@ -99,16 +99,15 @@ class AgentCoordinator
             // 前5章只收集数据，第6章开始决策（确保有足够历史数据）
             if (ConfigCenter::get('agent.strategy_agent.enabled', true) &&
                 $chNum > 5 && $chNum % $dynamicIntervals['strategy'] === 0) {
-                // 注入预测结果到上下文
                 $contextWithPredictions = array_merge($context, [
                     'predictions' => $results['predictions'],
                 ]);
-                $results['strategy'] = $this->strategyAgent->decide($contextWithPredictions);
+                $results['strategy'] = $this->strategyAgent->decideWithTimeout($contextWithPredictions);
             }
 
             if (ConfigCenter::get('agent.quality_agent.enabled', true) &&
                 $chNum > 5 && $chNum % $dynamicIntervals['quality'] === 0) {
-                $results['quality'] = $this->qualityAgent->decide($context);
+                $results['quality'] = $this->qualityAgent->decideWithTimeout($context);
             }
 
             if (ConfigCenter::get('agent.optimization_agent.enabled', true) &&
@@ -117,7 +116,7 @@ class AgentCoordinator
                     'strategy_decision' => $results['strategy'],
                     'quality_decision' => $results['quality'],
                 ]);
-                $results['optimization'] = $this->optimizationAgent->decide($optimizationContext);
+                $results['optimization'] = $this->optimizationAgent->decideWithTimeout($optimizationContext);
             }
 
             // ===== v1.11.8: 前5章特殊保护 =====

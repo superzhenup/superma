@@ -485,5 +485,7 @@ try {
             echo json_encode(['ok' => false, 'msg' => '未知操作: ' . $action], JSON_UNESCAPED_UNICODE);
     }
 } catch (Exception $e) {
-    echo json_encode(['ok' => false, 'msg' => '操作失败: ' . $e->getMessage()], JSON_UNESCAPED_UNICODE);
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] memory_actions: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
+    echo json_encode(safe_api_error_payload($e, '操作失败，请稍后重试'), JSON_UNESCAPED_UNICODE);
 }

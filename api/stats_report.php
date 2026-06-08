@@ -15,13 +15,17 @@ define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
+require_once dirname(__DIR__) . '/includes/auth.php';
+requireLoginApi();
+requireHttpMethod('POST');
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/stats_tracker.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
-$action = $_GET['action'] ?? 'report';
+$input = json_decode(file_get_contents('php://input'), true) ?: [];
+$action = $input['action'] ?? $_POST['action'] ?? $_GET['action'] ?? 'report';
 
 switch ($action) {
     case 'report':
@@ -39,8 +43,8 @@ switch ($action) {
         break;
 
     case 'record':
-        $words = (int)($_POST['words'] ?? $_GET['words'] ?? 0);
-        $chapters = (int)($_POST['chapters'] ?? $_GET['chapters'] ?? 1);
+        $words = (int)($input['words'] ?? $_POST['words'] ?? 0);
+        $chapters = (int)($input['chapters'] ?? $_POST['chapters'] ?? 1);
 
         if ($words <= 0) {
             echo json_encode(['success' => false, 'message' => 'Invalid words count']);
@@ -87,40 +91,6 @@ switch ($action) {
             'pending_stats' => $pending,
             'site_id' => StatsTracker::getSiteId(),
         ]);
-        break;
-
-    case 'debug':
-        $diag = [];
-        $diag['table_exists'] = false;
-        try {
-            $check = DB::fetch("SHOW TABLES LIKE 'usage_stats'");
-            $diag['table_exists'] = !empty($check);
-        } catch (\Throwable $e) {
-            $diag['table_exists_error'] = $e->getMessage();
-        }
-
-        if ($diag['table_exists']) {
-            try {
-                $diag['all_rows'] = DB::fetchAll("SELECT * FROM usage_stats ORDER BY id DESC LIMIT 5");
-            } catch (\Throwable $e) {
-                $diag['all_rows_error'] = $e->getMessage();
-            }
-        }
-
-        try {
-            $diag['insert_test'] = null;
-            DB::insert('usage_stats', [
-                'stat_date' => date('Y-m-d'),
-                'words_added' => 0,
-                'chapters_added' => 0,
-                'novels_active' => 0,
-            ]);
-            $diag['insert_test'] = 'ok';
-        } catch (\Throwable $e) {
-            $diag['insert_test'] = 'failed: ' . $e->getMessage();
-        }
-
-        echo json_encode(['success' => true, 'diag' => $diag], JSON_UNESCAPED_UNICODE);
         break;
 
     default:

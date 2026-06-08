@@ -61,9 +61,9 @@ if ($id > 0) {
             $novelCurrent = DB::fetch('SELECT status FROM novels WHERE id=?', [$id]);
             if ($novelCurrent && $novelCurrent['status'] === 'writing') {
                 // 检查2：异步进度文件是否近期更新（活跃进程会持续写入）
-                $progressDir = defined('CFG_PROGRESS_DIR') ? CFG_PROGRESS_DIR : sys_get_temp_dir() . '/novel_write_progress';
+                $progressDir = defined('CFG_PROGRESS_DIR') ? CFG_PROGRESS_DIR : dirname(__DIR__) . '/storage/write_progress';
                 if (is_dir($progressDir)) {
-                    $activeProgress = glob($progressDir . '/*.json');
+                    $activeProgress = glob($progressDir . '/w*.json');
                     if ($activeProgress) {
                         foreach ($activeProgress as $pf) {
                             // 进度文件在120秒内更新过，说明进程仍在运行
@@ -105,10 +105,6 @@ if (!$novel) {
     header('Location: index.php');
     exit;
 }
-
-// v1.11.8: 实时统计上报（每次访问 novel.php 都上报）
-require_once __DIR__ . '/includes/stats_tracker.php';
-StatsTracker::reportRealtime($novel);
 
 $allChapters = getNovelChapters($id);
 $models      = DB::fetchAll('SELECT * FROM ai_models ORDER BY is_default DESC, id ASC');
@@ -275,6 +271,9 @@ pageHeader('小说管理 - ' . $novel['title'], 'home');
                 <?= (!$novel['has_story_outline'] || $outlined === 0) ? 'disabled title="请先生成全书故事大纲和章节大纲"' : '' ?>>
           <i class="bi bi-lightning-charge me-1"></i>优化章节逻辑
         </button>
+        <a href="assist.php?id=<?= $id ?>" class="btn btn-sm btn-outline-info">
+          <i class="bi bi-stars me-1"></i>智能创作辅助系统
+        </a>
         <!-- 导入章节概要（创建后即可用）-->
         <button class="btn btn-sm btn-outline-primary" id="btn-import-synopsis-top"
                 onclick="document.getElementById('import-file-input-top').click()">
@@ -313,6 +312,11 @@ pageHeader('小说管理 - ' . $novel['title'], 'home');
                 data-novel="<?= $id ?>"
                 <?= $completed === 0 ? 'disabled title="请先完成至少一章"' : '' ?>>
           <i class="bi bi-shield-check me-1"></i>一致性检查
+        </button>
+        <!-- [v41] 全书体检报告 -->
+        <button class="btn btn-sm btn-outline-info" id="btn-fullbook-audit"
+                data-bs-toggle="modal" data-bs-target="#fullbookAuditModal">
+          <i class="bi bi-clipboard2-pulse me-1"></i>全书体检
         </button>
         <a href="create.php?edit=<?= $id ?>" class="btn btn-sm btn-outline-secondary">
           <i class="bi bi-pencil me-1"></i>编辑设定
@@ -660,190 +664,7 @@ try {
 
   <!-- Chapters Tab -->
   <div class="tab-pane fade show active" id="tab-chapters">
-    <?php if (empty($allChapters)): ?>
-    <div class="empty-state">
-      <div class="empty-icon"><i class="bi bi-list-ol"></i></div>
-      <h6>暂无章节</h6>
-      <p class="text-muted small">点击「生成章节大纲」按钮，AI将自动生成所有章节的大纲</p>
-    </div>
-    <?php endif; ?>
-
-    <div class="page-card">
-      <!-- 导出/导入按钮组 — 始终显示 -->
-      <div class="d-flex justify-content-end align-items-center mb-3 gap-2">
-        <div class="btn-group">
-          <button type="button" class="btn btn-sm btn-outline-success dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="false">
-            <i class="bi bi-download me-1"></i>导出章节概要
-          </button>
-          <ul class="dropdown-menu">
-            <li><a class="dropdown-item" href="javascript:void(0)" onclick="exportSynopses('json')">
-              <i class="bi bi-filetype-json me-2"></i>导出为JSON
-            </a></li>
-            <li><a class="dropdown-item" href="javascript:void(0)" onclick="exportSynopses('excel')">
-              <i class="bi bi-file-earmark-excel me-2"></i>导出为Excel
-            </a></li>
-            <li><a class="dropdown-item" href="javascript:void(0)" onclick="exportSynopses('txt')">
-              <i class="bi bi-filetype-txt me-2"></i>导出为TXT
-            </a></li>
-          </ul>
-        </div>
-        <button type="button" class="btn btn-sm btn-outline-primary" onclick="document.getElementById('import-file-input').click()">
-          <i class="bi bi-upload me-1"></i>导入章节概要
-        </button>
-        <input type="file" id="import-file-input" accept=".json,.csv,.txt" style="display:none" onchange="importSynopses(this.files[0])">
-        <button type="button" class="btn btn-sm btn-outline-success" onclick="openAddChaptersModal()" title="添加章节">
-          <i class="bi bi-plus-lg"></i>
-        </button>
-        <button type="button" class="btn btn-sm btn-outline-danger" onclick="clearAllChapters()" title="清空所有章节内容">
-          <i class="bi bi-trash"></i>
-        </button>
-      </div>
-
-      <?php if (!empty($allChapters)): ?>
-      <!-- 章节列表头 -->
-      <div class="chapter-list-header">
-        <span class="col-num">章节</span>
-        <span class="col-title">标题 / 大纲概要</span>
-        <span class="col-status">状态</span>
-        <span class="col-words">字数</span>
-        <span class="col-action">操作</span>
-      </div>
-      <!-- 章节行 -->
-      <?php foreach ($chapters as $ch): ?>
-      <?php
-        $statusColor = [
-          'pending'   => 'var(--text-muted)',
-          'outlined'  => 'var(--info)',
-          'writing'   => 'var(--warning)',
-          'completed' => 'var(--success)',
-        ][$ch['status']] ?? 'var(--text-muted)';
-
-        // 性能优化：从预加载的 $synopsisMap 中 O(1) 取值，无需再查数据库
-        $synopsisText = $synopsisMap[$ch['chapter_number']] ?? null;
-        $synopsis = $synopsisText ? ['synopsis' => $synopsisText] : null;
-      ?>
-      <div class="chapter-list-row" data-status="<?= h($ch['status']) ?>">
-        <div class="col-num">
-          <span class="ch-number">第<?= $ch['chapter_number'] ?>章</span>
-        </div>
-        <div class="col-title">
-          <div class="ch-title"><?= h($ch['title'] ?: '（待生成标题）') ?></div>
-          <?php if ($ch['outline']): ?>
-          <div class="ch-outline"><?= h(mb_substr($ch['outline'], 0, 80)) ?><?= mb_strlen($ch['outline']) > 80 ? '…' : '' ?></div>
-          <?php endif; ?>
-          <?php if ($synopsis && $synopsis['synopsis']): ?>
-          <div class="ch-synopsis mt-1">
-            <span class="badge bg-secondary me-1">概要</span>
-            <small class="text-muted"><?= h(mb_substr($synopsis['synopsis'], 0, 100)) ?><?= mb_strlen($synopsis['synopsis']) > 100 ? '…' : '' ?></small>
-          </div>
-          <?php endif; ?>
-        </div>
-        <div class="col-status"><?= statusBadge($ch['status']) ?></div>
-        <div class="col-words">
-          <?php
-            $chapterTargetWords = (int)$novel['chapter_words'];
-            $isOverLimit = $ch['words'] > 0 && $chapterTargetWords > 0 && $ch['words'] > $chapterTargetWords + 500;
-            if ($ch['words'] > 0) {
-              $wordStyle = $isOverLimit ? 'color:#ef4444;font-weight:700;' : '';
-              echo '<span class="ch-words" style="' . $wordStyle . '" title="' . ($isOverLimit ? "超出目标{$chapterTargetWords}字+500" : "字数正常") . '">' . number_format($ch['words']) . '</span>';
-            } else {
-              echo '<span class="ch-words-empty">—</span>';
-            }
-          ?>
-        </div>
-        <div class="col-action">
-          <?php if ($ch['status'] !== 'pending'): ?>
-          <a href="chapter.php?id=<?= $ch['id'] ?>&edit=1" class="btn btn-xs btn-outline-secondary" title="编辑章节">
-            <i class="bi bi-pencil"></i> 编辑
-          </a>
-          <?php endif; ?>
-          <?php if ($ch['status'] === 'completed'): ?>
-          <button class="btn btn-xs btn-outline-info btn-chapter-detail"
-                  data-chapter-id="<?= $ch['id'] ?>"
-                  data-chapter-num="<?= $ch['chapter_number'] ?>">
-            <i class="bi bi-eye"></i> 查看
-          </button>
-          <?php elseif ($ch['status'] === 'outlined'): ?>
-          <button class="btn btn-xs btn-outline-primary btn-write-single"
-                  data-novel="<?= $id ?>" data-chapter="<?= $ch['id'] ?>">
-            <i class="bi bi-pencil"></i> 写作
-          </button>
-          <?php elseif ($ch['status'] === 'writing'): ?>
-          <button class="btn btn-xs btn-outline-warning" onclick="resetSingleChapter(<?= $ch['id'] ?>)" title="取消并重置">
-            <i class="bi bi-x-circle"></i> 取消
-          </button>
-          <?php else: ?>
-          <span class="ch-status-text">待大纲</span>
-          <?php endif; ?>
-          <?php if ($ch['status'] !== 'pending'): ?>
-          <button class="btn btn-xs btn-outline-warning btn-regenerate-synopsis"
-                  data-novel="<?= $id ?>"
-                  data-chapter-id="<?= $ch['id'] ?>"
-                  data-chapter-num="<?= $ch['chapter_number'] ?>"
-                  data-has-title="<?= $ch['title'] ? '1' : '0' ?>"
-                  title="<?= $ch['title'] ? '重新生成细纲' : '生成章节标题' ?>">
-            <i class="bi bi-arrow-clockwise"></i>
-          </button>
-          <?php endif; ?>
-        </div>
-      </div>
-      <?php endforeach; ?>
-    </div>
-
-    <!-- 章节分页 -->
-    <?php if ($totalPages > 1): ?>
-    <div class="d-flex justify-content-center align-items-center mt-3 gap-2 flex-wrap">
-      <span class="text-muted small me-2">第 <?= $currentPage ?> / <?= $totalPages ?> 页（共 <?= $totalChapterCount ?> 章）</span>
-      <nav aria-label="章节分页">
-        <ul class="pagination pagination-sm mb-0">
-          <?php
-            $pageUrl = fn($p) => 'novel.php?id=' . $id . '&page=' . $p;
-            // 上一页
-            if ($currentPage > 1): ?>
-              <li class="page-item">
-                <a class="page-link" href="<?= $pageUrl($currentPage - 1) ?>"><i class="bi bi-chevron-left"></i></a>
-              </li>
-            <?php else: ?>
-              <li class="page-item disabled"><span class="page-link"><i class="bi bi-chevron-left"></i></span></li>
-            <?php endif;
-
-            // 页码按钮
-            $pageStart = max(1, $currentPage - 2);
-            $pageEnd   = min($totalPages, $currentPage + 2);
-            if ($pageStart > 1): ?>
-              <li class="page-item"><a class="page-link" href="<?= $pageUrl(1) ?>">1</a></li>
-              <?php if ($pageStart > 2): ?>
-                <li class="page-item disabled"><span class="page-link">…</span></li>
-              <?php endif;
-            endif;
-            for ($p = $pageStart; $p <= $pageEnd; $p++):
-              if ($p === $currentPage): ?>
-                <li class="page-item active"><span class="page-link"><?= $p ?></span></li>
-              <?php else: ?>
-                <li class="page-item"><a class="page-link" href="<?= $pageUrl($p) ?>"><?= $p ?></a></li>
-              <?php endif;
-            endfor;
-            if ($pageEnd < $totalPages):
-              if ($pageEnd < $totalPages - 1): ?>
-                <li class="page-item disabled"><span class="page-link">…</span></li>
-              <?php endif; ?>
-              <li class="page-item"><a class="page-link" href="<?= $pageUrl($totalPages) ?>"><?= $totalPages ?></a></li>
-            <?php endif;
-            // 下一页
-            if ($currentPage < $totalPages): ?>
-              <li class="page-item">
-                <a class="page-link" href="<?= $pageUrl($currentPage + 1) ?>"><i class="bi bi-chevron-right"></i></a>
-              </li>
-            <?php else: ?>
-              <li class="page-item disabled"><span class="page-link"><i class="bi bi-chevron-right"></i></span></li>
-            <?php endif; ?>
-        </ul>
-      </nav>
-    </div>
-    <?php endif; ?>
-    <!-- /章节分页 -->
-
-    <?php endif; ?>
+    <?php include __DIR__ . '/includes/chapter_list_partial.php'; ?>
   </div>
 
   <!-- Memory Engine Tab -->
@@ -978,6 +799,9 @@ try {
               <button class="btn btn-sm btn-outline-secondary" onclick="MemoryUI.loadCards()">
                 <i class="bi bi-arrow-clockwise me-1"></i>刷新
               </button>
+              <a href="character_network.php?novel_id=<?= $id ?>" class="btn btn-sm btn-outline-info">
+                <i class="bi bi-diagram-3 me-1"></i>查看关系网络
+              </a>
             </div>
           </div>
           <div id="cards-list" class="row g-3">
@@ -1244,6 +1068,8 @@ try {
           <div style="position:relative;height:220px;">
             <canvas id="hook-canvas"></canvas>
           </div>
+          <!-- v41 钩子回收健康 -->
+          <div id="hook-health" class="small mt-2"></div>
         </div>
       </div>
 
@@ -1589,7 +1415,7 @@ try {
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="assets/dist/chart.umd.min.js"></script>
 <script>
 const NOVEL_ID   = <?= $id ?>;
 const TARGET_CHS = <?= $novel['target_chapters'] ?>;
@@ -1622,17 +1448,13 @@ async function saveTargetChapters() {
   }
 
   try {
-    const res = await fetch('api/actions.php', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrf() },
-      body: JSON.stringify({
-        action: 'update_novel_settings',
-        novel_id: NOVEL_ID,
-        target_chapters: value
-      })
-    }).then(r => r.json());
+    const res = await apiPost('actions', {
+      action: 'update_novel_settings',
+      novel_id: NOVEL_ID,
+      target_chapters: value
+    });
 
-    if (res.success) {
+    if (res.ok) {
       document.getElementById('display-target-chapters').textContent = value + ' 章';
       cancelEditTargetChapters();
       // 更新全局变量
@@ -1665,17 +1487,13 @@ async function saveChapterWords() {
   }
 
   try {
-    const res = await fetch('api/actions.php', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrf() },
-      body: JSON.stringify({
-        action: 'update_novel_settings',
-        novel_id: NOVEL_ID,
-        chapter_words: value
-      })
-    }).then(r => r.json());
+    const res = await apiPost('actions', {
+      action: 'update_novel_settings',
+      novel_id: NOVEL_ID,
+      chapter_words: value
+    });
 
-    if (res.success) {
+    if (res.ok) {
       document.getElementById('display-chapter-words').textContent = value.toLocaleString() + ' 字';
       cancelEditChapterWords();
       alert('每章字数已更新为 ' + value.toLocaleString() + ' 字');
@@ -1694,12 +1512,8 @@ async function saveChapterWords() {
 // 记忆引擎API封装
 const MemoryAPI = {
   async call(action, data = {}) {
-    const response = await fetch('api/memory_actions.php', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrf() },
-      body: JSON.stringify({ action, novel_id: NOVEL_ID, ...data })
-    });
-    return response.json();
+    const response = await apiPost('memory_actions', { action, novel_id: NOVEL_ID, ...data });
+    return response;
   }
 };
 
@@ -2629,7 +2443,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     var status = document.getElementById('human-critic-status');
     try {
-      var res = await fetch('api/human_critic.php', {
+      var res = await fetch('/api/index.php?route=human_critic', {
         method: 'POST',
         headers: {'Content-Type':'application/x-www-form-urlencoded', 'X-CSRF-Token': getCsrf()},
         body: 'action=save&novel_id=' + NOVEL_ID + '&chapter_id=' + chapterId + '&scores=' + encodeURIComponent(JSON.stringify(scores))
@@ -2649,7 +2463,7 @@ document.addEventListener('DOMContentLoaded', () => {
   async function loadHumanCritic(chapterId) {
     var dims = ['thrill', 'immersion', 'pacing', 'freshness', 'read_next'];
     try {
-      var res = await fetch('api/human_critic.php?action=get&novel_id=' + NOVEL_ID + '&chapter_id=' + chapterId, {
+      var res = await fetch('/api/index.php?route=human_critic&action=get&novel_id=' + NOVEL_ID + '&chapter_id=' + chapterId, {
         headers: {'X-CSRF-Token': getCsrf()}
       });
       var data = await res.json();
@@ -2670,180 +2484,8 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (e) { /* ignore */ }
   }
 
-  // 详情Modal → 「查看完整章节」跳转
-  var detailViewBtn = document.getElementById('detail-view-chapter');
-  if (detailViewBtn) {
-    detailViewBtn.addEventListener('click', function(e) {
-      e.preventDefault();
-      var chapterId = document.getElementById('detail-chapter-id')?.value;
-      if (chapterId) {
-        window.location.href = 'chapter.php?id=' + chapterId;
-      }
-    });
-  }
-
-  // 详情Modal → 保存标题
-  var btnUpdateTitle = document.getElementById('btn-update-title');
-  if (btnUpdateTitle) {
-    btnUpdateTitle.addEventListener('click', async function() {
-      var chapterId = parseInt(document.getElementById('detail-chapter-id')?.value || 0);
-      var title = document.getElementById('detail-title')?.value || '';
-      if (!chapterId) return;
-      try {
-        var res = await fetch('api/actions.php', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json', 'X-CSRF-Token': getCsrf()},
-          body: JSON.stringify({ action: 'save_chapter', chapter_id: chapterId, title: title })
-        });
-        var data = await res.json();
-        if (data.ok) { alert('标题已保存'); location.reload(); }
-        else { alert('保存失败：' + (data.msg || '')); }
-      } catch(err) { alert('保存失败：' + err.message); }
-    });
-  }
-
-  // 详情Modal → 保存大纲
-  var btnUpdateOutline = document.getElementById('btn-update-outline');
-  if (btnUpdateOutline) {
-    btnUpdateOutline.addEventListener('click', async function() {
-      var chapterId = parseInt(document.getElementById('detail-chapter-id')?.value || 0);
-      var outline = document.getElementById('detail-outline')?.value || '';
-      if (!chapterId) return;
-      try {
-        var res = await fetch('api/actions.php', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json', 'X-CSRF-Token': getCsrf()},
-          body: JSON.stringify({ action: 'save_chapter_outline', chapter_id: chapterId, outline: outline, key_points: [], hook: '' })
-        });
-        var data = await res.json();
-        if (data.ok) alert('大纲已保存');
-        else alert('保存失败：' + (data.msg || ''));
-      } catch(err) { alert('保存失败：' + err.message); }
-    });
-  }
-
-  // 详情Modal → 清空章节
-  var btnClearContent = document.getElementById('btn-clear-content');
-  if (btnClearContent) {
-    btnClearContent.addEventListener('click', async function() {
-      if (!confirm('确定要清空本章内容吗？此操作不可撤销。')) return;
-      var chapterId = parseInt(document.getElementById('detail-chapter-id')?.value || 0);
-      if (!chapterId) return;
-      try {
-        var res = await fetch('api/actions.php', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json', 'X-CSRF-Token': getCsrf()},
-          body: JSON.stringify({ action: 'save_chapter', chapter_id: chapterId, content: '' })
-        });
-        var data = await res.json();
-        if (data.ok) { alert('章节已清空'); location.reload(); }
-        else alert('清空失败：' + (data.msg || ''));
-      } catch(err) { alert('清空失败：' + err.message); }
-    });
-  }
-
-  // 详情Modal → 重新生成
-  var btnRegenerate = document.getElementById('btn-regenerate');
-  if (btnRegenerate) {
-    btnRegenerate.addEventListener('click', async function() {
-      if (!confirm('确定要重新生成本章吗？现有内容将被替换。')) return;
-      var chapterId = parseInt(document.getElementById('detail-chapter-id')?.value || 0);
-      var plotHint = document.getElementById('detail-plot-hint')?.value || '';
-      if (!chapterId) return;
-
-      // 关闭详情 Modal
-      var detailModal = bootstrap.Modal.getInstance(document.getElementById('chapterDetailModal'));
-      if (detailModal) detailModal.hide();
-
-      // 打开写作 Modal
-      var modalEl = document.getElementById('writeModal');
-      if (!modalEl) { alert('缺少写作对话框'); return; }
-      var modal = new bootstrap.Modal(modalEl);
-      modal.show();
-      var contentEl = document.getElementById('writeModalContent');
-      var statsEl   = document.getElementById('writeModalStats');
-      if (contentEl) contentEl.textContent = '';
-      if (statsEl)   statsEl.textContent = plotHint ? '剧情提示：' + plotHint : '';
-
-      // 先重置章节状态
-      await fetch('api/actions.php', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json', 'X-CSRF-Token': getCsrf()},
-        body: JSON.stringify({ action: 'reset_chapter', chapter_id: chapterId })
-      });
-
-      // 调用写作 API
-      fetch('api/write_chapter.php', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json', 'X-CSRF-Token': getCsrf()},
-        body: JSON.stringify({ novel_id: NOVEL_ID, chapter_id: chapterId, plot_hint: plotHint })
-      })
-      .then(response => {
-        var reader  = response.body.getReader();
-        var decoder = new TextDecoder();
-        var fullText = '';
-        var gotContent = false;
-        function read() {
-          reader.read().then(function(result) {
-            if (result.done) {
-              if (gotContent && fullText.length > 50) {
-                if (statsEl) statsEl.textContent = '章节写作完成，等待后端处理...';
-                setTimeout(function() { window._novelContentUpdated = true; location.reload(); }, 3000);
-              } else {
-                if (statsEl) statsEl.textContent += '（关闭对话框后将刷新页面）';
-                window._novelContentUpdated = true;
-              }
-              return;
-            }
-            var text = decoder.decode(result.value);
-            var lines = text.split('\n');
-            for (var i = 0; i < lines.length; i++) {
-              var line = lines[i];
-              if (!line.startsWith('data: ')) continue;
-              var payload = line.slice(6);
-              if (payload === '[DONE]') {
-                if (statsEl) statsEl.textContent += '（关闭对话框后将刷新页面）';
-                window._novelContentUpdated = true;
-                return;
-              }
-              try {
-                var d = JSON.parse(payload);
-                if (d.chunk && contentEl) {
-                  fullText += d.chunk;
-                  gotContent = true;
-                  contentEl.textContent = fullText;
-                  contentEl.scrollTop = contentEl.scrollHeight;
-                }
-                if (d.stats && statsEl) statsEl.textContent = d.stats;
-              } catch(e) {}
-            }
-            read();
-          }).catch(function(readErr) {
-            if (gotContent && fullText.length > 50) {
-              if (statsEl) statsEl.textContent = '连接中断，后端可能仍在处理中，3秒后刷新查看...';
-              setTimeout(function() { window._novelContentUpdated = true; location.reload(); }, 3000);
-            } else {
-              if (contentEl) contentEl.textContent = '重新生成失败：网络连接中断（' + readErr.message + '）';
-            }
-          });
-        }
-        read();
-      })
-      .catch(err => {
-        if (contentEl) contentEl.textContent = '重新生成失败：' + err.message;
-      });
-    });
-  }
-
-  // 写作 Modal 关闭后刷新（如果内容已更新）
-  var writeModalEl = document.getElementById('writeModal');
-  if (writeModalEl) {
-    writeModalEl.addEventListener('hidden.bs.modal', function() {
-      if (window._novelContentUpdated) {
-        location.reload();
-      }
-    });
-  }
+  // 详情Modal → 标题保存/大纲保存/清空章节/重新生成
+  // 已由 app.js 章节详情弹窗模块统一处理，此处不再重复绑定
 
   // === 添加章节 Modal ===
   window.openAddChaptersModal = function() {
@@ -2856,12 +2498,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (count < 1 || count > 200) { showToast('章节数量需在 1-200 之间', 'error'); return; }
     this.disabled = true;
     try {
-      const res = await fetch('api/actions.php', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': getCsrf()},
-        body: JSON.stringify({ action: 'add_chapters', novel_id: NOVEL_ID, count: count, mode: 'empty' })
-      });
-      const data = await res.json();
+      const data = await apiPost('actions', { action: 'add_chapters', novel_id: NOVEL_ID, count: count, mode: 'empty' });
       if (data.ok) {
         showToast(data.msg || '添加成功', 'success');
         bootstrap.Modal.getInstance(document.getElementById('addChaptersModal'))?.hide();
@@ -2891,12 +2528,7 @@ document.addEventListener('DOMContentLoaded', () => {
   window.resetSingleChapter = async function(chapterId) {
     if (!confirm('确定要取消当前写作吗？章节状态将重置为"待写作"。')) return;
     try {
-      var res = await fetch('api/actions.php', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': getCsrf()},
-        body: JSON.stringify({ action: 'reset_chapter', chapter_id: chapterId })
-      });
-      var data = await res.json();
+      var data = await apiPost('actions', { action: 'reset_chapter', chapter_id: chapterId });
       if (data.ok) { location.reload(); }
       else { alert('操作失败：' + (data.msg || '')); }
     } catch(err) { alert('操作失败：' + err.message); }
@@ -2914,8 +2546,7 @@ const DaemonWrite = {
   async _getToken() {
     if (this._token) return this._token;
     try {
-      const res = await fetch('api/daemon_write.php', { cache: 'no-store' });
-      const d   = await res.json();
+      const d = await apiPost('daemon_token', { action: 'get_or_create' });
       if (d.token) {
         this._token = d.token;
         return this._token;
@@ -2952,7 +2583,11 @@ const DaemonWrite = {
     if (!token) { alert('获取挂机令牌失败，请刷新页面重试'); return; }
 
     try {
-      const res = await fetch(`api/daemon_write.php?token=${token}&novel_id=${NOVEL_ID}&action=enable`);
+      const res = await fetch('api/daemon_write.php', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: new URLSearchParams({ token, novel_id: String(NOVEL_ID), action: 'enable' })
+      });
       const d   = await res.json();
       if (!d.ok) { alert('启用失败：' + d.msg); return; }
 
@@ -2989,7 +2624,11 @@ const DaemonWrite = {
     if (!token) { alert('获取令牌失败'); return; }
 
     try {
-      const res = await fetch(`api/daemon_write.php?token=${token}&novel_id=${NOVEL_ID}&action=disable`);
+      const res = await fetch('api/daemon_write.php', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: new URLSearchParams({ token, novel_id: String(NOVEL_ID), action: 'disable' })
+      });
       const d   = await res.json();
       if (!d.ok) { alert('停用失败：' + d.msg); return; }
 
@@ -3139,8 +2778,8 @@ function showCoverModal(novelId) {
     var title = <?= json_encode($novel['title']) ?>;
 
     var previewHtml = currentCover
-        ? '<img src="' + currentCover + '?t=' + Date.now() + '" style="width:100%;height:100%;object-fit:cover;border-radius:8px">'
-        : '<div style="width:100%;height:100%;background:linear-gradient(135deg,' + coverColor + ',' + coverColor + '99);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:2rem;font-weight:700">' + title.substring(0, 4) + '</div>';
+        ? '<img src="' + _escAttr(currentCover) + '?t=' + Date.now() + '" style="width:100%;height:100%;object-fit:cover;border-radius:8px">'
+        : '<div style="width:100%;height:100%;background:linear-gradient(135deg,' + _escAttr(coverColor) + ',' + _escAttr(coverColor) + '99);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:2rem;font-weight:700">' + _escAttr(title.substring(0, 4)) + '</div>';
 
     var modal = document.createElement('div');
     modal.id = 'coverManageModal';
@@ -3182,6 +2821,14 @@ function showCoverModal(novelId) {
     new bootstrap.Modal(modal).show();
 }
 
+// 审计 P0：封面路径 / 标题等来自服务端响应或持久化数据，拼接进 innerHTML 的属性或
+// 文本前统一转义，防止属性击穿 / 标签注入造成 XSS。覆盖 & < > " ' 五类字符。
+function _escAttr(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+
 function uploadCoverFromModal(novelId) {
     var fileInput = document.getElementById('cover-modal-file');
     if (!fileInput.files || !fileInput.files[0]) { alert('请先选择图片'); return; }
@@ -3196,18 +2843,18 @@ function uploadCoverFromModal(novelId) {
     fd.append('novel_id', novelId);
     fd.append('cover_file', fileInput.files[0]);
 
-    fetch('api/cover_actions.php', { method: 'POST', body: fd, headers: {'X-CSRF-Token': getCsrf()} })
+    fetch('/api/index.php?route=cover_actions', { method: 'POST', body: fd, headers: {'X-CSRF-Token': getCsrf()} })
     .then(r => r.json())
     .then(data => {
         if (data.ok) {
             status.className = 'small text-success';
             status.innerHTML = '<i class="bi bi-check-circle me-1"></i>' + data.msg;
-            document.getElementById('cover-modal-preview').innerHTML = '<img src="' + data.path + '?t=' + Date.now() + '" style="width:100%;height:100%;object-fit:cover;border-radius:8px">';
+            document.getElementById('cover-modal-preview').innerHTML = '<img src="' + _escAttr(data.path) + '?t=' + Date.now() + '" style="width:100%;height:100%;object-fit:cover;border-radius:8px">';
             // 更新主页面封面
             var mainCover = document.querySelector('.novel-cover-sm');
             if (mainCover) {
                 mainCover.style.background = 'none';
-                mainCover.innerHTML = '<img src="' + data.path + '?t=' + Date.now() + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:inherit">';
+                mainCover.innerHTML = '<img src="' + _escAttr(data.path) + '?t=' + Date.now() + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:inherit">';
             }
         } else {
             status.className = 'small text-danger';
@@ -3229,7 +2876,7 @@ function generateCoverFromModal(novelId) {
     status.className = 'small text-info';
     status.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>正在生成封面，请稍候（约30秒）...';
 
-    fetch('api/cover_actions.php', {
+    fetch('/api/index.php?route=cover_actions', {
         method: 'POST',
         headers: {'Content-Type': 'application/json', 'X-CSRF-Token': getCsrf()},
         body: JSON.stringify({ action: 'generate', novel_id: novelId, keyword: keyword })
@@ -3239,11 +2886,11 @@ function generateCoverFromModal(novelId) {
         if (data.ok) {
             status.className = 'small text-success';
             status.innerHTML = '<i class="bi bi-check-circle me-1"></i>' + data.msg;
-            document.getElementById('cover-modal-preview').innerHTML = '<img src="' + data.path + '?t=' + Date.now() + '" style="width:100%;height:100%;object-fit:cover;border-radius:8px">';
+            document.getElementById('cover-modal-preview').innerHTML = '<img src="' + _escAttr(data.path) + '?t=' + Date.now() + '" style="width:100%;height:100%;object-fit:cover;border-radius:8px">';
             var mainCover = document.querySelector('.novel-cover-sm');
             if (mainCover) {
                 mainCover.style.background = 'none';
-                mainCover.innerHTML = '<img src="' + data.path + '?t=' + Date.now() + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:inherit">';
+                mainCover.innerHTML = '<img src="' + _escAttr(data.path) + '?t=' + Date.now() + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:inherit">';
             }
         } else {
             status.className = 'small text-danger';
@@ -3264,7 +2911,7 @@ function deleteCoverFromModal(novelId) {
     status.className = 'small text-info';
     status.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>删除中...';
 
-    fetch('api/cover_actions.php', {
+    fetch('/api/index.php?route=cover_actions', {
         method: 'POST',
         headers: {'Content-Type': 'application/json', 'X-CSRF-Token': getCsrf()},
         body: JSON.stringify({ action: 'delete', novel_id: novelId })
@@ -3276,11 +2923,11 @@ function deleteCoverFromModal(novelId) {
             status.innerHTML = '<i class="bi bi-check-circle me-1"></i>封面已移除';
             var coverColor = <?= json_encode($novel['cover_color'] ?? '#6366f1') ?>;
             var title = <?= json_encode($novel['title']) ?>;
-            document.getElementById('cover-modal-preview').innerHTML = '<div style="width:100%;height:100%;background:linear-gradient(135deg,' + coverColor + ',' + coverColor + '99);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:2rem;font-weight:700">' + title.substring(0, 4) + '</div>';
+            document.getElementById('cover-modal-preview').innerHTML = '<div style="width:100%;height:100%;background:linear-gradient(135deg,' + _escAttr(coverColor) + ',' + _escAttr(coverColor) + '99);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:2rem;font-weight:700">' + _escAttr(title.substring(0, 4)) + '</div>';
             var mainCover = document.querySelector('.novel-cover-sm');
             if (mainCover) {
                 mainCover.style.background = 'linear-gradient(135deg,' + coverColor + ',' + coverColor + '99)';
-                mainCover.innerHTML = title.substring(0, 4);
+                mainCover.innerHTML = _escAttr(title.substring(0, 4));
             }
         } else {
             status.className = 'small text-danger';
@@ -3326,7 +2973,7 @@ const AgentPanel = {
   async loadAll() {
     this.showLoading();
     try {
-      const res = await fetch('api/agent_status.php?novel_id=' + NOVEL_ID);
+      const res = await fetch('/api/index.php?route=agent_status&novel_id=' + NOVEL_ID);
       const data = await res.json();
       if (!data.ok) {
         this.showError(data.msg || '加载失败');
@@ -3586,13 +3233,7 @@ const AgentPanel = {
   async deactivateDirective(id) {
     if (!confirm('确定停用该指令？')) return;
     try {
-      const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
-      const res = await fetch('api/agent_status.php', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
-        body: JSON.stringify({ action: 'deactivate', novel_id: NOVEL_ID, directive_id: id })
-      });
-      const data = await res.json();
+      const data = await apiPost('agent_status', { action: 'deactivate', novel_id: NOVEL_ID, directive_id: id });
       if (data.ok) {
         this.refresh();
       } else {
@@ -3623,13 +3264,9 @@ document.getElementById('tab-emotion-trigger')?.addEventListener('shown.bs.tab',
 });
 
 function loadHealthDashboard() {
-  const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
-  fetch(`api/health_dashboard.php?novel_id=${NOVEL_ID}`, {
-    headers: { 'X-CSRF-Token': csrf }
-  })
-  .then(r => r.json())
+  apiGet('health_dashboard', { novel_id: NOVEL_ID })
   .then(res => {
-    if (!res.success) return;
+    if (!res.ok) return;
     const d = res.data;
 
     // 1. 情绪曲线
@@ -3646,6 +3283,9 @@ function loadHealthDashboard() {
     // 3. 钩子分布（柱状图）
     renderBarChart('hook-canvas', d.hook_distribution || [], '钩子分布');
 
+    // 3b. 钩子回收健康
+    renderHookHealth(d.hook_health || {});
+
     // 4. 角色出场状态
     renderCharacterList(d.characters || []);
 
@@ -3658,6 +3298,36 @@ function loadHealthDashboard() {
   .catch(err => {
     console.error('Health dashboard load error:', err);
   });
+}
+
+// v41 钩子回收健康面板
+function renderHookHealth(h) {
+  const el = document.getElementById('hook-health');
+  if (!el) return;
+  const checked = h.checked || 0;
+  if (!checked) {
+    el.innerHTML = '<span class="text-muted">钩子回收：暂无数据（写够 2 章后开始统计）</span>';
+    return;
+  }
+  const rate = (h.rate != null) ? h.rate : 0;
+  const rateClass = rate >= 85 ? 'text-success' : (rate >= 60 ? 'text-warning' : 'text-danger');
+  let html = '<div class="d-flex justify-content-between align-items-center mb-1">'
+    + '<span class="text-muted"><i class="bi bi-link-45deg me-1"></i>钩子回收率</span>'
+    + '<span class="' + rateClass + ' fw-bold">' + rate + '% '
+    + '<span class="text-muted fw-normal">(' + (h.resolved || 0) + '/' + checked + '，悬挂 ' + (h.dangling || 0) + ')</span></span>'
+    + '</div>';
+  const list = h.dangling_list || [];
+  if (list.length) {
+    html += '<div class="text-muted mb-1">⚠️ 悬挂钩子（抛出后未回收）：</div>';
+    html += list.map(x =>
+      '<div class="text-truncate" title="' + escHtml(x.hook || '') + '">'
+      + '<span class="badge bg-danger me-1">第' + x.chapter + '章</span>'
+      + escHtml(x.hook || '') + '</div>'
+    ).join('');
+  } else {
+    html += '<div class="text-success">✓ 近期无悬挂钩子</div>';
+  }
+  el.innerHTML = html;
 }
 
 function renderLineChart(canvasId, data, label, color) {
@@ -3819,10 +3489,64 @@ function renderSystemHealth(health) {
     section.style.display = 'none';
   }
 }
+</script>
 
-function escHtml(str) {
-  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
+<!-- [v41] 全书体检报告 Modal -->
+<div class="modal fade" id="fullbookAuditModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content bg-dark text-light border-secondary">
+      <div class="modal-header border-secondary">
+        <h5 class="modal-title"><i class="bi bi-clipboard2-pulse me-2 text-info"></i>全书一致性体检报告</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="fullbook-audit-body">
+        <div class="text-center text-muted py-4">加载中…</div>
+      </div>
+      <div class="modal-footer border-secondary">
+        <span class="text-muted small me-auto">每 50 章自动生成，存最近 10 份</span>
+        <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  var modalEl = document.getElementById('fullbookAuditModal');
+  if (!modalEl) return;
+  function esc(s){ return (s||'').replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];}); }
+  modalEl.addEventListener('shown.bs.modal', function(){
+    var body = document.getElementById('fullbook-audit-body');
+    body.innerHTML = '<div class="text-center text-muted py-4">加载中…</div>';
+    apiPost('actions', { action: 'get_fullbook_audits', novel_id: NOVEL_ID, limit: 10 })
+      .then(function(res){
+        var audits = (res && res.data && res.data.audits) || [];
+        if (!audits.length) {
+          body.innerHTML = '<div class="text-center text-muted py-4">尚无体检报告。写满 50 章后自动生成。</div>';
+          return;
+        }
+        body.innerHTML = audits.map(function(a){
+          var sev = {high:'🔴',medium:'🟠',low:'🟡'};
+          var issues = (a.issues||[]).map(function(i){
+            return '<li>'+(sev[i.severity]||'🟡')+' '+esc(i.desc||'')+'</li>';
+          }).join('');
+          var scoreBadge = a.score!=null
+            ? '<span class="badge '+(a.score>=8?'bg-success':a.score>=6?'bg-warning text-dark':'bg-danger')+'">'+a.score+'/10</span>'
+            : '';
+          return '<div class="mb-3 p-3 rounded border border-secondary">'
+            + '<div class="d-flex justify-content-between align-items-center mb-2">'
+            + '<strong>第 '+a.chapter_number+' 章体检</strong>'
+            + scoreBadge+'</div>'
+            + (a.verdict?('<div class="small text-info mb-2">结论：'+esc(a.verdict)+'</div>'):'')
+            + (issues?('<ul class="small mb-1" style="padding-left:1.1rem">'+issues+'</ul>'):'<div class="small text-muted">无明显问题</div>')
+            + '<div class="small text-muted mt-1">'+esc(a.created_at||'')+'</div>'
+            + '</div>';
+        }).join('');
+      })
+      .catch(function(err){
+        body.innerHTML = '<div class="text-danger py-3">加载失败：'+esc(err.message||'')+'</div>';
+      });
+  });
+})();
 </script>
 
 <?php
@@ -3833,6 +3557,9 @@ if (defined('APP_DEBUG') && APP_DEBUG && isset($debugInfo)) {
     echo '<!-- DEBUG: Final Memory Usage: ' . $memUsed . 'MB / Peak: ' . $memPeak . 'MB -->' . "\n";
 }
 
+?>
+
+<?php
 pageFooter();
 
 // 确保所有缓冲区都刷新

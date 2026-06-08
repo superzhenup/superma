@@ -128,7 +128,9 @@ try {
     ]);
     
 } catch (Exception $e) {
-    echo json_encode(['success' => false, 'error' => '生成失败: ' . $e->getMessage()]);
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] optimize_chapter_synopsis 优化失败: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
+    echo json_encode(['success' => false, 'error' => '生成失败，请稍后重试', 'request_id' => $rid]);
     exit;
 }
 

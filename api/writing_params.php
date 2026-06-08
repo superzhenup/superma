@@ -106,7 +106,8 @@ try {
                     }
                     $savedCount++;
                 } catch (\Throwable $e) {
-                    $errors[$key] = "{$def['label']} 保存失败: " . $e->getMessage();
+                    error_log("writing_params save {$key} 失败: " . $e->getMessage());
+                    $errors[$key] = "{$def['label']} 保存失败，请稍后重试";
                 }
             }
 
@@ -166,7 +167,9 @@ try {
     http_response_code(400);
     echo json_encode([
         'success' => false,
-        'error' => $e->getMessage(),
-        'message' => $e->getMessage(),
+        'error'   => '操作失败，请稍后重试',
+        'message' => '操作失败，请稍后重试',
+        'code'    => 'internal_error',
+        'request_id' => error_trace_id(),
     ]);
 }

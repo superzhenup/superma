@@ -93,6 +93,23 @@ class RewriteAgent
             $this->threshold
         ));
 
+        // v2 独立重写模型：自审盲区消除
+        // 如果用户配置了重写专用模型，则用不同模型重写，避免同一双眼睛看同一段文字
+        $rewriteModelId = (int)getSystemSetting('ws_rewrite_model_id', 0, 'int');
+        if ($rewriteModelId > 0 && $rewriteModelId !== (int)($modelId ?? 0)) {
+            $rwModel = \DB::fetch('SELECT id, name FROM ai_models WHERE id=?', [$rewriteModelId]);
+            if ($rwModel) {
+                $origName = $modelId ? (\DB::fetch('SELECT id, name FROM ai_models WHERE id=?', [$modelId])['name'] ?? '默认') : '默认';
+                addLog($this->novelId, 'info', sprintf(
+                    'RewriteAgent 使用独立重写模型 #%d（%s），正文模型：%s',
+                    $rewriteModelId, $rwModel['name'], $origName
+                ));
+                $modelId = $rewriteModelId;
+            } else {
+                addLog($this->novelId, 'warn', "配置的重写模型 #{$rewriteModelId} 不存在，回退到正文模型");
+            }
+        }
+
         // 检查是否需要重写
         if ($originalScore >= $this->threshold) {
             return [
@@ -462,7 +479,7 @@ EOT;
 
         try {
             require_once __DIR__ . '/../memory/MemoryEngine.php';
-            require_once __DIR__ . '/../../api/generate_summary.php';
+            require_once __DIR__ . '/../memory.php';   // generateChapterSummary() 定义处（原误指向不存在的 api/generate_summary.php）
 
             $engine = new MemoryEngine($this->novelId);
 

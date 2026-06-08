@@ -73,5 +73,7 @@ try {
     echo json_encode(['success' => true, 'message' => '章节简介已保存']);
 
 } catch (Exception $e) {
-    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] update_chapter_synopsis: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
+    echo json_encode(['success' => false, 'message' => '保存失败，请稍后重试', 'request_id' => $rid]);
 }

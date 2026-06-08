@@ -1,6 +1,6 @@
 <?php
 /**
- * 作者画像 API - 提供 RESTful 接口
+ * 作者画像API - 提供 RESTful 接口
  */
 
 define('APP_LOADED', true);
@@ -14,6 +14,7 @@ require_once $baseDir . '/includes/auth.php';
 require_once $baseDir . '/includes/author/AuthorProfile.php';
 require_once $baseDir . '/includes/author/WorkParser.php';
 require_once $baseDir . '/includes/author/AuthorAnalyzer.php';
+require_once $baseDir . '/includes/helpers.php';
 
 registerApiErrorHandlers();
 
@@ -78,11 +79,17 @@ try {
             break;
 
         default:
-            jsonResponse(['error' => '不支持的请求方法'], 405);
+            authorJsonResponse(['error' => '不支持的请求方法'], 405);
     }
 } catch (\Throwable $e) {
-    error_log('AuthorProfile API Error: ' . $e->getMessage());
-    jsonResponse(['error' => '服务器错误：' . $e->getMessage()], 500);
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] author_profile API: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
+    authorJsonResponse([
+        'ok' => false,
+        'error' => '服务器错误，请稍后重试',
+        'code' => 'internal_error',
+        'request_id' => $rid,
+    ], 500);
 }
 
 function updateProfilePromptsFromResults(int $profileId, array $results): void
@@ -144,11 +151,11 @@ function generateNaturalPrompt(string $dimension, $data): string
         'identity' => '身份秘密',
     ];
 
-    $densityLabels = ['sparse' => '简洁', 'moderate' => '适中', 'detailed' => '细腻'];
+    $densityLabels = ['sparse' => '简约', 'moderate' => '适中', 'detailed' => '细腻'];
     $complexityLabels = ['simple' => '简洁明了', 'moderate' => '中等', 'complex' => '文笔华丽'];
     $paceLabels = ['fast' => '快节奏', 'slow' => '慢节奏', 'medium' => '中等节奏', 'variable' => '变化节奏'];
     $editingLabels = ['minimal' => '轻度修改', 'moderate' => '中度润色', 'extensive' => '大量改写'];
-    $planningLabels = ['plotter' => '大纲规划型', 'pantser' => '即兴创作型', 'hybrid' => '混合型'];
+    $planningLabels = ['plotter' => '大纲规划者', 'pantser' => '即兴创作者', 'hybrid' => '混合型'];
 
     switch ($dimension) {
         case 'writing_habits':
@@ -166,16 +173,16 @@ function generateNaturalPrompt(string $dimension, $data): string
             $vp = $data['vocabulary_preference'] ?? [];
 
             if ($sl > 0) {
-                $parts[] = "平均句长约{$sl}字";
-                if ($sl < 25) $parts[] = '偏爱短句，节奏明快紧凑';
-                elseif ($sl > 50) $parts[] = '擅长长句铺陈，句式结构复杂';
-                else $parts[] = '句长适中，长短交替自然';
+                $parts[] = "平均句长约{$sl}词。";
+                if ($sl < 25) $parts[] = '偏爱短句，节奏明快紧凑。';
+                elseif ($sl > 50) $parts[] = '擅长长句铺陈，句式结构复杂。';
+                else $parts[] = '句长适中，长短交替自然。';
             }
 
             if ($pl > 0) {
-                $parts[] = "平均段落约{$pl}字";
-                if ($pl < 100) $parts[] = '段落精炼，适合快节奏阅读';
-                elseif ($pl > 250) $parts[] = '段落饱满，信息密度较高';
+                $parts[] = "平均段落约{$pl}字。";
+                if ($pl < 100) $parts[] = '段落精炼，适合快节奏阅读。';
+                elseif ($pl > 250) $parts[] = '段落饱满，信息密度较高。';
             }
 
             if (!empty($sp)) {
@@ -196,13 +203,13 @@ function generateNaturalPrompt(string $dimension, $data): string
             if ($ud > 0) {
                 $dialoguePct = round($ud * 100, 2);
                 $parts[] = "对话密度约{$dialoguePct}%";
-                if ($ud > 0.03) $parts[] = '对话密集，人物互动频繁生动';
-                elseif ($ud > 0.01) $parts[] = '对话与描写搭配均衡';
+                if ($ud > 0.03) $parts[] = '对话密集，人物互动频繁生动。';
+                elseif ($ud > 0.01) $parts[] = '对话与描写搭配均衡。';
                 else $parts[] = '以叙述描写为主，对话精简';
             }
 
             if ($up > 0) {
-                $parts[] = "被动语态密度：" . round($up, 2) . '‰';
+                $parts[] = "被动语态密度：" . round($up, 2) . '次';
             }
 
             if (!empty($rd)) {
@@ -212,7 +219,7 @@ function generateNaturalPrompt(string $dimension, $data): string
                 ];
                 $rdList = [];
                 foreach ($rd as $k => $v) {
-                    $rdList[] = ($rdNames[$k] ?? $k) . "({$v}处)";
+                    $rdList[] = ($rdNames[$k] ?? $k) . "({$v}次)";
                 }
                 $parts[] = '修辞手法：' . implode('、', $rdList);
             }
@@ -230,7 +237,6 @@ function generateNaturalPrompt(string $dimension, $data): string
 
             $cf = $data['confidence'] ?? 0;
             $parts[] = '置信度：' . round($cf * 100) . '%（分析' . ($data['source_chapter_count'] ?? 0) . '章）';
-
             return implode("。\n", $parts) . '。';
 
         case 'narrative_style':
@@ -272,7 +278,7 @@ function generateNaturalPrompt(string $dimension, $data): string
             }
 
             if ($im > 0) {
-                $elements[] = '内心独白密度：' . round($im, 2) . '‰';
+                $elements[] = '内心独白密度：' . round($im, 2) . '。';
                 if ($im > 2) $elements[] = '大量运用内心独白，人物心理刻画深入';
             }
 
@@ -281,8 +287,8 @@ function generateNaturalPrompt(string $dimension, $data): string
             if (!empty($tc)) {
                 $pattern = $tc['pattern'] ?? '';
                 $patternLabels = [
-                    'escalating' => '持续升级型', 'descending' => '渐降型',
-                    'wave_like' => '波浪起伏型', 'steady' => '平稳型', 'unknown' => '待分析',
+                    'escalating' => '持续升级', 'descending' => '渐降',
+                    'wave_like' => '波浪起伏', 'steady' => '平稳', 'unknown' => '待分析',
                 ];
                 $elements[] = '张力曲线：' . ($patternLabels[$pattern] ?? $pattern);
             }
@@ -323,7 +329,7 @@ function generateNaturalPrompt(string $dimension, $data): string
             }
 
             $dlLabels = [
-                'philosophical' => '哲思深度', 'thoughtful' => '有思想深度',
+                'philosophical' => '哲思深邃', 'thoughtful' => '有思想深度',
                 'entertaining' => '娱乐消遣', 'surface' => '表层叙事',
             ];
             if ($dl) $elements[] = '思想深度：' . ($dlLabels[$dl] ?? $dl);
@@ -447,13 +453,38 @@ function ensurePromptColumnsExist(): void
     if ($checked) return;
     $checked = true;
 
-    $columns = DB::fetchAll("SHOW COLUMNS FROM author_profiles LIKE 'writing_habits_prompt'");
-    if (empty($columns)) {
-        DB::query("ALTER TABLE author_profiles
-            ADD COLUMN `writing_habits_prompt` TEXT DEFAULT NULL COMMENT '写作习惯提示词' AFTER `influences`,
-            ADD COLUMN `narrative_style_prompt` TEXT DEFAULT NULL COMMENT '叙事手法提示词' AFTER `writing_habits_prompt`,
-            ADD COLUMN `sentiment_prompt` TEXT DEFAULT NULL COMMENT '思想情感提示词' AFTER `narrative_style_prompt`,
-            ADD COLUMN `creative_identity_prompt` TEXT DEFAULT NULL COMMENT '创作个性提示词' AFTER `sentiment_prompt`");
+    // 旧库升级兜底：四个风格提示词列按需补齐。
+    // 主迁移（includes/db.php 的字段迁移表 v29）已包含这四列并幂等执行；
+    // 此处为请求期安全网，逐列检查、仅添加缺失列，避免部分存在时整体失败。
+    //
+    // 历史缺陷（2026-05-31 审计 P1）：原先用单条多列 ALTER，前三个 COMMENT
+    // 字符串缺少闭合引号，AFTER 被吞入注释文本，老库升级路径必然抛 SQL 语法错误。
+    static $defs = [
+        'writing_habits_prompt'    => ['comment' => '写作习惯提示词', 'after' => 'influences'],
+        'narrative_style_prompt'   => ['comment' => '叙事手法提示词', 'after' => 'writing_habits_prompt'],
+        'sentiment_prompt'         => ['comment' => '思想情感提示词', 'after' => 'narrative_style_prompt'],
+        'creative_identity_prompt' => ['comment' => '创作个性提示词', 'after' => 'sentiment_prompt'],
+    ];
+
+    // 一次性取回现有列，避免逐列各查一次。
+    $existing = [];
+    foreach (DB::fetchAll("SHOW COLUMNS FROM author_profiles") as $row) {
+        if (isset($row['Field'])) {
+            $existing[$row['Field']] = true;
+        }
+    }
+
+    foreach ($defs as $name => $meta) {
+        if (isset($existing[$name])) {
+            continue;
+        }
+        // 列名 / AFTER 目标 / COMMENT 均为本函数内白名单字面量，无用户输入；
+        // 标识符与 COMMENT 无法用占位符绑定，故内联。
+        DB::query(
+            "ALTER TABLE `author_profiles` ADD COLUMN `{$name}` TEXT DEFAULT NULL "
+            . "COMMENT '{$meta['comment']}' AFTER `{$meta['after']}`"
+        );
+        $existing[$name] = true; // 后续列的 AFTER 依赖此列
     }
 }
 
@@ -469,7 +500,7 @@ function handleGet(string $action, array $pathParts, ?int $userId): void
         }
 
         $result = AuthorProfile::listAll($filters, $page);
-        jsonResponse($result);
+        authorJsonResponse($result);
     }
 
     if ($action === 'profile' && isset($pathParts[1])) {
@@ -477,11 +508,11 @@ function handleGet(string $action, array $pathParts, ?int $userId): void
         $profile = AuthorProfile::find($profileId);
 
         if (!$profile) {
-            jsonResponse(['error' => '画像不存在'], 404);
+            authorJsonResponse(['error' => '画像不存在'], 404);
         }
 
         $profile->incrementUsage();
-        jsonResponse($profile->toArray());
+        authorJsonResponse($profile->toArray());
     }
 
     if ($action === 'style-guide' && isset($pathParts[2])) {
@@ -489,10 +520,10 @@ function handleGet(string $action, array $pathParts, ?int $userId): void
         $profile = AuthorProfile::find($profileId);
 
         if (!$profile) {
-            jsonResponse(['error' => '画像不存在'], 404);
+            authorJsonResponse(['error' => '画像不存在'], 404);
         }
 
-        jsonResponse(['style_guide' => $profile->generateStyleGuide()]);
+        authorJsonResponse(['style_guide' => $profile->generateStyleGuide()]);
     }
 
     if ($action === 'vector' && isset($pathParts[2])) {
@@ -500,18 +531,18 @@ function handleGet(string $action, array $pathParts, ?int $userId): void
         $profile = AuthorProfile::find($profileId);
 
         if (!$profile) {
-            jsonResponse(['error' => '画像不存在'], 404);
+            authorJsonResponse(['error' => '画像不存在'], 404);
         }
 
-        jsonResponse($profile->toVectorStyle());
+        authorJsonResponse($profile->toVectorStyle());
     }
 
     if ($action === 'default') {
         $profile = AuthorProfile::getDefault();
         if (!$profile) {
-            jsonResponse(['error' => '没有默认画像'], 404);
+            authorJsonResponse(['error' => '没有默认画像'], 404);
         }
-        jsonResponse($profile->toArray());
+        authorJsonResponse($profile->toArray());
     }
 
     if ($action === 'works' && isset($pathParts[2])) {
@@ -520,30 +551,30 @@ function handleGet(string $action, array $pathParts, ?int $userId): void
             'SELECT * FROM author_uploaded_works WHERE profile_id=? ORDER BY created_at DESC',
             [$profileId]
         );
-        jsonResponse(['works' => $works ?: []]);
+        authorJsonResponse(['works' => $works ?: []]);
     }
 
     if ($action === 'detailed-report' && isset($pathParts[1])) {
         $profileId = intval($pathParts[1]);
         $profile = AuthorProfile::find($profileId);
         if (!$profile) {
-            jsonResponse(['error' => '画像不存在'], 404);
+            authorJsonResponse(['error' => '画像不存在'], 404);
         }
 
         $workId = $profile->toArray()['source_work_id'] ?? 0;
         if (!$workId) {
-            jsonResponse(['error' => '没有已上传的作品'], 400);
+            authorJsonResponse(['error' => '没有已上传的作品'], 400);
         }
 
         $work = DB::fetch('SELECT * FROM author_uploaded_works WHERE id=? AND profile_id=?', [$workId, $profileId]);
         if (!$work) {
-            jsonResponse(['error' => '作品不存在'], 404);
+            authorJsonResponse(['error' => '作品不存在'], 404);
         }
 
         $parser = new WorkParser();
         $content = $parser->extractContent($work['file_path'], $work['file_type']);
         if ($content === false) {
-            jsonResponse(['error' => '无法读取作品内容'], 500);
+            authorJsonResponse(['error' => '无法读取作品内容'], 500);
         }
 
         $parseResult = $parser->parseText($content);
@@ -612,7 +643,7 @@ function handleGet(string $action, array $pathParts, ?int $userId): void
             ];
         }
 
-        jsonResponse([
+        authorJsonResponse([
             'success' => true,
             'profile_name' => $profile->toArray()['profile_name'] ?? '',
             'analysis_status' => $profile->toArray()['analysis_status'] ?? '',
@@ -623,7 +654,7 @@ function handleGet(string $action, array $pathParts, ?int $userId): void
         ]);
     }
 
-    jsonResponse(['error' => '未知操作'], 400);
+    authorJsonResponse(['error' => '未知操作'], 400);
 }
 
 function handlePost(string $action, ?int $userId): void
@@ -651,37 +682,37 @@ function handlePost(string $action, ?int $userId): void
 
             if (!$profile) {
                 error_log('AuthorProfile::create returned null');
-                jsonResponse(['success' => false, 'message' => '创建画像失败'], 500);
+                authorJsonResponse(['success' => false, 'message' => '创建画像失败'], 500);
             }
 
             error_log('Profile created successfully - id: ' . $profile->toArray()['id']);
-            jsonResponse(['success' => true, 'data' => $profile->toArray()], 201);
+            authorJsonResponse(['success' => true, 'data' => $profile->toArray()], 201);
         } catch (\Exception $e) {
             error_log('Error creating profile: ' . $e->getMessage());
-            jsonResponse(['success' => false, 'message' => '创建画像失败: ' . $e->getMessage()], 500);
+            authorJsonResponse(safe_api_error_payload($e, '创建画像失败，请稍后重试'), 500);
         }
     }
 
     if ($action === 'upload') {
         $profileId = intval($input['profile_id'] ?? 0);
         if (!$profileId) {
-            jsonResponse(['error' => '缺少 profile_id'], 400);
+            authorJsonResponse(['error' => '缺少 profile_id'], 400);
         }
 
         $profile = AuthorProfile::find($profileId);
         if (!$profile) {
-            jsonResponse(['error' => '画像不存在'], 404);
+            authorJsonResponse(['error' => '画像不存在'], 404);
         }
 
         if (empty($_FILES['file'])) {
-            jsonResponse(['error' => '没有上传文件'], 400);
+            authorJsonResponse(['error' => '没有上传文件'], 400);
         }
 
         $parser = new WorkParser();
         $result = $parser->parseUpload($_FILES['file']);
 
         if (!$result['success']) {
-            jsonResponse(['error' => $result['error'] ?? '文件解析失败'], 400);
+            authorJsonResponse(['error' => $result['error'] ?? '文件解析失败'], 400);
         }
 
         $workId = DB::insert('author_uploaded_works', [
@@ -700,7 +731,7 @@ function handlePost(string $action, ?int $userId): void
             'analysis_status' => 'pending',
         ], 'id=?', [$profileId]);
 
-        jsonResponse([
+        authorJsonResponse([
             'success' => true,
             'work_id' => $workId,
             'chapter_count' => $result['chapter_count'],
@@ -712,28 +743,28 @@ function handlePost(string $action, ?int $userId): void
     if ($action === 'analyze') {
         $profileId = intval($input['profile_id'] ?? 0);
         if (!$profileId) {
-            jsonResponse(['error' => '缺少 profile_id'], 400);
+            authorJsonResponse(['error' => '缺少 profile_id'], 400);
         }
 
         $profile = AuthorProfile::find($profileId);
         if (!$profile) {
-            jsonResponse(['error' => '画像不存在'], 404);
+            authorJsonResponse(['error' => '画像不存在'], 404);
         }
 
         $workId = $input['work_id'] ?? $profile->toArray()['source_work_id'] ?? 0;
         if (!$workId) {
-            jsonResponse(['error' => '没有上传作品进行分析'], 400);
+            authorJsonResponse(['error' => '没有上传作品进行分析'], 400);
         }
 
         $work = DB::fetch('SELECT * FROM author_uploaded_works WHERE id=? AND profile_id=?', [$workId, $profileId]);
         if (!$work) {
-            jsonResponse(['error' => '作品不存在'], 404);
+            authorJsonResponse(['error' => '作品不存在'], 404);
         }
 
         $parser = new WorkParser();
         $content = $parser->extractContent($work['file_path'], $work['file_type']);
         if ($content === false) {
-            jsonResponse(['error' => '无法读取作品内容'], 500);
+            authorJsonResponse(['error' => '无法读取作品内容'], 500);
         }
 
         $parseResult = $parser->parseText($content);
@@ -741,12 +772,12 @@ function handlePost(string $action, ?int $userId): void
         $result = AuthorAnalyzer::analyzeFromWork($profileId, $parseResult);
 
         if (!$result['success']) {
-            jsonResponse(['error' => $result['error'] ?? '分析失败'], 500);
+            authorJsonResponse(['error' => $result['error'] ?? '分析失败'], 500);
         }
 
         updateProfilePromptsFromResults($profileId, $result['results']);
 
-        jsonResponse([
+        authorJsonResponse([
             'success' => true,
             'results' => $result['results'],
             'summary' => $result['summary'],
@@ -757,31 +788,31 @@ function handlePost(string $action, ?int $userId): void
         $profileId = intval($input['profile_id'] ?? 0);
         $dimension = $input['dimension'] ?? '';
         if (!$profileId) {
-            jsonResponse(['error' => '缺少 profile_id'], 400);
+            authorJsonResponse(['error' => '缺少 profile_id'], 400);
         }
         if (!in_array($dimension, ['writing_habits', 'narrative_style', 'sentiment', 'creative_identity'])) {
-            jsonResponse(['error' => '无效的维度'], 400);
+            authorJsonResponse(['error' => '无效的维度'], 400);
         }
 
         $profile = AuthorProfile::find($profileId);
         if (!$profile) {
-            jsonResponse(['error' => '画像不存在'], 404);
+            authorJsonResponse(['error' => '画像不存在'], 404);
         }
 
         $workId = $input['work_id'] ?? $profile->toArray()['source_work_id'] ?? 0;
         if (!$workId) {
-            jsonResponse(['error' => '没有上传作品进行分析'], 400);
+            authorJsonResponse(['error' => '没有上传作品进行分析'], 400);
         }
 
         $work = DB::fetch('SELECT * FROM author_uploaded_works WHERE id=? AND profile_id=?', [$workId, $profileId]);
         if (!$work) {
-            jsonResponse(['error' => '作品不存在'], 404);
+            authorJsonResponse(['error' => '作品不存在'], 404);
         }
 
         $parser = new WorkParser();
         $content = $parser->extractContent($work['file_path'], $work['file_type']);
         if ($content === false) {
-            jsonResponse(['error' => '无法读取作品内容'], 500);
+            authorJsonResponse(['error' => '无法读取作品内容'], 500);
         }
 
         $parseResult = $parser->parseText($content);
@@ -791,7 +822,7 @@ function handlePost(string $action, ?int $userId): void
         $result = $analyzer->analyzeDimension($dimension);
 
         if (!$result['success']) {
-            jsonResponse(['error' => $result['error'] ?? '分析失败'], 500);
+            authorJsonResponse(['error' => $result['error'] ?? '分析失败'], 500);
         }
 
         $dimensionPromptMap = [
@@ -807,7 +838,7 @@ function handlePost(string $action, ?int $userId): void
             DB::update('author_profiles', [$promptField => $promptValue], 'id=?', [$profileId]);
         }
 
-        jsonResponse([
+        authorJsonResponse([
             'success' => true,
             'dimension' => $result['dimension'],
             'result' => $result['result'],
@@ -820,15 +851,15 @@ function handlePost(string $action, ?int $userId): void
         $text = trim($input['text'] ?? '');
 
         if (!$profileId) {
-            jsonResponse(['error' => '缺少 profile_id'], 400);
+            authorJsonResponse(['error' => '缺少 profile_id'], 400);
         }
 
         if (empty($text)) {
-            jsonResponse(['error' => '缺少分析文本'], 400);
+            authorJsonResponse(['error' => '缺少分析文本'], 400);
         }
 
         if (mb_strlen($text) < 1000) {
-            jsonResponse(['error' => '文本太短，至少需要1000字进行分析'], 400);
+            authorJsonResponse(['error' => '文本太短，至少需要1000字进行分析'], 400);
         }
 
         $parser = new WorkParser();
@@ -837,19 +868,19 @@ function handlePost(string $action, ?int $userId): void
         $result = AuthorAnalyzer::analyzeFromWork($profileId, $parseResult);
 
         if (!$result['success']) {
-            jsonResponse(['error' => $result['error'] ?? '分析失败'], 500);
+            authorJsonResponse(['error' => $result['error'] ?? '分析失败'], 500);
         }
 
         updateProfilePromptsFromResults($profileId, $result['results']);
 
-        jsonResponse([
+        authorJsonResponse([
             'success' => true,
             'results' => $result['results'],
             'summary' => $result['summary'],
         ]);
     }
 
-    jsonResponse(['error' => '未知操作'], 400);
+    authorJsonResponse(['error' => '未知操作'], 400);
 }
 
 function handlePut(string $action, array $pathParts, ?int $userId): void
@@ -859,7 +890,7 @@ function handlePut(string $action, array $pathParts, ?int $userId): void
         $profile = AuthorProfile::find($profileId);
 
         if (!$profile) {
-            jsonResponse(['error' => '画像不存在'], 404);
+            authorJsonResponse(['error' => '画像不存在'], 404);
         }
 
         $input = json_decode(file_get_contents('php://input'), true) ?? [];
@@ -881,7 +912,7 @@ function handlePut(string $action, array $pathParts, ?int $userId): void
         }
 
         if (empty($updateData)) {
-            jsonResponse(['error' => '没有需要更新的字段'], 400);
+            authorJsonResponse(['error' => '没有需要更新的字段'], 400);
         }
 
         $hasPromptUpdate = !empty(array_intersect(array_keys($updateData), $promptFields));
@@ -891,10 +922,10 @@ function handlePut(string $action, array $pathParts, ?int $userId): void
 
         $success = $profile->update($updateData);
         if (!$success) {
-            jsonResponse(['error' => '更新失败'], 500);
+            authorJsonResponse(['error' => '更新失败'], 500);
         }
 
-        jsonResponse($profile->toArray());
+        authorJsonResponse($profile->toArray());
     }
 
     if ($action === 'dimension' && isset($pathParts[1]) && isset($pathParts[2])) {
@@ -903,25 +934,25 @@ function handlePut(string $action, array $pathParts, ?int $userId): void
 
         $validDimensions = ['writing_habits', 'narrative_style', 'sentiment', 'creative_identity'];
         if (!in_array($dimension, $validDimensions)) {
-            jsonResponse(['error' => '无效的维度'], 400);
+            authorJsonResponse(['error' => '无效的维度'], 400);
         }
 
         $profile = AuthorProfile::find($profileId);
         if (!$profile) {
-            jsonResponse(['error' => '画像不存在'], 404);
+            authorJsonResponse(['error' => '画像不存在'], 404);
         }
 
         $input = json_decode(file_get_contents('php://input'), true) ?? [];
         $resultData = $input['result'] ?? null;
 
         if ($resultData === null) {
-            jsonResponse(['error' => '缺少结果数据'], 400);
+            authorJsonResponse(['error' => '缺少结果数据'], 400);
         }
 
-        jsonResponse(['success' => true, 'dimension' => $dimension]);
+        authorJsonResponse(['success' => true, 'dimension' => $dimension]);
     }
 
-    jsonResponse(['error' => '未知操作'], 400);
+    authorJsonResponse(['error' => '未知操作'], 400);
 }
 
 function handleDelete(string $action, array $pathParts, ?int $userId): void
@@ -931,7 +962,7 @@ function handleDelete(string $action, array $pathParts, ?int $userId): void
         $profile = AuthorProfile::find($profileId);
 
         if (!$profile) {
-            jsonResponse(['error' => '画像不存在'], 404);
+            authorJsonResponse(['error' => '画像不存在'], 404);
         }
 
         $works = DB::fetchAll('SELECT file_path FROM author_uploaded_works WHERE profile_id=?', [$profileId]);
@@ -943,10 +974,10 @@ function handleDelete(string $action, array $pathParts, ?int $userId): void
 
         $success = $profile->delete();
         if (!$success) {
-            jsonResponse(['error' => '删除失败'], 500);
+            authorJsonResponse(['error' => '删除失败'], 500);
         }
 
-        jsonResponse(['success' => true, 'message' => '画像已删除']);
+        authorJsonResponse(['success' => true, 'message' => '画像已删除']);
     }
 
     if ($action === 'work' && isset($pathParts[1])) {
@@ -954,7 +985,7 @@ function handleDelete(string $action, array $pathParts, ?int $userId): void
         $work = DB::fetch('SELECT * FROM author_uploaded_works WHERE id=?', [$workId]);
 
         if (!$work) {
-            jsonResponse(['error' => '作品不存在'], 404);
+            authorJsonResponse(['error' => '作品不存在'], 404);
         }
 
         if (!empty($work['file_path']) && file_exists($work['file_path'])) {
@@ -963,13 +994,13 @@ function handleDelete(string $action, array $pathParts, ?int $userId): void
 
         DB::delete('author_uploaded_works', 'id=?', [$workId]);
 
-        jsonResponse(['success' => true, 'message' => '作品已删除']);
+        authorJsonResponse(['success' => true, 'message' => '作品已删除']);
     }
 
-    jsonResponse(['error' => '未知操作'], 400);
+    authorJsonResponse(['error' => '未知操作'], 400);
 }
 
-function jsonResponse(array $data, int $code = 200): void
+function authorJsonResponse(array $data, int $code = 200): void
 {
     if (ob_get_level()) ob_end_clean();
     http_response_code($code);

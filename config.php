@@ -37,7 +37,7 @@ define('AUTO_WRITE_INTERVAL',     2);      // 自动写作间隔(秒)
 // ============================================================
 // 文字数据统计 隐私化统计 仅统计文字数量 可以关闭
 // ============================================================
-define('STATS_REPORT_ENABLED',    true);                                        // 是否启用统计上报（true/false）
+define('STATS_REPORT_ENABLED',    false);                                       // 是否启用统计上报（true/false）
 define('STATS_SERVER_URL',        'https://www.itzo.cn/api/stats_receiver.php'); // 上报服务器地址
 define('STATS_SITE_ID',           '');                                          // 站点唯一标识（留空则自动生成）
 
@@ -55,6 +55,9 @@ define('CFG_OUTLINE_THINKING_TIMEOUT', 600);
 
 // ---- 禁止直接访问 includes/api 文件（由各入口文件定义） ----
 defined('APP_LOADED') or define('APP_LOADED', true);
+
+// ---- 产品版本单一来源 ----
+require_once __DIR__ . '/includes/version.php';
 
 // ---- 引入集中配置常量（Phase 3） ----
 require_once __DIR__ . '/includes/config_constants.php';
@@ -150,4 +153,3 @@ function getAgentConfig(): array {
     ];
 }
 } // function_exists('getAgentConfig')
-

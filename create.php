@@ -425,6 +425,17 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
               </button>
             </div>
             <div class="form-text">推荐分辨率 1086×1448，支持 JPG/PNG/WebP，最大 10MB</div>
+          </div>
+            <label class="form-label small text-muted">AI 生成封面（基于 gpt-image-2）</label>
+            <div class="input-group input-group-sm">
+              <input type="text" class="form-control" id="cover-keyword" placeholder="输入封面描述关键词，如：仙侠少年持剑立于云端，背景是巍峨仙山">
+              <button type="button" class="btn btn-outline-info" id="btn-generate-cover" onclick="generateCoverAI()">
+                <i class="bi bi-stars me-1"></i>AI 生成
+              </button>
+            </div>
+            <div class="form-text">需要先在模型设置中配置图片生成 API。生成尺寸约 1024×1536，会自动缩放。</div>
+            <div id="cover-generate-status" class="small mt-1" style="display:none"></div>
+          </div>
           <div class="mb-3">
             <label class="form-label small text-muted">封面颜色（无封面图时显示）</label>
             <input type="color" name="cover_color" class="form-control form-control-sm" style="width:60px;height:36px;padding:2px" value="<?= h($v['cover_color'] ?? '#6366f1') ?>">

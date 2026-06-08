@@ -43,6 +43,24 @@ class AgentDirectives
                 ? date('Y-m-d H:i:s', time() + $expiresInHours * 3600)
                 : null;
 
+            // v2 去重：同类指令取前 80 字符指纹比对，匹配则刷新过期时间
+            $fingerprint = mb_substr($directive, 0, 80);
+            $existing = DB::fetch(
+                "SELECT id FROM agent_directives
+                 WHERE novel_id=? AND type=? AND is_active=1
+                   AND apply_from <= ? AND apply_to >= ?
+                   AND directive LIKE ?
+                 LIMIT 1",
+                [$novelId, $type, $applyFrom, $applyFrom, $fingerprint . '%']
+            );
+            if ($existing) {
+                DB::update('agent_directives', [
+                    'apply_to' => $applyTo,
+                    'expires_at' => $expiresAt,
+                ], 'id=?', [$existing['id']]);
+                return true;
+            }
+
             DB::insert('agent_directives', [
                 'novel_id' => $novelId,
                 'apply_from' => $applyFrom,

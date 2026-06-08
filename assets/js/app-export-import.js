@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 导出/导入章节概要功能
  * 这个文件会被 app.js 引用
  */
@@ -52,29 +52,23 @@ async function importSynopses(file) {
         return;
     }
 
-    if (!confirm(
-        '确定要导入章节概要吗？\n\n' +
-        '导入将增量更新现有章节信息。\n\n' +
-        '⚠️ 重要提醒：\n' +
-        '导入后，旧的「全书故事大纲」可能不再匹配新的章节内容，\n' +
-        '建议在导入完成后，点击「生成故事大纲」基于新章节重新生成。'
-    )) {
-        return;
-    }
-
-    // 默认增量更新模式
-    const importMode = 'incremental';
+    // 询问导入模式
+    const importMode = confirm('选择导入模式：\n\n确定 = 增量更新（只更新非空字段）\n取消 = 批量覆盖（覆盖所有字段）') ? 'incremental' : 'overwrite';
 
     // 创建表单数据
     const formData = new FormData();
     formData.append('novel_id', novelId);
     formData.append('file', file);
     formData.append('import_mode', importMode);
+    // CSRF token:从 meta 读取，后端在 csrf.php 中会从 $_POST['_csrf'] 识别
+    const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+    formData.append('_csrf', csrfMeta ? csrfMeta.content : '');
 
     try {
         showToast('正在导入...', 'info');
 
-        const response = await fetch('api/import_chapter_synopses.php', {
+        // 切到正式接口（原 debug 版建议生产禁用/删除）
+        const response = await fetch('/api/index.php?route=import_chapter_synopses', {
             method: 'POST',
             body: formData
         });
@@ -118,42 +112,4 @@ async function importSynopses(file) {
 
     // 清空文件输入框
     document.getElementById('import-file-input').value = '';
-}
-
-/**
- * 清空所有章节及其内容
- */
-async function clearAllChapters() {
-    const novelId = new URLSearchParams(window.location.search).get('id');
-    if (!novelId) {
-        showToast('无法获取小说ID', 'error');
-        return;
-    }
-
-    if (!confirm('⚠️ 确认清空所有章节？\n\n此操作将：\n• 删除所有章节及其正文内容\n• 删除所有章节版本历史\n• 删除所有章节概要\n• 删除人物状态卡片和记忆引擎数据\n• 重置小说状态为"已创建"\n\n⚠️ 保留：全书故事大纲（不受影响）\n\n此操作不可撤销！')) {
-        return;
-    }
-
-    try {
-        showToast('正在清空...', 'info');
-
-        const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
-        const response = await fetch('api/actions.php', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
-            body: JSON.stringify({ action: 'clear_all_chapters', novel_id: parseInt(novelId) }),
-        });
-
-        const result = await response.json();
-
-        if (result.ok) {
-            showToast('已清空所有章节', 'success');
-            setTimeout(() => location.reload(), 1000);
-        } else {
-            showToast('清空失败：' + (result.msg || '未知错误'), 'error');
-        }
-    } catch (err) {
-        console.error('清空失败：', err);
-        showToast('清空失败：' + err.message, 'error');
-    }
 }

@@ -1,6 +1,10 @@
 <?php
 defined('APP_LOADED') or die('Direct access denied.');
 
+// 产品版本单一来源：layout 会渲染 APP_VERSION，故自身兜底加载，
+// 不依赖调用方是否已通过 config.php 引入（兼容旧版安装生成的 config.php）。
+require_once __DIR__ . '/version.php';
+
 /**
  * 静态资源路径解析函数（已弃用） U2FsdGVkX19YFiriD38FrjiWR4tiAwlsLvY1RBc/rqbyF23S2bBYDuywYgjFtTli
  * 当前版本强制使用CDN加载Bootstrap资源，确保最新版本和最佳性能。
@@ -27,8 +31,8 @@ function pageHeader(string $title = '', string $activeNav = ''): void {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="csrf-token" content="<?= htmlspecialchars($_SESSION['csrf_token']) ?>">
 <title><?= h($pageTitle) ?></title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+<link rel="stylesheet" href="assets/vendor/bootstrap.min.css">
+<link rel="stylesheet" href="assets/vendor/bootstrap-icons.min.css">
 <link rel="stylesheet" href="assets/css/style.css">
 <!-- 立即读取主题，避免闪烁 -->
 <script>
@@ -100,19 +104,21 @@ function pageHeader(string $title = '', string $activeNav = ''): void {
   <nav class="sidebar-nav">
     <a href="index.php"    class="nav-item <?= $activeNav==='home'     ? 'active':'' ?>">
       <i class="bi bi-house-door"></i> 我的书库 </a>
-    <a href="create.php"   class="nav-item <?= $activeNav==='create'   ? 'active':'' ?>">
-      <i class="bi bi-plus-circle"></i> 新建小说 </a>
+    <a href="start.php"    class="nav-item <?= $activeNav==='start'     ? 'active':'' ?>">
+      <i class="bi bi-stars"></i> 开始创作 </a>
     <a href="workshop.php" class="nav-item <?= $activeNav==='workshop' ? 'active':'' ?>">
       <i class="bi bi-lightbulb"></i> 创意工坊 </a>
     <a href="analyze.php"  class="nav-item <?= $activeNav==='analyze'  ? 'active':'' ?>">
       <i class="bi bi-search-heart"></i> 拆书分析 </a>
+    <a href="shorts.php"   class="nav-item <?= $activeNav==='shorts'   ? 'active':'' ?>">
+      <i class="bi bi-journal-text"></i> 短篇创作 </a>
     <a href="settings.php" class="nav-item <?= $activeNav==='settings' ? 'active':'' ?>">
       <i class="bi bi-cpu"></i> 模型设置 </a>
     <a href="writing_settings.php" class="nav-item <?= $activeNav==='writing_settings' ? 'active':'' ?>">
       <i class="bi bi-sliders"></i> 写作参数 </a>
   </nav>
   <div class="sidebar-footer">
-    <small>Super Ma Agents v1.6</small>
+    <small>Super Ma Pro Agents v<?= htmlspecialchars(APP_VERSION, ENT_QUOTES, 'UTF-8') ?> 免费版</small>
   </div>
 </div>
 
@@ -154,8 +160,8 @@ function pageFooter(): void {
   </div><!-- .content-area -->
 </div><!-- .main-content -->
 
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-<script src="assets/js/app.js"></script>
+<script src="assets/vendor/bootstrap.bundle.min.js"></script>
+<script src="assets/js/app.js?v=<?= @filemtime(dirname(__DIR__) . '/assets/js/app.js') ?: time() ?>"></script>
 <script src="assets/js/app-export-import.js"></script>
 <!-- 优化大纲 AJAX 方案 -->
 <script src="assets/js/optimize_outline_ajax.js"></script>

@@ -4,10 +4,7 @@
  */
 define('APP_LOADED', true);
 require_once __DIR__ . '/config.php';
-
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-}
+require_once __DIR__ . '/includes/auth.php';  // 会话启动 + 登录限速辅助函数
 
 // 已登录直接跳首页
 if (!empty($_SESSION['logged_in'])) {
@@ -23,16 +20,13 @@ if (!file_exists(__DIR__ . '/install.lock')) {
 
 $error = '';
 
-// 暴力破解保护：初始化会话计数器
-if (!isset($_SESSION['login_attempts'])) {
-    $_SESSION['login_attempts'] = 0;
-    $_SESSION['last_attempt_time'] = 0;
-    $_SESSION['lockout_until'] = 0;
-}
+// 暴力破解保护：按客户端 IP 服务端持久化（不可通过丢弃 cookie 绕过）
+$clientIp = clientIp();
+$throttle = loginThrottleState($clientIp);
 
 // 检查是否被锁定
-if ($_SESSION['lockout_until'] > time()) {
-    $remaining = $_SESSION['lockout_until'] - time();
+if ($throttle['lockout_until'] > time()) {
+    $remaining = $throttle['lockout_until'] - time();
     $error = '登录尝试次数过多，请 ' . ceil($remaining / 60) . ' 分钟后再试。';
 } else {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -40,15 +34,13 @@ if ($_SESSION['lockout_until'] > time()) {
         $pass = $_POST['password'] ?? '';
 
         // 计算延迟（每次失败增加2秒，最多30秒）
-        $delay = min(30, $_SESSION['login_attempts'] * 2);
-        if ($delay > 0 && time() - $_SESSION['last_attempt_time'] < $delay) {
+        $delay = min(30, $throttle['attempts'] * 2);
+        if ($delay > 0 && time() - $throttle['last_attempt'] < $delay) {
             $error = '请等待 ' . $delay . ' 秒后再试。';
         } else {
             if ($user === ADMIN_USER && password_verify($pass, ADMIN_PASS)) {
-                // 登录成功，重置计数器
-                $_SESSION['login_attempts'] = 0;
-                $_SESSION['last_attempt_time'] = 0;
-                $_SESSION['lockout_until'] = 0;
+                // 登录成功，清除该 IP 限速记录
+                loginThrottleReset($clientIp);
                 $_SESSION['logged_in']  = true;
                 $_SESSION['username']   = $user;
                 $_SESSION['user_id']    = 1;
@@ -56,13 +48,9 @@ if ($_SESSION['lockout_until'] > time()) {
                 header('Location: index.php');
                 exit;
             } else {
-                // 登录失败
-                $_SESSION['login_attempts']++;
-                $_SESSION['last_attempt_time'] = time();
-                
-                // 如果失败次数超过10次，锁定15分钟
-                if ($_SESSION['login_attempts'] >= 10) {
-                    $_SESSION['lockout_until'] = time() + 15 * 60;
+                // 登录失败，持久化记录一次
+                $throttle = loginThrottleRecordFail($clientIp);
+                if ($throttle['lockout_until'] > time()) {
                     $error = '登录尝试次数过多，账户已被锁定15分钟。';
                 } else {
                     $error = '用户名或密码错误，请重试。';
@@ -78,8 +66,8 @@ if ($_SESSION['lockout_until'] > time()) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>登录 - <?= defined('SITE_NAME') ? htmlspecialchars(SITE_NAME) : 'AI小说创作系统' ?></title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+<link rel="stylesheet" href="assets/vendor/bootstrap.min.css">
+<link rel="stylesheet" href="assets/vendor/bootstrap-icons.min.css">
 <link rel="stylesheet" href="assets/css/style.css">
 <script>(function(){ var t=localStorage.getItem('novel-theme')||'dark'; document.documentElement.setAttribute('data-theme',t); })();</script>
 <style>

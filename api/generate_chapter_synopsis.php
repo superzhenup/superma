@@ -38,7 +38,7 @@ if (!$novel) { sse('error', ['msg' => '小说不存在']); sseDone(); exit; }
 
 // 预检：至少要有一个模型
 try { getModelFallbackList($novel['model_id'] ?: null, 'synopsis'); }
-catch (RuntimeException $e) { sse('error', ['msg' => $e->getMessage()]); sseDone(); exit; }
+catch (RuntimeException $e) { sse('error', safe_sse_error_payload($e, '模型不可用，请稍后重试')); sseDone(); exit; }
 
 // 获取全书故事大纲
 $storyOutline = DB::fetch('SELECT * FROM story_outlines WHERE novel_id=?', [$novelId]);
@@ -138,7 +138,7 @@ foreach ($chapters as $ch) {
             }
         );
     } catch (RuntimeException $e) {
-        sse('error', ['msg' => "第{$ch['chapter_number']}章概要生成失败：" . $e->getMessage()]);
+        sse('error', safe_sse_error_payload($e, "第{$ch['chapter_number']}章概要生成失败"));
         continue;
     }
 

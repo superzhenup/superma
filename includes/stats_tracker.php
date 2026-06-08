@@ -137,7 +137,7 @@ class StatsTracker
             'words_added' => $totalWords,
             'chapters_added' => $totalChapters,
             'novels_active' => $novelsActive,
-            'version' => '1.5',
+            'version' => APP_VERSION,
         ];
 
         try {
@@ -148,7 +148,7 @@ class StatsTracker
                 CURLOPT_POSTFIELDS => json_encode($payload),
                 CURLOPT_HTTPHEADER => [
                     'Content-Type: application/json',
-                    'User-Agent: Super-Ma-Novel-System/1.5',
+                    'User-Agent: Super-Ma-Novel-System/' . APP_VERSION,
                 ],
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_TIMEOUT => 10,
@@ -223,7 +223,7 @@ class StatsTracker
                 'words_added' => $totalWords,
                 'chapters_added' => $totalChapters,
                 'novels_active' => $novelsActive,
-                'version' => '1.5',
+                'version' => APP_VERSION,
             ];
 
             error_log('StatsTracker::reportRealtime payload: ' . json_encode($payload, JSON_UNESCAPED_UNICODE));
@@ -251,7 +251,7 @@ class StatsTracker
             CURLOPT_POSTFIELDS => json_encode($payload),
             CURLOPT_HTTPHEADER => [
                 'Content-Type: application/json',
-                'User-Agent: Super-Ma-Novel-System/1.5',
+                'User-Agent: Super-Ma-Novel-System/' . APP_VERSION,
             ],
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 5,
@@ -314,12 +314,15 @@ class StatsTracker
     {
         try {
             $cutoff = date('Y-m-d', strtotime('-7 days'));
-            $count = DB::affecting(
+            // 审计 P1：原先误用不存在的包装器方法 DB::affecting，异常后返回 0，
+            // 使清理任务错误地报告"未清理任何数据"。execute 返回受影响行数。
+            $count = DB::execute(
                 "DELETE FROM usage_stats WHERE reported_at IS NOT NULL AND stat_date < ?",
                 [$cutoff]
             );
             return $count;
         } catch (\Throwable $e) {
+            error_log('StatsTracker::cleanup failed: ' . $e->getMessage());
             return 0;
         }
     }

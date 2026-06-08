@@ -74,7 +74,7 @@ if (!StatsTracker::isEnabled()) {
             'words_added' => 1000,
             'chapters_added' => 1,
             'novels_active' => 1,
-            'version' => '1.5-test',
+            'version' => APP_VERSION . '-test',
         ];
 
         $serverUrl = StatsTracker::getServerUrl();
@@ -88,7 +88,7 @@ if (!StatsTracker::isEnabled()) {
             CURLOPT_POSTFIELDS => json_encode($testPayload),
             CURLOPT_HTTPHEADER => [
                 'Content-Type: application/json',
-                'User-Agent: Super-Ma-Novel-System/1.5-test',
+                'User-Agent: Super-Ma-Novel-System/' . APP_VERSION . '-test',
             ],
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 10,
@@ -116,7 +116,7 @@ if ($serverUrl) {
     curl_setopt_array($ch, [
         CURLOPT_URL => $serverUrl,
         CURLOPT_HTTPHEADER => [
-            'User-Agent: Super-Ma-Novel-System/1.5-test',
+            'User-Agent: Super-Ma-Novel-System/' . APP_VERSION . '-test',
         ],
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT => 10,

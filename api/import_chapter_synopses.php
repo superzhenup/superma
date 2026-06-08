@@ -242,9 +242,12 @@ try {
     }
     
     http_response_code(500);
-    $errorMessage = '导入失败：' . $e->getMessage();
-    error_log('import_chapter_synopses.php 错误: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
-    error_log('import_chapter_synopses.php 堆栈跟踪: ' . $e->getTraceAsString());
+    // 审计 P0：客户端只看到友好文案 + 追踪号；完整异常细节写日志与调试文件。
+    $rid = error_trace_id();
+    $errorMessage = '导入失败，请稍后重试（追踪号 ' . $rid . '）';
+    error_log(sprintf('[%s] import_chapter_synopses %s: %s in %s:%d',
+        $rid, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine()));
+    error_log('[' . $rid . '] 堆栈跟踪: ' . $e->getTraceAsString());
     
     // 写入调试日志到文件
     $debugLog = [
@@ -275,19 +278,25 @@ try {
         header('Content-Type: application/json; charset=utf-8');
     }
     
-    $jsonResponse = json_encode([
-        'error' => $errorMessage,
-        'debug' => [
+    $payload = [
+        'error'      => $errorMessage,
+        'code'       => 'import_failed',
+        'request_id' => $rid,
+    ];
+    // 仅在显式开启调试开关时附带内部细节（默认关闭，见审计 P0「由环境开关控制」）。
+    if (defined('APP_DEBUG') && APP_DEBUG) {
+        $payload['debug'] = [
             'message' => $e->getMessage(),
-            'file' => basename($e->getFile()),
-            'line' => $e->getLine(),
-            'trace' => $e->getTrace()
-        ]
-    ], JSON_UNESCAPED_UNICODE);
-    
+            'file'    => basename($e->getFile()),
+            'line'    => $e->getLine(),
+            'trace'   => $e->getTrace(),
+        ];
+    }
+    $jsonResponse = json_encode($payload, JSON_UNESCAPED_UNICODE);
+
     if ($jsonResponse === false) {
-        // JSON编码失败，返回简单的错误消息
-        echo '{"error":"导入失败：服务器内部错误"}';
+        // JSON 编码失败，返回稳定的兜底错误
+        echo '{"error":"导入失败，请稍后重试","code":"import_failed"}';
     } else {
         echo $jsonResponse;
     }

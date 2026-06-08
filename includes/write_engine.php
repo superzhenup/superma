@@ -15,8 +15,44 @@
 
 defined('APP_LOADED') or die('Direct access denied.');
 
+require_once __DIR__ . '/cache.php';
+require_once __DIR__ . '/data.php';
+
+class WriteEngineValidationException extends RuntimeException {}
+class WriteEnginePersistenceException extends RuntimeException {}
+
 class WriteEngine
 {
+    /** 后处理「进行中」标志文件路径（防止下一章在记忆/指令落库前就开写） */
+    private static function postProcessPendingFlag(int $novelId, int $chNum): string
+    {
+        return BASE_PATH . "/storage/pp_pending_{$novelId}_{$chNum}.flag";
+    }
+
+    /**
+     * 等待指定章节的后处理完成（摘要/记忆入库/Agent指令落库）。
+     * 仅当存在「进行中」标志时才等待，避免对历史章节空等。
+     * 超时后放行并记日志（防止后台进程意外退出导致死等）。
+     */
+    private static function waitForPostProcess(int $novelId, int $chNum, int $maxWaitSec = 90): void
+    {
+        if ($chNum < 1) return;
+        $flag = self::postProcessPendingFlag($novelId, $chNum);
+        if (!file_exists($flag)) return; // 未在后处理中（已完成或为历史章节）
+
+        $deadline = time() + $maxWaitSec;
+        while (time() < $deadline) {
+            usleep(400000); // 0.4s
+            if (!file_exists($flag)) {
+                addLog($novelId, 'info', "已等待第{$chNum}章后处理完成，开始写下一章");
+                return;
+            }
+        }
+        // 超时兜底：清除标志并放行，避免死等
+        @unlink($flag);
+        addLog($novelId, 'warn', "等待第{$chNum}章后处理超时（{$maxWaitSec}秒），继续写作（记忆可能滞后）");
+    }
+
     /**
      * Phase 1: 解析待写章节（含僵死 writing 状态清理 + Agent决策）
      * @return array{n: array, ch: array}
@@ -83,6 +119,10 @@ class WriteEngine
             throw $e;
         }
 
+        // v2: 记忆竞态修复——若上一章后处理（摘要/记忆/指令）仍在后台进行，
+        // 先等它完成再构建本章 prompt，否则本章会读到滞后的记忆与漏掉的 Agent 指令。
+        self::waitForPostProcess($novelId, (int)$ch['chapter_number'] - 1);
+
         return ['n' => $novel, 'ch' => $ch];
     }
 
@@ -102,18 +142,20 @@ class WriteEngine
         catch (Throwable $e) { addLog($novelId, 'warn', 'ensureEmbeddings 失败：' . $e->getMessage()); }
 
         $queryText = trim(($chapter['title'] ?? '') . '：' . ($chapter['outline'] ?? ''));
-        $semanticTopK = max(1, min(20, (int)getSystemSetting('ws_embedding_top_k', 5, 'int')));
+        $semanticTopK = max(1, min(40, (int)getSystemSetting('ws_embedding_top_k', 16, 'int')));
 
-        // 检测是否应该使用1M完整上下文模式
         $contextMode = getSystemSetting('ws_context_mode', 'auto', 'string');
         $is1MSupported = $aiClient ? $aiClient->is1MContext() : false;
         $useFullContext = false;
+        $chNum = (int)($chapter['chapter_number'] ?? $chapter['chapter'] ?? 0);
 
         if ($contextMode === 'full' && $is1MSupported) {
             $useFullContext = true;
         } elseif ($contextMode === 'auto' && $is1MSupported) {
-            // 自动模式：模型支持1M时使用完整上下文
-            $useFullContext = true;
+            $fullContextThreshold = (int)getSystemSetting('ws_full_context_threshold', 10, 'int');
+            if ($chNum >= $fullContextThreshold) {
+                $useFullContext = true;
+            }
         }
 
         try {
@@ -129,7 +171,9 @@ class WriteEngine
                 ));
             } else {
                 // 标准压缩模式
-                $memoryCtx = $engine->getPromptContext((int)$chapter['chapter_number'], $queryText, CFG_MEMORY_TOKEN_BUDGET, 20, $semanticTopK);
+                // v41: token 预算配置化（缓存让大上下文便宜，默认从 6000 提到 20000）
+                $memBudget = max(2000, (int)getSystemSetting('ws_memory_token_budget', 20000, 'int'));
+                $memoryCtx = $engine->getPromptContext((int)$chapter['chapter_number'], $queryText, $memBudget, 20, $semanticTopK);
             }
         } catch (Throwable $e) {
             addLog($novelId, 'error', 'MemoryEngine 上下文构建失败：' . $e->getMessage());
@@ -242,7 +286,9 @@ class WriteEngine
         callable $onMsg,
         callable $onHeartbeat,
         ?callable $onThinking = null,
-        ?int $preferredModelId = null
+        ?int $preferredModelId = null,
+        int $chapterNumber = 0,
+        int $targetChapters = 0
     ): array {
         $modelList   = getModelFallbackList($preferredModelId);
         $modelErrors = [];
@@ -300,6 +346,75 @@ class WriteEngine
                     'model' => $modelLabel, 'attempt' => $sameModelRetries + 1,
                     'timeout' => $timeoutSec, 'thinking' => $isThinking,
                 ]);
+
+                if ($chapterNumber > 0 && $targetChapters > 0) {
+                    $progressRatio = $chapterNumber / $targetChapters;
+                    $origTemp = $ai->getTemperature();
+                    $tempDelta = 0.0;
+
+                    $isVolumeEnd = false;
+                    try {
+                        $volEnd = DB::fetch(
+                            'SELECT 1 FROM volume_outlines WHERE novel_id=? AND end_chapter=?',
+                            [$novelId, $chapterNumber]
+                        );
+                        $isVolumeEnd = !empty($volEnd);
+                    } catch (Throwable) {}
+
+                    $chMeta = null;
+                    try {
+                        $chMeta = DB::fetch(
+                            'SELECT outline, pacing, cool_point_type FROM chapters WHERE novel_id=? AND chapter_number=?',
+                            [$novelId, $chapterNumber]
+                        );
+                    } catch (Throwable) {}
+
+                    $outline = trim((string)($chMeta['outline'] ?? ''));
+                    $pacing  = $chMeta['pacing'] ?? '';
+                    $cpType  = $chMeta['cool_point_type'] ?? '';
+
+                    $highIntensityKw = ['决战','反杀','爆发','突破','觉醒','大战','终极','生死','逆袭','翻盘','对决','屠杀','毁灭','渡劫','天劫','围攻','血战','绝杀','拼死'];
+                    $midIntensityKw  = ['对峙','阴谋','追杀','围困','抉择','考验','危机','伏击','暗算','冲突','对抗','谈判','布局','陷阱','试探'];
+                    $lowIntensityKw  = ['休整','修炼','日常','回忆','感悟','疗伤','整顿','休憩','闲聊','游历','探索','修炼','冥想','闭关','温习'];
+
+                    $highHits = 0; $midHits = 0; $lowHits = 0;
+                    if ($outline !== '') {
+                        foreach ($highIntensityKw as $kw) { if (mb_strpos($outline, $kw) !== false) $highHits++; }
+                        foreach ($midIntensityKw as $kw) { if (mb_strpos($outline, $kw) !== false) $midHits++; }
+                        foreach ($lowIntensityKw as $kw) { if (mb_strpos($outline, $kw) !== false) $lowHits++; }
+                    }
+
+                    $outlineScore = min(0.15, $highHits * 0.05)
+                                  + min(0.06, $midHits * 0.02)
+                                  - min(0.12, $lowHits * 0.04);
+
+                    $pacingDelta = match($pacing) {
+                        'fast' => 0.05,
+                        'slow' => -0.05,
+                        default => 0.0,
+                    };
+
+                    $cpDelta = 0.0;
+                    if ($cpType !== '' && $cpType !== 'none') {
+                        $highCp = ['underdog_win','face_slap','last_stand','truth_reveal'];
+                        $cpDelta = in_array($cpType, $highCp, true) ? 0.06 : 0.03;
+                    }
+
+                    if ($isVolumeEnd) {
+                        $tempDelta += 0.12;
+                    } elseif ($progressRatio > 0.85) {
+                        $tempDelta += 0.10;
+                    } elseif ($progressRatio < 0.1) {
+                        $tempDelta -= 0.08;
+                    }
+
+                    $tempDelta += $outlineScore + $pacingDelta + $cpDelta;
+                    $tempDelta = max(-0.2, min(0.25, $tempDelta));
+
+                    if (abs($tempDelta) >= 0.02) {
+                        $ai->setTemperature($origTemp + $tempDelta);
+                    }
+                }
 
                 $canceled = false; $cancelCount = 0;
                 $cancelCheckInterval = 10;
@@ -418,65 +533,109 @@ class WriteEngine
 
         // 过滤AI误生成的段落标记
         $fullContent = stripSegmentMarkers($fullContent);
+        // 过滤AI误把章节坐标写进正文（伏笔回收穿帮）
+        $fullContent = stripMetaLeaks($fullContent);
+
+        // === 标题禁用词「落盘前自动改写」（根治：标题P0阻断落盘→挂机死锁）===
+        // 必须在后置校验之前执行，使校验看到的是已清洗的标题，从根上避免 P0 阻断。
+        $titleAutoFixed = false;
+        try {
+            require_once __DIR__ . '/constraints/ConstraintConfig.php';
+            require_once __DIR__ . '/constraints/TitleSanitizer.php';
+            if (ConstraintConfig::isEnabled()) {
+                $san = TitleSanitizer::sanitize((string)($ch['title'] ?? ''), (int)($ch['chapter_number'] ?? 0));
+                if ($san['changed']) {
+                    $oldTitle       = (string)$ch['title'];
+                    $ch['title']    = $san['title'];
+                    $titleAutoFixed = true;
+                    addLog($novelId, 'info', sprintf(
+                        '第%d章标题含禁用词「%s」，已自动改写：《%s》→《%s》（不再阻断落盘）',
+                        (int)$ch['chapter_number'],
+                        implode('、', $san['hit_words']),
+                        $oldTitle,
+                        $ch['title']
+                    ), $chId);
+                }
+            }
+        } catch (\Throwable $e) {
+            addLog($novelId, 'warn', '标题自动改写跳过：' . $e->getMessage());
+        }
 
         // === 约束框架后置校验 ===
-        $p0StrictBlock = false;
+        // P0 判定在 try 外部执行：即使校验过程发生异常，已检测到的 P0 也不会被静默放行
+        $validationResult = null;
         try {
             require_once __DIR__ . '/constraints/ConstraintConfig.php';
             require_once __DIR__ . '/constraints/ConstraintStateDB.php';
             require_once __DIR__ . '/constraints/PostWriteValidator.php';
             $validator = new PostWriteValidator($novelId, $ch, $fullContent, $targetWords);
             $validationResult = $validator->run();
-
-            // === 紧急响应通道（工程控制论：缩短响应延迟）===
-            // P0 严重问题不管是否严格模式，都立即写紧急指令到下一章
-            if ($validationResult['has_p0']) {
-                $urgentIssues = [];
-                foreach ($validationResult['p0_issues'] as $p0) {
-                    $urgentIssues[] = $p0['issue_desc'];
-                }
-                $urgentMsg = "【紧急修复】上章发生严重问题：" . implode('；', $urgentIssues) .
-                    "。本章必须立即修正，避免问题延续。";
-                try {
-                    require_once __DIR__ . '/agents/AgentDirectives.php';
-                    AgentDirectives::add(
-                        $novelId,
-                        (int)$ch['chapter_number'] + 1,
-                        'urgent',
-                        $urgentMsg,
-                        1,    // 只影响下一章
-                        24    // 24小时过期
-                    );
-                    addLog($novelId, 'warn', sprintf(
-                        '紧急通道触发：第%d章P0问题已写紧急指令',
-                        (int)$ch['chapter_number']
-                    ));
-                } catch (\Throwable $e) {
-                    addLog($novelId, 'warn', '紧急指令写入失败：' . $e->getMessage());
-                }
-            }
-
-            if ($validationResult['has_p0'] && ConstraintConfig::isStrictMode()) {
-                $issue = $validationResult['p0_issues'][0]['issue_desc'];
-                $p0StrictBlock = "严格模式：第{$ch['chapter_number']}章 P0 违规阻止落盘 — {$issue}";
-            } elseif ($validationResult['has_p1']) {
-                $p1Count = count($validationResult['p1_issues']);
-                addLog($novelId, 'warn', "第{$ch['chapter_number']}章触发{$p1Count}项P1约束");
-            }
         } catch (\Throwable $e) {
             addLog($novelId, 'warn', '约束后置校验跳过：' . $e->getMessage());
         }
+
+        $p0StrictBlock = false;
+
+        if ($validationResult && $validationResult['has_p0']) {
+            // === 紧急响应通道（工程控制论：缩短响应延迟）===
+            // P0 严重问题不管是否严格模式，都立即写紧急指令到下一章
+            $urgentIssues = [];
+            foreach ($validationResult['p0_issues'] as $p0) {
+                $urgentIssues[] = $p0['issue_desc'];
+            }
+            $urgentMsg = "【紧急修复】上章发生严重问题：" . implode('；', $urgentIssues) .
+                "。本章必须立即修正，避免问题延续。";
+            try {
+                require_once __DIR__ . '/agents/AgentDirectives.php';
+                AgentDirectives::add(
+                    $novelId,
+                    (int)$ch['chapter_number'] + 1,
+                    'urgent',
+                    $urgentMsg,
+                    1,    // 只影响下一章
+                    24    // 24小时过期
+                );
+                addLog($novelId, 'warn', sprintf(
+                    '紧急通道触发：第%d章P0问题已写紧急指令',
+                    (int)$ch['chapter_number']
+                ));
+            } catch (\Throwable $e) {
+                addLog($novelId, 'warn', '紧急指令写入失败：' . $e->getMessage());
+            }
+
+            if (ConstraintConfig::isStrictMode()) {
+                $issue = $validationResult['p0_issues'][0]['issue_desc'];
+                $p0StrictBlock = "严格模式：第{$ch['chapter_number']}章 P0 违规阻止落盘 — {$issue}";
+            }
+        } elseif ($validationResult && $validationResult['has_p1']) {
+            $p1Count = count($validationResult['p1_issues']);
+            addLog($novelId, 'warn', "第{$ch['chapter_number']}章触发{$p1Count}项P1约束");
+        }
+
         if ($p0StrictBlock !== false) {
-            throw new RuntimeException($p0StrictBlock);
+            throw new WriteEngineValidationException($p0StrictBlock);
         }
 
         $words = countWords($fullContent);
         $updates = [
             'content' => $fullContent, 'words' => $words, 'status' => 'completed',
         ];
+        // 标题被自动改写时，连同新标题一起落盘（否则恢复后仍是旧标题，死锁复现）
+        if ($titleAutoFixed) {
+            $updates['title'] = (string)$ch['title'];
+        }
         // v1.4: 落盘 token 用量和耗时数据，为 OptimizationAgent 提供真实数据基础
         if ($usage !== null && isset($usage['total_tokens'])) {
             $updates['tokens_used'] = (int)$usage['total_tokens'];
+        }
+        // v41: 落盘提示词缓存命中 token（1000章优化埋点）
+        if ($usage !== null && isset($usage['cache_hit_tokens'])) {
+            $updates['cache_hit_tokens'] = (int)$usage['cache_hit_tokens'];
+            $promptTokens = (int)($usage['prompt_tokens'] ?? 0);
+            if ($promptTokens > 0 && $usage['cache_hit_tokens'] > 0) {
+                $hitPct = round($usage['cache_hit_tokens'] / $promptTokens * 100, 1);
+                addLog($novelId, 'info', "提示词缓存命中：{$usage['cache_hit_tokens']}/{$promptTokens} tokens（{$hitPct}%）", $chId);
+            }
         }
         if ($durationMs !== null) {
             $updates['duration_ms'] = $durationMs;
@@ -502,6 +661,11 @@ class WriteEngine
         }
         $affected = DB::update('chapters', $updates, 'id=? AND status="writing"', [$chId]);
 
+        // 清除章节缓存
+        if ($affected > 0) {
+            clearChapterCache($chId, $novelId);
+        }
+
         // v1.5.3: 落盘异常保底逻辑 — 若主更新失败，尝试最小化保存
         if ($affected === 0) {
             // 检查章节是否仍存在且状态为writing
@@ -519,6 +683,8 @@ class WriteEngine
                     if ($minimalAffected > 0) {
                         addLog($novelId, 'warn', "第{$ch['chapter_number']}章通过保底逻辑落盘（主更新失败）");
                         $affected = $minimalAffected;
+                        // 清除章节缓存
+                        clearChapterCache($chId, $novelId);
                     }
                 } catch (\Throwable $fallbackError) {
                     addLog($novelId, 'error', "第{$ch['chapter_number']}章保底落盘也失败：" . $fallbackError->getMessage());
@@ -528,10 +694,19 @@ class WriteEngine
 
         if ($affected === 0) {
             addLog($novelId, 'warn', "第{$ch['chapter_number']}章落盘被阻止：状态已被外部修改");
-            throw new RuntimeException('写作已被中断（章节状态已变更）');
+            throw new WriteEnginePersistenceException('写作已被中断（章节状态已变更）');
         }
 
         updateNovelStats($novelId);
+
+        // v2: 标记本章「后处理进行中」——下一章 resolveChapter 会等待此标志清除，
+        // 确保摘要/记忆/Agent指令落库后再构建下一章 prompt（消除记忆竞态）。
+        try {
+            @file_put_contents(
+                self::postProcessPendingFlag($novelId, (int)$ch['chapter_number']),
+                (string)time()
+            );
+        } catch (\Throwable $e) { /* 标志写入失败不影响落盘 */ }
 
         $modelInfo = $usedModel ? "（{$usedModel->modelLabel}）" : '';
         $wordDiff = $words - $targetWords;
@@ -547,7 +722,20 @@ class WriteEngine
             DB::update('novels', ['status' => 'completed'], 'id=?', [$novelId]);
         }
 
-        return ['words' => $words, 'chapter' => $ch, 'all_done' => $pendingCount === 0, 'model_info' => $modelInfo];
+        // 预查下一章 ID（供前端自动写作循环直接跳转，省一次 HTTP 轮询）
+        $nextCh = DB::fetch(
+            'SELECT id, chapter_number FROM chapters WHERE novel_id=? AND status IN ("outlined","skipped") ORDER BY chapter_number ASC LIMIT 1',
+            [$novelId]
+        );
+
+        return [
+            'words'            => $words,
+            'chapter'          => $ch,
+            'all_done'         => $pendingCount === 0,
+            'model_info'       => $modelInfo,
+            'next_chapter_id'  => $nextCh['id'] ?? null,
+            'next_chapter_num' => $nextCh['chapter_number'] ?? null,
+        ];
     }
     public static function postProcess(int $novelId, array $chapter, string $fullContent, MemoryEngine $engine): void
     {
@@ -721,6 +909,14 @@ class WriteEngine
             }
         } catch (Throwable $e) {
             addLog($novelId, 'warn', '金句回调追踪跳过：' . $e->getMessage());
+        }
+
+        // --- v41 钩子回收验证（闭环：本章是否承接了上章章末钩子）---
+        try {
+            require_once __DIR__ . '/HookPayoffChecker.php';
+            HookPayoffChecker::run($novelId, $chapter, $fullContent);
+        } catch (Throwable $e) {
+            addLog($novelId, 'warn', '钩子回收验证跳过：' . $e->getMessage());
         }
 
         // --- 知识库提取 ---
@@ -1124,6 +1320,19 @@ class WriteEngine
             addLog($novelId, 'warn', '约束状态更新失败：' . $e->getMessage());
         }
 
+        // === v41 角色语音指纹生成（每 N 章为缺指纹的主要角色补差异化语音规则）===
+        try {
+            $chNum = (int)($chapter['chapter_number'] ?? 0);
+            $vpInterval = max(3, (int)getSystemSetting('ws_voice_profile_interval', 12, 'int'));
+            if ($chNum > 0 && getSystemSetting('ws_voice_profile_enabled', true, 'bool')
+                && $chNum % $vpInterval === 0) {
+                require_once __DIR__ . '/VoiceProfileGenerator.php';
+                VoiceProfileGenerator::generateMissing($novelId, $chNum, $novelData['model_id'] ?? null);
+            }
+        } catch (\Throwable $e) {
+            addLog($novelId, 'warn', '角色语音指纹生成跳过：' . $e->getMessage());
+        }
+
         // === PID控制器（工程控制论：P/I/D整定）===
         // 每章写完后对4个核心控制变量做PID评估，产生智能调控建议
         try {
@@ -1256,6 +1465,36 @@ class WriteEngine
             } catch (\Throwable $e) {
                 addLog($novelId, 'warn', '系统健康监控跳过：' . $e->getMessage());
             }
+        }
+
+        // v2: 清除「后处理进行中」标志，放行下一章写作
+        // 注意：放在全书圣经之前——圣经允许滞后一章，不阻塞下一章开写。
+        @unlink(self::postProcessPendingFlag($novelId, (int)$chapter['chapter_number']));
+
+        // === v41 全书圣经（每 N 章增量压缩，根治中段遗忘）===
+        try {
+            $chNum = (int)($chapter['chapter_number'] ?? 0);
+            $bibleInterval = max(5, (int)getSystemSetting('ws_bible_interval', 20, 'int'));
+            if ($chNum > 0 && getSystemSetting('ws_story_bible_enabled', true, 'bool')
+                && $chNum % $bibleInterval === 0) {
+                require_once __DIR__ . '/memory/StoryBible.php';
+                StoryBible::regenerate($novelId, $chNum, $novelData['model_id'] ?? null);
+            }
+        } catch (\Throwable $e) {
+            addLog($novelId, 'warn', '全书圣经更新跳过：' . $e->getMessage());
+        }
+
+        // === v41 全书一致性体检（每 N 章一次的宏观审计，存报告供作者查看）===
+        try {
+            $chNum = (int)($chapter['chapter_number'] ?? 0);
+            $auditInterval = max(10, (int)getSystemSetting('ws_fullbook_audit_interval', 50, 'int'));
+            if ($chNum > 0 && getSystemSetting('ws_fullbook_audit_enabled', true, 'bool')
+                && $chNum % $auditInterval === 0) {
+                require_once __DIR__ . '/FullBookAudit.php';
+                FullBookAudit::run($novelId, $chNum, $novelData['model_id'] ?? null);
+            }
+        } catch (\Throwable $e) {
+            addLog($novelId, 'warn', '全书体检跳过：' . $e->getMessage());
         }
 
         addLog($novelId, 'info', "第{$chapter['chapter_number']}章后处理完成（摘要/记忆/知识库/质检）");

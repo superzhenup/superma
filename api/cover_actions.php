@@ -22,6 +22,9 @@ header('Content-Type: application/json; charset=utf-8');
 // 兼容三种请求方式：FormData($_POST)、JSON body、GET 参数
 $jsonInput = json_decode(file_get_contents('php://input'), true) ?? [];
 $action = $_POST['action'] ?? $jsonInput['action'] ?? $_GET['action'] ?? '';
+if ($action !== 'get_image_api_config') {
+    requireHttpMethod('POST');
+}
 
 try {
     switch ($action) {
@@ -44,7 +47,11 @@ try {
             throw new RuntimeException('无效的操作');
     }
 } catch (Throwable $e) {
-    echo json_encode(['ok' => false, 'msg' => $e->getMessage()], JSON_UNESCAPED_UNICODE);
+    error_log('cover_actions error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+    $safeMsg = in_array($e->getMessage(), ['无效的操作', '缺少小说ID', '小说不存在', '文件超过 10MB 限制', '仅支持 JPG、PNG、WebP 格式'], true)
+        ? $e->getMessage()
+        : '操作失败，请稍后重试';
+    echo json_encode(safe_api_error_payload($e, $safeMsg), JSON_UNESCAPED_UNICODE);
 }
 
 /**
@@ -212,7 +219,7 @@ function generateCover(array $input): void {
             'Content-Type: application/json',
             'Authorization: Bearer ' . $apiKey,
         ],
-        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYPEER => true,
     ]);
 
     $response = curl_exec($ch);
@@ -311,22 +318,45 @@ function generateCover(array $input): void {
             throw new RuntimeException('图片保存失败，请检查 storage/covers 目录权限（路径：' . $destPath . '，可写：' . (is_writable($coversDir) ? '是' : '否') . '）');
         }
     } else {
-        // URL 格式：下载图片到本地
+        if (!preg_match('#^https://#i', $imageUrl)) {
+            throw new RuntimeException('仅支持 HTTPS 协议的图片地址');
+        }
+
+        $dlHost = parse_url($imageUrl, PHP_URL_HOST);
+        if (!$dlHost) {
+            throw new RuntimeException('无法解析图片地址');
+        }
+        $dlIp = gethostbyname($dlHost);
+        $privateRanges = [
+            '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16',
+            '127.0.0.0/8', '169.254.0.0/16', '0.0.0.0/8',
+        ];
+        foreach ($privateRanges as $cidr) {
+            list($subnet, $bits) = explode('/', $cidr);
+            $subnetLong = ip2long($subnet);
+            $ipLong = ip2long($dlIp);
+            if ($ipLong === false) continue;
+            $mask = -1 << (32 - (int)$bits);
+            if (($ipLong & $mask) === ($subnetLong & $mask)) {
+                throw new RuntimeException('不允许访问内网地址');
+            }
+        }
+
         $imgContent = false;
         $dlHttpCode = 0;
         $dlErr = '';
 
-        // 优先用 curl 下载
         if (function_exists('curl_init')) {
             $dlCh = curl_init($imageUrl);
             curl_setopt_array($dlCh, [
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_TIMEOUT        => 120,
                 CURLOPT_CONNECTTIMEOUT => 30,
-                CURLOPT_SSL_VERIFYPEER => false,
-                CURLOPT_FOLLOWLOCATION => true,
-                CURLOPT_MAXREDIRS      => 5,
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_FOLLOWLOCATION => false,
+                CURLOPT_MAXFILESIZE    => 5 * 1024 * 1024,
                 CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) CoverDownloader',
+                CURLOPT_PROTOCOLS      => CURLPROTO_HTTPS,
             ]);
             $imgContent = curl_exec($dlCh);
             $dlHttpCode = (int)curl_getinfo($dlCh, CURLINFO_HTTP_CODE);
@@ -334,20 +364,20 @@ function generateCover(array $input): void {
             curl_close($dlCh);
         }
 
-        // curl 失败，尝试 file_get_contents
-        if ($dlHttpCode !== 200 || !$imgContent) {
-            $ctx = stream_context_create(['http' => ['timeout' => 60, 'follow_location' => true], 'ssl' => ['verify_peer' => false]]);
-            $imgContent = @file_get_contents($imageUrl, false, $ctx);
-        }
-
         if (!$imgContent) {
-            throw new RuntimeException('下载图片失败（curl: HTTP ' . $dlHttpCode . ', ' . $dlErr . '），远程地址：' . $imageUrl);
+            error_log("cover download failed: HTTP {$dlHttpCode}, {$dlErr}, URL: " . parse_url($imageUrl, PHP_URL_HOST));
+            throw new RuntimeException('下载图片失败，请稍后重试');
         }
 
-        $written = file_put_contents($destPath, $imgContent);
-        if ($written === false) {
-            throw new RuntimeException('图片保存失败，请检查 storage/covers 目录权限（路径：' . $destPath . '，可写：' . (is_writable($coversDir) ? '是' : '否') . '）');
+        $tmpPath = $destPath . '.tmp';
+        file_put_contents($tmpPath, $imgContent);
+        $imgCheck = @getimagesize($tmpPath);
+        $allowedMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+        if (!$imgCheck || !in_array($imgCheck['mime'], $allowedMimes, true)) {
+            @unlink($tmpPath);
+            throw new RuntimeException('下载的文件不是有效的图片');
         }
+        rename($tmpPath, $destPath);
     }
 
     // 缩放到 1086x1448

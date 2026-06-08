@@ -26,6 +26,9 @@ abstract class BaseAgent
     
     /** @var int 决策历史最大保留数 */
     protected $maxHistorySize = 100;
+
+    /** @var int 单次决策超时秒数 */
+    protected const DECISION_TIMEOUT = 50;
     
     /**
      * 构造函数
@@ -366,5 +369,54 @@ abstract class BaseAgent
         } catch (\Throwable $e) {
             return 1;
         }
+    }
+
+    protected function decideWithTimeout(array $context): array
+    {
+        $timeout = static::DECISION_TIMEOUT;
+        $deadline = time() + $timeout;
+        $result = [];
+        $finished = false;
+
+        $prevHandler = set_error_handler(function ($s, $m, $f, $l) {
+            if (!(error_reporting() & $s)) return false;
+            throw new \ErrorException($m, 0, $s, $f, $l);
+        });
+
+        register_shutdown_function(function () use (&$finished, $timeout) {
+            if ($finished) return;
+            $err = error_get_last();
+            if ($err && in_array($err['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+                error_log("Agent[{$this->agentType}] 决策致命错误: {$err['message']} in {$err['file']}:{$err['line']}");
+            }
+        });
+
+        try {
+            set_time_limit(max(60, $timeout + 10));
+            $result = $this->decide($context);
+        } catch (\Throwable $e) {
+            $elapsed = time() - ($deadline - $timeout);
+            if ($elapsed >= $timeout - 2) {
+                error_log("Agent[{$this->agentType}] 决策超时({$timeout}s)，已跳过");
+                $result = [
+                    'skipped' => true,
+                    'reason'  => 'timeout',
+                    'timeout' => $timeout,
+                    'error'   => $e->getMessage(),
+                ];
+            } else {
+                error_log("Agent[{$this->agentType}] 决策异常: " . $e->getMessage());
+                $result = [
+                    'skipped' => true,
+                    'reason'  => 'error',
+                    'error'   => $e->getMessage(),
+                ];
+            }
+        } finally {
+            $finished = true;
+            restore_error_handler();
+        }
+
+        return $result;
     }
 }

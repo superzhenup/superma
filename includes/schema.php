@@ -631,6 +631,176 @@ class Schema
             // 没有 SQL 定义的表（由 install.php 等外部脚本管理）仅在此处占位
             // novels, chapters, ai_models, writing_logs, volume_outlines
             // 这些表在 install.php 中已有完整定义
+
+            // ========== 高阶写作向导表 (v1.8) ==========
+
+            'novel_wizard_progress' => "CREATE TABLE IF NOT EXISTS `novel_wizard_progress` (
+                `novel_id` INT UNSIGNED PRIMARY KEY,
+                `current_stage` VARCHAR(20) NOT NULL DEFAULT 'topic' COMMENT '当前阶段: topic/blueprint/content/launch',
+                `completed_stages` JSON DEFAULT NULL COMMENT '已完成阶段列表',
+                `metadata` JSON DEFAULT NULL COMMENT '阶段元数据(策划文档/世界观文档等)',
+                `started_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                `last_active` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                FOREIGN KEY (`novel_id`) REFERENCES `novels`(`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='高阶向导进度表'",
+
+            'novel_wizard_chats' => "CREATE TABLE IF NOT EXISTS `novel_wizard_chats` (
+                `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `novel_id` INT UNSIGNED NOT NULL,
+                `stage` VARCHAR(20) NOT NULL COMMENT '阶段: topic/blueprint/content/launch',
+                `role` ENUM('user','assistant','system') NOT NULL,
+                `content` MEDIUMTEXT NOT NULL COMMENT '消息内容',
+                `model_id` INT UNSIGNED DEFAULT NULL COMMENT '使用的AI模型ID',
+                `tokens` INT UNSIGNED DEFAULT 0 COMMENT '消耗token数',
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX `idx_novel_stage` (`novel_id`, `stage`, `created_at`),
+                FOREIGN KEY (`novel_id`) REFERENCES `novels`(`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='高阶向导对话表'",
+
+            // ========== 导入续写表 (v1.8) ==========
+
+            'novel_import_sessions' => "CREATE TABLE IF NOT EXISTS `novel_import_sessions` (
+                `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `user_id` INT UNSIGNED NOT NULL COMMENT '用户ID',
+                `novel_id` INT UNSIGNED DEFAULT NULL COMMENT '关联小说ID',
+                `session_key` VARCHAR(64) NOT NULL COMMENT '会话唯一标识',
+                `total_batches` INT NOT NULL DEFAULT 0 COMMENT '总批次数',
+                `completed_batches` JSON DEFAULT NULL COMMENT '已完成批次列表',
+                `total_chapters` INT NOT NULL DEFAULT 0 COMMENT '总章节数',
+                `imported_chapters` INT NOT NULL DEFAULT 0 COMMENT '已导入章节数',
+                `total_words` BIGINT NOT NULL DEFAULT 0 COMMENT '总字数',
+                `status` ENUM('pending','importing','completed','failed') DEFAULT 'pending' COMMENT '导入状态',
+                `novel_meta` JSON DEFAULT NULL COMMENT '小说元数据',
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY `uk_session_key` (`session_key`),
+                INDEX `idx_user` (`user_id`),
+                INDEX `idx_novel` (`novel_id`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='导入续写会话表'",
+
+            'short_stories' => "CREATE TABLE IF NOT EXISTS `short_stories` (
+                `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `user_id` INT UNSIGNED NOT NULL DEFAULT 0,
+                `title` VARCHAR(200) NOT NULL DEFAULT '',
+                `genre` VARCHAR(100) NOT NULL DEFAULT '',
+                `theme` VARCHAR(200) DEFAULT NULL,
+                `premise` TEXT DEFAULT NULL,
+                `protagonist` VARCHAR(200) DEFAULT NULL,
+                `conflict` TEXT DEFAULT NULL,
+                `ending_direction` TEXT DEFAULT NULL,
+                `style` VARCHAR(100) DEFAULT NULL,
+                `target_words` INT UNSIGNED NOT NULL DEFAULT 3000,
+                `structure_type` ENUM('six_beat','eight_beat','three_act') NOT NULL DEFAULT 'eight_beat',
+                `chapter_count` TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '章节数量,1=单篇模式',
+                `brief_json` JSON DEFAULT NULL,
+                `beats_json` JSON DEFAULT NULL,
+                `chapters_json` JSON DEFAULT NULL COMMENT '章节数组:order/title/synopsis/beat_refs/word_budget/content/status',
+                `content` MEDIUMTEXT DEFAULT NULL,
+                `quality_score` DECIMAL(4,1) DEFAULT NULL,
+                `quality_report` JSON DEFAULT NULL,
+                `status` ENUM('draft','brief_ready','beats_ready','written','polished','completed') NOT NULL DEFAULT 'draft',
+                `model_id` INT UNSIGNED DEFAULT NULL,
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                KEY `idx_user` (`user_id`),
+                KEY `idx_status` (`status`),
+                KEY `idx_created_at` (`created_at`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='短篇小说主表'",
+
+            'short_story_versions' => "CREATE TABLE IF NOT EXISTS `short_story_versions` (
+                `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `story_id` INT UNSIGNED NOT NULL,
+                `version` INT UNSIGNED NOT NULL DEFAULT 1,
+                `title` VARCHAR(200) DEFAULT NULL,
+                `content` MEDIUMTEXT DEFAULT NULL,
+                `brief_json` JSON DEFAULT NULL,
+                `beats_json` JSON DEFAULT NULL,
+                `chapters_json` JSON DEFAULT NULL,
+                `quality_score` DECIMAL(4,1) DEFAULT NULL,
+                `note` VARCHAR(200) DEFAULT NULL,
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY `uk_story_version` (`story_id`, `version`),
+                KEY `idx_story_id` (`story_id`),
+                KEY `idx_created_at` (`created_at`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='短篇小说版本历史'",
+
+            // ==================== 热门选题(Hot Topics) ====================
+            'hot_novels' => "CREATE TABLE IF NOT EXISTS `hot_novels` (
+                `id`                   INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `source`               ENUM('qidian','fanqie','zongheng','qimao') NOT NULL,
+                `title`                VARCHAR(200) NOT NULL,
+                `title_norm`           VARCHAR(200) NOT NULL COMMENT '标准化书名(去标点空格小写),用于去重',
+                `author`               VARCHAR(100) NOT NULL DEFAULT '',
+                `author_norm`          VARCHAR(100) NOT NULL DEFAULT '' COMMENT '标准化作者',
+                `raw_category`         VARCHAR(80)  NOT NULL DEFAULT '' COMMENT '平台原始题材',
+                `normalized_category`  VARCHAR(40)  DEFAULT NULL COMMENT '归一化题材',
+                `channel`              ENUM('male','female','general','unknown') NOT NULL DEFAULT 'unknown',
+                `tags`                 JSON DEFAULT NULL,
+                `word_count`           BIGINT UNSIGNED DEFAULT NULL,
+                `click_count`          BIGINT UNSIGNED DEFAULT NULL,
+                `collect_count`        BIGINT UNSIGNED DEFAULT NULL,
+                `recommend_count`      BIGINT UNSIGNED DEFAULT NULL,
+                `hotness_score`        SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+                `rank_no`              SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+                `rank_type`            VARCHAR(60) NOT NULL DEFAULT '' COMMENT '平台原始榜单名',
+                `extra_rank_types`     JSON DEFAULT NULL,
+                `intro`                TEXT DEFAULT NULL,
+                `cover_url`            VARCHAR(500) DEFAULT NULL,
+                `source_url`           VARCHAR(500) DEFAULT NULL COMMENT '官方详情页',
+                `collected_at`         DATETIME NOT NULL,
+                `confidence_score`     TINYINT UNSIGNED NOT NULL DEFAULT 0,
+                `last_batch_id`        VARCHAR(40) DEFAULT NULL,
+                `first_seen_at`        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                `last_seen_at`         TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY `uk_title_author` (`title_norm`, `author_norm`),
+                KEY `idx_source` (`source`),
+                KEY `idx_channel_cat` (`channel`, `normalized_category`),
+                KEY `idx_rank_type` (`rank_type`),
+                KEY `idx_hotness` (`hotness_score`),
+                KEY `idx_collected` (`collected_at`),
+                KEY `idx_last_seen` (`last_seen_at`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='热门选题书籍主表'",
+
+            'hot_novel_analysis' => "CREATE TABLE IF NOT EXISTS `hot_novel_analysis` (
+                `novel_id`        INT UNSIGNED PRIMARY KEY,
+                `appeals`         TEXT DEFAULT NULL COMMENT '爽点',
+                `selling_points`  TEXT DEFAULT NULL COMMENT '卖点',
+                `tropes`          TEXT DEFAULT NULL COMMENT '套路',
+                `audience`        TEXT DEFAULT NULL COMMENT '受众',
+                `risks`           TEXT DEFAULT NULL COMMENT '风险',
+                `suggestions`     TEXT DEFAULT NULL COMMENT '选题建议',
+                `hooks`           TEXT DEFAULT NULL COMMENT '开篇钩子',
+                `benchmarks`      JSON DEFAULT NULL COMMENT '对标作品',
+                `evidence`        JSON DEFAULT NULL COMMENT '_evidence',
+                `updated_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='热门选题爆款分析'",
+
+            'hot_novel_batches' => "CREATE TABLE IF NOT EXISTS `hot_novel_batches` (
+                `id`                  INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `batch_id`            VARCHAR(60) NOT NULL,
+                `source`              VARCHAR(20) NOT NULL,
+                `pushed_by`           VARCHAR(60) DEFAULT NULL,
+                `prepared_items`      INT UNSIGNED NOT NULL DEFAULT 0,
+                `submitted_items`     INT UNSIGNED NOT NULL DEFAULT 0,
+                `accepted`            INT UNSIGNED NOT NULL DEFAULT 0,
+                `updated`             INT UNSIGNED NOT NULL DEFAULT 0,
+                `duplicated`          INT UNSIGNED NOT NULL DEFAULT 0,
+                `failed`              INT UNSIGNED NOT NULL DEFAULT 0,
+                `failed_reasons`      JSON DEFAULT NULL,
+                `summary`             JSON DEFAULT NULL,
+                `diversity_metrics`   JSON DEFAULT NULL,
+                `fetch_failed`        TINYINT(1) NOT NULL DEFAULT 0,
+                `client_ip`           VARCHAR(64) DEFAULT NULL,
+                `created_at`          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY `uk_batch_id` (`batch_id`),
+                KEY `idx_source_created` (`source`, `created_at`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='热门选题推送批次日志'",
+
+            'hot_novel_nonces' => "CREATE TABLE IF NOT EXISTS `hot_novel_nonces` (
+                `nonce`       VARCHAR(64) PRIMARY KEY,
+                `created_at`  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                KEY `idx_created_at` (`created_at`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='热门选题Nonce防重放(24h清理)'",
         ];
     }
 
@@ -646,6 +816,8 @@ class Schema
         $installManaged = [
             'novels', 'chapters', 'ai_models',
             'writing_logs', 'volume_outlines',
+            'novel_bible',   // v41: 全书圣经（StoryBible 懒建表）
+            'novel_audits',  // v41: 全书一致性体检（FullBookAudit 懒建表）
         ];
 
         return array_unique(array_merge($schemaTables, $installManaged));

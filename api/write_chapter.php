@@ -45,28 +45,41 @@ $asyncProgressFile = null;
 $asyncMessages = [];
 $_writingChapterId = null;
 
-// 全局异常捕获，确保发生错误时正常结束SSE连接，避免触发 ERR_INCOMPLETE_CHUNKED_ENCODING
+require_once dirname(__DIR__) . '/includes/helpers.php';
+require_once dirname(__DIR__) . '/includes/sse_error_handler.php';
+
 set_exception_handler(function (Throwable $e) {
     global $asyncTaskId;
+    // 审计 P0：异常细节只写服务端日志；异步任务与 SSE 都只回传友好文案 + 追踪号。
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] write_chapter uncaught %s: %s in %s:%d',
+        $rid, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine()));
     if ($asyncTaskId) {
         updateAsyncProgress([
-            'status' => 'error',
-            'error'  => 'Fatal Error: ' . $e->getMessage() . ' in ' . basename($e->getFile()) . ':' . $e->getLine(),
+            'status'     => 'error',
+            'error'      => '服务器内部错误，请稍后重试（追踪号 ' . $rid . '）',
+            'request_id' => $rid,
         ]);
     } else {
-        if (!headers_sent()) {
-            http_response_code(200);
-            header('Content-Type: text/event-stream; charset=utf-8');
-            header('Cache-Control: no-cache');
-            header('X-Accel-Buffering: no');
-        }
-        echo 'data: ' . json_encode([
-            'error' => 'Fatal Error: ' . $e->getMessage() . ' in ' . basename($e->getFile()) . ':' . $e->getLine()
-        ], JSON_UNESCAPED_UNICODE) . "\n\n";
-        echo "data: [DONE]\n\n";
-        if (ob_get_level()) ob_flush();
-        flush();
+        // sseFatalError 内部已记录细节并只回传友好文案（同一追踪号）。
+        sseFatalError('Exception', $e->getMessage(), basename($e->getFile()), $e->getLine());
     }
+});
+
+// v2: 断连遗嘱——连接中断时写标记文件，前端可识别"后端仍在写作"vs"真正失败"
+register_shutdown_function(function () {
+    global $_writingChapterId, $novelId;
+    if (!$_writingChapterId || !$novelId) return;
+    if (!function_exists('connection_aborted') || !connection_aborted()) return;
+
+    $markerDir = CFG_PROGRESS_DIR;
+    if (!is_dir($markerDir)) @mkdir($markerDir, 0755, true);
+    $markerFile = $markerDir . "/reconnect_{$novelId}.marker";
+    @file_put_contents($markerFile, json_encode([
+        'chapter_id' => $_writingChapterId,
+        'timestamp'  => time(),
+        'status'     => 'writing',
+    ], JSON_UNESCAPED_UNICODE), LOCK_EX);
 });
 
 set_error_handler(function ($severity, $message, $file, $line) {
@@ -87,18 +100,7 @@ register_shutdown_function(function () {
                 'error'  => 'Fatal Shutdown Error: ' . $error['message'] . ' in ' . basename($error['file']) . ':' . $error['line'],
             ]);
         } else {
-            if (!headers_sent()) {
-                http_response_code(200);
-                header('Content-Type: text/event-stream; charset=utf-8');
-                header('Cache-Control: no-cache');
-                header('X-Accel-Buffering: no');
-            }
-            echo 'data: ' . json_encode([
-                'error' => 'Fatal Shutdown Error: ' . $error['message'] . ' in ' . basename($error['file']) . ':' . $error['line']
-            ], JSON_UNESCAPED_UNICODE) . "\n\n";
-            echo "data: [DONE]\n\n";
-            if (ob_get_level()) ob_flush();
-            flush();
+            sseFatalError('Shutdown', $error['message'], basename($error['file']), $error['line']);
         }
     }
 });
@@ -155,15 +157,56 @@ class SwitchModelException extends RuntimeException {
 }
 
 // ============================================================
-// SSE 心跳机制 + 异步进度写入
+// SseChannel 实例化 + 写作专用心跳
 // ============================================================
-$lastHeartbeat = time();
 
-// 更新异步进度文件（线程安全）
+class WriteSseChannel extends SseChannel {
+    private int $writingChapterId = 0;
+
+    public function setWritingChapterId(int $id): void {
+        $this->writingChapterId = $id;
+    }
+
+    public function heartbeat(): void {
+        if ($this->writingChapterId > 0) {
+            try {
+                DB::query('UPDATE chapters SET updated_at = NOW() WHERE id = ? AND status = "writing"', [$this->writingChapterId]);
+            } catch (\Throwable) {}
+        }
+        parent::heartbeat();
+    }
+
+    public function chunk(string $text): void {
+        $this->heartbeat();
+        if ($this->isAsync) {
+            $fp = fopen($this->getProgressFile(), 'r+');
+            if ($fp) {
+                flock($fp, LOCK_EX);
+                $data = stream_get_contents($fp);
+                $progress = json_decode($data, true) ?: [];
+                $progress['content'] = ($progress['content'] ?? '') . $text;
+                $progress['status'] = 'writing';
+                $progress['progress'] = min(90, ($progress['progress'] ?? 0) + 0.1);
+                $progress['updated_at'] = time();
+                fseek($fp, 0);
+                ftruncate($fp, 0);
+                fwrite($fp, json_encode($progress, JSON_UNESCAPED_UNICODE));
+                flock($fp, LOCK_UN);
+                fclose($fp);
+            }
+        } else {
+            echo 'data: ' . json_encode(['chunk' => $text], JSON_UNESCAPED_UNICODE) . "\n\n";
+            $this->flush();
+        }
+    }
+}
+
+// $asyncTaskId / $asyncProgressFile 已在顶部初始化
+$sse = new WriteSseChannel($asyncTaskId, $asyncProgressFile, defined('CFG_SSE_HEARTBEAT') ? CFG_SSE_HEARTBEAT : 10);
+
 function updateAsyncProgress(array $updates): void {
     global $asyncProgressFile;
     if (!$asyncProgressFile || !file_exists($asyncProgressFile)) return;
-    
     $fp = fopen($asyncProgressFile, 'r+');
     if (!$fp) return;
     flock($fp, LOCK_EX);
@@ -177,116 +220,40 @@ function updateAsyncProgress(array $updates): void {
     fclose($fp);
 }
 
+// 保留全局函数名供 WriteEngine 回调
 function sendHeartbeatWrite(): void {
-    global $lastHeartbeat, $asyncTaskId, $_writingChapterId;
-    $now = time();
-    if ($now - $lastHeartbeat < CFG_SSE_HEARTBEAT) return;
-    
-    // 心跳时刷新章节 updated_at，防止 Watchdog 误杀正在写作的章节
-    if ($_writingChapterId > 0) {
-        try {
-            DB::query('UPDATE chapters SET updated_at = NOW() WHERE id = ? AND status = "writing"', [$_writingChapterId]);
-        } catch (\Throwable) {}
-    }
-    
-    if ($asyncTaskId) {
-        // 异步模式：更新进度文件的时间戳（保活）
-        updateAsyncProgress(['status' => 'writing', 'heartbeat' => $now]);
-    } else {
-        // SSE 模式：发送心跳事件
-        echo "event: heartbeat\n";
-        echo "data: " . json_encode(['time' => $now, 'msg' => 'keep-alive']) . "\n\n";
-        if (ob_get_level()) ob_flush();
-        flush();
-    }
-    $lastHeartbeat = $now;
+    global $sse;
+    $sse->heartbeat();
 }
 
 function sseChunkWrite(string $chunk): void {
-    global $asyncTaskId, $asyncProgressFile, $asyncMessages;
-    sendHeartbeatWrite();
-    
-    if ($asyncTaskId) {
-        // 异步模式：将新文字追加到进度文件
-        $fp = fopen($asyncProgressFile, 'r+');
-        if ($fp) {
-            flock($fp, LOCK_EX);
-            $data = stream_get_contents($fp);
-            $progress = json_decode($data, true) ?: [];
-            $progress['content'] = ($progress['content'] ?? '') . $chunk;
-            $progress['status'] = 'writing';
-            $progress['progress'] = min(90, ($progress['progress'] ?? 0) + 0.1);
-            $progress['updated_at'] = time();
-            fseek($fp, 0);
-            ftruncate($fp, 0);
-            fwrite($fp, json_encode($progress, JSON_UNESCAPED_UNICODE));
-            flock($fp, LOCK_UN);
-            fclose($fp);
-        }
-    } else {
-        // SSE 模式
-        echo 'data: ' . json_encode(['chunk' => $chunk], JSON_UNESCAPED_UNICODE) . "\n\n";
-        if (ob_get_level()) ob_flush();
-        flush();
-    }
+    global $sse;
+    $sse->chunk($chunk);
 }
 
 function sseMsgWrite(array $payload): void {
-    global $asyncTaskId, $asyncMessages;
-    sendHeartbeatWrite();
-    
-    // 收集消息供异步模式使用
-    $asyncMessages[] = $payload;
-    
-    if ($asyncTaskId) {
-        // 异步模式：将消息追加到进度文件的 messages 数组
-        updateAsyncProgress([
-            'messages' => $asyncMessages,
-            'status'   => $payload['status'] ?? (($payload['waiting'] ?? false) ? 'waiting' : 'writing'),
-        ]);
-    } else {
-        // SSE 模式
-        echo 'data: ' . json_encode($payload, JSON_UNESCAPED_UNICODE) . "\n\n";
-        if (ob_get_level()) ob_flush();
-        flush();
-    }
+    global $sse;
+    $sse->msg($payload);
 }
 
 function sseThinkingWrite(string $thinkingChunk): void {
-    global $asyncTaskId;
-    // 异步模式：思考过程不写入进度文件（write_chapter_worker 有独立实现）
-    if ($asyncTaskId) return;
-    // SSE 模式：发送 thinking 事件，前端可以据此展示深度思考过程
-    echo "event: thinking\n";
-    echo 'data: ' . json_encode(['thinking' => $thinkingChunk], JSON_UNESCAPED_UNICODE) . "\n\n";
-    if (ob_get_level()) ob_flush();
-    flush();
+    global $sse;
+    $sse->thinking($thinkingChunk);
 }
 
 function sseDoneWrite(): void {
-    global $asyncTaskId;
-    if ($asyncTaskId) {
-        // 异步模式：标记完成
-        updateAsyncProgress(['status' => 'done', 'progress' => 100]);
-    } else {
-        // SSE 模式
-        echo "data: [DONE]\n\n";
-        if (ob_get_level()) ob_flush();
-        flush();
-    }
+    global $sse;
+    $sse->done();
 }
 
-// 注册全局心跳函数，供 AIClient 的 CURLOPT_PROGRESSFUNCTION 调用
 $GLOBALS['sendHeartbeat'] = 'sendHeartbeatWrite';
-// 注册全局等待状态函数，AI 长时间无输出时通知前端
 $GLOBALS['sendWaiting'] = function(int $elapsedSeconds) {
-    echo 'data: ' . json_encode([
+    global $sse;
+    $sse->msg([
         'waiting'  => true,
         'msg'      => "AI 思考中（已等待 {$elapsedSeconds} 秒）…",
         'elapsed'  => $elapsedSeconds,
-    ], JSON_UNESCAPED_UNICODE) . "\n\n";
-    if (ob_get_level()) ob_flush();
-    flush();
+    ]);
 };
 
 // 字数截断：streamWrite() 内已恢复自动截断，AI 超字时自动修剪至容差上限
@@ -302,6 +269,7 @@ try {
     $novel      = $resolved['n'];
     $ch         = $resolved['ch'];
     $_writingChapterId = (int)$ch['id'];
+    $sse->setWritingChapterId($_writingChapterId);
 
     // 小说自身的 chapter_words 优先，全局 ws_chapter_words 仅作为兜底默认值
     $novelWords = (int)($novel['chapter_words'] ?? 0);
@@ -313,7 +281,7 @@ try {
     }
     $novel['chapter_words'] = max(500, $novelWords);
 } catch (RuntimeException $e) {
-    sseMsgWrite(['error' => $e->getMessage()]);
+    sseMsgWrite(safe_sse_error_payload($e, '写作失败，请稍后重试'));
     sseDoneWrite(); exit;
 }
 
@@ -364,7 +332,9 @@ try {
         function(array $payload) { sseMsgWrite($payload); },
         function() { sendHeartbeatWrite(); },
         function(string $reasoning) { sseThinkingWrite($reasoning); },
-        $novel['model_id'] ? (int)$novel['model_id'] : null
+        $novel['model_id'] ? (int)$novel['model_id'] : null,
+        (int)$ch['chapter_number'],
+        (int)$novel['target_chapters']
     );
     $fullContent       = $result['content'];
     $usedModel         = $result['model'];
@@ -405,10 +375,12 @@ try {
     // 这样 Nginx/FPM 超时不会影响前端——前端已收到 [DONE] + 章节完成数据
     // 后处理（摘要/记忆/知识库/质检）通过后台异步请求完成，不阻塞 SSE 连接
     sseMsgWrite([
-        'stats'      => "第{$ch['chapter_number']}章《{$ch['title']}》完成，共 {$words} 字{$modelInfo}",
-        'chapter_id' => $ch['id'],
-        'words'      => $words,
-        'done'       => $allDone,
+        'stats'            => "第{$ch['chapter_number']}章《{$ch['title']}》完成，共 {$words} 字{$modelInfo}",
+        'chapter_id'       => $ch['id'],
+        'words'            => $words,
+        'done'             => $allDone,
+        'next_chapter_id'  => $saveResult['next_chapter_id'] ?? null,
+        'next_chapter_num' => $saveResult['next_chapter_num'] ?? null,
         'model_used' => $usedModel?->modelLabel,
         'postprocessing' => true,  // 告知前端后处理将在后台进行
     ]);
@@ -416,7 +388,14 @@ try {
     // ---- 记录使用统计 ----
     StatsTracker::record($words, 1);
 
-} catch (Throwable $e) {
+} catch (WriteEngineValidationException $e) {
+    $errMsg = $e->getMessage();
+    addLog($novelId, 'error', 'P0 strict validation blocked chapter save: ' . $errMsg);
+    DB::update('chapters', ['status' => 'outlined'], 'id=? AND status="writing"', [$ch['id']]);
+    DB::update('novels', ['status' => 'paused'], 'id=?', [$novelId]);
+    sseMsgWrite(['error' => $errMsg, 'validation_blocked' => true]);
+    sseDoneWrite(); exit;
+} catch (WriteEnginePersistenceException $e) {
     $errMsg = $e->getMessage();
     if ($errMsg === 'canceled') {
         sseMsgWrite(['error' => '用户已取消写作', 'canceled' => true]);
@@ -425,6 +404,7 @@ try {
     addLog($novelId, 'error', '正文落盘异常：' . $errMsg);
 
     // 保底：确保正文被保存
+    $backupSaved = false;
     if (!empty($fullContent)) {
         $currentCh = DB::fetch('SELECT status FROM chapters WHERE id=?', [$ch['id']]);
         if ($currentCh && $currentCh['status'] === 'writing') {
@@ -443,10 +423,27 @@ try {
             DB::update('chapters', $backupUpdates, 'id=?', [$ch['id']]);
             updateNovelStats($novelId);
             addLog($novelId, 'write', "落盘异常后保底保存：第{$ch['chapter_number']}章，{$words}字");
+            $backupSaved = true;
         }
     }
 
-    sseMsgWrite(['warning' => '⚠️ 正文已保存，但落盘异常：' . $errMsg]);
+    if ($backupSaved) {
+        sseMsgWrite(['warning' => '⚠️ 正文已保存，但落盘异常：' . $errMsg]);
+    } else {
+        sseMsgWrite(['error' => $errMsg]);
+        sseDoneWrite(); exit;
+    }
+} catch (Throwable $e) {
+    $errMsg = $e->getMessage();
+    if ($errMsg === 'canceled') {
+        sseMsgWrite(['error' => '用户已取消写作', 'canceled' => true]);
+        sseDoneWrite(); exit;
+    }
+    addLog($novelId, 'error', 'Unexpected save failure: ' . $errMsg);
+    DB::update('chapters', ['status' => 'outlined'], 'id=? AND status="writing"', [$ch['id']]);
+    DB::update('novels', ['status' => 'paused'], 'id=?', [$novelId]);
+    sseMsgWrite(['error' => $errMsg]);
+    sseDoneWrite(); exit;
 }
 
 // 正文落盘后必须立即结束 SSE 流，这是防止 ERR_INCOMPLETE_CHUNKED_ENCODING 的关键

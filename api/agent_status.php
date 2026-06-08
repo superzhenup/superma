@@ -184,8 +184,5 @@ try {
     ], JSON_UNESCAPED_UNICODE);
 
 } catch (Exception $e) {
-    echo json_encode([
-        'ok'  => false,
-        'msg' => $e->getMessage(),
-    ], JSON_UNESCAPED_UNICODE);
+    echo json_encode(safe_api_error_payload($e, 'Agent 状态获取失败，请稍后重试'), JSON_UNESCAPED_UNICODE);
 }

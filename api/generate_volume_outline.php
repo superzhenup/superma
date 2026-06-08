@@ -110,7 +110,7 @@ try {
         }
     );
 } catch (RuntimeException $e) {
-    sse('error', ['msg' => '卷大纲生成失败 — ' . $e->getMessage()]);
+    sse('error', safe_sse_error_payload($e, '卷大纲生成失败，请稍后重试'));
     sseDone(); exit;
 }
 
@@ -182,6 +182,10 @@ EOT;
     $act2 = $actDivision['act2'] ?? [];
     $act3 = $actDivision['act3'] ?? [];
 
+    // PHP 字符串插值 {$...} 内不支持 ?? 运算符，必须先算成普通变量
+    $storyArcText        = $storyOutline['story_arc'] ?? '（无）';
+    $protagonistInfoText = $novel['protagonist_info'] ?? '（无）';
+
     $user = <<<EOT
 为小说《{$novel['title']}》设计卷级大纲。
 
@@ -192,7 +196,7 @@ EOT;
 卷数：{$numVolumes}卷（每卷约{$volumeSize}章）
 
 【全书故事主线】
-{$storyOutline['story_arc'] ?? '（无）'}
+{$storyArcText}
 
 【三幕结构】
 - 第一幕（1-{$act1['chapters']}）：{$act1['theme']}，关键事件：{$act1['key_events'][0]}、{$act1['key_events'][1]}、{$act1['key_events'][2]}
@@ -200,7 +204,7 @@ EOT;
 - 第三幕（{$act3['chapters']}）：{$act3['theme']}，关键事件：{$act3['key_events'][0]}、{$act3['key_events'][1]}、{$act3['key_events'][2]}
 
 【主角设定】
-{$novel['protagonist_info'] ?? '（无）'}
+{$protagonistInfoText}
 
 请输出以下格式的JSON数组（共{$numVolumes}个元素）：
 [

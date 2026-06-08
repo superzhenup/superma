@@ -138,7 +138,11 @@ class WorkParser
     private function parseDoc(string $filePath): string|false
     {
         // 检查 catdoc 是否可用
-        $catdocAvailable = (stripos(PHP_OS, 'WIN') === false) && @shell_exec('which catdoc 2>/dev/null');
+        // shell_exec 在宝塔默认 disable_functions 中被禁用，调用被禁用函数会触发致命错误，
+        // @ 也无法抑制，故必须先 function_exists 守卫（否则解析 .doc 时整页 500）。
+        // Windows 下 catdoc/antiword 不可用，直接跳过 shell 调用
+        $shellOk = function_exists('shell_exec') && (PHP_OS_FAMILY !== 'Windows');
+        $catdocAvailable = $shellOk && @shell_exec('which catdoc 2>/dev/null');
 
         if ($catdocAvailable) {
             $content = @shell_exec('catdoc ' . escapeshellarg($filePath) . ' 2>/dev/null');
@@ -148,7 +152,7 @@ class WorkParser
         }
 
         // 回退方案1：尝试使用 antiword（另一个doc解析工具）
-        $antiwordAvailable = (stripos(PHP_OS, 'WIN') === false) && @shell_exec('which antiword 2>/dev/null');
+        $antiwordAvailable = $shellOk && @shell_exec('which antiword 2>/dev/null');
         if ($antiwordAvailable) {
             $content = @shell_exec('antiword ' . escapeshellarg($filePath) . ' 2>/dev/null');
             if ($content !== null && trim($content) !== '') {

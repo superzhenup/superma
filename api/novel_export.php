@@ -66,7 +66,7 @@ try {
 
 } catch (Exception $e) {
     http_response_code(500);
-    echo json_encode(['error' => '导出失败：' . $e->getMessage()]);
+    echo json_encode(safe_api_error_payload($e, '导出失败，请稍后重试'));
 }
 
 /**

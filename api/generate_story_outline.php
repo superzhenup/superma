@@ -34,8 +34,11 @@ $novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$novelId]);
 if (!$novel) { sse('error', ['msg' => '小说不存在']); sseDone(); exit; }
 
 // 预检：至少要有一个模型
-try { getModelFallbackList($novel['model_id'] ?: null, 'structured'); }
-catch (RuntimeException $e) { sse('error', ['msg' => $e->getMessage()]); sseDone(); exit; }
+try { getModelFallbackList($novel['model_id'] ?: null, 'structured'); } catch (RuntimeException $e) {
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] generate_story_outline all models failed: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
+    sse('error', safe_sse_error_payload($e, '所有模型均失败，请稍后重试'));
+    sseDone(); exit; }
 
 // 检查是否已存在故事大纲——重新生成时先删除旧记录
 $existing = DB::fetch('SELECT id FROM story_outlines WHERE novel_id=?', [$novelId]);
@@ -114,7 +117,7 @@ try {
         }
     );
 } catch (RuntimeException $e) {
-    sse('error', ['msg' => '所有模型均失败 — ' . $e->getMessage()]);
+    sse('error', safe_sse_error_payload($e, '所有模型均失败，请稍后重试'));
     sseDone(); exit;
 }
 
@@ -198,9 +201,7 @@ try {
         'total_tokens'      => $usage['prompt_tokens'] + $usage['completion_tokens'],
     ]);
 } catch (\Throwable $e) {
-    sse('error', [
-        'msg' => '保存故事大纲失败：' . $e->getMessage(),
-    ]);
+    sse('error', safe_sse_error_payload($e, '保存故事大纲失败，请稍后重试'));
 }
 
 sseDone();

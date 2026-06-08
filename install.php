@@ -11,6 +11,7 @@
 // install.php 是安装向导，不依赖 config.php（它是被安装程序创建的）
 // 但后续 include 的 schema.php 等文件需要此常量，在此手动定义
 define('APP_LOADED', true);
+require_once __DIR__ . '/includes/version.php';
 
 define('LOCK_FILE', __DIR__ . '/install.lock');
 
@@ -112,6 +113,21 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `ref_author`            VARCHAR(200) DEFAULT NULL COMMENT '参考作者',
                     `author_profile_id`     INT UNSIGNED DEFAULT NULL COMMENT '绑定的作者画像ID',
                     `target_reader`         VARCHAR(30) NOT NULL DEFAULT 'general' COMMENT '目标读者画像(qidian_male/qidian_female/jjwxc/fanqie/physical_book/general)',
+                    `narrative_structure`   VARCHAR(50) DEFAULT NULL COMMENT '叙事结构',
+                    `narrative_method`      VARCHAR(50) DEFAULT NULL COMMENT '叙事方法',
+                    `narrative_pov`         VARCHAR(50) DEFAULT NULL COMMENT '叙事视角',
+                    `literary_genre`        VARCHAR(100) DEFAULT NULL COMMENT '文学流派',
+                    `world_setting_era`     VARCHAR(100) DEFAULT NULL COMMENT '世界设定（时代）',
+                    `novel_types`           JSON DEFAULT NULL COMMENT '小说类型多选',
+                    `writing_tone`          JSON DEFAULT NULL COMMENT '文风多选',
+                    `protagonist_traits`    JSON DEFAULT NULL COMMENT '主角设定多选',
+                    `core_conflicts`        JSON DEFAULT NULL COMMENT '核心冲突多选',
+                    `appeal_points`         JSON DEFAULT NULL COMMENT '爽点多选',
+                    `taboos`                JSON DEFAULT NULL COMMENT '禁忌多选',
+                    `opening_type`          VARCHAR(50) DEFAULT NULL COMMENT '开篇类型',
+                    `protagonist_entrance`  VARCHAR(50) DEFAULT NULL COMMENT '主角出场',
+                    `custom_settings`       TEXT DEFAULT NULL COMMENT '自定义设定',
+                    `chapter_word_target`   INT DEFAULT NULL COMMENT '单章字数目标',
                     `created_at`            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     `updated_at`            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     KEY `idx_status`  (`status`),
@@ -128,6 +144,7 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `key_points`      TEXT COMMENT '关键情节点(JSON)',
                     `hook`            VARCHAR(500) NOT NULL DEFAULT '' COMMENT '结尾钩子',
                     `hook_type`       VARCHAR(30)  DEFAULT NULL COMMENT '钩子六式类型',
+                    `hook_resolved`   TINYINT(1)   DEFAULT NULL COMMENT '本章是否回收上章钩子(1是/0悬挂/NULL未检测)',
                     `cool_point_type` VARCHAR(30)  DEFAULT NULL COMMENT '爽点类型',
                     `opening_type`    VARCHAR(30)  DEFAULT NULL COMMENT '开篇五式类型',
                     `actual_opening_type` VARCHAR(30) DEFAULT NULL COMMENT '实际检测到的开篇类型',
@@ -144,8 +161,11 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     `iterative_history` JSON DEFAULT NULL COMMENT '迭代历史详情',
                     `iteration_evaluation` JSON DEFAULT NULL COMMENT '迭代效果评估',
                     `rewrite_time` DATETIME DEFAULT NULL COMMENT '最后一次重写时间',
+                    `cognitive_load` JSON DEFAULT NULL COMMENT '认知负荷分析：新元素数量、累计趋势',
+                    `style_drift_report` JSON DEFAULT NULL COMMENT 'StyleGuard风格漂移检测结果',
                     `gate_results`    JSON         DEFAULT NULL COMMENT '五关检测结果',
                     `tokens_used`     INT          NOT NULL DEFAULT 0 COMMENT 'AI生成本章消耗的token总数',
+                    `cache_hit_tokens` INT         NOT NULL DEFAULT 0 COMMENT '本章命中的提示词缓存token数',
                     `duration_ms`     INT          NOT NULL DEFAULT 0 COMMENT '本章生成耗时(毫秒)',
                     `emotion_density` JSON         DEFAULT NULL COMMENT '情绪词频统计(各类别次/万字)',
                     `emotion_score`   DECIMAL(4,1) DEFAULT NULL COMMENT '情绪密度评分(0-100)',
@@ -960,6 +980,214 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     KEY `idx_character` (`novel_id`, `character_name`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='角色情绪历史表'",
 
+                // ==================== 高阶写作向导表 ====================
+
+                // 向导进度表（四阶段向导流程状态跟踪）
+                "CREATE TABLE IF NOT EXISTS `novel_wizard_progress` (
+                    `novel_id` INT UNSIGNED PRIMARY KEY,
+                    `current_stage` VARCHAR(20) NOT NULL DEFAULT 'topic' COMMENT '当前阶段: topic/blueprint/content/launch',
+                    `completed_stages` JSON DEFAULT NULL COMMENT '已完成阶段列表',
+                    `metadata` JSON DEFAULT NULL COMMENT '阶段元数据(策划文档/世界观文档等)',
+                    `started_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    `last_active` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    FOREIGN KEY (`novel_id`) REFERENCES `novels`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='高阶向导进度表'",
+
+                // 向导对话表（数字精灵助手聊天记录）
+                "CREATE TABLE IF NOT EXISTS `novel_wizard_chats` (
+                    `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id` INT UNSIGNED NOT NULL,
+                    `stage` VARCHAR(20) NOT NULL COMMENT '阶段: topic/blueprint/content/launch',
+                    `role` ENUM('user','assistant','system') NOT NULL,
+                    `content` MEDIUMTEXT NOT NULL COMMENT '消息内容',
+                    `model_id` INT UNSIGNED DEFAULT NULL COMMENT '使用的AI模型ID',
+                    `tokens` INT UNSIGNED DEFAULT 0 COMMENT '消耗token数',
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX `idx_novel_stage` (`novel_id`, `stage`, `created_at`),
+                    FOREIGN KEY (`novel_id`) REFERENCES `novels`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='高阶向导对话表'",
+
+                // 全书圣经（1000章长程记忆：世界规则/人物现状/主线时间线，每N章增量压缩）
+                "CREATE TABLE IF NOT EXISTS `novel_bible` (
+                    `novel_id` INT UNSIGNED PRIMARY KEY,
+                    `world_md` MEDIUMTEXT COMMENT '世界规则',
+                    `character_md` MEDIUMTEXT COMMENT '人物现状',
+                    `timeline_md` MEDIUMTEXT COMMENT '主线时间线',
+                    `updated_chapter` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '最后更新到的章节',
+                    `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='全书圣经'",
+
+                // 全书一致性体检报告（每N章一次宏观审计）
+                "CREATE TABLE IF NOT EXISTS `novel_audits` (
+                    `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `novel_id` INT UNSIGNED NOT NULL,
+                    `chapter_number` INT UNSIGNED NOT NULL COMMENT '体检时的章节号',
+                    `score` DECIMAL(3,1) DEFAULT NULL COMMENT '总体评分0-10',
+                    `verdict` VARCHAR(60) DEFAULT NULL COMMENT '结论',
+                    `report` MEDIUMTEXT COMMENT 'markdown 报告',
+                    `issues` JSON DEFAULT NULL COMMENT '结构化问题清单',
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX `idx_novel` (`novel_id`, `chapter_number`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='全书一致性体检'",
+
+                // ==================== 短篇小说工作台 ====================
+
+                // 短篇小说主表
+                "CREATE TABLE IF NOT EXISTS `short_stories` (
+                    `id`               INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `user_id`          INT UNSIGNED NOT NULL DEFAULT 0,
+                    `title`            VARCHAR(200) NOT NULL DEFAULT '',
+                    `genre`            VARCHAR(100) NOT NULL DEFAULT '',
+                    `theme`            VARCHAR(200) DEFAULT NULL,
+                    `premise`          TEXT DEFAULT NULL,
+                    `protagonist`      VARCHAR(200) DEFAULT NULL,
+                    `conflict`         TEXT DEFAULT NULL,
+                    `ending_direction` TEXT DEFAULT NULL,
+                    `style`            VARCHAR(100) DEFAULT NULL,
+                    `target_words`     INT UNSIGNED NOT NULL DEFAULT 3000,
+                    `structure_type`   ENUM('six_beat','eight_beat','three_act') NOT NULL DEFAULT 'eight_beat',
+                    `chapter_count`    TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '章节数量,1=单篇模式',
+                    `brief_json`       JSON DEFAULT NULL,
+                    `beats_json`       JSON DEFAULT NULL,
+                    `chapters_json`    JSON DEFAULT NULL COMMENT '章节数组:order/title/synopsis/beat_refs/word_budget/content/status',
+                    `content`          MEDIUMTEXT DEFAULT NULL,
+                    `quality_score`    DECIMAL(4,1) DEFAULT NULL,
+                    `quality_report`   JSON DEFAULT NULL,
+                    `status`           ENUM('draft','brief_ready','beats_ready','written','polished','completed') NOT NULL DEFAULT 'draft',
+                    `model_id`         INT UNSIGNED DEFAULT NULL,
+                    `created_at`       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at`       TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    KEY `idx_user` (`user_id`),
+                    KEY `idx_status` (`status`),
+                    KEY `idx_created_at` (`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='短篇小说主表'",
+
+                // 短篇小说版本历史
+                "CREATE TABLE IF NOT EXISTS `short_story_versions` (
+                    `id`            INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `story_id`      INT UNSIGNED NOT NULL,
+                    `version`       INT UNSIGNED NOT NULL DEFAULT 1,
+                    `title`         VARCHAR(200) DEFAULT NULL,
+                    `content`       MEDIUMTEXT DEFAULT NULL,
+                    `brief_json`    JSON DEFAULT NULL,
+                    `beats_json`    JSON DEFAULT NULL,
+                    `chapters_json` JSON DEFAULT NULL,
+                    `quality_score` DECIMAL(4,1) DEFAULT NULL,
+                    `note`          VARCHAR(200) DEFAULT NULL,
+                    `created_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uk_story_version` (`story_id`, `version`),
+                    KEY `idx_story_id` (`story_id`),
+                    KEY `idx_created_at` (`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='短篇小说版本历史'",
+
+                // ==================== 热门选题 ====================
+
+                "CREATE TABLE IF NOT EXISTS `hot_novels` (
+                    `id`                   INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `source`               ENUM('qidian','fanqie','zongheng','qimao') NOT NULL,
+                    `title`                VARCHAR(200) NOT NULL,
+                    `title_norm`           VARCHAR(200) NOT NULL,
+                    `author`               VARCHAR(100) NOT NULL DEFAULT '',
+                    `author_norm`          VARCHAR(100) NOT NULL DEFAULT '',
+                    `raw_category`         VARCHAR(80)  NOT NULL DEFAULT '',
+                    `normalized_category`  VARCHAR(40)  DEFAULT NULL,
+                    `channel`              ENUM('male','female','general','unknown') NOT NULL DEFAULT 'unknown',
+                    `tags`                 JSON DEFAULT NULL,
+                    `word_count`           BIGINT UNSIGNED DEFAULT NULL,
+                    `click_count`          BIGINT UNSIGNED DEFAULT NULL,
+                    `collect_count`        BIGINT UNSIGNED DEFAULT NULL,
+                    `recommend_count`      BIGINT UNSIGNED DEFAULT NULL,
+                    `hotness_score`        SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+                    `rank_no`              SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+                    `rank_type`            VARCHAR(60) NOT NULL DEFAULT '',
+                    `extra_rank_types`     JSON DEFAULT NULL,
+                    `intro`                TEXT DEFAULT NULL,
+                    `cover_url`            VARCHAR(500) DEFAULT NULL,
+                    `source_url`           VARCHAR(500) DEFAULT NULL,
+                    `collected_at`         DATETIME NOT NULL,
+                    `confidence_score`     TINYINT UNSIGNED NOT NULL DEFAULT 0,
+                    `last_batch_id`        VARCHAR(40) DEFAULT NULL,
+                    `first_seen_at`        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    `last_seen_at`         TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uk_title_author` (`title_norm`, `author_norm`),
+                    KEY `idx_source` (`source`),
+                    KEY `idx_channel_cat` (`channel`, `normalized_category`),
+                    KEY `idx_rank_type` (`rank_type`),
+                    KEY `idx_hotness` (`hotness_score`),
+                    KEY `idx_collected` (`collected_at`),
+                    KEY `idx_last_seen` (`last_seen_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='热门选题书籍主表'",
+
+                "CREATE TABLE IF NOT EXISTS `hot_novel_analysis` (
+                    `novel_id`        INT UNSIGNED PRIMARY KEY,
+                    `appeals`         TEXT DEFAULT NULL,
+                    `selling_points`  TEXT DEFAULT NULL,
+                    `tropes`          TEXT DEFAULT NULL,
+                    `audience`        TEXT DEFAULT NULL,
+                    `risks`           TEXT DEFAULT NULL,
+                    `suggestions`     TEXT DEFAULT NULL,
+                    `hooks`           TEXT DEFAULT NULL,
+                    `benchmarks`      JSON DEFAULT NULL,
+                    `evidence`        JSON DEFAULT NULL,
+                    `updated_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='热门选题爆款分析'",
+
+                "CREATE TABLE IF NOT EXISTS `hot_novel_batches` (
+                    `id`                  INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `batch_id`            VARCHAR(60) NOT NULL,
+                    `source`              VARCHAR(20) NOT NULL,
+                    `pushed_by`           VARCHAR(60) DEFAULT NULL,
+                    `prepared_items`      INT UNSIGNED NOT NULL DEFAULT 0,
+                    `submitted_items`     INT UNSIGNED NOT NULL DEFAULT 0,
+                    `accepted`            INT UNSIGNED NOT NULL DEFAULT 0,
+                    `updated`             INT UNSIGNED NOT NULL DEFAULT 0,
+                    `duplicated`          INT UNSIGNED NOT NULL DEFAULT 0,
+                    `failed`              INT UNSIGNED NOT NULL DEFAULT 0,
+                    `failed_reasons`      JSON DEFAULT NULL,
+                    `summary`             JSON DEFAULT NULL,
+                    `diversity_metrics`   JSON DEFAULT NULL,
+                    `fetch_failed`        TINYINT(1) NOT NULL DEFAULT 0,
+                    `client_ip`           VARCHAR(64) DEFAULT NULL,
+                    `created_at`          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uk_batch_id` (`batch_id`),
+                    KEY `idx_source_created` (`source`, `created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='热门选题推送批次日志'",
+
+                "CREATE TABLE IF NOT EXISTS `hot_novel_nonces` (
+                    `nonce`       VARCHAR(64) PRIMARY KEY,
+                    `created_at`  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    KEY `idx_created_at` (`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='热门选题Nonce防重放'",
+
+                // 热门选题默认配置
+                "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES
+                    ('hot_novels_ingest_key',             ''),
+                    ('hot_novels_ingest_enabled',         '1'),
+                    ('hot_novels_unsupported_categories', '奇闻异事,游戏,体育,古风世情'),
+                    ('hot_novels_min_confidence',         '50')",
+
+                // ==================== 导入续写表 ====================
+
+                // 导入会话表（Excel批量导入断点续传）
+                "CREATE TABLE IF NOT EXISTS `novel_import_sessions` (
+                    `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    `user_id` INT UNSIGNED NOT NULL COMMENT '用户ID',
+                    `novel_id` INT UNSIGNED DEFAULT NULL COMMENT '关联小说ID',
+                    `session_key` VARCHAR(64) NOT NULL COMMENT '会话唯一标识',
+                    `total_batches` INT NOT NULL DEFAULT 0 COMMENT '总批次数',
+                    `completed_batches` JSON DEFAULT NULL COMMENT '已完成批次列表',
+                    `total_chapters` INT NOT NULL DEFAULT 0 COMMENT '总章节数',
+                    `imported_chapters` INT NOT NULL DEFAULT 0 COMMENT '已导入章节数',
+                    `total_words` BIGINT NOT NULL DEFAULT 0 COMMENT '总字数',
+                    `status` ENUM('pending','importing','completed','failed') DEFAULT 'pending' COMMENT '导入状态',
+                    `novel_meta` JSON DEFAULT NULL COMMENT '小说元数据',
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uk_session_key` (`session_key`),
+                    INDEX `idx_user` (`user_id`),
+                    INDEX `idx_novel` (`novel_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='导入续写会话表'",
+
                 // Agent默认配置
                 "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES 
                     ('agent.enabled', '1'),
@@ -973,13 +1201,19 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // v1.9 重写/迭代改进默认配置（AdaptiveParameterTuner 动态调参基线）
                 "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES
-                    ('ws_rewrite_enabled',          '0'),
+                    ('ws_rewrite_enabled',          '1'),
                     ('ws_rewrite_threshold',        '70'),
                     ('ws_rewrite_min_gain',         '10'),
                     ('ir_max_iterations',           '3'),
                     ('ir_target_score',             '80'),
                     ('ir_min_improvement',          '5.0'),
                     ('ir_quality_decline_threshold','3.0')",
+
+                // v1.10+ Agent 后置检测开关
+                "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES
+                    ('ws_critic_enabled',              '1'),
+                    ('ws_style_guard_enabled',          '1'),
+                    ('ws_ai_patterns_check_enabled',    '1')",
 
                 // 约束框架默认配置（Phase 1）
                 "INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES 
@@ -1005,6 +1239,11 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 "ALTER TABLE `character_cards` ADD COLUMN `voice_profile` JSON DEFAULT NULL COMMENT '语音指纹' AFTER `alive`",
                 "ALTER TABLE `foreshadowing_items` ADD COLUMN `last_mentioned_chapter` INT UNSIGNED DEFAULT NULL COMMENT '最近提及章节' AFTER `resolved_at`",
                 "ALTER TABLE `foreshadowing_items` ADD COLUMN `mention_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '提及次数' AFTER `last_mentioned_chapter`",
+
+                // v40: 短篇分章节写作支持（老库升级兜底）
+                "ALTER TABLE `short_stories` ADD COLUMN `chapter_count` TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '章节数量,1=单篇模式' AFTER `structure_type`",
+                "ALTER TABLE `short_stories` ADD COLUMN `chapters_json` JSON DEFAULT NULL COMMENT '章节数组' AFTER `beats_json`",
+                "ALTER TABLE `short_story_versions` ADD COLUMN `chapters_json` JSON DEFAULT NULL AFTER `beats_json`",
             ];
 
             foreach ($statements as $sql) {
@@ -1074,12 +1313,15 @@ define('AUTO_WRITE_INTERVAL',     2);
 // ============================================================
 // 文字数据统计 隐私化统计 仅统计文字数量 可以关闭
 // ============================================================
-define('STATS_REPORT_ENABLED',    true);                                        // 是否启用统计上报（true/false）
+define('STATS_REPORT_ENABLED',    false);                                       // 是否启用统计上报（true/false）
 define('STATS_SERVER_URL',        'https://www.itzo.cn/api/stats_receiver.php'); // 上报服务器地址
 define('STATS_SITE_ID',           '');                                          // 站点唯一标识（留空则自动生成）
 
 // ---- 禁止直接访问 includes/api 文件（由各入口文件定义） ----
 defined('APP_LOADED') or define('APP_LOADED', true);
+
+// ---- 产品版本单一来源 ----
+require_once __DIR__ . '/includes/version.php';
 
 // ---- 引入集中配置常量 ----
 require_once __DIR__ . '/includes/config_constants.php';
@@ -1132,11 +1374,16 @@ PHP;
 
             // 写入前检查目录权限
             if (!is_writable(__DIR__)) {
-                $who = function_exists('posix_getpwuid') ? posix_getpwuid(posix_geteuid())['name'] : 'web';
-                $error = "项目目录不可写（" . __DIR__ . "），Web 进程用户（{$who}）没有写入权限。"
-                       . "请在服务器执行：<code>chmod -R 755 " . htmlspecialchars(__DIR__) . "</code> "
-                       . "或 <code>chown -R www:www " . htmlspecialchars(__DIR__) . "</code>"
-                       . "（将 www:www 替换为你的 Web 用户）";
+                $who = function_exists('posix_getpwuid') ? posix_getpwuid(posix_geteuid())['name'] : (getenv('USERNAME') ?: getenv('USER') ?: 'web');
+                if (PHP_OS_FAMILY === 'Windows') {
+                    $error = "项目目录不可写（" . __DIR__ . "），Web 进程用户（{$who}）没有写入权限。"
+                           . "请右键目录 → 属性 → 安全，授予 Web 进程用户写入权限。";
+                } else {
+                    $error = "项目目录不可写（" . __DIR__ . "），Web 进程用户（{$who}）没有写入权限。"
+                           . "请在服务器执行：<code>chmod -R 755 " . htmlspecialchars(__DIR__) . "</code> "
+                           . "或 <code>chown -R www:www " . htmlspecialchars(__DIR__) . "</code>"
+                           . "（将 www:www 替换为你的 Web 用户）";
+                }
             } else {
                 file_put_contents(__DIR__ . '/config.php', $configContent);
                 file_put_contents(LOCK_FILE,
@@ -1144,8 +1391,17 @@ PHP;
                     "DB Host: $host\n" .
                     "DB Name: $dbname\n" .
                     "Admin: $adminUser\n" .
-                    "Version: v1.5 (Thinking + KnowledgeBase + CoverImage + Agent)\n"
+                    "Version: v" . APP_VERSION . " (Thinking + KnowledgeBase + CoverImage + Agent)\n"
                 );
+
+                // 确保缓存目录存在且可写
+                $cacheDir = __DIR__ . '/storage/cache';
+                if (!is_dir($cacheDir)) {
+                    @mkdir($cacheDir, 0755, true);
+                }
+                if (is_dir($cacheDir) && !is_writable($cacheDir)) {
+                    @chmod($cacheDir, 0755);
+                }
 
                 $success = "安装成功！管理员账号：<strong>" . htmlspecialchars($adminUser) . "</strong>，数据库已就绪。";
             }
@@ -1165,8 +1421,8 @@ PHP;
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>安装向导 - Super Ma  AI小说创作系统</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+<link rel="stylesheet" href="assets/vendor/bootstrap.min.css">
+<link rel="stylesheet" href="assets/vendor/bootstrap-icons.min.css">
 <script>(function(){ var t=localStorage.getItem('novel-theme')||'dark'; document.documentElement.setAttribute('data-theme',t); })();</script>
 <style>
 :root {
@@ -1212,7 +1468,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
   <div class="card-install p-4 p-md-5 shadow-lg">
     <div class="text-center mb-4">
       <div class="logo">✦ Super Ma AI创作系统</div>
-      <p class="text-muted mt-1 mb-0" style="font-size:.8rem">安装向导 · v1.5</p>
+      <p class="text-muted mt-1 mb-0" style="font-size:.8rem">安装向导 · v<?= htmlspecialchars(APP_VERSION, ENT_QUOTES, 'UTF-8') ?></p>
     </div>
 
     <?php if ($success): ?>
@@ -1220,7 +1476,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
       <i class="bi bi-check-circle me-1"></i><?= $success ?>
     </div>
       <div class="mb-3 p-3" style="background:rgba(16,185,129,.05);border:1px solid rgba(16,185,129,.2);border-radius:8px">
-      <div style="font-size:.78rem;color:var(--muted);margin-bottom:6px;font-weight:600;">已创建数据库结构 (v1.5)</div>
+      <div style="font-size:.78rem;color:var(--muted);margin-bottom:6px;font-weight:600;">已创建数据库结构 (v<?= htmlspecialchars(APP_VERSION, ENT_QUOTES, 'UTF-8') ?>)</div>
       <ul class="feature-list">
         <li>ai_models · novels · chapters · writing_logs</li>
         <li>story_outlines — 全书故事大纲</li>
@@ -1250,7 +1506,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
         <li><strong style="color:#10b981">agent_directive_outcomes — Agent指令效果反馈表（决策闭环）</strong></li>
         <li><strong style="color:#10b981">iterative_settings — 迭代改进设置表</strong></li>
         <li><strong style="color:#10b981">novel_catchphrases — 金句调度表（v1.3.5）</strong></li>
-        <li><strong style="color:#10b981">pid_states — PID控制器状态表（v1.5）</strong></li>
+        <li><strong style="color:#10b981">pid_states — PID控制器状态表（v<?= htmlspecialchars(APP_VERSION, ENT_QUOTES, 'UTF-8') ?>）</strong></li>
       </ul>
     </div>
     <a href="login.php" class="btn btn-primary btn-install w-100">
@@ -1371,6 +1627,11 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           }
 
           // 4. PHP CLI 二进制修正（php-fpm → php-cli，宝塔关键修复）
+          // Windows：Web SAPI 下 PHP_BINARY 多为 php-cgi.exe，须转 php.exe（CLI），否则 worker 被 403/argv 丢失打死
+          if (PHP_OS_FAMILY === 'Windows' && preg_match('#php-cgi\.exe$#i', $phpBin)) {
+              $phpBin = preg_replace('#php-cgi\.exe$#i', 'php.exe', $phpBin);
+              $asyncDiag['php_binary_fixed'] = true;
+          }
           if (PHP_OS_FAMILY !== 'Windows' && preg_match('#/php-fpm\d*$#', $phpBin)) {
               @exec('which php 2>/dev/null', $whichOut, $whichCode);
               if ($whichCode === 0 && !empty($whichOut[0])) {
@@ -1453,41 +1714,39 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           $asyncDiag['verdict_msg'] = 'exec() 被禁用，无法检测异步写作环境';
       }
       ?>
-      <div class="section-title"><span class="step-badge">0</span>环境检测</div>
-      <div class="mb-3 p-3" style="background:<?= $hasWarning ? 'rgba(245,158,11,.06)' : 'rgba(16,185,129,.05)' ?>;border:1px solid <?= $hasWarning ? 'rgba(245,158,11,.2)' : 'rgba(16,185,129,.2)' ?>;border-radius:8px">
-        <?php foreach ($envChecks as $check): list($name, $ok, $desc) = $check; ?>
-        <div class="d-flex align-items-center gap-2 py-1" style="font-size:.82rem">
-          <?php if ($ok): ?>
-            <i class="bi bi-check-circle-fill text-success"></i>
-            <span><?= $name ?></span>
-            <span class="text-muted" style="font-size:.72rem">— <?= $desc ?></span>
-          <?php else: ?>
-            <i class="bi bi-exclamation-triangle-fill text-warning"></i>
-            <span class="fw-semibold"><?= $name ?></span>
-            <span class="text-warning" style="font-size:.72rem">— 已禁用，<?= $desc ?></span>
-          <?php endif; ?>
-        </div>
-        <?php endforeach; ?>
-        <?php if ($hasWarning): ?>
-        <div class="mt-2 pt-2" style="border-top:1px solid var(--border);font-size:.75rem;color:var(--muted)">
-          <i class="bi bi-info-circle me-1"></i>警告项不影响安装，但可能影响部分功能。exec/popen/pclose 禁用时写作将自动使用 SSE 直连模式（可能受 Nginx 超时限制）。PHP CLI 未找到时异步写作不可用。
-        </div>
-        <?php endif; ?>
-      </div>
-
-      <!-- ================================================================ -->
-      <!-- 异步写作深度诊断结果 -->
-      <!-- ================================================================ -->
       <?php
+      // 异步写作深度检测判定（已合并入「环境检测」区块，故提前到此计算以决定整体配色）
       $v = $asyncDiag['verdict'];
       $isOk      = ($v === 'ok');
       $isUnstable= ($v === 'unstable');
       $isSseOnly = ($v === 'sse_only');
+      $sectionWarn = $hasWarning || !$isOk;   // 环境有警告，或异步写作非「可用」，整体按警告色
       ?>
-      <div class="section-title mt-3"><span class="step-badge">⚡</span>异步写作深度检测</div>
-      <div class="mb-3 p-3" style="background:<?= $isOk ? 'rgba(16,185,129,.05)' : 'rgba(245,158,11,.06)' ?>;border:1px solid <?= $isOk ? 'rgba(16,185,129,.2)' : 'rgba(245,158,11,.2)' ?>;border-radius:8px">
+      <div class="section-title"><span class="step-badge">0</span>环境检测 · 异步写作深度检测</div>
+      <div class="mb-3 p-3" style="background:<?= $sectionWarn ? 'rgba(245,158,11,.06)' : 'rgba(16,185,129,.05)' ?>;border:1px solid <?= $sectionWarn ? 'rgba(245,158,11,.2)' : 'rgba(16,185,129,.2)' ?>;border-radius:8px">
+        <?php foreach ($envChecks as $check): list($name, $ok, $desc) = $check; ?>
+        <div class="d-flex align-items-center gap-2 py-1" style="font-size:.82rem">
+          <?php if ($ok): ?>
+            <i class="bi bi-check-circle-fill text-success"></i>
+            <span style="color:#fff"><?= $name ?></span>
+            <span style="font-size:.72rem;color:#fff">— <?= $desc ?></span>
+          <?php else: ?>
+            <i class="bi bi-exclamation-triangle-fill text-warning"></i>
+            <span class="fw-semibold" style="color:#fff"><?= $name ?></span>
+            <span style="font-size:.72rem;color:#fff">— 已禁用，<?= $desc ?></span>
+          <?php endif; ?>
+        </div>
+        <?php endforeach; ?>
+        <?php if ($hasWarning): ?>
+        <div class="mt-2 pt-2" style="border-top:1px solid var(--border);font-size:.75rem;color:#fff">
+          <i class="bi bi-info-circle me-1"></i>警告项不影响安装，但可能影响部分功能。exec/popen/pclose 禁用时写作将自动使用 SSE 直连模式（可能受 Nginx 超时限制）。PHP CLI 未找到时异步写作不可用。
+        </div>
+        <?php endif; ?>
+        <!-- 异步写作深度检测（已合并入「环境检测」区块，原为独立 section） -->
+        <div class="mt-3 pt-3" style="border-top:1px solid var(--border)">
+          <div class="fw-semibold mb-2" style="font-size:.8rem;color:#fff"><i class="bi bi-lightning-charge-fill text-warning me-1"></i>异步写作深度检测</div>
         <?php if (!$asyncDiag['tested']): ?>
-        <div style="font-size:.82rem;color:var(--muted)">
+        <div style="font-size:.82rem;color:#fff">
           <i class="bi bi-info-circle me-1"></i>exec() 被禁用，跳过异步写作深度检测。写作将自动使用 SSE 直连模式。
         </div>
         <?php else: ?>
@@ -1498,12 +1757,12 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
             <?php if ($isOk): ?>
               <i class="bi bi-check-circle-fill text-success me-1"></i>异步写作可用
             <?php elseif ($isUnstable): ?>
-              <i class="bi bi-exclamation-triangle-fill text-warning me-1"></i>SEE写作不稳定（会偶发自动写作章节断开问题）
+              <i class="bi bi-exclamation-triangle-fill text-warning me-1"></i>SSE写作不稳定（会偶发自动写作章节断开问题）
             <?php else: ?>
               <i class="bi bi-x-circle-fill text-danger me-1"></i>仅 SSE 直连模式
             <?php endif; ?>
           </div>
-          <div style="font-size:.75rem;color:var(--muted);margin-top:2px"><?= htmlspecialchars($asyncDiag['verdict_msg']) ?></div>
+          <div style="font-size:.75rem;color:#fff;margin-top:2px"><?= htmlspecialchars($asyncDiag['verdict_msg']) ?></div>
         </div>
 
         <!-- 详细检测项 -->
@@ -1531,17 +1790,18 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
         <div class="d-flex align-items-center gap-2 py-1" style="font-size:.78rem">
           <?php if ($ok): ?>
             <i class="bi bi-check-circle-fill text-success" style="font-size:.7rem"></i>
-            <span><?= $name ?></span>
-            <span class="text-muted" style="font-size:.7rem">— <?= $desc ?></span>
+            <span style="color:#fff"><?= $name ?></span>
+            <span style="font-size:.7rem;color:#fff">— <?= $desc ?></span>
           <?php else: ?>
             <i class="bi bi-x-circle-fill text-danger" style="font-size:.7rem"></i>
-            <span class="fw-semibold"><?= $name ?></span>
-            <span style="color:#dc3545;font-size:.7rem">— <?= $desc ?></span>
+            <span class="fw-semibold" style="color:#fff"><?= $name ?></span>
+            <span style="color:#fff;font-size:.7rem">— <?= $desc ?></span>
           <?php endif; ?>
         </div>
         <?php endforeach; ?>
 
         <?php endif; ?>
+        </div>
       </div>
 
       <?php if ($isSseOnly || $isUnstable): ?>
@@ -1551,7 +1811,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           <i class="bi bi-exclamation-triangle-fill me-1"></i>
           <?= $isSseOnly ? '异步写作不可用，仅 SSE 直连模式' : '异步写作可能不稳定' ?>
         </div>
-        <div style="font-size:.75rem;color:var(--muted)">
+        <div style="font-size:.75rem;color:#fff">
           <?php if ($isSseOnly): ?>
           写作将使用 SSE 直连模式（Server-Sent Events），该模式受 Nginx/Apache 超时限制（通常 60-120 秒），
           长篇章节写作可能被截断。建议在服务器上安装并启用 PHP CLI，确保 <code>exec()</code> 未被禁用。
@@ -1560,7 +1820,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           建议检查 PHP CLI 配置，确保 CLI 与 FPM 使用相同的扩展（尤其是 pdo_mysql）。
           <?php endif; ?>
         </div>
-        <div style="font-size:.72rem;color:var(--muted);margin-top:4px">
+        <div style="font-size:.72rem;color:#fff;margin-top:4px">
           <i class="bi bi-check2-square me-1"></i>你仍可继续安装，但写作功能可能因超时而中断。
         </div>
       </div>
@@ -1645,9 +1905,9 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
         <i class="bi bi-exclamation-circle me-1"></i>两次密码不一致
       </div>
 
-      <!-- 将创建的数据库结构预览 -->
+      <!-- 将创建的数据库结构预览 
       <div class="mb-3 p-3" style="background:rgba(99,102,241,.05);border:1px solid rgba(99,102,241,.15);border-radius:8px">
-        <div style="font-size:.75rem;color:#6366f1;font-weight:600;margin-bottom:6px;">安装后将创建以下数据库结构 (v1.5)</div>
+        <div style="font-size:.75rem;color:#6366f1;font-weight:600;margin-bottom:6px;">安装后将创建以下数据库结构 (v<?= htmlspecialchars(APP_VERSION, ENT_QUOTES, 'UTF-8') ?>)</div>
         <ul class="feature-list">
           <li>ai_models / novels / chapters / writing_logs（基础表）</li>
           <li>story_outlines — 全书故事大纲表</li>
@@ -1679,7 +1939,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
         <li><strong>novel_catchphrases — 金句调度表（v1.10.3）</strong></li>
         <li><strong>pid_states — PID控制器状态表（v1.10.3）</strong></li>
       </ul>
-    </div>
+    </div>-->
 
     <button type="submit" class="btn btn-primary btn-install w-100 mt-1">
         <i class="bi bi-lightning-charge me-1"></i>一键安装

@@ -4,8 +4,8 @@
  * 
  * 诊断 + 修复一步到位。适合部署后运行一次。
  * 
- * GET /api/fix_semantic.php?novel_id=1&dry_run=1   — 只看不动
- * GET /api/fix_semantic.php?novel_id=1              — 执行修复
+ * GET  /api/fix_semantic.php?novel_id=1&dry_run=1   — 只看不动
+ * POST /api/fix_semantic.php {"novel_id":1}         — 执行修复
  */
 define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
@@ -19,8 +19,12 @@ require_once dirname(__DIR__) . '/includes/memory/Vector.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
-$novelId = (int)($_GET['novel_id'] ?? 0);
-$dryRun  = isset($_GET['dry_run']);
+$input = json_decode(file_get_contents('php://input'), true) ?: [];
+$novelId = (int)($input['novel_id'] ?? $_POST['novel_id'] ?? $_GET['novel_id'] ?? 0);
+$dryRun  = isset($_GET['dry_run']) || !empty($input['dry_run']) || !empty($_POST['dry_run']);
+if (!$dryRun) {
+    requireHttpMethod('POST');
+}
 
 if (!$novelId) {
     echo json_encode(['ok' => false, 'error' => '缺少 novel_id'], JSON_UNESCAPED_UNICODE);

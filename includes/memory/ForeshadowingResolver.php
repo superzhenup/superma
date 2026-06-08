@@ -258,10 +258,12 @@ class ForeshadowingResolver
 
         foreach ($selected as $i => $item) {
             $num = $i + 1;
-            $dl = $item['deadline_chapter'] > 0 ? "（建议第{$item['deadline_chapter']}章前回收）" : '';
-            $planted = $item['planted_chapter'];
-            $lines[] = "{$num}. 【第{$planted}章埋】{$item['description']}{$dl}";
-            $lines[] = "   评分理由：{$this->formatReasons($item['reasons'])}";
+            // 只给伏笔“内容”，绝不给章节号/deadline——那是创作坐标，会被模型抄进正文穿帮
+            $age = $this->currentChapter - (int)$item['planted_chapter'];
+            $urgency = $age > 30 ? '（埋藏极久，本章务必收）'
+                     : ($age > 15 ? '（久未触及，宜尽快回收）' : '');
+            $lines[] = "{$num}. {$item['description']}{$urgency}";
+            $lines[] = "   回收理由：{$this->formatReasons($item['reasons'])}";
         }
 
         $lines[] = '';
@@ -270,6 +272,7 @@ class ForeshadowingResolver
         $lines[] = "2. 回收时应产生新的信息量或反转，给读者「原来如此」的阅读快感";
         $lines[] = "3. 多条伏笔可以串联回收（一次揭晓解决多个谜团），但不要为了回收而回收";
         $lines[] = "4. 回收后在 resolved_foreshadowing 中使用该伏笔的精确原始描述文本";
+        $lines[] = "5. 以上编号与提示仅供创作参考，严禁出现在正文。角色不知道自己身处第几章；正文不得出现「第N章」「根据第N章」「记录/档案显示」等指向章节号或卷册编号的表述";
 
         return implode("\n", $lines) . "\n\n";
     }

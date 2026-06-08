@@ -621,7 +621,7 @@ EOT;
             $rewrittenWords = countWords($rewritten);
 
             // 统一使用动态容忍度计算（与 WriteEngine 保持一致）
-            require_once dirname(__DIR__) . '/../prompt.php';
+            require_once dirname(__DIR__) . '/prompt.php';   // includes/prompt.php（原多了一个 /.. 指向了不存在的根目录 prompt.php）
             $tol = calculateDynamicTolerance($origWords);
             $maxAllowed = $tol['max'];
 

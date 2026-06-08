@@ -62,6 +62,73 @@ function generateWordCountWarnings(int $targetWords): string
 }
 
 /**
+ * v41 去套路化：全书桥段台账——聚合全书爽点/钩子/开篇的累计频率，
+ * 注入"高频 TOP-N"让 AI 跨全书(而非仅近窗口)主动求新。复用现有 chapters 列，无新表。
+ */
+function buildGlobalBeatStats(int $novelId, int $count): string
+{
+    if (!getSystemSetting('ws_beat_stats_enabled', true, 'bool')) return '';
+    try {
+        $lines = [];
+
+        // 爽点类型（actual_cool_point_types 是 JSON 数组，PHP 端聚合以兼容 MySQL 5.7）
+        $coolRows = \DB::fetchAll(
+            "SELECT actual_cool_point_types FROM chapters
+             WHERE novel_id=? AND actual_cool_point_types IS NOT NULL AND actual_cool_point_types <> ''",
+            [$novelId]
+        );
+        $coolFreq = [];
+        foreach ($coolRows as $r) {
+            $types = json_decode($r['actual_cool_point_types'] ?? '[]', true) ?: [];
+            foreach ($types as $t) {
+                if (is_string($t) && $t !== '') $coolFreq[$t] = ($coolFreq[$t] ?? 0) + 1;
+            }
+        }
+        arsort($coolFreq);
+        if ($coolFreq) {
+            $parts = [];
+            foreach (array_slice($coolFreq, 0, 5, true) as $t => $n) {
+                $parts[] = (COOL_POINT_TYPES[$t]['name'] ?? $t) . "×{$n}";
+            }
+            $lines[] = "爽点：" . implode('、', $parts);
+        }
+
+        // 钩子类型
+        $hookRows = \DB::fetchAll(
+            "SELECT hook_type, COUNT(*) c FROM chapters
+             WHERE novel_id=? AND hook_type IS NOT NULL AND hook_type <> ''
+             GROUP BY hook_type ORDER BY c DESC LIMIT 5",
+            [$novelId]
+        );
+        if ($hookRows) {
+            $lines[] = "钩子：" . implode('、', array_map(fn($r) => "{$r['hook_type']}×{$r['c']}", $hookRows));
+        }
+
+        // 开篇类型（实际检测）
+        $openRows = \DB::fetchAll(
+            "SELECT actual_opening_type, COUNT(*) c FROM chapters
+             WHERE novel_id=? AND actual_opening_type IS NOT NULL AND actual_opening_type <> ''
+             GROUP BY actual_opening_type ORDER BY c DESC LIMIT 4",
+            [$novelId]
+        );
+        if ($openRows) {
+            $lines[] = "开篇：" . implode('、', array_map(
+                fn($r) => (defined('OPENING_TYPES') && isset(OPENING_TYPES[$r['actual_opening_type']]['name'])
+                    ? OPENING_TYPES[$r['actual_opening_type']]['name'] : $r['actual_opening_type']) . "×{$r['c']}",
+                $openRows
+            ));
+        }
+
+        if (empty($lines)) return '';
+        return "\n【⚠️ 全书高频套路统计——以下为全书累计出现次数，排名靠前者已被反复使用，本批必须主动降低使用、换新花样】\n"
+            . implode("\n", $lines)
+            . "\n（高频 TOP3 套路在本批{$count}章中各最多再用 1 次）\n";
+    } catch (\Throwable $e) {
+        return '';
+    }
+}
+
+/**
  * 构建大纲生成 Prompt（三层记忆：弧段摘要 + 近章大纲 + 上批钩子）
  */
 function buildOutlinePrompt(
@@ -135,7 +202,8 @@ function buildOutlinePrompt(
     $contextSection = '';
     if (!empty($recentOutlines)) {
         $lines = [];
-        foreach (array_slice($recentOutlines, -10) as $oc) {
+        $recentShow = max(5, (int)getSystemSetting('ws_outline_recent_show', 16, 'int'));
+        foreach (array_slice($recentOutlines, -$recentShow) as $oc) {
             $summary = safe_substr(trim($oc['outline'] ?? ''), 0, 120);
             $hookTip = !empty($oc['hook']) ? " →钩：{$oc['hook']}" : '';
             $openTip = !empty($oc['opening_type']) ? " [{$oc['opening_type']}式]" : '';
@@ -229,7 +297,8 @@ function buildOutlinePrompt(
     $hookHistorySection = '';
     if (!empty($recentHookTypes)) {
         $lines = [];
-        foreach (array_slice($recentHookTypes, 0, 5) as $h) {
+        $hookShow = max(3, (int)getSystemSetting('ws_outline_hook_history', 10, 'int'));
+        foreach (array_slice($recentHookTypes, 0, $hookShow) as $h) {
             $lines[] = "第{$h['chapter']}章：{$h['hook_type']}";
         }
         $hookHistorySection = "\n【近章钩子类型（避免连续重复）】\n" . implode("\n", $lines) . "\n";
@@ -239,8 +308,9 @@ function buildOutlinePrompt(
     $coolPointSection = '';
     $recentCoolTypes = [];  // 近3章已用爽点类型（用于铁律禁令）
     if (!empty($coolPointHistory)) {
-        // $coolPointHistory 是按章节升序排列的，取最后8条（最近的）
-        $recentCoolPoints = array_slice($coolPointHistory, -8);
+        // $coolPointHistory 是按章节升序排列的，取最近 N 条（v41 默认 15，跨更多章防重复）
+        $coolShow = max(5, (int)getSystemSetting('ws_outline_cool_history', 15, 'int'));
+        $recentCoolPoints = array_slice($coolPointHistory, -$coolShow);
         $lines = [];
         $totalRecent = count($recentCoolPoints);
         foreach ($recentCoolPoints as $idx => $c) {
@@ -313,6 +383,9 @@ function buildOutlinePrompt(
         $sceneTemplateSection = "\n【🚫 已耗尽场景模板（设计大纲时严禁再安排以下模板）】\n"
             . implode("\n", $stLines) . "\n";
     }
+
+    // v41 全书桥段台账（全书级套路频率，补齐"只看近窗口"的盲区）
+    $beatStatsSection = buildGlobalBeatStats((int)$novel['id'], $count);
 
     // 已用章节标题黑名单（防重复标题）
     $usedTitlesSection = '';
@@ -646,6 +719,7 @@ function buildOutlinePrompt(
 17. 如有【本卷必须回收的逾期伏笔】，须在本批内安排完毕，不得拖到下一批
 18. 如处于收尾阶段，核心矛盾须获得实质性推进或解决，不再开启新支线
 19. 如有【全书故事主线】，本批大纲的情节走向必须与主线严格对齐，不得自行发明新主线或改变故事方向
+19b. 每章必须写清 story_delta、conflict、result、next_trigger、unique_role，用于证明本章与前后章节不同且有明确推进
 20. 禁止使用"——"、禁用高频AI词汇，包括但不限于：深邃、凝视、缓缓、蓦然、骤然、 indeed、无疑、显然、事实上、值得注意的是、毫无疑问、通常来说、在此基础上、应当注意到、铁锈味、指节泛白、沉默下来、看了几秒、一愣、沉默了几秒、泛白、愣在原地、愣了一下等。换成更生动的表达，比如"老实说"、"很多时候"、"这么一来"、"这里有个细节"、少用破折号【】以及禁用非对话的""
 21. 我发给你的提示词不要出现在文章里面，举例：**章末钩子(info bomb型)：**、【信息爆炸型钩子：检测到信息揭示情节】**高潮段(约700字)**、**(发展段：约600字，对话密集)**、**（铺垫段：约450字）**
 {$protagonistAnchorRule}
@@ -661,9 +735,9 @@ EOT;
 情节：{$plotSettings}
 世界观：{$worldSettings}
 其他：{$extraSettings}
-{$progressSection}{$endingContext}{$storyOutlineSection}{$volumeSection}{$overdueSection}{$volumeForceResolve}{$arcSection}{$contextSection}{$prevHookSection}{$momentumSection}{$arcSummarySection}{$hookHistorySection}{$coolPointSection}{$expressionGuide}{$sceneTemplateSection}{$usedTitlesSection}{$keyEventsSection}{$characterSection}{$foreshadowSection}
+{$progressSection}{$endingContext}{$storyOutlineSection}{$volumeSection}{$overdueSection}{$volumeForceResolve}{$arcSection}{$contextSection}{$prevHookSection}{$momentumSection}{$arcSummarySection}{$hookHistorySection}{$coolPointSection}{$beatStatsSection}{$expressionGuide}{$sceneTemplateSection}{$usedTitlesSection}{$keyEventsSection}{$characterSection}{$foreshadowSection}
 输出JSON数组（{$count}个元素）：
-[{"chapter_number":整数,"title":"标题","summary":"概要","key_points":["点1","点2"],"hook":"钩子","hook_type":"九选一","pacing":"快/中/慢","suspense":"有/无"},...]
+[{"chapter_number":整数,"title":"标题","summary":"概要","key_points":["点1","点2"],"hook":"钩子","hook_type":"九选一","pacing":"快/中/慢","suspense":"有/无","story_delta":"本章相对上一章新增的变化","conflict":"本章核心冲突","result":"本章结束时局面变化","next_trigger":"下一章触发点","unique_role":"本章在本卷里的唯一作用"},...]
 
 直接输出JSON，从 [ 开始：
 EOT;
@@ -947,6 +1021,20 @@ function buildChapterSynopsisPrompt(array $novel, array $chapter, array $storyOu
     $protagonistRuleCS = $protagonistNameCS
         ? "\n6. 主角名锚定：本小说主角固定为「{$protagonistNameCS}」，characters 列表中必须包含此名字且不可更改"
         : '';
+
+    // 等级框架：反派实力对标规则
+    $antagonistConstraint = '';
+    require_once __DIR__ . '/PowerSystem.php';
+    try {
+        $powerSystem = new PowerSystem((int)($novel['id'] ?? 0));
+        $protagInfo = $powerSystem->getProtagonistRealm();
+        if (!empty($protagInfo['realm'])) {
+            $antagonistConstraint = "\n" . $powerSystem->buildAntagonistConstraint($protagInfo['name'], $protagInfo['realm']);
+        }
+    } catch (\Throwable $e) {
+        // PowerSystem 不可用，跳过
+    }
+
     $system = <<<EOT
 你是一位小说场景设计师,擅长将章节大纲细化为可执行的写作蓝图。
 输出规则（必须严格遵守）：
@@ -955,7 +1043,7 @@ function buildChapterSynopsisPrompt(array $novel, array $chapter, array $storyOu
 3. 对话要点要符合人物性格
 4. 感官细节要丰富,有代入感
 5. 章节逻辑要合理经得起推敲，并且章节不要重复
-6. 所有字段值中不得出现未转义的双引号{$protagonistRuleCS}
+6. 所有字段值中不得出现未转义的双引号{$protagonistRuleCS}{$antagonistConstraint}
 EOT;
 
     $storyArcExcerpt = $truncate($storyOutline['story_arc'] ?? '', 150);
@@ -1798,8 +1886,33 @@ function calculateCoolPointSchedule(int $startChapter, int $count, array $histor
         }
     }
 
+    // v41 去套路化：呼吸章（蓄力/日常/情感/伏笔章）——约 1/N 章免爽点，打破每章同构。
+    // 收尾期（进度≥80%）不安排，保证高潮冲刺；批次首章不安排，保证承接上章钩子。
+    $breatherEnabled  = getSystemSetting('ws_breather_enabled', true, 'bool');
+    $breatherInterval = max(3, (int)getSystemSetting('ws_breather_interval', 4, 'int'));
+    $breatherPhase    = $novelId ? ($novelId % $breatherInterval) : 0; // 每本相位错开，避免机械规律
+    $isEndgame        = false;
+    if ($novelId) {
+        try {
+            $tc = (int)(\DB::fetch('SELECT target_chapters FROM novels WHERE id=?', [$novelId])['target_chapters'] ?? 0);
+            if ($tc > 0 && ($startChapter + $count) / $tc >= 0.8) $isEndgame = true;
+        } catch (\Throwable $e) { /* 忽略 */ }
+    }
+
     for ($i = 0; $i < $count; $i++) {
         $chNum = $startChapter + $i;
+
+        // 呼吸章判定：免爽点，直接记录后跳过排期
+        if ($breatherEnabled && !$isEndgame && $i > 0
+            && ((($chNum + $breatherPhase) % $breatherInterval) === 0)) {
+            $lines[] = [
+                'chapter'   => $chNum,
+                'primary'   => ['type' => 'breather', 'name' => '🌿蓄力/呼吸章', 'hunger' => 0],
+                'secondary' => null,
+                'breather'  => true,
+            ];
+            continue;
+        }
 
         // ── 计算每种爽点的饥饿度 ──────────────────────────────────────
         $candidates = [];
@@ -1825,12 +1938,35 @@ function calculateCoolPointSchedule(int $startChapter, int $count, array $histor
         // 按分数降序排列
         usort($candidates, fn($a, $b) => $b['score'] <=> $a['score']);
 
-        // ── 防止主爽点与上一章单爽点重复 ────────────────────────────
-        $prevType  = $i > 0 ? ($lines[$i - 1]['primary']['type']  ?? '') : '';
-        $selected  = $candidates[0] ?? null;
-        if ($selected && $selected['type'] === $prevType && count($candidates) > 1) {
-            $selected = $candidates[1];
-            // 把选中的移到首位（方便后续取第二个）
+        // ── v41 去周期化：近 N 章不重复主爽点 + top-K 加权随机抖动 ────────
+        // 原逻辑只查上一章 + 永远取最高分 → 准周期、可预测。
+        $norepeatWin = max(1, (int)getSystemSetting('ws_coolpoint_norepeat_window', 3, 'int'));
+        $recentTypes = [];
+        for ($k = max(0, $i - $norepeatWin); $k < $i; $k++) {
+            $tp = $lines[$k]['primary']['type'] ?? '';
+            if ($tp && $tp !== 'breather') $recentTypes[$tp] = true;
+        }
+        // 优先从"近 N 章未用过"的候选里选；若全被排除则回退全集
+        $fresh = array_values(array_filter($candidates, fn($c) => !isset($recentTypes[$c['type']])));
+        $pool  = !empty($fresh) ? $fresh : $candidates;
+
+        $selected = $pool[0] ?? null;
+        if ($selected && getSystemSetting('ws_coolpoint_jitter', true, 'bool') && count($pool) > 1) {
+            // 在 top-3 里按 score 加权随机（可复现：种子=novelId*1e5+章号）
+            $topK   = array_slice($pool, 0, 3);
+            $totalW = 0.0;
+            foreach ($topK as $c) $totalW += max(0.01, (float)$c['score']);
+            mt_srand((($novelId ?: 1) * 100000) + $chNum);
+            $r = (mt_rand() / mt_getrandmax()) * $totalW;
+            mt_srand(); // 立即复位，避免污染后续随机
+            $acc = 0.0;
+            foreach ($topK as $c) {
+                $acc += max(0.01, (float)$c['score']);
+                if ($r <= $acc) { $selected = $c; break; }
+            }
+        }
+        if ($selected) {
+            // 把选中的移到 candidates 首位，保留下游双爽点逻辑
             $candidates = array_values(array_filter($candidates, fn($c) => $c['type'] !== $selected['type']));
             array_unshift($candidates, $selected);
         }
@@ -1881,7 +2017,14 @@ function calculateCoolPointSchedule(int $startChapter, int $count, array $histor
     // ── 格式化输出 ────────────────────────────────────────────────────
     $bigTypes = ['underdog_win', 'face_slap'];
     $result   = [];
+    $hasBreather = false;
     foreach ($lines as $l) {
+        // v41 呼吸章：免爽点行
+        if (!empty($l['breather'])) {
+            $hasBreather = true;
+            $result[] = "  第{$l['chapter']}章 → 🌿蓄力/呼吸章（不安排爽点，专注铺垫/日常/情感/伏笔/世界观，钩子可弱，用悬念或情感留白收尾）";
+            continue;
+        }
         $pri  = $l['primary'];
         $sec  = $l['secondary'];
         $flag = in_array($pri['type'], $bigTypes) ? '【大爽点】' : '';
@@ -1894,7 +2037,11 @@ function calculateCoolPointSchedule(int $startChapter, int $count, array $histor
         }
     }
 
-    return implode("\n", $result);
+    $out = implode("\n", $result);
+    if ($hasBreather) {
+        $out .= "\n（🌿呼吸章不强行塞爽点，用于调节节奏、避免每章同构；其余章按上表排期，相邻不重复）";
+    }
+    return $out;
 }
 
 // ================================================================

@@ -274,6 +274,12 @@ class DialogueVoiceChecker
             if (!empty($vp['vocabulary_level'])) {
                 $parts[] = '用语：' . $vp['vocabulary_level'];
             }
+            if (!empty($vp['subtext_style'])) {
+                $parts[] = '潜台词：' . $vp['subtext_style'];
+            }
+            if (!empty($vp['subtext_signals'])) {
+                $parts[] = '隐情信号：' . implode('、', array_slice($vp['subtext_signals'], 0, 2));
+            }
             if ($parts) {
                 $lines[] = "· {$name}：" . implode('，', $parts);
             }

@@ -100,10 +100,10 @@ async function checkModelConfig() {
     const modelId = modelSelect ? modelSelect.value : null;
     
     try {
-        const url = modelId 
-            ? `api/workshop.php?action=check_model&model_id=${modelId}`
-            : 'api/workshop.php?action=check_model';
-        
+        const url = modelId
+            ? `/api/workshop.php?action=check_model&model_id=${modelId}`
+            : '/api/workshop.php?action=check_model';
+
         const response = await fetch(url);
         const result = await response.json();
         
@@ -253,7 +253,8 @@ async function generateIdea() {
             model_id: modelId || null
         });
     } catch (error) {
-        alert('生成失败: ' + error.message);
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        alert('生成失败: ' + errorMsg);
         document.getElementById('empty-state').style.display = 'block';
         document.getElementById('loading-state').style.display = 'none';
     } finally {
@@ -293,7 +294,7 @@ async function generateWithStream(params) {
             }
         }, 30000);
         
-        const response = await fetch('api/workshop.php?action=generate_stream', {
+        const response = await fetch('/api/workshop.php?action=generate_stream', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
@@ -372,7 +373,7 @@ async function generateWithStream(params) {
                                 break;
                                 
                             case 'error':
-                                throw new Error(parsed.message || parsed || '生成失败');
+                                throw new Error(parsed.message || String(parsed) || '生成失败');
                                 
                             default:
                                 // 兼容旧格式
@@ -390,13 +391,13 @@ async function generateWithStream(params) {
                                     updateLoadingStatus(parsed.message);
                                 }
                         }
-                    } catch (e) {
-                        // JSON 解析失败，可能是纯文本
-                        if (data.includes('error') || data.includes('失败')) {
-                            throw new Error(data);
-                        }
-                        console.warn('SSE 数据解析:', e.message, data);
-                    }
+    } catch (e) {
+        // JSON 解析失败，可能是纯文本
+        if (data.includes('error') || data.includes('失败')) {
+            throw new Error(data);
+        }
+        console.warn('SSE 数据解析:', e instanceof Error ? e.message : String(e), data);
+    }
                     
                     currentEvent = ''; // 重置事件类型
                 }
@@ -474,7 +475,7 @@ function previewContent(content) {
 async function generateWithoutStream(params) {
     updateLoadingStatus('正在生成...');
     
-    const response = await fetch('api/workshop.php?action=generate', {
+    const response = await fetch('/api/workshop.php?action=generate', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json'
@@ -574,7 +575,7 @@ async function confirmCreateNovel() {
         const editedPlot = document.getElementById('result-plot').value.trim();
         const editedExtra = document.getElementById('result-extra').value.trim();
         
-        const response = await fetch('api/workshop.php?action=create_novel', {
+        const response = await fetch('/api/workshop.php?action=create_novel', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
@@ -608,7 +609,8 @@ async function confirmCreateNovel() {
             throw new Error(result.error || '创建失败');
         }
     } catch (error) {
-        alert('创建失败: ' + error.message);
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        alert('创建失败: ' + errorMsg);
         createBtn.disabled = false;
         createBtn.innerHTML = '<i class="bi bi-check-circle me-1"></i>确认创建';
     }
@@ -678,7 +680,7 @@ async function regenerateSection(section) {
         const modelId = document.getElementById('model-select').value || null;
         const context = getCurrentContext();
         
-        const response = await fetch('api/workshop.php?action=rewrite_section', {
+        const response = await fetch('/api/workshop.php?action=rewrite_section', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -701,7 +703,8 @@ async function regenerateSection(section) {
             throw new Error(result.error || '重新生成失败');
         }
     } catch (error) {
-        alert('重新生成失败: ' + error.message);
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        alert('重新生成失败: ' + errorMsg);
     } finally {
         sectionEl.classList.remove('rewriting');
         spinner.style.display = 'none';
@@ -759,7 +762,7 @@ async function confirmRewrite() {
         const modelId = document.getElementById('model-select').value || null;
         const context = getCurrentContext();
         
-        const response = await fetch('api/workshop.php?action=rewrite_section', {
+        const response = await fetch('/api/workshop.php?action=rewrite_section', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -782,7 +785,8 @@ async function confirmRewrite() {
             throw new Error(result.error || '改写失败');
         }
     } catch (error) {
-        alert('改写失败: ' + error.message);
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        alert('改写失败: ' + errorMsg);
     } finally {
         sectionEl.classList.remove('rewriting');
         spinner.style.display = 'none';
@@ -792,15 +796,13 @@ async function confirmRewrite() {
     }
 }
 
-// ================================================================
-// 将函数显式暴露到 window，供 HTML 内联 onclick 调用
-// （修复点击"重新生成/意见改写"按钮无反应的问题）
-// ================================================================
-window.resetForm             = resetForm;
-window.generateIdea          = generateIdea;
-window.regenerateResult      = regenerateResult;
-window.createNovel           = createNovel;
-window.confirmCreateNovel    = confirmCreateNovel;
-window.regenerateSection     = regenerateSection;
-window.openRewriteModal      = openRewriteModal;
-window.confirmRewrite        = confirmRewrite;
+// 兼容内联 onclick：显式挂到 window，避免浏览器/加载环境差异导致按钮找不到函数。
+window.resetForm = resetForm;
+window.generateIdea = generateIdea;
+window.regenerateResult = regenerateResult;
+window.createNovel = createNovel;
+window.confirmCreateNovel = confirmCreateNovel;
+window.regenerateSection = regenerateSection;
+window.openRewriteModal = openRewriteModal;
+window.confirmRewrite = confirmRewrite;
+

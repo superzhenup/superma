@@ -25,7 +25,10 @@ require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
+require_once dirname(__DIR__) . '/includes/cache.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
+require_once dirname(__DIR__) . '/includes/OutlineQualityGuard.php';
+require_once dirname(__DIR__) . '/includes/helpers.php';
 requireLoginApi();
 session_write_close();
 
@@ -81,46 +84,8 @@ function resetDynamicTimeout(int $silenceTimeout, int $maxTotal = 7200): void
 
 while (ob_get_level()) ob_end_clean();
 
-// 全局异常捕获
-set_exception_handler(function (Throwable $e) {
-    if (!headers_sent()) {
-        http_response_code(200);
-        header('Content-Type: text/event-stream; charset=utf-8');
-        header('Cache-Control: no-cache');
-        header('X-Accel-Buffering: no');
-    }
-    echo "event: fatal_error\n";
-    echo 'data: ' . json_encode([
-        'type'    => get_class($e),
-        'message' => $e->getMessage(),
-        'file'    => basename($e->getFile()),
-        'line'    => $e->getLine(),
-    ], JSON_UNESCAPED_UNICODE) . "\n\n";
-    if (ob_get_level()) ob_flush();
-    flush();
-});
-
-set_error_handler(function ($severity, $message, $file, $line) {
-    throw new ErrorException($message, 0, $severity, $file, $line);
-});
-
-register_shutdown_function(function () {
-    $error = error_get_last();
-    if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
-        if (!headers_sent()) {
-            http_response_code(200);
-            header('Content-Type: text/event-stream; charset=utf-8');
-            header('Cache-Control: no-cache');
-            header('X-Accel-Buffering: no');
-        }
-        echo "event: error\n";
-        echo 'data: ' . json_encode([
-            'msg' => 'Fatal Shutdown Error: ' . $error['message'] . ' in ' . basename($error['file']) . ':' . $error['line']
-        ], JSON_UNESCAPED_UNICODE) . "\n\n";
-        if (ob_get_level()) ob_flush();
-        flush();
-    }
-});
+require_once dirname(__DIR__) . '/includes/sse_error_handler.php';
+registerSseErrorHandlers();
 
 header('Content-Type: text/event-stream; charset=utf-8');
 header('Cache-Control: no-cache');
@@ -144,7 +109,7 @@ $novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$novelId]);
 if (!$novel) { sse('error', ['msg' => '小说不存在']); sseDone(); exit; }
 
 try { getModelFallbackList($novel['model_id'] ?: null, 'structured'); }
-catch (RuntimeException $e) { sse('error', ['msg' => $e->getMessage()]); sseDone(); exit; }
+catch (RuntimeException $e) { sse('error', safe_sse_error_payload($e, '模型检查失败，请稍后重试')); sseDone(); exit; }
 
 // 检测模型是否支持 1M 上下文，决定批量大小和超时
 $is1MModel = false;
@@ -200,8 +165,13 @@ try {
         }
     }
 
-    // 获取近章大纲上下文
-    $memoryLookback = max(3, min(20, (int)getSystemSetting('ws_memory_lookback', 8, 'int')));
+    // 获取近章大纲上下文（v41 去套路化：细纲专用窗口，默认更大，便于跨更多章去重）
+    // 向后兼容：优先新键 ws_outline_lookback；用户在 UI 里调过的旧键 ws_memory_lookback 仍生效。
+    $memoryLookback = max(3, min(40, (int)getSystemSetting(
+        'ws_outline_lookback',
+        (int)getSystemSetting('ws_memory_lookback', 16, 'int'),
+        'int'
+    )));
     $recentOutlines = DB::fetchAll(
         'SELECT chapter_number, title, outline, hook, pacing, suspense FROM chapters
          WHERE novel_id=? AND chapter_number < ? AND outline IS NOT NULL AND outline != ""
@@ -230,13 +200,13 @@ try {
         $memoryCtx = $engine->getPromptContext(
             $startCh,
             $queryText !== '：' ? $queryText : null,
-            5000,
+            max(2000, (int)getSystemSetting('ws_outline_memory_budget', 12000, 'int')),
             20,
             $semanticTopK
         );
     } catch (Throwable $e) {
         $memoryCtx = null;
-        sse('progress', ['msg' => '记忆上下文获取失败，使用降级上下文：' . $e->getMessage()]);
+        sse('progress', safe_sse_error_payload($e, '记忆上下文获取失败，使用降级上下文'));
     }
 
     // 降级回退：MemoryEngine 失败时，手动构建最小记忆上下文，防止 AI 裸奔
@@ -385,7 +355,7 @@ try {
                         echo 'data: ' . json_encode(['t' => $token], JSON_UNESCAPED_UNICODE) . "\n\n";
                         if (ob_get_level()) ob_flush();
                         flush();
-                    }, 'structured', $onThinking);
+                    }, 'outline', $onThinking);   // v41: 细纲走高温档，去套路化
                 },
                 function (AIClient $nextAi, string $errMsg) use ($startCh, $endCh) {
                     sse('model_switch', [
@@ -396,7 +366,7 @@ try {
                 }
             );
         } catch (RuntimeException $e) {
-            sse('error', ['msg' => "第{$startCh}～{$endCh}章：所有模型均失败 — " . $e->getMessage()]);
+            sse('error', safe_sse_error_payload($e, "第{$startCh}～{$endCh}章：所有模型均失败"));
             sseDone();
             exit;
         }
@@ -408,7 +378,9 @@ try {
             sse('progress', ['msg' => "第{$startCh}～{$endCh}章大纲解析失败，自动重试（{$parseAttempt}/{$maxParseRetries}）..."]);
         }
     }
-    unset($GLOBALS['sendHeartbeat']);
+    // 注意：此处不再注销 $GLOBALS['sendHeartbeat']。后续质量返修 / 转折点 / 弧段摘要
+    // 都是阻塞式 AI 调用（无流式输出），需保留心跳回调，否则 SSE 静默会被 nginx
+    // fastcgi_read_timeout 掐断（ERR_INCOMPLETE_CHUNKED_ENCODING）。注销移到 sseDone() 前。
 
     $expected = $endCh - $startCh + 1;
     $parseNote = '';
@@ -426,85 +398,113 @@ try {
         $parseNote = "（仅解析到 " . count($outlines) . "/{$expected} 章，可能被截断）";
     }
 
-    // 入库（批量查询已有章节，消除 N+1）
-    $saved = 0;
-    $savedChNums = [];
-    $allChNums = [];
-    foreach ($outlines as $item) {
-        $cn = (int)($item['chapter_number'] ?? 0);
-        if ($cn > 0) $allChNums[] = $cn;
-    }
-    $existMap = [];
-    if (!empty($allChNums)) {
-        $ph = implode(',', array_fill(0, count($allChNums), '?'));
-        $existingRows = DB::fetchAll(
-            "SELECT id, chapter_number FROM chapters WHERE novel_id=? AND chapter_number IN ({$ph})",
-            array_merge([$novelId], $allChNums)
-        );
-        $existMap = array_column($existingRows, 'id', 'chapter_number');
-    }
-
-    foreach ($outlines as $item) {
-        $chNum   = (int)($item['chapter_number'] ?? 0);
-        $title   = trim($item['title']           ?? '');
-        $summary = trim($item['summary']         ?? $item['outline'] ?? '');
-        $kpts    = $item['key_points']            ?? [];
-        $hook    = trim($item['hook']             ?? '');
-        $pacing  = trim($item['pacing']           ?? '中');
-        $suspense = trim($item['suspense']        ?? '无');
-        $hookType     = trim($item['hook_type']      ?? '');
-        $coolPtType   = trim($item['cool_point_type'] ?? '');
-        if (!in_array($pacing, ['快', '中', '慢'])) $pacing = '中';
-        if (!in_array($suspense, ['有', '无'])) $suspense = '无';
-        $validHookTypes = array_keys(\HOOK_TYPES);
-        if ($hookType && !in_array($hookType, $validHookTypes)) $hookType = '';
-        $validCoolTypes = array_keys(\COOL_POINT_TYPES);
-        if ($coolPtType && !in_array($coolPtType, $validCoolTypes)) $coolPtType = '';
-
-        if (!$chNum) continue;
-
-        // 标题去重：与已有章节（非本批）的标题精确匹配时，自动追加序号后缀
-        if ($title !== '' && isset($existingTitles) && is_array($existingTitles)) {
-            $otherTitles = array_filter($existingTitles, fn($k) => $k != $chNum, ARRAY_FILTER_USE_KEY);
-            if (in_array($title, $otherTitles, true)) {
-                $suffix = 2;
-                $baseTitle = $title;
-                do {
-                    $title = $baseTitle . "（{$suffix}）";
-                    $suffix++;
-                } while (in_array($title, $otherTitles, true));
-                sse('progress', ['msg' => "第{$chNum}章标题「{$baseTitle}」与已有章节重复，已自动调整为「{$title}」"]);
+    // 持久化闭包：把一批 outlines 落库（幂等——已存在 UPDATE、新章 INSERT、completed 跳过）。
+    // 抽成闭包是为了「先存原始解析结果、再增强后回写」：即便后续质量返修/转折点/弧段摘要
+    // 被任何超时（nginx fastcgi_read_timeout / php-fpm request_terminate_timeout）或异常杀掉，
+    // 本批章节也已落库、前端也已据 batch_done 推进 —— 杜绝「生成完却没保存、随后重复整批生成」。
+    $persistOutlines = function (array $outlines) use (&$existingTitles, $novelId): array {
+        $saved = 0;
+        $savedChNums = [];
+        $allChNums = [];
+        foreach ($outlines as $item) {
+            $cn = (int)($item['chapter_number'] ?? 0);
+            if ($cn > 0) $allChNums[] = $cn;
+        }
+        $existMap = [];
+        if (!empty($allChNums)) {
+            $ph = implode(',', array_fill(0, count($allChNums), '?'));
+            $existingRows = DB::fetchAll(
+                "SELECT id, chapter_number, status FROM chapters WHERE novel_id=? AND chapter_number IN ({$ph})",
+                array_merge([$novelId], $allChNums)
+            );
+            // 保留 id + status：已完成章节不能被重写大纲覆盖（否则状态被重置为 outlined，正文会被下次写作覆盖）
+            foreach ($existingRows as $er) {
+                $existMap[(int)$er['chapter_number']] = ['id' => (int)$er['id'], 'status' => $er['status']];
             }
         }
 
-        // 将本章节标题加入已用列表，防同批内后续重复
-        if ($title !== '') {
-            $existingTitles[$chNum] = $title;
+        foreach ($outlines as $item) {
+            $chNum   = (int)($item['chapter_number'] ?? 0);
+            $title   = trim($item['title']           ?? '');
+            $summary = trim($item['summary']         ?? $item['outline'] ?? '');
+            $kpts    = $item['key_points']            ?? [];
+            $hook    = trim($item['hook']             ?? '');
+            $pacing  = trim($item['pacing']           ?? '中');
+            $suspense = trim($item['suspense']        ?? '无');
+            $hookType     = trim($item['hook_type']      ?? '');
+            $coolPtType   = trim($item['cool_point_type'] ?? '');
+            if (!in_array($pacing, ['快', '中', '慢'])) $pacing = '中';
+            if (!in_array($suspense, ['有', '无'])) $suspense = '无';
+            $validHookTypes = array_keys(\HOOK_TYPES);
+            if ($hookType && !in_array($hookType, $validHookTypes)) $hookType = '';
+            $validCoolTypes = array_keys(\COOL_POINT_TYPES);
+            if ($coolPtType && !in_array($coolPtType, $validCoolTypes)) $coolPtType = '';
+
+            if (!$chNum) continue;
+
+            // 标题去重：与已有章节（非本批）的标题精确匹配时，自动追加序号后缀
+            if ($title !== '' && isset($existingTitles) && is_array($existingTitles)) {
+                $otherTitles = array_filter($existingTitles, fn($k) => $k != $chNum, ARRAY_FILTER_USE_KEY);
+                if (in_array($title, $otherTitles, true)) {
+                    $suffix = 2;
+                    $baseTitle = $title;
+                    do {
+                        $title = $baseTitle . "（{$suffix}）";
+                        $suffix++;
+                    } while (in_array($title, $otherTitles, true));
+                    sse('progress', ['msg' => "第{$chNum}章标题「{$baseTitle}」与已有章节重复，已自动调整为「{$title}」"]);
+                }
+            }
+
+            // 将本章节标题加入已用列表，防同批内后续重复
+            if ($title !== '') {
+                $existingTitles[$chNum] = $title;
+            }
+
+            $existing = $existMap[$chNum] ?? null;
+            // 数据保护：已完成（已写正文）的章节，不被重写大纲覆盖，避免正文被下次写作清掉
+            if ($existing && $existing['status'] === 'completed') {
+                sse('progress', ['msg' => "第{$chNum}章已写完，跳过大纲覆盖（保护正文）"]);
+                continue;
+            }
+            $row = [
+                'title'      => $title,
+                'outline'    => $summary,
+                'key_points' => json_encode($kpts, JSON_UNESCAPED_UNICODE),
+                'hook'       => $hook,
+                'pacing'     => $pacing,
+                'suspense'   => $suspense,
+                'status'     => 'outlined',
+            ];
+            if ($hookType !== '') $row['hook_type'] = $hookType;
+            if ($coolPtType !== '') $row['cool_point_type'] = $coolPtType;
+            if ($existing) {
+                // 双保险：WHERE 排除 completed，防并发期间状态变更
+                DB::update('chapters', $row, 'id=? AND status<>"completed"', [$existing['id']]);
+            } else {
+                DB::insert('chapters', array_merge($row, [
+                    'novel_id'       => $novelId,
+                    'chapter_number' => $chNum,
+                ]));
+            }
+            $saved++;
+            $savedChNums[] = $chNum;
         }
 
-        $existingId = $existMap[$chNum] ?? null;
-        $row = [
-            'title'      => $title,
-            'outline'    => $summary,
-            'key_points' => json_encode($kpts, JSON_UNESCAPED_UNICODE),
-            'hook'       => $hook,
-            'pacing'     => $pacing,
-            'suspense'   => $suspense,
-            'status'     => 'outlined',
-        ];
-        if ($hookType !== '') $row['hook_type'] = $hookType;
-        if ($coolPtType !== '') $row['cool_point_type'] = $coolPtType;
-        if ($existingId) {
-            DB::update('chapters', $row, 'id=?', [$existingId]);
-        } else {
-            DB::insert('chapters', array_merge($row, [
-                'novel_id'       => $novelId,
-                'chapter_number' => $chNum,
-            ]));
+        if ($saved > 0) {
+            Cache::delete("novel_chapters:{$novelId}:all");
+            Cache::delete("novel:{$novelId}");
+            Cache::delete("novel_chapter_count:{$novelId}");
         }
-        $saved++;
-        $savedChNums[] = $chNum;
-    }
+
+        return ['saved' => $saved, 'savedChNums' => $savedChNums];
+    };
+
+    // ① 先把原始解析结果落库 + 立即 batch_done（章节安全 + 前端可据 actual_end 推进）。
+    //    质量增强放到 batch_done 之后，绝不阻塞「章节先落库」这件最重要的事。
+    $persistResult = $persistOutlines($outlines);
+    $saved       = $persistResult['saved'];
+    $savedChNums = $persistResult['savedChNums'];
 
     addLog($novelId, 'outline', "生成第{$startCh}-{$endCh}章大纲，共{$saved}章{$parseNote}");
 
@@ -520,7 +520,7 @@ try {
         }
     }
 
-    // 先发送 batch_done，让前端立即推进，弧段压缩和状态更新后置
+    // 先发送 batch_done，让前端立即推进，质量增强/弧段压缩/状态更新一律后置
     sse('batch_done', [
         'msg'               => "第 {$startCh}～{$endCh} 章大纲已保存（{$saved} 章）{$parseNote}",
         'start'             => $startCh,
@@ -535,6 +535,43 @@ try {
         'completion_tokens' => $usage['completion_tokens'],
         'total_tokens'      => $usage['prompt_tokens'] + $usage['completion_tokens'],
     ]);
+
+    // ② 质量返修 + 转折点增强（含阻塞式 AI 调用、较慢）。此时章节已落库、前端已推进，
+    //    即便以下任一步骤被超时/异常中断，也只是丢失"增强"，不丢章、不重复整批生成。
+    try {
+        $qualityResult = repairOutlineBatchWithGuard(
+            $novel,
+            $outlines,
+            $recentOutlines,
+            function (string $event, array $payload): void {
+                sse($event, $payload);
+            }
+        );
+        $outlines = $qualityResult['outlines'];
+    } catch (\Throwable $e) {
+        // 质量返修失败不阻断：保留原始已落库版本
+    }
+
+    // v41 结构兑现验证：核对本批应触发的全书转折点是否写入，缺失则定向返修
+    try {
+        $tpResult = enforceTurningPoints($novel, $startCh, $endCh, $outlines,
+            function (string $event, array $payload): void { sse($event, $payload); });
+        if (!empty($tpResult['missing'])) {
+            $tpMiss = implode('；', array_map(fn($t) => "第{$t['chapter']}章:{$t['event']}", $tpResult['missing']));
+            addLog($novelId, $tpResult['repaired'] ? 'info' : 'warn',
+                ($tpResult['repaired'] ? '转折点已补入细纲：' : '转折点未覆盖（建议人工检查）：') . $tpMiss);
+        }
+        $outlines = $tpResult['outlines'];
+    } catch (\Throwable $e) {
+        // 结构验证失败不阻断生成
+    }
+
+    // ③ 增强后回写（覆盖已存行；若增强未改动则为幂等更新）。
+    try {
+        $persistOutlines($outlines);
+    } catch (\Throwable $e) {
+        // 回写失败不阻断：原始版本已在库
+    }
 
     // 弧段摘要压缩（每 10 章）— 后置执行，不阻塞前端进度
     $shouldCompress = ($endCh % 10 === 0) || (($endCh - $startCh + 1) >= 5 && count($outlines) >= 3);
@@ -557,18 +594,27 @@ try {
         DB::update('novels', ['status' => 'draft'], 'id=?', [$novelId]);
     }
 
+    // 后处理（含阻塞式 AI 调用）已全部完成，至此注销心跳回调
+    unset($GLOBALS['sendHeartbeat']);
     sseDone();
 
 } catch (Throwable $e) {
+    // 审计 P0：异常细节（类型/消息/文件/行号）只写服务端日志，
+    // 客户端仅收到稳定文案 + 可追踪请求 ID。
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] generate_outline uncaught %s: %s in %s:%d',
+        $rid, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine()));
     if (!headers_sent()) {
         http_response_code(200);
     }
+    $clientMsg = '服务器内部错误，请稍后重试（追踪号 ' . $rid . '）';
     echo "event: fatal_error\n";
     echo 'data: ' . json_encode([
-        'type'    => get_class($e),
-        'message' => $e->getMessage(),
-        'file'    => basename($e->getFile()),
-        'line'    => $e->getLine()
+        'code'       => 'internal_error',
+        'error'      => $clientMsg,
+        'message'    => $clientMsg,
+        'msg'        => $clientMsg,
+        'request_id' => $rid,
     ], JSON_UNESCAPED_UNICODE) . "\n\n";
     // 确保 [DONE] 被发送，让前端知道流已正常结束
     echo "data: [DONE]\n\n";

@@ -21,6 +21,7 @@ require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
+require_once dirname(__DIR__) . '/includes/OutlineQualityGuard.php';
 
 try {
     requireLoginApi();
@@ -72,7 +73,9 @@ if (empty($chapters)) {
 try {
     getModelFallbackList($novel['model_id'] ?: null, 'structured');
 } catch (RuntimeException $e) {
-    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] optimize_outline_ajax: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
+    echo json_encode(['success' => false, 'message' => $e->getMessage(), 'code' => 'business_error', 'request_id' => $rid]);
     exit;
 }
 
@@ -150,6 +153,7 @@ foreach ($batch as $ch) {
 
 // 前批大纲作为上下文
 $prevContext = '';
+$prevBatch = [];
 if ($batchStart > 0) {
     $prevStart = max(0, $batchStart - $batchSize);
     $prevBatch = array_slice($chapters, $prevStart, $batchSize);
@@ -217,8 +221,7 @@ try {
         }
     );
 } catch (Exception $e) {
-    $errMsg = $e->getMessage();
-    // 判断是否为可重试的网络错误（非 API 业务错误）
+    $errMsg = 'AI 调用失败，请稍后重试';
     $isNetworkError = false;
     $networkPatterns = [
         'Connection reset by peer',
@@ -234,20 +237,23 @@ try {
         'SSL connection timeout',
     ];
     foreach ($networkPatterns as $pattern) {
-        if (stripos($errMsg, $pattern) !== false) {
+        if (stripos($e->getMessage(), $pattern) !== false) {
             $isNetworkError = true;
             break;
         }
     }
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] optimize_outline_ajax batch %d: %s in %s:%d', $rid, $batchIndex, $e->getMessage(), $e->getFile(), $e->getLine()));
 
     echo json_encode([
         'success'         => false,
-        'message'         => 'AI 调用失败: ' . $errMsg,
+        'message'         => $isNetworkError ? 'AI 服务暂时不可用，请稍后重试' : 'AI 调用失败，请稍后重试',
         'retryable'       => $isNetworkError,
         'is_network_error'=> $isNetworkError,
         'batch_index'     => $batchIndex,
         'batch_from'      => $batchFrom,
         'batch_to'        => $batchTo,
+        'request_id'      => $rid,
     ], JSON_UNESCAPED_UNICODE);
     exit;
 }
@@ -266,6 +272,9 @@ if (!is_array($batchResult)) {
     ]);
     exit;
 }
+
+$qualityResult = repairOutlineBatchWithGuard($novel, $batchResult, $prevBatch, null);
+$batchResult = $qualityResult['outlines'];
 
 // 更新数据库
 $updatedCount = 0;
@@ -307,7 +316,10 @@ echo json_encode([
         'from' => $batchFrom,
         'to' => $batchTo,
         'updated' => $updatedCount,
-        'changed' => array_filter($batchResult, fn($item) => !empty($item['changed']))
+        'changed' => array_filter($batchResult, fn($item) => !empty($item['changed'])),
+        'quality_passed' => $qualityResult['passed'],
+        'quality_issues' => $qualityResult['issues'],
+        'quality_attempts' => $qualityResult['attempts']
     ],
     'next_batch' => $batchIndex + 1,
     'has_more' => ($batchEnd < $totalChapters)

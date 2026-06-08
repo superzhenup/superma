@@ -30,7 +30,9 @@ require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
+require_once dirname(__DIR__) . '/includes/cache.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
+require_once dirname(__DIR__) . '/includes/helpers.php';
 requireLoginApi();
 session_write_close(); // 释放 Session 锁，防止补写期间其他页面被阻塞
 
@@ -41,43 +43,8 @@ ignore_user_abort(true);
 // 关闭所有输出缓冲，确保 SSE 实时推送
 while (ob_get_level()) ob_end_clean();
 
-// 全局异常捕获，确保发生错误时正常结束SSE连接
-set_exception_handler(function (Throwable $e) {
-    if (!headers_sent()) {
-        http_response_code(200);
-        header('Content-Type: text/event-stream; charset=utf-8');
-        header('Cache-Control: no-cache');
-        header('X-Accel-Buffering: no');
-    }
-    echo "event: error\n";
-    echo 'data: ' . json_encode([
-        'msg' => 'Fatal Error: ' . $e->getMessage() . ' in ' . basename($e->getFile()) . ':' . $e->getLine()
-    ], JSON_UNESCAPED_UNICODE) . "\n\n";
-    if (ob_get_level()) ob_flush();
-    flush();
-});
-
-set_error_handler(function ($severity, $message, $file, $line) {
-    throw new ErrorException($message, 0, $severity, $file, $line);
-});
-
-register_shutdown_function(function () {
-    $error = error_get_last();
-    if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
-        if (!headers_sent()) {
-            http_response_code(200);
-            header('Content-Type: text/event-stream; charset=utf-8');
-            header('Cache-Control: no-cache');
-            header('X-Accel-Buffering: no');
-        }
-        echo "event: error\n";
-        echo 'data: ' . json_encode([
-            'msg' => 'Fatal Shutdown Error: ' . $error['message'] . ' in ' . basename($error['file']) . ':' . $error['line']
-        ], JSON_UNESCAPED_UNICODE) . "\n\n";
-        if (ob_get_level()) ob_flush();
-        flush();
-    }
-});
+require_once dirname(__DIR__) . '/includes/sse_error_handler.php';
+registerSseErrorHandlers();
 
 header('Content-Type: text/event-stream; charset=utf-8');
 header('Cache-Control: no-cache');
@@ -106,7 +73,7 @@ if (!$novel) { sse('error', ['msg' => '小说不存在']); sseDone(); exit; }
 
 // 预检：至少要有一个模型
 try { getModelFallbackList($novel['model_id'] ?: null, 'structured'); }
-catch (RuntimeException $e) { sse('error', ['msg' => $e->getMessage()]); sseDone(); exit; }
+catch (RuntimeException $e) { sse('error', safe_sse_error_payload($e, '模型检查失败，请稍后重试')); sseDone(); exit; }
 
 // 初始化记忆引擎
 require_once dirname(__DIR__) . '/includes/memory/MemoryEngine.php';
@@ -327,7 +294,7 @@ foreach ($segments as $segIdx => $seg) {
                         }
                     );
                 } catch (RuntimeException $e) {
-                    sse('error', ['msg' => "第{$chNum}章细纲生成失败 — " . $e->getMessage()]);
+                    sse('error', safe_sse_error_payload($e, "第{$chNum}章细纲生成失败"));
                     continue;
                 }
 
@@ -420,7 +387,7 @@ foreach ($segments as $segIdx => $seg) {
             );
         } catch (Throwable $e) {
             $memoryCtx = null;
-            sse('progress', ['msg' => '记忆上下文获取失败，使用降级上下文：' . $e->getMessage()]);
+            sse('progress', safe_sse_error_payload($e, '记忆上下文获取失败，使用降级上下文'));
         }
 
         // 降级回退：MemoryEngine 失败时，手动构建最小记忆上下文
@@ -526,7 +493,7 @@ foreach ($segments as $segIdx => $seg) {
                     }
                 );
             } catch (RuntimeException $e) {
-                sse('error', ['msg' => "第{$current}～{$batchEnd}章补写失败 — " . $e->getMessage()]);
+                sse('error', safe_sse_error_payload($e, "第{$current}～{$batchEnd}章补写失败"));
                 $current = $batchEnd + 1;
                 continue 2;
             }
@@ -553,6 +520,24 @@ foreach ($segments as $segIdx => $seg) {
             continue;
         }
 
+        // v41: 接通大纲质检闭环（与 generate_outline 一致——不合格自动局部返修后再入库）
+        try {
+            require_once dirname(__DIR__) . '/includes/OutlineQualityGuard.php';
+            $qualityResult = repairOutlineBatchWithGuard(
+                $novel,
+                $outlines,
+                $recentOutlines ?? [],
+                function (string $event, array $payload): void { sse($event, $payload); }
+            );
+            if (!empty($qualityResult['outlines'])) {
+                $outlines = $qualityResult['outlines'];
+            }
+        } catch (\Throwable $e) {
+            // 质检失败不阻断补写，保留原始解析结果
+            error_log('supplement_outline: 细纲质检跳过 — ' . $e->getMessage());
+            sse('progress', ['msg' => '细纲质检跳过']);
+        }
+
         // ---- 入库（批量查询已有章节 + 标题去重） ----
         $saved = 0;
         $savedChNums = [];
@@ -565,10 +550,12 @@ foreach ($segments as $segIdx => $seg) {
         if (!empty($allChNums)) {
             $ph = implode(',', array_fill(0, count($allChNums), '?'));
             $existingRows = DB::fetchAll(
-                "SELECT id, chapter_number FROM chapters WHERE novel_id=? AND chapter_number IN ({$ph})",
+                "SELECT id, chapter_number, status FROM chapters WHERE novel_id=? AND chapter_number IN ({$ph})",
                 array_merge([$novelId], $allChNums)
             );
-            $existMap = array_column($existingRows, 'id', 'chapter_number');
+            foreach ($existingRows as $er) {
+                $existMap[(int)$er['chapter_number']] = ['id' => (int)$er['id'], 'status' => $er['status']];
+            }
         }
 
         foreach ($outlines as $item) {
@@ -598,7 +585,12 @@ foreach ($segments as $segIdx => $seg) {
                 $existingTitles[$chNum] = $title;
             }
 
-            $existingId = $existMap[$chNum] ?? null;
+            $existing = $existMap[$chNum] ?? null;
+            // 数据保护：已完成章节不被补写大纲覆盖（保护正文）
+            if ($existing && $existing['status'] === 'completed') {
+                sse('progress', ['msg' => "第{$chNum}章已写完，跳过大纲覆盖（保护正文）"]);
+                continue;
+            }
             $row = [
                 'title'      => $title,
                 'outline'    => $summary,
@@ -606,8 +598,8 @@ foreach ($segments as $segIdx => $seg) {
                 'hook'       => $hook,
                 'status'     => 'outlined',
             ];
-            if ($existingId) {
-                DB::update('chapters', $row, 'id=?', [$existingId]);
+            if ($existing) {
+                DB::update('chapters', $row, 'id=? AND status<>"completed"', [$existing['id']]);
             } else {
                 DB::insert('chapters', array_merge($row, [
                     'novel_id'       => $novelId,
@@ -616,6 +608,12 @@ foreach ($segments as $segIdx => $seg) {
             }
             $saved++;
             $savedChNums[] = $chNum;
+        }
+
+        if ($saved > 0) {
+            Cache::delete("novel_chapters:{$novelId}:all");
+            Cache::delete("novel:{$novelId}");
+            Cache::delete("novel_chapter_count:{$novelId}");
         }
 
         $totalSupplemented += $saved;

@@ -1,13 +1,43 @@
-// ================================================================
+﻿// ================================================================
 // 优化大纲逻辑（AJAX 轮询版本 - 避免 SSE 超时问题）
 // ================================================================
 
 let optimizeOutlineAjaxRunning = false;
 
-// 单批次最大重试次数（网络错误）
-const BATCH_MAX_RETRIES = 3;
-// 重试基础等待时间（毫秒），指数增长
+// 单批次最大重试次数（网络错误）— 调大至 8 次，应对 HTTP/2 偶发中断
+const BATCH_MAX_RETRIES = 8;
+// 重试基础等待时间（毫秒），指数增长（上限 60s）
 const BATCH_RETRY_BASE_DELAY = 3000;
+const BATCH_RETRY_MAX_DELAY  = 60000;
+
+// 判断是否网络层错误（值得继续硬重试不跳过）
+function isNetworkError(err) {
+    const msg = (err?.message || err || '').toString().toLowerCase();
+    return (
+        msg.includes('failed to fetch') ||
+        msg.includes('network') ||
+        msg.includes('http2_protocol_error') ||
+        msg.includes('http 502') || msg.includes('http 503') || msg.includes('http 504') ||
+        msg.includes('connection') ||
+        msg.includes('timeout') ||
+        msg.includes('aborted')
+    );
+}
+
+async function fetchLastOptimized(novelId) {
+    try {
+        const response = await fetch(`api/get_optimize_progress.php?novel_id=${encodeURIComponent(novelId)}`, {
+            cache: 'no-store'
+        });
+        const data = await response.json();
+        if (data && typeof data.optimized_chapter !== 'undefined') {
+            return parseInt(data.optimized_chapter, 10) || 0;
+        }
+    } catch (err) {
+        console.warn('读取优化进度失败，将从头检查:', err.message);
+    }
+    return 0;
+}
 
 /**
  * 调用 AJAX API 处理一批章节（带自动重试）
@@ -17,18 +47,18 @@ async function processBatch(novelId, batchIndex, lastOptimized, progressLabel, b
     for (let retry = 0; retry <= BATCH_MAX_RETRIES; retry++) {
         if (!optimizeOutlineAjaxRunning) return null;
 
-        // 重试时等待（指数退避：3s, 6s, 12s）
+        // 重试时指数退避（3s→6s→12s→24s→48s→60s 封顶）
         if (retry > 0) {
-            const delay = BATCH_RETRY_BASE_DELAY * Math.pow(2, retry - 1);
-            progressLabel.textContent = `第 ${batchIndex * 10 + 1}～${(batchIndex + 1) * 10} 章网络错误，${delay / 1000}秒后第 ${retry} 次重试...`;
+            const delay = Math.min(BATCH_RETRY_BASE_DELAY * Math.pow(2, retry - 1), BATCH_RETRY_MAX_DELAY);
+            progressLabel.textContent = `第 ${batchIndex * 10 + 1}～${(batchIndex + 1) * 10} 章网络错误，${delay / 1000}秒后第 ${retry}/${BATCH_MAX_RETRIES} 次重试...`;
             await new Promise(resolve => setTimeout(resolve, delay));
             if (!optimizeOutlineAjaxRunning) return null;
         }
 
         try {
-            const response = await fetch('api/optimize_outline_ajax.php', {
+            const response = await fetch('/api/index.php?route=optimize_outline_ajax', {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
+                headers: jsonHeaders(),
                 body: JSON.stringify({
                     novel_id: novelId,
                     batch_index: batchIndex,
@@ -70,10 +100,30 @@ async function processBatch(novelId, batchIndex, lastOptimized, progressLabel, b
             return null;
 
         } catch (fetchErr) {
-            // 网络层面的异常（fetch 本身失败）
-            if (retry < BATCH_MAX_RETRIES) {
-                console.warn(`批次 ${batchIndex} fetch 失败，准备重试:`, fetchErr.message);
-                continue;
+            // 网络层错误 — 持续重试（不主动跳过），让用户能看到状态
+            console.warn(`批次 ${batchIndex} fetch 失败 (retry=${retry}):`, fetchErr.message);
+            if (isNetworkError(fetchErr)) {
+                // 网络错误强重试：到达 MAX_RETRIES 后再开始"温和重试"（每 30s 一次，最多再 20 次）
+                if (retry < BATCH_MAX_RETRIES) continue;
+                // 温和阶段（用户能看到，让其手动停止）
+                for (let soft = 0; soft < 20; soft++) {
+                    if (!optimizeOutlineAjaxRunning) return null;
+                    progressLabel.textContent = `第 ${batchIndex * 10 + 1}～${(batchIndex + 1) * 10} 章持续网络错误，30秒后第 ${BATCH_MAX_RETRIES + soft + 1} 次重试（点击停止可中断）...`;
+                    await new Promise(r => setTimeout(r, 30000));
+                    if (!optimizeOutlineAjaxRunning) return null;
+                    try {
+                        const r = await fetch('/api/index.php?route=optimize_outline_ajax', {
+                            method: 'POST',
+                            headers: jsonHeaders(),
+                            body: JSON.stringify({ novel_id: novelId, batch_index: batchIndex, start_from: lastOptimized })
+                        });
+                        if (r.ok) {
+                            const d = await r.json();
+                            if (d.success) return d;
+                        }
+                    } catch {}
+                }
+                // 仍持续失败 — 真的跳过
             }
             if (batchLog) {
                 batchLog.style.display = '';
@@ -151,8 +201,8 @@ async function optimizeOutlineLogicAjax() {
                 batchIndex++;
                 streamBox.textContent = `已跳过 ${totalSkipped} 个批次，继续处理...`;
 
-                // v1.12: 安全检查 - 如果连续跳过太多批次，停止循环
-                if (totalSkipped > 50) {
+                // v1.13: 提高跳过容忍上限 — 网络错误已硬重试 28 次（8 + 20）才会到这一步
+                if (totalSkipped > 200) {
                     progressLabel.textContent = `连续跳过 ${totalSkipped} 个批次，已停止优化。请检查网络或稍后重试。`;
                     showToast('优化过程中断，请稍后重试', 'error');
                     break;
@@ -175,8 +225,21 @@ async function optimizeOutlineLogicAjax() {
                 const item = document.createElement('div');
                 item.className = 'p-2 border-bottom border-secondary small';
                 const changedCount = result.batch_result.changed ? result.batch_result.changed.length : 0;
-                item.innerHTML = `<span class="text-success"><i class="bi bi-check-circle me-1"></i>第 ${result.batch_result.from}～${result.batch_result.to} 章优化完成，修改了 ${changedCount} 章</span>`;
+                const qualityAttempts = result.batch_result.quality_attempts || 0;
+                const qualityTail = qualityAttempts > 0 ? `，质量返修 ${qualityAttempts} 次` : '';
+                item.innerHTML = `<span class="text-success"><i class="bi bi-check-circle me-1"></i>第 ${result.batch_result.from}～${result.batch_result.to} 章优化完成，修改了 ${changedCount} 章${qualityTail}</span>`;
                 batchLog.appendChild(item);
+                if (result.batch_result.quality_issues && result.batch_result.quality_issues.length) {
+                    const warn = document.createElement('div');
+                    warn.className = 'p-2 border-bottom border-secondary small text-warning';
+                    warn.textContent = `仍有 ${result.batch_result.quality_issues.length} 个逻辑风险，已保留当前最优版本`;
+                    batchLog.appendChild(warn);
+                } else if (result.batch_result.quality_passed) {
+                    const pass = document.createElement('div');
+                    pass.className = 'px-2 pb-2 small text-info';
+                    pass.textContent = '细纲质量检查通过';
+                    batchLog.appendChild(pass);
+                }
                 batchLog.scrollTop = batchLog.scrollHeight;
                 totalUpdated += result.batch_result.updated || 0;
             }

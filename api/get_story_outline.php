@@ -70,5 +70,7 @@ try {
     echo json_encode(['success' => true, 'data' => $outline]);
 
 } catch (Exception $e) {
-    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] get_story_outline: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
+    echo json_encode(['success' => false, 'message' => '获取失败，请稍后重试', 'request_id' => $rid]);
 }

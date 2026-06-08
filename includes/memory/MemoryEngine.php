@@ -31,6 +31,11 @@ final class MemoryEngine
 
     private const MEMORY_ARC_SUMMARY_LIMIT = 5;
 
+    // v2 实例级缓存：同一请求内 getPromptContext/getFullPromptContext 共享 buildBatch 结果
+    // 在 auto-write 循环中每章是一个新请求，但请求内多次调用不再重复查 DB
+    private array $batchCache = [];
+    private array $contextCache = [];
+
     public function __construct(int $novelId)
     {
         $this->novelId       = $novelId;
@@ -67,6 +72,10 @@ final class MemoryEngine
      */
     public function ingestChapter(int $chapterNumber, array $summary): array
     {
+        // v2 写入后清空缓存：下一次 getPromptContext 会重建
+        $this->batchCache = [];
+        $this->contextCache = [];
+
         $report = [
             'cards_upserted'      => 0,
             'cards_inserted'      => 0,  // v1.11.2: 区分新增和更新
@@ -213,8 +222,10 @@ final class MemoryEngine
         $keyEvent = trim((string)($summary['key_event'] ?? ''));
         if ($keyEvent !== '') {
             try {
+                $emotionTag = $this->detectEmotionTag($keyEvent . ' ' . ($summary['narrative_summary'] ?? ''));
                 $atomId = $this->atoms->add('plot_detail', $keyEvent, $chapterNumber, 1.0, [
                     'is_key_event' => 1,
+                    'emotion_tag'  => $emotionTag,
                 ]);
                 $report['events_added'] = 1;
                 $report['new_atom_ids'][] = $atomId;  // v1.11.2 Bug #5 修复
@@ -362,6 +373,12 @@ final class MemoryEngine
      */
     private function buildBatch(int $currentChapter, int $keyEventLimit): array
     {
+        // v2 实例缓存：同一请求内多次调用（如 getPromptContext + getFullPromptContext 回退）复用结果
+        $cacheKey = "batch:{$currentChapter}:{$keyEventLimit}";
+        if (isset($this->batchCache[$cacheKey])) {
+            return $this->batchCache[$cacheKey];
+        }
+
         // ── Q1: novels 全局设定 ──────────────────────────────────────
         $novel = DB::fetch(
             'SELECT protagonist_name, protagonist_info, world_settings, plot_settings, writing_style, genre,
@@ -381,7 +398,7 @@ final class MemoryEngine
             'SELECT arc_index, chapter_from, chapter_to, summary
              FROM arc_summaries
              WHERE novel_id=? AND chapter_to < ?
-             ORDER BY chapter_to DESC LIMIT ' . self::MEMORY_ARC_SUMMARY_LIMIT,
+             ORDER BY chapter_to DESC LIMIT ' . max(1, (int)getSystemSetting('ws_arc_summary_limit', 50, 'int')),
             [$this->novelId, $currentChapter]
         );
 
@@ -503,13 +520,18 @@ final class MemoryEngine
             }
         }
 
-        return compact(
+        $result = compact(
             'novel', 'novelState', 'arcSummaries',
             'recentChapters', 'previousTail', 'hookTypeRows',
             'cards',
             'allUnresolvedFs', 'fsDueSoon', 'fsOverdue', 'fsOther',
             'keyEventRows', 'coolPointRows'
         );
+        // 存入实例缓存（同一请求内多次调用命中）
+        if (!isset($this->batchCache[$cacheKey])) {
+            $this->batchCache[$cacheKey] = $result;
+        }
+        return $result;
     }
 
     public function getPromptContext(
@@ -649,6 +671,26 @@ final class MemoryEngine
         if ($queryText && EmbeddingProvider::getConfig()) {
             try {
                 $hits = $this->semanticSearch($queryText, $semanticTopK, $currentChapter, true, true);
+
+                $currentEmotion = $this->detectEmotionTag($queryText);
+                if ($currentEmotion !== 'neutral' && !empty($hits)) {
+                    foreach ($hits as &$hit) {
+                        if (($hit['source'] ?? '') === 'atom') {
+                            $meta = null;
+                            try {
+                                $row = DB::fetch('SELECT metadata FROM memory_atoms WHERE id=?', [$hit['id'] ?? 0]);
+                                $meta = json_decode($row['metadata'] ?? '{}', true) ?: [];
+                            } catch (\Throwable) {}
+                            $hitEmotion = $meta['emotion_tag'] ?? '';
+                            if ($hitEmotion !== '' && $hitEmotion === $currentEmotion) {
+                                $hit['score'] = ($hit['score'] ?? 0.5) * 1.3;
+                            }
+                        }
+                    }
+                    unset($hit);
+                    usort($hits, fn($a, $b) => ($b['score'] ?? 0) <=> ($a['score'] ?? 0));
+                }
+
                 $ctx['semantic_hits'] = $hits;
             } catch (\Throwable $e) {
                 $ctx['debug']['semantic_error'] = $e->getMessage();
@@ -688,40 +730,39 @@ final class MemoryEngine
      */
     public function getFullPromptContext(int $currentChapter, int $maxChapters = 100): array
     {
-        // 先获取压缩模式的上下文作为基础
         $ctx = $this->getPromptContext($currentChapter, null, 1000000, 50, 20);
 
-        // 移除 budget 裁剪的影响
         $ctx['debug']['mode'] = 'full_1m';
         $ctx['debug']['budget_used'] = 0;
         $ctx['debug']['budget_total'] = 1000000;
         $ctx['debug']['dropped'] = [];
 
-        // ── 1. 完整章节大纲历史（而非仅最近5章）──
+        $ctx['full_outlines'] = [];
+        $outlineLimit = min(50, max(10, $currentChapter - 1));
         $allOutlines = DB::fetchAll(
             "SELECT chapter_number, title, outline, hook, key_points, opening_type, emotion_score
              FROM chapters
              WHERE novel_id=? AND chapter_number < ? AND status IN ('outlined','writing','completed')
              ORDER BY chapter_number ASC
              LIMIT ?",
-            [$this->novelId, $currentChapter, $maxChapters]
+            [$this->novelId, $currentChapter, $outlineLimit]
         );
-
-        $ctx['full_outlines'] = [];
         foreach ($allOutlines as $ch) {
+            $outlineText = ($ch['outline'] ?? '');
+            if (mb_strlen($outlineText) > 200) {
+                $outlineText = mb_substr($outlineText, 0, 200) . '…';
+            }
             $ctx['full_outlines'][] = [
                 'chapter'  => (int)$ch['chapter_number'],
-                'title'    => $ch['title'] ?? '',
-                'outline'  => $ch['outline'] ?? '',
-                'hook'     => $ch['hook'] ?? '',
-                'key_points' => json_decode($ch['key_points'] ?? '[]', true),
+                'title'    => mb_substr($ch['title'] ?? '', 0, 50),
+                'outline'  => $outlineText,
+                'hook'     => mb_substr($ch['hook'] ?? '', 0, 100),
+                'key_points' => array_slice(json_decode($ch['key_points'] ?? '[]', true) ?? [], 0, 3),
             ];
         }
 
-        // ── 2. 完整章节正文（而非仅前章尾部）──
-        // 注：为避免 token 过多，只取最近 N 章的完整正文，更早的取摘要
-        $fullContentChapters = min(20, (int)($currentChapter * 0.3));  // 最近 20 章或 30%
-        $fullContentChapters = max(5, $fullContentChapters);
+        $fullContentChapters = min(8, (int)($currentChapter * 0.15));
+        $fullContentChapters = max(3, $fullContentChapters);
 
         $recentContents = DB::fetchAll(
             "SELECT chapter_number, title, content, chapter_summary
@@ -734,15 +775,18 @@ final class MemoryEngine
 
         $ctx['full_contents'] = [];
         foreach (array_reverse($recentContents) as $ch) {
+            $content = $ch['content'] ?? '';
+            if (mb_strlen($content) > 3000) {
+                $content = mb_substr($content, 0, 3000) . '…[已截断]';
+            }
             $ctx['full_contents'][] = [
                 'chapter'  => (int)$ch['chapter_number'],
-                'title'    => $ch['title'] ?? '',
-                'content'  => $ch['content'] ?? '',
-                'summary'  => $ch['chapter_summary'] ?? '',
+                'title'    => mb_substr($ch['title'] ?? '', 0, 50),
+                'content'  => $content,
+                'summary'  => mb_substr($ch['chapter_summary'] ?? '', 0, 500),
             ];
         }
 
-        // 更早章节只取摘要
         $olderSummaries = DB::fetchAll(
             "SELECT chapter_number, title, chapter_summary
              FROM chapters
@@ -756,13 +800,14 @@ final class MemoryEngine
             if (!empty($ch['chapter_summary'])) {
                 $ctx['older_summaries'][] = [
                     'chapter' => (int)$ch['chapter_number'],
-                    'title'   => $ch['title'] ?? '',
-                    'summary' => $ch['chapter_summary'],
+                    'title'   => mb_substr($ch['title'] ?? '', 0, 50),
+                    'summary' => mb_substr($ch['chapter_summary'], 0, 300),
                 ];
             }
         }
 
-        // ── 3. 所有未回收伏笔（完整信息，不截断）──
+        $ctx['all_foreshadowing'] = [];
+        $foreshadowLimit = 30;
         $allForeshadowing = DB::fetchAll(
             "SELECT id, description, priority, planted_chapter, deadline_chapter,
                     last_mentioned_chapter, mention_count
@@ -770,15 +815,14 @@ final class MemoryEngine
              WHERE novel_id=? AND resolved_chapter IS NULL
              ORDER BY
                 CASE priority WHEN 'critical' THEN 1 WHEN 'major' THEN 2 ELSE 3 END,
-                planted_chapter ASC",
-            [$this->novelId]
+                planted_chapter ASC
+             LIMIT ?",
+            [$this->novelId, $foreshadowLimit]
         );
-
-        $ctx['all_foreshadowing'] = [];
         foreach ($allForeshadowing as $f) {
             $ctx['all_foreshadowing'][] = [
                 'id'          => (int)$f['id'],
-                'description' => $f['description'],
+                'description' => mb_substr($f['description'], 0, 200),
                 'priority'    => $f['priority'],
                 'planted_at'  => (int)$f['planted_chapter'],
                 'deadline'    => $f['deadline_chapter'] ? (int)$f['deadline_chapter'] : null,
@@ -787,47 +831,51 @@ final class MemoryEngine
             ];
         }
 
-        // ── 4. 角色完整历史轨迹 ──
+        $ctx['characters_full'] = [];
+        $charLimit = 15;
         $cardsWithHistory = DB::fetchAll(
             "SELECT cc.id, cc.name, cc.title, cc.status, cc.alive, cc.attributes, cc.last_updated_chapter,
                     (SELECT JSON_ARRAYAGG(JSON_OBJECT('chapter', cch.chapter_number, 'field', cch.field_name, 'old', cch.old_value, 'new', cch.new_value))
                      FROM character_card_history cch WHERE cch.card_id = cc.id ORDER BY cch.chapter_number ASC) as history
              FROM character_cards cc
              WHERE cc.novel_id=?
-             ORDER BY cc.last_updated_chapter DESC",
-            [$this->novelId]
+             ORDER BY cc.last_updated_chapter DESC
+             LIMIT ?",
+            [$this->novelId, $charLimit]
         );
 
-        $ctx['characters_full'] = [];
         foreach ($cardsWithHistory as $card) {
             $attrs = is_string($card['attributes']) ? json_decode($card['attributes'], true) : $card['attributes'];
             $history = is_string($card['history']) ? json_decode($card['history'], true) : $card['history'];
+            if (is_array($history) && count($history) > 10) {
+                $history = array_slice($history, -10);
+            }
             $ctx['characters_full'][] = [
                 'name'      => $card['name'],
                 'title'     => $card['title'],
                 'status'    => $card['status'],
                 'alive'     => (bool)$card['alive'],
-                'attributes' => $attrs ?? [],
+                'attributes' => is_array($attrs) ? array_slice($attrs, 0, 10, true) : [],
                 'last_chapter' => (int)$card['last_updated_chapter'],
                 'history'   => $history ?? [],
             ];
         }
 
-        // ── 5. 所有关键事件（按章节排列）──
+        $ctx['all_key_events'] = [];
+        $eventsLimit = 50;
         $allKeyEvents = DB::fetchAll(
             "SELECT source_chapter, content, atom_type
              FROM memory_atoms
              WHERE novel_id=? AND atom_type='plot_detail' AND source_chapter < ?
              ORDER BY source_chapter ASC
-             LIMIT 200",
-            [$this->novelId, $currentChapter]
+             LIMIT ?",
+            [$this->novelId, $currentChapter, $eventsLimit]
         );
 
-        $ctx['all_key_events'] = [];
         foreach ($allKeyEvents as $e) {
             $ctx['all_key_events'][] = [
                 'chapter' => (int)$e['source_chapter'],
-                'event'   => $e['content'],
+                'event'   => mb_substr($e['content'], 0, 150),
             ];
         }
 
@@ -886,7 +934,7 @@ final class MemoryEngine
             'SELECT arc_index, chapter_from, chapter_to, summary
              FROM arc_summaries
              WHERE novel_id=? AND chapter_to < ?
-             ORDER BY chapter_to DESC LIMIT ' . self::MEMORY_ARC_SUMMARY_LIMIT,
+             ORDER BY chapter_to DESC LIMIT ' . max(1, (int)getSystemSetting('ws_arc_summary_limit', 50, 'int')),
             [$this->novelId, $currentChapter]
         );
         
@@ -1004,10 +1052,11 @@ final class MemoryEngine
         if ($qEmb && !empty($qEmb['vec'])) {
             // atoms 向量
             $atomCandidates = [];
+            $atomPool = max(50, (int)getSystemSetting('ws_atom_pool_size', 500, 'int'));
             foreach ($longTailTypes as $t) {
                 $atomCandidates = array_merge(
                     $atomCandidates,
-                    $this->atoms->listWithEmbedding($t, $beforeChapter, 100)
+                    $this->atoms->listWithEmbedding($t, $beforeChapter, $atomPool)
                 );
             }
             if (!empty($atomCandidates)) {
@@ -1015,11 +1064,15 @@ final class MemoryEngine
             }
 
             // KB 向量(novel_embeddings 表,字段不一样要改造为 Vector::topK 的输入格式)
+            // [v41] 1000章优化：加 recency 上限，避免长篇下全表暴力扫余弦拖慢每章写作。
+            // 默认 1500 仅作运行时护栏，普通小说不会触及；超长篇下世界观长记忆由「全书圣经」(缓存前缀) 兜底。
             if ($includeKB) {
+                $kbScanLimit = max(200, (int)getSystemSetting('ws_kb_scan_limit', 1500, 'int'));
                 $kbCandidates = DB::fetchAll(
                     "SELECT source_id AS id, source_type, content, embedding_blob AS `blob`
                      FROM novel_embeddings
-                     WHERE novel_id=? AND source_type IN ('character','worldbuilding','plot','style')",
+                     WHERE novel_id=? AND source_type IN ('character','worldbuilding','plot','style')
+                     ORDER BY novel_embeddings.id DESC LIMIT " . (int)$kbScanLimit,
                     [$this->novelId]
                 );
                 if (!empty($kbCandidates)) {
@@ -1027,12 +1080,16 @@ final class MemoryEngine
                 }
             }
 
-            // foreshadowing_items 向量
+            // foreshadowing_items 向量——未回收伏笔是长程线索，优先级高者优先保留
+            // [v41] 加上限护栏：按 priority(critical>major>minor) 再按埋设章倒序，截断尾部低优先级
             if ($includeForeshadowing) {
+                $fsScanLimit = max(100, (int)getSystemSetting('ws_foreshadow_scan_limit', 300, 'int'));
                 $fsCandidates = DB::fetchAll(
                     "SELECT id, description AS content, embedding AS `blob`, planted_chapter
                      FROM foreshadowing_items
-                     WHERE novel_id=? AND embedding IS NOT NULL AND resolved_chapter IS NULL",
+                     WHERE novel_id=? AND embedding IS NOT NULL AND resolved_chapter IS NULL
+                     ORDER BY FIELD(priority,'critical','major','minor'), planted_chapter DESC
+                     LIMIT " . (int)$fsScanLimit,
                     [$this->novelId]
                 );
                 if (!empty($fsCandidates)) {
@@ -1462,12 +1519,15 @@ final class MemoryEngine
         $oldRealm = $oldAttrs['realm'] ?? null;
         if (!$oldRealm || $oldRealm === $newRealm) return null;
 
-        $realmOrder = ['炼气', '筑基', '金丹', '元婴', '化神', '炼虚', '合体', '大乘', '渡劫',
-            '凡人', '武者', '武师', '武王', '武皇', '武宗', '武尊', '武圣', '武帝',
-            '见习', '初级', '中级', '高级', '特级', 'S级', 'SS级', 'SSS级',
-            '一阶', '二阶', '三阶', '四阶', '五阶', '六阶', '七阶', '八阶', '九阶',
-            '斗者', '斗师', '大斗师', '斗灵', '斗王', '斗皇', '斗宗', '斗尊', '斗圣', '斗帝',
-        ];
+        // 使用 PowerSystem 获取动态境界链（替代硬编码）
+        try {
+            require_once __DIR__ . '/../PowerSystem.php';
+            $ps = new PowerSystem($this->novelId);
+            $realmOrder = $ps->getRealmOrder();
+        } catch (\Throwable $e) {
+            // PowerSystem 完全不可用时，用修仙体系作为最终兜底（不再使用混合链）
+            $realmOrder = ['炼气', '筑基', '金丹', '元婴', '化神', '炼虚', '合体', '大乘', '渡劫'];
+        }
 
         $oldIdx = -1;
         $newIdx = -1;
@@ -1510,11 +1570,16 @@ final class MemoryEngine
         $oldRealm = $oldAttrs['realm'] ?? '';
         if (!$oldRealm || $oldRealm === $newRealm) return [];
 
-        $realmOrder = ['炼气', '筑基', '金丹', '元婴', '化神', '炼虚', '合体', '大乘', '渡劫',
-            '凡人', '武者', '武师', '武王', '武皇', '武宗', '武尊', '武圣', '武帝',
-            '一阶', '二阶', '三阶', '四阶', '五阶', '六阶', '七阶', '八阶', '九阶',
-            '斗者', '斗师', '大斗师', '斗灵', '斗王', '斗皇', '斗宗', '斗尊', '斗圣', '斗帝',
-        ];
+        // 使用 PowerSystem 获取动态境界链（替代硬编码）
+        try {
+            require_once __DIR__ . '/../PowerSystem.php';
+            $ps = new PowerSystem($this->novelId);
+            $realmOrder = $ps->getRealmOrder();
+            // 如果 worldbuilding 有自定义境界链，使用它；否则用内置默认
+        } catch (\Throwable $e) {
+            // PowerSystem 完全不可用时，用修仙体系作为最终兜底（不再使用混合链）
+            $realmOrder = ['炼气', '筑基', '金丹', '元婴', '化神', '炼虚', '合体', '大乘', '渡劫'];
+        }
 
         $oldIdx = -1;
         $newIdx = -1;
@@ -1846,5 +1911,31 @@ EOT;
         }
 
         return $emotions;
+    }
+
+    private const EMOTION_KEYWORDS = [
+        'tense'   => ['追杀','围困','对峙','危机','阴谋','伏击','陷阱','生死','决战','血战','杀机','围杀','暗算','绝境'],
+        'tragic'  => ['牺牲','陨落','离别','死亡','覆灭','背叛','绝望','惨烈','代价','永别','痛失','殒命','诀别','崩溃'],
+        'triumph' => ['突破','逆袭','反杀','觉醒','翻盘','大胜','碾压','顿悟','渡劫','成功','凯旋','击败','斩杀','灭杀','臣服'],
+        'warm'    => ['重逢','守护','陪伴','温馨','日常','休整','归家','团圆','治愈','安慰','关怀','微笑','拥抱','温馨'],
+        'eerie'   => ['诡异','阴暗','古墓','深渊','幽灵','诅咒','封印','禁地','血月','黑暗','迷雾','鬼火','阴森','未知'],
+        'epic'    => ['天劫','浩劫','毁灭','降世','远古','传承','禁忌','天命','万古','纪元','天地','混沌','洪荒','苍穹'],
+        'romantic'=> ['心动','暧昧','亲吻','告白','羞涩','脸红','拥抱','温柔','依偎','相拥','深情','倾心','暗恋','相思'],
+    ];
+
+    private function detectEmotionTag(string $text): string
+    {
+        if (trim($text) === '') return 'neutral';
+        $scores = [];
+        foreach (self::EMOTION_KEYWORDS as $emotion => $keywords) {
+            $score = 0;
+            foreach ($keywords as $kw) {
+                if (mb_strpos($text, $kw) !== false) $score++;
+            }
+            if ($score > 0) $scores[$emotion] = $score;
+        }
+        if (empty($scores)) return 'neutral';
+        arsort($scores);
+        return array_key_first($scores);
     }
 }

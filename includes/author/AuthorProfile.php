@@ -157,9 +157,12 @@ class AuthorProfile
     public function incrementUsage(): void
     {
         try {
-            DB::exec('UPDATE author_profiles SET usage_count = usage_count + 1 WHERE id=?', [$this->id]);
+            // 审计 P1：原先误用不存在的包装器方法 DB::exec，异常被空 catch 吞掉，
+            // 导致使用次数永不入库。DB 包装器仅提供 execute（返回受影响行数）。
+            DB::execute('UPDATE author_profiles SET usage_count = usage_count + 1 WHERE id=?', [$this->id]);
             $this->data['usage_count'] = ($this->data['usage_count'] ?? 0) + 1;
         } catch (\Throwable $e) {
+            error_log('AuthorProfile::incrementUsage failed: ' . $e->getMessage());
         }
     }
 

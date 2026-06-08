@@ -15,6 +15,30 @@ function h(?string $s): string {
 }
 
 /**
+ * 生成本次请求的稳定追踪 ID（每个请求内多次调用返回同一值）。
+ *
+ * 用途（2026-05-31 审计 P0）：把"客户端看到的友好错误文案"与"服务端日志里的
+ * 完整异常细节（消息/文件/行号/堆栈）"关联起来，使运维可凭追踪号定位问题，
+ * 同时不向客户端泄露任何内部结构或路径。ID 本身不含敏感信息。
+ *
+ * 以 function_exists 守护：error_handler.php / sse_error_handler.php 可能在
+ * 未加载 helpers.php 的上下文里各自定义同名函数，避免重复声明致命错误。
+ */
+if (!function_exists('error_trace_id')) {
+    function error_trace_id(): string {
+        static $rid = null;
+        if ($rid === null) {
+            try {
+                $rid = bin2hex(random_bytes(6));
+            } catch (\Throwable $e) {
+                $rid = substr(md5(uniqid('', true)), 0, 12);
+            }
+        }
+        return $rid;
+    }
+}
+
+/**
  * 多字节安全字符串截取（兼容无 mbstring 扩展的环境）
  */
 function safe_substr(string $string, int $start, ?int $length = null): string {
@@ -85,7 +109,7 @@ function countWords(string $text): int {
  */
 function truncateToWordLimit(string $content, int $maxWords): string
 {
-    if (mb_strlen($content) <= $maxWords) return $content;
+    if (countWords($content) <= $maxWords) return $content;
 
     // v1.5.3 修复：searchEnd 严格限制在 maxWords，与 Prompt 铁律一致
     // 不允许超字，在 maxWords 以内寻找最佳截断点
@@ -159,6 +183,31 @@ function stripSegmentMarkers(string $content): string
 }
 
 /**
+ * 过滤AI误把"章节坐标"写进正文造成的穿帮
+ * 例："根据第129章炼骨圣火的克制记录" → "根据炼骨圣火的克制记录"
+ * 只剜除指向章节号/卷册编号的引用，保留句子其余部分。
+ * @param string $content 原始内容
+ * @return string 过滤后的内容
+ */
+function stripMetaLeaks(string $content): string
+{
+    $num = '[一二三四五六七八九十百千万零〇\d]+';
+    $content = preg_replace([
+        // “根据/依据/按照/参考/据第129章(的)” → 去掉坐标，保留连接词
+        "/(根据|依据|按照|参考|据)第{$num}章的?/u",
+        // “第129章的XX”所有格交叉引用 → 去掉“第129章的”，保留其后内容
+        // 注：要求“的”+后接中文，避免误伤“第一章战斗”这类无所有格的词；
+        //     代价是会改写极少数“世界观内书籍第N章的…”的合法引用，安全网取舍可接受
+        "/第{$num}章的(?=[\\x{4e00}-\\x{9fa5}])/u",
+    ], ['$1', ''], $content);
+    // 整段引用括注直接删除：（见第129章）/（详见第129章）
+    $content = preg_replace("/[（(]\\s*(?:详见|另见|见)?第{$num}章[^）)]*[）)]/u", '', $content);
+    // 清理可能产生的连续空行
+    $content = preg_replace("/\n{3,}/", "\n\n", $content);
+    return trim($content);
+}
+
+/**
  * 文本相似度（0-100），用于情节重复检测
  */
 function textSimilarity(string $text1, string $text2): float {
@@ -220,9 +269,20 @@ function styleOptions(): array {
 /**
  * 输出 JSON 响应并终止
  */
-function jsonResponse(bool $ok, $data = null, string $msg = '') {
-    header('Content-Type: application/json; charset=utf-8');
-    echo json_encode(['ok' => $ok, 'data' => $data, 'msg' => $msg], JSON_UNESCAPED_UNICODE);
+function jsonResponse(bool $ok, $data = null, string $msg = '', string $errorCode = '') {
+    if (!headers_sent()) {
+        header('Content-Type: application/json; charset=utf-8');
+    }
+    $payload = ['ok' => $ok];
+    if ($ok) {
+        $payload['data'] = $data;
+        if ($msg !== '') $payload['msg'] = $msg;
+    } else {
+        $payload['error'] = $msg ?: '未知错误';
+        if ($errorCode !== '') $payload['code'] = $errorCode;
+        if ($data !== null) $payload['data'] = $data;
+    }
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE);
     exit;
 }
 
@@ -241,6 +301,115 @@ function sseDone(): void {
     echo "data: [DONE]\n\n";
     if (ob_get_level()) ob_flush();
     flush();
+}
+
+class SseChannel {
+    private bool $isAsync;
+    private ?string $progressFile;
+    private ?string $taskId;
+    private array $messages = [];
+    private int $lastHeartbeat = 0;
+    private int $heartbeatInterval = 10;
+
+    public function __construct(?string $taskId = null, ?string $progressFile = null, int $heartbeatInterval = 10) {
+        $this->taskId = $taskId;
+        $this->progressFile = $progressFile;
+        $this->isAsync = $taskId !== null && $progressFile !== null;
+        $this->lastHeartbeat = time();
+        $this->heartbeatInterval = $heartbeatInterval;
+    }
+
+    public function chunk(string $text): void {
+        $this->heartbeat();
+        if ($this->isAsync) {
+            $this->appendProgress(['content' => ($this->readProgress()['content'] ?? '') . $text, 'status' => 'writing']);
+        } else {
+            echo 'data: ' . json_encode(['chunk' => $text], JSON_UNESCAPED_UNICODE) . "\n\n";
+            $this->flush();
+        }
+    }
+
+    public function msg(array $payload): void {
+        $this->heartbeat();
+        $this->messages[] = $payload;
+        if ($this->isAsync) {
+            $this->appendProgress(['messages' => $this->messages, 'status' => $payload['status'] ?? (($payload['waiting'] ?? false) ? 'waiting' : 'writing')]);
+        } else {
+            echo 'data: ' . json_encode($payload, JSON_UNESCAPED_UNICODE) . "\n\n";
+            $this->flush();
+        }
+    }
+
+    public function done(): void {
+        if ($this->isAsync) {
+            $this->appendProgress(['status' => 'done', 'progress' => 100]);
+        } else {
+            echo "data: [DONE]\n\n";
+            $this->flush();
+        }
+    }
+
+    public function thinking(string $content): void {
+        if ($this->isAsync) return;
+        echo "event: thinking\n";
+        echo 'data: ' . json_encode(['thinking' => $content], JSON_UNESCAPED_UNICODE) . "\n\n";
+        $this->flush();
+    }
+
+    public function event(string $eventName, array $data): void {
+        $this->heartbeat();
+        echo "event: {$eventName}\n";
+        echo 'data: ' . json_encode($data, JSON_UNESCAPED_UNICODE) . "\n\n";
+        $this->flush();
+    }
+
+    public function heartbeat(): void {
+        $now = time();
+        if ($now - $this->lastHeartbeat < $this->heartbeatInterval) return;
+        if ($this->isAsync) {
+            $this->appendProgress(['status' => 'writing', 'heartbeat' => $now]);
+        } else {
+            echo "event: heartbeat\n";
+            echo 'data: ' . json_encode(['time' => $now, 'msg' => 'keep-alive'], JSON_UNESCAPED_UNICODE) . "\n\n";
+            $this->flush();
+        }
+        $this->lastHeartbeat = $now;
+    }
+
+    public function getTaskId(): ?string { return $this->taskId; }
+    public function getProgressFile(): ?string { return $this->progressFile; }
+    public function isAsync(): bool { return $this->isAsync; }
+
+    private function flush(): void {
+        if (ob_get_level()) ob_flush();
+        flush();
+    }
+
+    private function readProgress(): array {
+        if (!$this->progressFile || !file_exists($this->progressFile)) return [];
+        $fp = fopen($this->progressFile, 'r');
+        if (!$fp) return [];
+        flock($fp, LOCK_SH);
+        $data = stream_get_contents($fp);
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        return json_decode($data, true) ?: [];
+    }
+
+    private function appendProgress(array $updates): void {
+        if (!$this->progressFile || !file_exists($this->progressFile)) return;
+        $fp = fopen($this->progressFile, 'r+');
+        if (!$fp) return;
+        flock($fp, LOCK_EX);
+        $data = stream_get_contents($fp);
+        $progress = json_decode($data, true) ?: [];
+        fseek($fp, 0);
+        ftruncate($fp, 0);
+        $progress = array_merge($progress, $updates, ['updated_at' => time()]);
+        fwrite($fp, json_encode($progress, JSON_UNESCAPED_UNICODE));
+        flock($fp, LOCK_UN);
+        fclose($fp);
+    }
 }
 
 // ================================================================

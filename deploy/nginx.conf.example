@@ -1,0 +1,75 @@
+# ============================================================
+# Nginx 部署保护配置示例（与项目内各 .htaccess 等价）
+# ============================================================
+# 背景：仓库内的 .htaccess 只在 Apache 下生效。若部署在 Nginx，
+# 这些保护会被**完全忽略**，导致 /tests、/docs、/storage/cache、
+# 日志、配置、点文件等可被任意下载（见 docs/audits 审计 P1）。
+#
+# 用法：把下面 server{} 里的 location 块并入你的站点配置，
+# 按注释改 root 路径与 PHP-FPM 的 fastcgi_pass 地址，然后：
+#   nginx -t && systemctl reload nginx
+#
+# 重要：封面图片存放在 /storage/covers/ 且需要对外可访问——
+# 本配置只拒绝 /storage/cache/ 与日志类扩展名，不会拦截封面。
+#
+# 对照关系（.htaccess → 本配置）：
+#   根 .htaccess        FilesMatch \.(lock|log|sh|sql|bak|ini|sample|md)$  →  规则 2
+#   根 .htaccess        <Files config.php>                                 →  规则 3
+#   根 .htaccess        FilesMatch ^\.（点文件）                            →  规则 1
+#   config/.htaccess    Require all denied                                 →  规则 4
+#   includes/.htaccess  Require all denied                                 →  规则 4
+#   tests/.htaccess     Require all denied                                 →  规则 4
+#   storage/cache/.htaccess  Require all denied                            →  规则 4
+#   storage/.htaccess   Options -Indexes（封面可访问）                       →  autoindex off + 不拦 /storage/covers/
+# ============================================================
+
+server {
+    listen 80;
+    server_name your-domain.example;          # ← 改成你的域名
+    root /path/to/1.7-PRO;                     # ← 改成项目根目录绝对路径
+    index index.php index.html;
+
+    # 关闭目录列举（等价 Apache 的 Options -Indexes）
+    autoindex off;
+
+    # ---- 规则 1：拒绝点文件（.git / .env 等），放行 ACME 证书校验 ----
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+
+    # ---- 规则 2：拒绝敏感扩展名（任意目录，含 /storage 下的 *.log）----
+    location ~* \.(lock|log|sh|sql|bak|ini|sample|md)$ {
+        deny all;
+    }
+
+    # ---- 规则 3：拒绝主配置文件（纵深防御：万一 PHP 处理器失效也不泄露源码/密钥）----
+    location = /config.php {
+        deny all;
+    }
+
+    # ---- 规则 4：拒绝仅供服务端引用 / 非公开目录 ----
+    #     ^~ 前缀匹配优先级高于下面的 \.php$ 正则，故这些目录下的 .php 也会被拒绝执行。
+    location ^~ /config/        { deny all; }
+    location ^~ /includes/      { deny all; }
+    location ^~ /tests/         { deny all; }
+    location ^~ /docs/          { deny all; }
+    location ^~ /storage/cache/ { deny all; }
+    # 说明：/storage/ 其余内容（尤其 /storage/covers/ 封面图）保持可访问；
+    #       日志等敏感文件已被规则 2 的扩展名拦截。
+
+    # ---- 正常请求 ----
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    # ---- PHP 交给 PHP-FPM ----
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        # Authorization 头默认不透传给 FPM；挂机令牌用 Authorization: Bearer 时需要这一行
+        # （用 X-Daemon-Token 头则无需，自定义 X- 头会自动以 HTTP_X_DAEMON_TOKEN 传入）。
+        fastcgi_param HTTP_AUTHORIZATION $http_authorization;
+        fastcgi_pass unix:/run/php/php-fpm.sock;   # ← 改成你的 PHP-FPM 监听地址
+        # 或 TCP： fastcgi_pass 127.0.0.1:9000;
+    }
+}

@@ -16,6 +16,22 @@
 
 defined('APP_LOADED') or die('Direct access denied.');
 
+// 请求追踪 ID 辅助函数。规范定义在 includes/helpers.php；此处守护式重复定义，
+// 确保未加载 helpers.php 的 API 上下文也能使用（避免重复声明致命错误）。
+if (!function_exists('error_trace_id')) {
+    function error_trace_id(): string {
+        static $rid = null;
+        if ($rid === null) {
+            try {
+                $rid = bin2hex(random_bytes(6));
+            } catch (\Throwable $e) {
+                $rid = substr(md5(uniqid('', true)), 0, 12);
+            }
+        }
+        return $rid;
+    }
+}
+
 /**
  * 返回标准 JSON 错误并退出。
  * 
@@ -49,6 +65,34 @@ function api_error_unless(bool $condition, string $message, int $httpCode = 400)
 }
 
 /**
+ * 在 catch 块中构造一个"安全"的 JSON 错误响应体（不退出当前进程）。
+ *
+ * 审计 P0（2026-06-04 全量收口）：50 个 API 端点的 catch 块曾直接把
+ * `$e->getMessage()` 拼进 `msg` / `error` 字段回传客户端，泄露内部异常信息。
+ * 该辅助函数把完整异常细节（类名/消息/文件/行号）只写服务端日志，
+ * 并返回一个 {ok:false, msg:友好文案, code, request_id} 的稳定结构。
+ *
+ * 使用方式（替代 `jsonOut(['ok'=>false, 'msg'=>$e->getMessage()])`）：
+ *   } catch (Throwable $e) {
+ *       jsonOut(safe_api_error_payload($e, '保存失败，请稍后重试'));
+ *       return;
+ *   }
+ *
+ * 任何客户端文案（含操作语义）由调用点传入，库内只兜底默认文案。
+ */
+function safe_api_error_payload(Throwable $e, string $clientMsg = '操作失败，请稍后重试', string $code = 'internal_error'): array {
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] %s: %s in %s:%d',
+        $rid, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine()));
+    return [
+        'ok'         => false,
+        'msg'        => $clientMsg,
+        'code'       => $code,
+        'request_id' => $rid,
+    ];
+}
+
+/**
  * 注册 API 全局异常/错误处理器。
  * 
  * - 异常：统一返回 JSON 错误（避免裸 500 HTML 页面）
@@ -59,8 +103,17 @@ function api_error_unless(bool $condition, string $message, int $httpCode = 400)
  */
 function registerApiErrorHandlers(): void {
     // 全局异常处理
+    // 审计 P0：完整异常细节（类名/消息/文件/行号/堆栈）只写服务端日志，
+    // 客户端仅收到稳定错误码 + 友好文案 + 可追踪请求 ID。
     set_exception_handler(function (Throwable $e) {
-        api_error('服务器错误: ' . $e->getMessage(), 500);
+        $rid = error_trace_id();
+        error_log(sprintf('[%s] Uncaught %s: %s in %s:%d',
+            $rid, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine()));
+        error_log(sprintf('[%s] trace: %s', $rid, $e->getTraceAsString()));
+        api_error('服务器内部错误，请稍后重试', 500, [
+            'code'       => 'internal_error',
+            'request_id' => $rid,
+        ]);
     });
 
     // 全局错误处理
@@ -70,16 +123,14 @@ function registerApiErrorHandlers(): void {
             return false;
         }
 
-        // 致命错误 → JSON 返回
+        // 致命错误 → JSON 返回（同样只把细节写日志，不回传 message/file/line）
         if (in_array($severity, [E_ERROR, E_USER_ERROR, E_PARSE, E_COMPILE_ERROR, E_CORE_ERROR], true)) {
-            header('Content-Type: application/json; charset=utf-8');
-            echo json_encode([
-                'ok'    => false,
-                'error' => "PHP 严重错误: $message",
-                'file'  => basename($file),
-                'line'  => $line,
-            ], JSON_UNESCAPED_UNICODE);
-            exit;
+            $rid = error_trace_id();
+            error_log(sprintf('[%s] PHP fatal: %s in %s:%d', $rid, $message, $file, $line));
+            api_error('服务器内部错误，请稍后重试', 500, [
+                'code'       => 'internal_error',
+                'request_id' => $rid,
+            ]);
         }
 
         // notice/warning → error_log

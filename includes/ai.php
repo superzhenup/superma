@@ -115,6 +115,48 @@ class AIClient {
     }
 
     /**
+     * v2: 动态调整 temperature（高潮章节提高创意度，过渡章节降低随机性）
+     */
+    public function setTemperature(float $temp): void {
+        $this->temperature = max(0.1, min(2.0, $temp));
+    }
+
+    public function getTemperature(): float {
+        return $this->temperature;
+    }
+
+    /**
+     * 解析可用的 CA 证书包路径，供 CLI（异步写作 worker）下 php.ini 未配 curl.cainfo 时使用。
+     * 场景：Windows 宝塔 FastCGI php.ini 配了 curl.cainfo（网页端 HTTPS 正常），但 CLI php.ini 没配，
+     * 导致 worker 调 AI(HTTPS) 时 CURLOPT_SSL_VERIFYPEER 验证失败、整章写不出（无限重试、content=0）。
+     * 返回 null = php.ini 已有有效 CA，交给 curl 默认（不改变网页端既有行为）。
+     */
+    public static function caBundle(): ?string {
+        static $resolved = false, $path = null;
+        if ($resolved) return $path;
+        $resolved = true;
+        // 1) php.ini 已有有效 CA 配置 → 不覆盖（保持网页端行为不变）
+        foreach (['curl.cainfo', 'openssl.cafile'] as $k) {
+            $v = ini_get($k);
+            if ($v && @is_file($v)) return $path = null;
+        }
+        // 2) PHP 目录附近的 cacert.pem（宝塔常自带）
+        $cands = [];
+        $bin = (defined('PHP_BINARY') && PHP_BINARY) ? dirname(PHP_BINARY) : '';
+        if ($bin !== '') {
+            $cands[] = $bin . DIRECTORY_SEPARATOR . 'extras' . DIRECTORY_SEPARATOR . 'ssl' . DIRECTORY_SEPARATOR . 'cacert.pem';
+            $cands[] = $bin . DIRECTORY_SEPARATOR . 'cacert.pem';
+            $cands[] = $bin . DIRECTORY_SEPARATOR . 'extras' . DIRECTORY_SEPARATOR . 'cacert.pem';
+        }
+        // 3) 应用自带兜底（includes/cacert.pem，随仓库分发，保证一定有可用 CA）
+        $cands[] = __DIR__ . DIRECTORY_SEPARATOR . 'cacert.pem';
+        foreach ($cands as $c) {
+            if (@is_file($c)) return $path = $c;
+        }
+        return $path = null;
+    }
+
+    /**
      * 普通同步请求
      * @param string $taskType creative | structured | synopsis
      */
@@ -188,7 +230,7 @@ class AIClient {
 
         $that = $this;  // 闭包内访问 $this 的别名（兼容 PHP 7/8）
         $ch = curl_init($url);
-        curl_setopt_array($ch, [
+        $curlOptions = [
             CURLOPT_POST            => true,
             CURLOPT_POSTFIELDS      => json_encode($body),
             CURLOPT_HTTPHEADER      => $this->headers(),
@@ -197,19 +239,25 @@ class AIClient {
             CURLOPT_RETURNTRANSFER  => false,
             CURLOPT_SSL_VERIFYPEER  => true,
             CURLOPT_SSL_VERIFYHOST  => 2,
-            // TCP Keepalive — 防止防火墙/代理杀掉长时间空闲连接
-            CURLOPT_TCP_KEEPALIVE   => 1,
-            CURLOPT_TCP_KEEPIDLE    => 60,
-            CURLOPT_TCP_KEEPINTVL   => 15,
             // 强制 HTTP/1.1，避免 HTTP/2 在某些代理下导致连接重置
             CURLOPT_HTTP_VERSION    => CURL_HTTP_VERSION_1_1,
-            CURLOPT_HEADERFUNCTION => function ($ch, $header) use (&$httpCode) {
+        ];
+        // TCP Keepalive — 防止防火墙/代理杀掉长时间空闲连接
+        // CURLOPT_TCP_KEEPALIVE 在 PHP 8.2+ 才正式定义，低版本需守卫
+        if (defined('CURLOPT_TCP_KEEPALIVE')) {
+            $curlOptions[CURLOPT_TCP_KEEPALIVE]   = 1;
+            $curlOptions[CURLOPT_TCP_KEEPIDLE]    = 60;
+            $curlOptions[CURLOPT_TCP_KEEPINTVL]   = 15;
+        }
+        curl_setopt_array($ch, $curlOptions);
+        // 需要在 curl_setopt_array 之后单独设置回调（它们不能放入数组）
+        curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($ch, $header) use (&$httpCode) {
                 if (preg_match('/^HTTP\/\S+\s+(\d+)/i', $header, $m)) {
                     $httpCode = (int)$m[1];
                 }
                 return strlen($header);
-            },
-            CURLOPT_WRITEFUNCTION  => function ($ch, $data) use (
+            });
+        curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) use (
                 &$buffer, &$usage, &$httpCode, &$rawBody, &$streamErr, &$finishReason, $onChunk, $onThinking, &$lastHeartbeat, $heartbeatInterval, &$lastAiChunk, $that
             ) {
                 // 在收到数据时检查并发送心跳
@@ -241,10 +289,20 @@ class AIClient {
                     $decoded = json_decode($payload, true);
                     if (!$decoded) continue;
                     if (!empty($decoded['usage'])) {
+                        $u = $decoded['usage'];
+                        // 命中的提示词缓存 token——各厂商字段名不同：
+                        //   DeepSeek:  prompt_cache_hit_tokens
+                        //   OpenAI/通义/Kimi: prompt_tokens_details.cached_tokens
+                        //   智谱/其他: cached_tokens
+                        $cacheHit = (int)($u['prompt_cache_hit_tokens']
+                            ?? $u['prompt_tokens_details']['cached_tokens']
+                            ?? $u['cached_tokens']
+                            ?? 0);
                         $usage = [
-                            'prompt_tokens'     => (int)($decoded['usage']['prompt_tokens']     ?? 0),
-                            'completion_tokens' => (int)($decoded['usage']['completion_tokens'] ?? 0),
-                            'total_tokens'      => (int)($decoded['usage']['total_tokens']      ?? 0),
+                            'prompt_tokens'     => (int)($u['prompt_tokens']     ?? 0),
+                            'completion_tokens' => (int)($u['completion_tokens'] ?? 0),
+                            'total_tokens'      => (int)($u['total_tokens']      ?? 0),
+                            'cache_hit_tokens'  => $cacheHit,
                         ];
                     }
                     if (!empty($decoded['error'])) {
@@ -276,10 +334,10 @@ class AIClient {
                     }
                 }
                 return strlen($data);
-            },
-            // 添加进度回调，在 curl 执行期间定期发送心跳和静默检测
-            CURLOPT_NOPROGRESS => false,
-            CURLOPT_PROGRESSFUNCTION => function ($ch, $dlTotal, $dlNow, $ulTotal, $ulNow) use (&$lastHeartbeat, $heartbeatInterval, &$lastAiChunk, $silenceThreshold, &$lastWaitingSent, $that) {
+            });
+        // 添加进度回调，在 curl 执行期间定期发送心跳和静默检测
+        curl_setopt($ch, CURLOPT_NOPROGRESS, false);
+        curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function ($ch, $dlTotal, $dlNow, $ulTotal, $ulNow) use (&$lastHeartbeat, $heartbeatInterval, &$lastAiChunk, $silenceThreshold, &$lastWaitingSent, $that) {
                 $now = time();
                 if ($now - $lastHeartbeat >= $heartbeatInterval) {
                     if ($that->heartbeatCallback) {
@@ -307,8 +365,10 @@ class AIClient {
                     return 1;
                 }
                 return 0;
-            },
-        ]);
+            });
+
+        // CLI（异步 worker）下 php.ini 未配 curl.cainfo 时补上 CA 证书包，否则 HTTPS 证书验证失败、整章写不出
+        if ($caBundle = self::caBundle()) curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
 
         curl_exec($ch);
         $curlErr = curl_error($ch);
@@ -401,7 +461,12 @@ class AIClient {
 
         if ($temp === null) {
             // v11: 根据任务类型从系统设置读取 temperature 和 max_tokens
-            if ($taskType === 'structured') {
+            if ($taskType === 'outline') {
+                // v41 去套路化：章节细纲需要创意多样性，用比 structured(0.3) 更高的温度。
+                // 与摘要/抽取的 structured 档分开，互不影响。JSON 结构靠 prompt 约束保证。
+                $temp = (float)getSystemSetting('ws_temperature_outline_gen', 0.75, 'float');
+                $mt = max($mt, (int)getSystemSetting('ws_max_tokens_outline', 4096, 'int'));
+            } elseif ($taskType === 'structured') {
                 $temp = (float)getSystemSetting('ws_temperature_outline', 0.3, 'float');
                 $mt = max($mt, (int)getSystemSetting('ws_max_tokens_outline', 4096, 'int'));
             } elseif ($taskType === 'synopsis') {
@@ -410,6 +475,12 @@ class AIClient {
                 $tChapter = (float)getSystemSetting('ws_temperature_chapter', 0.8, 'float');
                 $temp = round(($tOutline + $tChapter) / 2, 2);
                 $mt = max($mt, (int)getSystemSetting('ws_max_tokens_outline', 4096, 'int'));
+            } elseif ($taskType === 'title') {
+                // 标题极短：关键约束是「必须在上游代理(nginx/CF)超时前返回」，否则浏览器拿到空响应。
+                // 用【小】上限把单次生成压到几秒：普通模型快速出标题；推理模型也快速结束（额度耗尽→空内容，
+                // 交由调用方 fallback 换下一个模型）。这里直接赋值（不向 4096/8192 floor 抬高）。
+                $temp = (float)getSystemSetting('ws_temperature_outline', 0.3, 'float');
+                $mt = max(64, (int)getSystemSetting('ws_max_tokens_title', 512, 'int'));
             } else {
                 $temp = (float)getSystemSetting('ws_temperature_chapter', $this->temperature, 'float');
                 $mt = max($mt, (int)getSystemSetting('ws_max_tokens_chapter', 8192, 'int'));
@@ -520,6 +591,12 @@ class AIClient {
         $maxRetries = 3;
         $lastErr    = '';
 
+        // 阻塞式同步请求期间的心跳：质量返修 / 转折点 / 弧段摘要等后处理会调用本方法，
+        // 若整段静默会被 nginx fastcgi_read_timeout（默认 60s）掐断 SSE，
+        // 客户端报 ERR_INCOMPLETE_CHUNKED_ENCODING 且本批未落库。
+        $that   = $this;
+        $lastHb = time();
+
         for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
             if ($attempt > 1) {
                 // 指数退避：2s, 4s, 8s（最多 10 秒）
@@ -546,7 +623,25 @@ class AIClient {
                 // 允许跟随重定向
                 CURLOPT_FOLLOWLOCATION  => true,
                 CURLOPT_MAXREDIRS       => 3,
+                // 定期心跳保活，避免 SSE 在阻塞等待响应期间长时间静默被代理掐断。
+                // 仅在注册了心跳回调（SSE 场景）时才输出；普通 AJAX 调用无回调 → 静默无副作用。
+                CURLOPT_NOPROGRESS       => false,
+                CURLOPT_PROGRESSFUNCTION => function ($ch, $dlTotal, $dlNow, $ulTotal, $ulNow) use (&$lastHb, $that) {
+                    $now = time();
+                    if ($now - $lastHb >= 5) {
+                        if ($that->heartbeatCallback) {
+                            ($that->heartbeatCallback)();
+                        } elseif (isset($GLOBALS['sendHeartbeat']) && is_callable($GLOBALS['sendHeartbeat'])) {
+                            call_user_func($GLOBALS['sendHeartbeat']);
+                        }
+                        $lastHb = $now;
+                    }
+                    return 0;
+                },
             ]);
+
+            // CLI（异步 worker）下 php.ini 未配 curl.cainfo 时补上 CA 证书包（同流式请求）
+            if ($caBundle = self::caBundle()) curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
 
             $resp = curl_exec($ch);
             $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -581,10 +676,18 @@ class AIClient {
 // 获取单个模型客户端
 // ================================================================
 function getAIClient(?int $modelId = null): AIClient {
-    $model = $modelId
-        ? DB::fetch('SELECT * FROM ai_models WHERE id=?', [$modelId])
-        : (DB::fetch('SELECT * FROM ai_models WHERE is_default=1 LIMIT 1')
-           ?: DB::fetch('SELECT * FROM ai_models ORDER BY id LIMIT 1'));
+    // 先按指定模型查找（如小说绑定的 model_id）。
+    $model = $modelId ? DB::fetch('SELECT * FROM ai_models WHERE id=?', [$modelId]) : null;
+
+    // 修复：指定的模型不存在（典型场景——小说绑定了一个【已被删除/重建】的 model_id）时，
+    // 必须回退到默认/任意可用模型，而不是误报“请先添加模型”。
+    // 否则像“标题优化”这类直接 getAIClient($novel['model_id']) 的功能会在库里明明有模型时报错，
+    // 而走 getModelFallbackList 的写作流程却正常（后者对缺失的首选 id 本就会兜底）。
+    if (!$model) {
+        $model = DB::fetch('SELECT * FROM ai_models WHERE is_default=1 LIMIT 1')
+              ?: DB::fetch('SELECT * FROM ai_models ORDER BY id LIMIT 1');
+    }
+
     if (!$model) throw new RuntimeException('请先在【模型设置】中添加至少一个AI模型。');
     return new AIClient($model);
 }

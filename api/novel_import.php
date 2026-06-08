@@ -97,7 +97,7 @@ try {
         $pdo->rollBack();
     }
     http_response_code(500);
-    echo json_encode(['error' => '导入失败：' . $e->getMessage()], JSON_UNESCAPED_UNICODE);
+    echo json_encode(safe_api_error_payload($e, '导入失败，请稍后重试'), JSON_UNESCAPED_UNICODE);
 }
 
 /**

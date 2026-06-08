@@ -50,5 +50,6 @@ try {
         'anomaly'  => $anomaly,
     ], JSON_UNESCAPED_UNICODE);
 } catch (\Throwable $e) {
-    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+    error_log('emotion_curve: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+    echo json_encode(safe_api_error_payload($e, '情绪曲线计算失败，请稍后重试'));
 }

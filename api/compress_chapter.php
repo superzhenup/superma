@@ -164,10 +164,8 @@ try {
         sse('message', ['model_switch' => true, 'to' => $nextAi->modelLabel, 'reason' => $errMsg]);
     });
 } catch (Throwable $e) {
-    $errMsg = $e->getMessage();
-    error_log('compress_chapter.php 异常: ' . $errMsg . ' | 已尝试模型: ' . implode(', ', $modelTried));
-    $detail = $modelTried ? '（已尝试: ' . implode(' → ', $modelTried) . '）' : '';
-    sse('message', ['error' => '压缩失败：' . $errMsg . $detail]);
+    error_log('compress_chapter.php 异常: ' . $e->getMessage() . ' | 已尝试模型: ' . implode(', ', $modelTried));
+    sse('message', safe_sse_error_payload($e, '压缩服务暂时不可用，请稍后重试'));
     sseDone();
     exit;
 }

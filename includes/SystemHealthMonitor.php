@@ -33,11 +33,22 @@ class SystemHealthMonitor
         $alerts = [];
         $score = 100;
 
+        $agentEnabled = $this->isAgentEnabled();
+
+        if ($agentEnabled) {
+            $agentActive = $this->checkAgentActivity();
+            if ($agentActive['alert']) {
+                $alerts[] = $agentActive['alert'];
+            }
+        }
+
         // 1. Agent 决策失败率
-        $agentResult = $this->checkAgentFailureRate();
-        if ($agentResult['alert']) {
-            $alerts[] = $agentResult['alert'];
-            $score -= 25;
+        if ($agentEnabled) {
+            $agentResult = $this->checkAgentFailureRate();
+            if ($agentResult['alert']) {
+                $alerts[] = $agentResult['alert'];
+                $score -= 25;
+            }
         }
 
         // 2. CriticAgent 评分异常
@@ -48,10 +59,12 @@ class SystemHealthMonitor
         }
 
         // 3. 指令写入停滞
-        $directiveResult = $this->checkDirectiveStagnation();
-        if ($directiveResult['alert']) {
-            $alerts[] = $directiveResult['alert'];
-            $score -= 15;
+        if ($agentEnabled) {
+            $directiveResult = $this->checkDirectiveStagnation();
+            if ($directiveResult['alert']) {
+                $alerts[] = $directiveResult['alert'];
+                $score -= 15;
+            }
         }
 
         // 4. 章节写入停滞
@@ -272,6 +285,49 @@ class SystemHealthMonitor
 
             return ['alert' => null];
         } catch (\Throwable $e) {
+            return ['alert' => null];
+        }
+    }
+
+    private function isAgentEnabled(): bool
+    {
+        try {
+            return (bool)(DB::fetch(
+                "SELECT setting_value FROM system_settings WHERE setting_key = 'agent.enabled'"
+            )['setting_value'] ?? '1') !== '0';
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * 检查 Agent 是否有活动记录（决策日志 / 指令数据为空 = Agent 从未运行）
+     */
+    private function checkAgentActivity(): array
+    {
+        try {
+            $totalDecisions = (int)(DB::fetch(
+                'SELECT COUNT(*) as cnt FROM agent_decision_logs WHERE novel_id = ?',
+                [$this->novelId]
+            )['cnt'] ?? 0);
+
+            $totalDirectives = (int)(DB::fetch(
+                'SELECT COUNT(*) as cnt FROM agent_directives WHERE novel_id = ?',
+                [$this->novelId]
+            )['cnt'] ?? 0);
+
+            if ($totalDecisions === 0 && $totalDirectives === 0) {
+                return [
+                    'alert' => [
+                        'level'   => 'info',
+                        'type'    => 'agent_no_data',
+                        'message' => 'Agent 系统已启用但尚无执行记录（决策日志和指令表为空）',
+                    ],
+                ];
+            }
+
+            return ['alert' => null];
+        } catch (\Throwable) {
             return ['alert' => null];
         }
     }

@@ -16,6 +16,9 @@ function wsVal(string $key, array $defs, array $vals): string {
 // 当前分页
 $activeTab = $_GET['tab'] ?? 'params';
 
+// ========== AI 模型列表（供迭代重写页选择重写模型） ==========
+$aiModels = \DB::fetchAll('SELECT id, name, model_name FROM ai_models ORDER BY is_default DESC, id ASC');
+
 // ========== 作者画像相关变量 ==========
 $userId = $_SESSION['user_id'] ?? $_SESSION['uid'] ?? null;
 $profileId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
@@ -384,6 +387,23 @@ pageHeader('写作设置', 'writing_settings');
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox" id="ir-ai-patterns"
                                        style="width:3rem;height:1.5rem">
+                            </div>
+                        </div>
+                        <div class="mb-0">
+                            <div class="d-flex justify-content-between align-items-start mb-2">
+                                <div>
+                                    <div class="fw-semibold" style="font-size:.9rem">重写专用模型</div>
+                                    <div class="text-muted small">使用与正文写作不同的模型进行重写，消除同一模型的自审盲区</div>
+                                </div>
+                            </div>
+                            <select class="form-select form-select-sm" id="ir-rewrite-model" style="max-width:320px">
+                                <option value="0">默认（与正文写作使用相同模型）</option>
+                                <?php foreach ($aiModels as $m): ?>
+                                <option value="<?= $m['id'] ?>"><?= h($m['name']) ?> (<?= h($m['model_name']) ?>)</option>
+                                <?php endforeach; ?>
+                            </select>
+                            <div class="form-text mt-1" style="font-size:.78rem;line-height:1.6">
+                                推荐选择与正文模型不同厂商/版本的模型作为重写模型。确保两个模型在 <a href="settings.php" target="_blank">模型管理</a> 中均已配置可用的 API Key。
                             </div>
                         </div>
                     </div>
@@ -1958,6 +1978,7 @@ function renderChapterStats(chapters) {
         document.getElementById('ir-critic').checked = !!rw.use_critic_agent;
         document.getElementById('ir-style-guard').checked = rw.style_guard_enabled !== false;
         document.getElementById('ir-ai-patterns').checked = rw.ai_patterns_check_enabled !== false;
+        document.getElementById('ir-rewrite-model').value = rw.rewrite_model_id || 0;
         document.getElementById('ir-max-iter').value = ir.max_iterations || 3;
         document.getElementById('ir-max-iter-badge').textContent = ir.max_iterations || 3;
         document.getElementById('ir-min-improve').value = ir.min_improvement || 5;
@@ -1979,7 +2000,8 @@ function renderChapterStats(chapters) {
                 iterative_mode: true,
                 use_critic_agent: document.getElementById('ir-critic').checked,
                 style_guard_enabled: document.getElementById('ir-style-guard').checked,
-                ai_patterns_check_enabled: document.getElementById('ir-ai-patterns').checked
+                ai_patterns_check_enabled: document.getElementById('ir-ai-patterns').checked,
+                rewrite_model_id: parseInt(document.getElementById('ir-rewrite-model').value)
             },
             iterative_refinement: {
                 max_iterations: parseInt(document.getElementById('ir-max-iter').value),

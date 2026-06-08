@@ -71,9 +71,19 @@ class ChapterPromptBuilder
             $blocks[] = '【风格延续】保持卷首章已建立的黄金三行/四段式/情绪密度/对话风格。';
         }
 
-        $blocks[] = trim($this->fourSegmentRhythm());   // 动态比例，每章不同
-        $blocks[] = trim($this->hookGuidance());         // 钩子类型随章变化
-        $blocks[] = trim($this->densityStandards());     // 题材依赖，每章保留
+        // v2: System Prompt 按章节位置渐进减量
+        // v41: fourSegmentRhythm 含「每章不同的动态比例」，已移至用户消息尾部，
+        // 否则它会让 system prompt 每章都变、击穿提示词前缀缓存。
+        $tier = $this->getSystemPromptTier();
+
+        if ($tier === 'full' || $tier === 'compact') {
+            $blocks[] = trim($this->hookGuidance());      // 完整钩子指南
+            $blocks[] = trim($this->densityStandards());  // 完整描写密度指南
+        } else {
+            // minimal: 第21章+非教育章，极度精简（~80 token）
+            $blocks[] = '【钩子】章末必须有钩子（悬念/反转/信息爆炸），禁止连续重复前三章的钩子类型。';
+            $blocks[] = '【密度】保持适当描写密度，禁止AI高频词（深邃、凝视、缓缓、蓦然、骤然）。';
+        }
 
         return implode("\n\n", $blocks);
     }
@@ -115,6 +125,20 @@ class ChapterPromptBuilder
         }
 
         return null;
+    }
+
+    /**
+     * v2: System Prompt 渐进减量层级
+     *
+     * full    (ch 1-5)  : 完整教学型 system prompt
+     * compact (ch 6-20) : 保留钩子指南+密度标准，裁撤教学段落
+     * minimal (ch 21+)  : 仅铁律+节奏+一行钩子/密度提醒
+     */
+    private function getSystemPromptTier(): string
+    {
+        if ($this->chNum <= 5) return 'full';
+        if ($this->chNum <= 20) return 'compact';
+        return 'minimal';
     }
 
     /**
@@ -202,29 +226,68 @@ EOT;
             ? "\n9. 主角名锚定：本小说主角固定为「{$protagonistName}」，绝对不可更改、替换、省略或使用其他称呼作为主角，所有涉及主角的内容必须使用此名字"
             : '';
 
-        // v1.12: 场景连续性约束
-        $locationRule = $this->buildLocationRule();
+        // v41: 场景连续性约束已移至用户消息动态区（buildUserPrompt），
+        // 使 system prompt 在同一 tier 内逐字节稳定 → 命中提示词前缀缓存。
 
         return <<<EOT
-【写作铁律，必须遵守优先级最高】
-1. 字数目标（最高优先级）：正文目标 {$targetWords} 字（±{$tol['tolerance']}字弹性区间），严格控制在 {$minWords} ~ {$maxWords} 字之间。
-   - 优先保证情节自然完整，不可为凑字数添加无意义描述
-   - 严禁为达到字数硬切情节、强行收尾
-   - 预算允许时优先延展高潮段落
-   - 字数到达 {$maxWords} 字时必须停笔
-2. 字数预警系统（写作时心中估算字数进度）：
+【写作铁律 · 三级优先级——P0必须100%遵守，P1重点执行，P2参考执行】
+
+── P0 核心铁律（违反即废稿）──
+① 字数：目标 {$targetWords} 字，弹性区间 {$minWords}~{$maxWords} 字。情节自然完整优先，禁止凑字/硬切/强行收尾。到达 {$maxWords} 字必须停笔。
+② 人物锚定：所有角色的职务、身份、生死、境界必须与【人物当前状态】完全一致，禁止擅自改变。{$protagonistRule}
+③ 直接输出：从本章标题行直接开始正文，禁止任何前言/后记/解释/"好的我来写"等废话。
+
+── P1 强化约束（重点执行）──
+④ 逻辑自洽：本章事件必须是前情的自然延伸，因果链清晰，不得出现无因之果。
+⑤ 情节不重复：【全书已发生事件】中的任何事件，严禁以任何形式重演或变体重复。
+⑥ 场景连续：开场场景必须承接上章结尾，场景切换必须有转场描写，禁止无过渡跳跃。
+⑦ 风格统一：保持与前文一致的叙事视角、语气和文风，不得中途切换人称。
+
+── P2 参考指引（选择性遵守）──
+⑧ 字数节奏参考：写到约 {$earlyFinish} 字时进入钩子收尾；开头黄金三行直接抓人；中间对话与动作交替推进。
+⑨ 字数预警（心中估算，不必精确）：
 {$warnings}
-3. 字数控制技巧：
-   - 开头快速入戏，黄金三行直接抓人
-   - 中间情节紧凑，对话与动作交替推进
-   - 写到约 {$earlyFinish} 字时必须进入钩子收尾
-4. 人物一致性：所有人物的职务、身份、生死状态必须与【人物当前状态】完全一致，不得擅自改变
-5. 情节不重复：【全书已发生事件】中出现的任何事件，严禁以任何形式重演或变体重复
-6. 逻辑自洽：本章发生的事件必须是前情的自然延伸，因果链条清晰，不得出现无因之果
-7. 场景连续性：本章开场的场景位置必须承接上章结尾，场景切换必须有明确的转场描写，禁止无过渡的场景跳跃
-8. 直接开始：从"第{$this->chNum}章 {$this->chapter['title']}"这一行直接开始输出正文，不要有任何前言、后记、解释或"好的，我来写"等废话
-9. 风格统一：保持与前文一致的叙事视角、语气和文风，不得中途切换人称{$protagonistRule}{$locationRule}
 EOT;
+    }
+
+    /**
+     * v41: 场景连续性约束的用户消息包装（带段落间距）。
+     * 从 ironRules 移出后，作为动态区独立段落注入，保证 system prompt 可缓存。
+     */
+    private function buildLocationSection(): string
+    {
+        $r = $this->buildLocationRule();
+        return $r === '' ? '' : ltrim($r) . "\n\n";
+    }
+
+    /**
+     * v41 钩子回收强化：注入上一章的章末钩子，强约束本章开头正面回应它。
+     * 此前钩子是"开环"的（只埋不验证），这里把上章悬念明确点出，要求本章前 1/3 回收。
+     */
+    private function buildPrevHookSection(): string
+    {
+        if (!getSystemSetting('ws_hook_payoff_enabled', true, 'bool')) return '';
+        if ($this->chNum <= 1) return '';
+        try {
+            require_once __DIR__ . '/prompt.php';
+            $prev = \DB::fetch(
+                "SELECT hook, hook_type FROM chapters
+                 WHERE novel_id=? AND chapter_number=? AND status='completed' LIMIT 1",
+                [(int)$this->novel['id'], $this->chNum - 1]
+            );
+        } catch (\Throwable $e) { return ''; }
+        $hook = trim((string)($prev['hook'] ?? ''));
+        if ($hook === '') return '';
+        $typeName = '';
+        $ht = trim((string)($prev['hook_type'] ?? ''));
+        if ($ht !== '' && defined('HOOK_TYPES') && isset(HOOK_TYPES[$ht]['name'])) {
+            $typeName = '（' . HOOK_TYPES[$ht]['name'] . '）';
+        }
+        $prevNum = $this->chNum - 1;
+        return "【⚠️ 上章钩子待回收{$typeName}】\n"
+            . "上一章（第{$prevNum}章）结尾抛出的悬念：「{$hook}」\n"
+            . "本章必须在前 1/3 内正面回应/推进它——给出后续、揭示真相、或将其升级为新冲突；"
+            . "禁止无视、跳开另起或拖到很久以后。\n\n";
     }
 
     /**
@@ -301,23 +364,35 @@ EOT;
             $adj = new RhythmAdjuster((int)$this->novel['id']);
             $rhythm = $adj->calculateRhythm($this->chNum, []);
             if (!empty($rhythm['segment_ratios'])) {
-                return [
+                $base = [
                     'setup'  => (int)($rhythm['segment_ratios']['setup']  ?? 20),
                     'rising' => (int)($rhythm['segment_ratios']['rising'] ?? 30),
                     'climax' => (int)($rhythm['segment_ratios']['climax'] ?? 35),
                     'hook'   => (int)($rhythm['segment_ratios']['hook']   ?? 15),
                 ];
+                try {
+                    require_once __DIR__ . '/ChapterTypeDetector.php';
+                    return ChapterTypeDetector::adjustRatios($base, trim((string)($this->chapter['outline'] ?? '')));
+                } catch (\Throwable) {}
+                return $base;
             }
         } catch (\Throwable $e) {
             // 回退到静态配置
         }
 
-        return [
+        $fallback = [
             'setup'  => (int)getSystemSetting('ws_segment_ratio_setup',  20, 'int'),
             'rising' => (int)getSystemSetting('ws_segment_ratio_rising', 30, 'int'),
             'climax' => (int)getSystemSetting('ws_segment_ratio_climax', 35, 'int'),
             'hook'   => (int)getSystemSetting('ws_segment_ratio_hook',   15, 'int'),
         ];
+
+        try {
+            require_once __DIR__ . '/ChapterTypeDetector.php';
+            return ChapterTypeDetector::adjustRatios($fallback, trim((string)($this->chapter['outline'] ?? '')));
+        } catch (\Throwable) {
+            return $fallback;
+        }
     }
 
     public function hookGuidance(): string
@@ -410,62 +485,146 @@ EOT;
         // - 弱信息放中间（被压缩的位置）
         // - Agent 指令和"请开始写作"放最末（动态、最高优先级）
 
-        // ── 头部：强约束 + 关键信息 ──
-        $head = implode('', array_filter([
-            $this->buildQualityFeedbackSection(),  // v1.5 新增：近章质量短板
-            $this->buildAuthorProfileSection(),    // 作者画像风格指导
-            $this->buildReaderProfileSection(),    // v1.10.3: 目标读者画像
-            $this->buildCharacterSection(),         // 人物状态（防 OOC）
-            $this->buildVoiceProfileSection(),      // v1.10.3: 角色语音规则
-            $this->buildForeshadowSection(),        // 待回收伏笔
-            $this->buildOutlineSection(),          // 本章大纲
-            $this->buildSynopsisSection(),          // 章节简介（详细蓝图）
-        ]));
+        // v41: 缓存友好布局开关——把静态背景段前置成「稳定前缀」，使提示词前缀缓存
+        //      从 system message 延伸进 user message；动态内容仍按 U 型排在后面。
+        $cacheLayout = (bool)getSystemSetting('ws_cache_prompt_layout', true, 'bool');
 
-        // ── 中部：弱信息 / 上下文 ──
-        $middle = implode('', array_filter([
-            $this->buildArcChapterSection(),        // 全书故事线
-            $this->buildStoryOutlineSection(),      // v1.6 算法 E：全书三幕结构（全局定位）
-            $this->buildPrevSection(),              // 前情提要
-            $this->buildRecentChapterSection(),     // 近章大纲
-            $this->buildTailSection(),              // 前章尾文
-            $this->buildMomentumSection(),          // 故事势能 + 弧段摘要
-            $this->buildEventsSection(),            // 关键事件
-            $this->buildSemanticSection(),          // 语义召回
-            $this->buildKBContextSection(),         // v1.6 算法 D：KB 语义召回（知识库）
-            $this->buildCatchphraseSection(),       // v1.10.3: 金句回调
-            $this->buildVolumeGoalSection(),
-            $this->buildProgressSection(),
-            $this->buildEndingContextSection(),
-        ]));
-
-        // ── 尾部：节奏 + 收尾 + 强约束规则 ──
-        // v1.11.8: 防套路化信息移到 tail（强约束位置）
-        $tail = implode('', array_filter([
-            $this->buildNovelInfo(),                // 小说信息
-            $this->buildRhythmSection(),            // 节奏阶段（含 segment_ratios，已修双源）
-            $this->buildEndingSection(),            // 收尾期强制（如适用）
-            $this->buildUserDensitySection(),       // 描写密度
-            $this->buildUserHookSection(),          // 钩子类型
-            $this->buildHookHistorySection(),       // v1.11.8: 移到tail - 近章钩子类型历史（防套路化）
-            $this->buildCoolPointHistorySection(),  // v1.11.8: 移到tail - 爽点类型历史（防套路化）
-            $this->buildRecurringMotifsSection(),   // v1.11.8: 移到tail - 全书重复意象
-            $this->buildTropesSection(),            // v1.11.8: 移到tail - 已用桥段（防套路化核心）
-            $this->buildUserRulesSection(),         // 写作铁律重申
-            $this->buildPOVSection(),               // v1.11.2: POV 视角约束
-            $this->buildCognitiveLoadSection(),     // v1.11.2: 信息密度约束
-            $this->buildEmotionStateSection(),      // v1.11.2: 角色情绪状态
-        ]));
+        if ($cacheLayout) {
+            // ── 稳定前缀（整本基本不变 / 每~10章才变 → 命中缓存）──
+            $prefix = implode('', array_filter([
+                $this->buildNovelInfo(),                // 小说信息（静态）
+                $this->buildStoryOutlineSection(),      // 全书三幕结构（静态）
+                $this->buildBibleSection(),             // v41: 全书圣经（每N章变，命中缓存）
+                $this->buildAuthorProfileSection(),     // 作者画像（静态）
+                $this->buildReaderProfileSection(),     // 目标读者画像（静态）
+                $this->buildArcChapterSection(),        // 全书故事线（每10章变）
+                $this->buildVoiceProfileSection(),      // 角色语音规则（半静态）
+                $this->buildRecurringMotifsSection(),   // 全书重复意象（半静态）
+                $this->buildStyleExemplarSection(),     // v41: 文风范本（本书高分片段，show not tell）
+                $this->buildUserDensitySection(),       // 描写密度（静态规则）
+                $this->buildPOVSection(),               // POV 视角约束（静态）
+            ]));
+            // ── 动态头：本章关键信息（强注意）──
+            $dynHead = implode('', array_filter([
+                $this->buildQualityFeedbackSection(),
+                $this->buildCharacterSection(),
+                $this->buildLocationSection(),
+                $this->buildPrevHookSection(),          // v41: 上章钩子待回收（强约束本章开头承接）
+                $this->buildForeshadowSection(),
+                $this->buildOutlineSection(),           // 本章大纲
+                $this->buildSceneAtmosphereSection(),   // 场景意境指引
+                $this->buildChapterTypeSection(),       // 章节类型识别与节奏差异
+                $this->buildCausalChainSection(),       // 因果链预警
+                $this->buildPreWriteChecklist(),
+                $this->buildSynopsisSection(),
+            ]));
+            // ── 动态中部（弱注意区，可被裁剪）──
+            $middle = implode('', array_filter([
+                $this->buildPrevSection(),
+                $this->buildRecentChapterSection(),
+                $this->buildTailSection(),
+                $this->buildMomentumSection(),
+                $this->buildCognitiveLoadSection(),
+                $this->buildEmotionStateSection(),
+                $this->buildEventsSection(),
+                $this->buildSemanticSection(),
+                $this->buildKBContextSection(),
+                $this->buildCatchphraseSection(),
+                $this->buildHookHistorySection(),
+                $this->buildCoolPointHistorySection(),
+                $this->buildTropesSection(),
+                $this->buildVolumeGoalSection(),
+                $this->buildProgressSection(),
+                $this->buildEndingContextSection(),
+            ]));
+            $head = $prefix . $dynHead;
+            // ── 动态尾（强 recency）──
+            $tail = implode('', array_filter([
+                $this->fourSegmentRhythm() . "\n\n",
+                $this->buildRhythmSection(),
+                $this->buildUserHookSection(),
+                $this->buildEndingSection(),
+                $this->buildUserRulesSection(),         // 字数/主角名锚定（保留在尾部吃 recency）
+            ]));
+        } else {
+            // ── 旧 U 型布局（回退用，ws_cache_prompt_layout=0）──
+            $head = implode('', array_filter([
+                $this->buildQualityFeedbackSection(),
+                $this->buildAuthorProfileSection(),
+                $this->buildReaderProfileSection(),
+                $this->buildCharacterSection(),
+                $this->buildLocationSection(),
+                $this->buildPrevHookSection(),          // v41: 上章钩子待回收
+                $this->buildVoiceProfileSection(),
+                $this->buildForeshadowSection(),
+                $this->buildOutlineSection(),
+                $this->buildSceneAtmosphereSection(),   // 场景意境指引
+                $this->buildChapterTypeSection(),       // 章节类型识别与节奏差异
+                $this->buildCausalChainSection(),       // 因果链预警
+                $this->buildPreWriteChecklist(),
+                $this->buildSynopsisSection(),
+            ]));
+            $middle = implode('', array_filter([
+                $this->buildNovelInfo(),
+                $this->buildArcChapterSection(),
+                $this->buildStoryOutlineSection(),
+                $this->buildPrevSection(),
+                $this->buildRecentChapterSection(),
+                $this->buildTailSection(),
+                $this->buildMomentumSection(),
+                $this->buildStyleExemplarSection(),     // v41: 文风范本
+                $this->buildUserDensitySection(),
+                $this->buildPOVSection(),
+                $this->buildCognitiveLoadSection(),
+                $this->buildEmotionStateSection(),
+                $this->buildEventsSection(),
+                $this->buildSemanticSection(),
+                $this->buildKBContextSection(),
+                $this->buildCatchphraseSection(),
+                $this->buildHookHistorySection(),
+                $this->buildCoolPointHistorySection(),
+                $this->buildRecurringMotifsSection(),
+                $this->buildTropesSection(),
+                $this->buildVolumeGoalSection(),
+                $this->buildProgressSection(),
+                $this->buildEndingContextSection(),
+            ]));
+            $tail = implode('', array_filter([
+                $this->fourSegmentRhythm() . "\n\n",
+                $this->buildRhythmSection(),
+                $this->buildUserHookSection(),
+                $this->buildEndingSection(),
+                $this->buildUserRulesSection(),
+            ]));
+        }
 
         // 注意：Agent 指令必须在"请开始写作"之前——LLM 读到启动指令后会忽略其后内容
-        $userPrompt = $head . $middle . $tail
-            . $this->buildAgentSection()
-            . "\n请开始写作：\n";
+        // tailPart = 尾部强约束 + Agent 指令 + 启动指令，必须完整保留（U 型注意力尾权重最高）
+        $tailPart = $tail . $this->buildAgentSection() . "\n请开始写作：\n";
 
-        $promptLen = mb_strlen($userPrompt);
-        if ($promptLen > 6000) {
-            addLog((int)$this->novel['id'], 'warn', "prompt 过长：{$promptLen} 字，可能挤压输出空间");
+        $maxPromptLen = max(8000, (int)getSystemSetting('ws_max_prompt_len', 40000, 'int'));
+        // 超长时只裁剪"中部"（弱注意区），永不动 head 与 tailPart，
+        // 确保大纲、节奏/钩子/铁律、"请开始写作" 不被切掉。
+        $fixedLen = mb_strlen($head) + mb_strlen($tailPart);
+        if ($fixedLen + mb_strlen($middle) > $maxPromptLen) {
+            $middleBudget = max(0, $maxPromptLen - $fixedLen);
+            $origMiddleLen = mb_strlen($middle);
+            if ($origMiddleLen > $middleBudget) {
+                $marker = "\n【上下文过长，已省略部分参考信息】\n";
+                $keep = max(0, $middleBudget - mb_strlen($marker));
+                $cut = $origMiddleLen - $keep;
+                $middle = $keep > 0 ? (mb_substr($middle, 0, $keep) . $marker) : '';
+                if ($fixedLen > $maxPromptLen) {
+                    addLog((int)$this->novel['id'], 'warn', "prompt 过长：head+尾部强约束已达 {$fixedLen} 字（超 {$maxPromptLen}），中部已全部省略，请精简上下文配置");
+                } else {
+                    addLog((int)$this->novel['id'], 'warn', "prompt 过长：中部已裁剪 {$cut} 字（head/大纲/尾部指令完整保留）");
+                }
+            }
+        } elseif ($fixedLen + mb_strlen($middle) > 15000) {
+            addLog((int)$this->novel['id'], 'warn', "prompt 偏长：" . ($fixedLen + mb_strlen($middle)) . " 字，建议检查上下文配置");
         }
+
+        $userPrompt = $head . $middle . $tailPart;
 
         return $userPrompt;
     }
@@ -590,6 +749,18 @@ EOT;
                 $realmAnchor = !empty($pAttrs['realm']) ? $pAttrs['realm'] : ($pAttrs['level'] ?? '');
                 $powerText = !empty($pAttrs['power']) ? "（战力：{$pAttrs['power']}）" : '';
                 $section .= "【主角境界锚定】{$canonicalProtagonist} 当前为 {$realmAnchor}{$powerText}。后续写作中主角境界变化必须符合修炼体系逻辑，不得无故跳级或退化。如本章有境界突破，突破后的境界必须合理递进。\n\n";
+                
+                // 注入反派实力对标规则
+                try {
+                    require_once __DIR__ . '/PowerSystem.php';
+                    $ps = new PowerSystem((int)($this->novel['id'] ?? 0));
+                    $constraint = $ps->buildAntagonistConstraint($canonicalProtagonist, $realmAnchor);
+                    if (!empty($constraint)) {
+                        $section .= "{$constraint}\n\n";
+                    }
+                } catch (\Throwable $e) {
+                    // PowerSystem 不可用则跳过
+                }
             }
         }
 
@@ -602,6 +773,21 @@ EOT;
         if ($lines) {
             $section .= "【人物当前状态（必须严格遵守，不得与此矛盾）】\n" . implode("\n", $lines) . "\n\n";
         }
+
+        // 已死亡/离场角色黑名单 — 防止 AI 在后期章节复活已死角色
+        // MemoryEngine 仅查 alive=1，此处单独查询死亡角色
+        try {
+            $deadCards = \DB::fetchAll(
+                'SELECT name FROM character_cards WHERE novel_id=? AND alive=0 ORDER BY name ASC',
+                [(int)$this->novel['id']]
+            );
+            if ($deadCards) {
+                $deadNames = array_column($deadCards, 'name');
+                $section .= "【⚠️ 已死亡/离场角色——本章绝对不可出场】\n"
+                    . implode('、', $deadNames) . "\n"
+                    . "以上角色已死亡或永久离开故事，禁止在正文中以任何形式出现。\n\n";
+            }
+        } catch (\Throwable) {}
 
         return $section;
     }
@@ -661,6 +847,51 @@ EOT;
 
             require_once __DIR__ . '/agents/DialogueVoiceChecker.php';
             return DialogueVoiceChecker::buildVoiceSection($voiceMap);
+        } catch (\Throwable) {
+            return '';
+        }
+    }
+
+    private function buildChapterTypeSection(): string
+    {
+        try {
+            require_once __DIR__ . '/ChapterTypeDetector.php';
+            return ChapterTypeDetector::buildGuidanceSection(
+                trim((string)($this->chapter['outline'] ?? ''))
+            );
+        } catch (\Throwable) {
+            return '';
+        }
+    }
+
+    private function buildCausalChainSection(): string
+    {
+        try {
+            require_once __DIR__ . '/CausalChainGuard.php';
+            $guard = new CausalChainGuard(
+                (int)$this->novel['id'],
+                $this->chNum,
+                trim((string)($this->chapter['outline'] ?? ''))
+            );
+            return $guard->buildPromptSection();
+        } catch (\Throwable) {
+            return '';
+        }
+    }
+
+    private function buildSceneAtmosphereSection(): string
+    {
+        try {
+            require_once __DIR__ . '/SceneAtmosphereBuilder.php';
+            $builder = new SceneAtmosphereBuilder(
+                (int)$this->novel['id'],
+                $this->genre,
+                trim((string)($this->chapter['outline'] ?? '')),
+                trim((string)($this->chapter['pacing'] ?? '')),
+                trim((string)($this->memoryCtx['current_location'] ?? '')),
+                $this->chNum
+            );
+            return $builder->build();
         } catch (\Throwable) {
             return '';
         }
@@ -861,19 +1092,42 @@ EOT;
             $parts[] = trim($this->resolverResult['prompt_section']);
         }
 
-        // 2) 到期伏笔紧急提醒（deadline 临近）
+        // 2) 伏笔倒计时压力：逾期越久措辞越强
         $pending = $this->memoryCtx['pending_foreshadowing'] ?? [];
+        $resolvedIds = array_column($this->resolverResult['items'] ?? [], 'id');
+        $agedLines = [];
+        foreach ($pending as $f) {
+            $fId = (int)($f['id'] ?? 0);
+            if ($fId > 0 && in_array($fId, $resolvedIds)) continue;
+            $planted = (int)($f['chapter'] ?? $f['planted_chapter'] ?? 0);
+            if ($planted <= 0) continue;
+            $age = $this->chNum - $planted;
+            if ($age > 30) {
+                $icon = '🔴【紧急回收】';
+            } elseif ($age > 20) {
+                $icon = '🟡【优先回收】';
+            } elseif ($age > 10) {
+                $icon = '📌【建议回收】';
+            } else {
+                continue;  // 埋设不到10章，不施加压力
+            }
+            $agedLines[] = "{$icon}{$f['desc']}（已埋{$age}章，宜尽快回收）";
+        }
+        if (!empty($agedLines)) {
+            $parts[] = "【伏笔倒计时——逾期越久必须越早回收】\n" . implode("\n", $agedLines);
+        }
+
+        // 3) 到期伏笔紧急提醒（deadline 临近，优先级高于倒计时）
         $due = array_filter($pending, fn($f) => !empty($f['deadline']) && $this->chNum >= (int)$f['deadline'] - 3);
         if (!empty($due)) {
             $dueLines = [];
-            $resolvedIds = array_column($this->resolverResult['items'] ?? [], 'id');
             foreach ($due as $f) {
                 $fId = (int)($f['id'] ?? 0);
                 if ($fId > 0 && in_array($fId, $resolvedIds)) continue;
                 $dl = (int)$f['deadline'];
                 $dueLines[] = ($this->chNum >= $dl - 2 && $this->chNum <= $dl + 2)
-                    ? "⚠️【紧急】第{$f['chapter']}章埋：{$f['desc']}（应{$dl}章前回收）"
-                    : "第{$f['chapter']}章埋：{$f['desc']}（建议{$dl}章前回收）";
+                    ? "⚠️【紧急·临近回收期限】{$f['desc']}"
+                    : "{$f['desc']}（临近回收期限）";
             }
             if (!empty($dueLines)) {
                 $parts[] = "【到期伏笔提醒】\n" . implode("\n", $dueLines);
@@ -901,6 +1155,11 @@ EOT;
         }
 
         if (empty($parts)) return '';
+        // 护栏：禁止把章节号/编号等创作元数据写进正文，避免穿帮
+        $parts[] = "【硬性规则】以上编号与提示仅供创作参考，严禁出现在正文。"
+                 . "角色不知道自己身处第几章；正文不得出现「第N章」「根据第N章」"
+                 . "「记录/档案显示」等指向章节号或卷册编号的表述。伏笔回收须通过"
+                 . "角色的记忆、对话、线索自然呈现。";
         return implode("\n\n", $parts) . "\n\n";
     }
 
@@ -1188,6 +1447,63 @@ EOT;
     }
 
     /**
+     * 章节控制卡：在正式写作前强制 LLM 自我问答
+     *
+     * 利用 chain-of-thought 锚定效应——LLM 在脑中回答这些问题时
+     * 会激活对应方向的 token 分布，提升伏笔回收率和情节一致性。
+     */
+    private function buildPreWriteChecklist(): string
+    {
+        $protagonist = trim($this->novel['protagonist_name'] ?? '');
+        $protagonist = $protagonist ?: '主角';
+
+        // 从 memoryCtx 读取伏笔压力
+        $pendingFs = $this->memoryCtx['pending_foreshadowing'] ?? [];
+        $fsCount   = count($pendingFs);
+        if ($fsCount > 0) {
+            // 列出最高优先级的待回收伏笔（最多2条）
+            $fsSamples = array_slice($pendingFs, 0, 2);
+            $fsDescs   = array_map(fn($f) => $f['description'] ?? '', $fsSamples);
+            $fsDescs   = array_filter($fsDescs);
+            $fsHint    = !empty($fsDescs)
+                ? "你有 {$fsCount} 条待回收伏笔，本章至少推进或回收其中 1 条。例如：「" . implode('」、「', $fsDescs) . "」"
+                : "你有 {$fsCount} 条待回收伏笔，本章至少推进或回收其中 1 条";
+        } else {
+            $fsHint = "暂无待回收伏笔。本章可埋设新伏笔，但需确保在接下来 10 章内回收";
+        }
+
+        // 从章节数据读取已有钩子类型，防止重复
+        $hookType = trim($this->chapter['hook_type'] ?? '');
+        $hookHint = $hookType
+            ? "本章指定钩子类型为「{$hookType}」，章末 3 段必须兑现"
+            : "章末必须制造悬念/反转/信息爆炸，让读者无法放下";
+
+        // 收尾期检测（后 15% 章节）
+        $targetChapters = (int)($this->novel['target_chapters'] ?? 0);
+        $inEnding = $targetChapters > 0 && $this->chNum >= (int)($targetChapters * 0.85);
+        $endingHint = $inEnding
+            ? "⚠️ 本书已进入收尾期（第{$this->chNum}/{$targetChapters}章），禁止新开支线和新埋未回收的伏笔！本章应以回收主线伏笔为主，推动故事走向结局"
+            : '';
+
+        $lines = [
+            "【本章写作控制卡——请在脑中明确答案后再动笔】",
+            "1. 本章结束后，{$protagonist}身上改变了什么？（状态/关系/能力/认知——至少选一项明确改变）",
+            "2. 本章推动了哪条主线/支线？进度前进了多少？（描述具体的推进幅度）",
+            "3. 伏笔处理：{$fsHint}",
+            "4. 核心冲突场景——本章最高张力的对抗/抉择/危机是什么？发生在谁和谁之间？",
+            "5. {$hookHint}",
+        ];
+
+        if ($endingHint) {
+            $lines[] = "6. {$endingHint}";
+        }
+
+        $lines[] = "（以上问题无需在正文中输出，仅用于在你脑中设定写作方向）";
+
+        return implode("\n", $lines) . "\n\n";
+    }
+
+    /**
      * 作者画像风格指导段
      * 从 novels.ref_author / writing_style 提取，引导 AI 模仿指定作者风格
      */
@@ -1386,6 +1702,63 @@ EOT;
      * KB 语义召回段（v1.6 算法 D）
      * 从 memoryCtx['semantic_hits'] 中提取 KB 类别的命中
      */
+    /**
+     * v41: 全书圣经（世界规则/人物现状/主线时间线）。
+     * 每 N 章才更新一次 → 待在缓存前缀里，给 1000 章全程设定零漂移，几乎免费。
+     */
+    private function buildBibleSection(): string
+    {
+        if (!getSystemSetting('ws_story_bible_enabled', true, 'bool')) return '';
+        try {
+            require_once __DIR__ . '/memory/StoryBible.php';
+            $bible = StoryBible::get((int)$this->novel['id']);
+        } catch (\Throwable $e) {
+            return '';
+        }
+        if (!$bible) return '';
+        $parts = [];
+        if (trim($bible['world_md']) !== '')     $parts[] = "## 世界规则\n" . trim($bible['world_md']);
+        if (trim($bible['character_md']) !== '') $parts[] = "## 人物现状\n" . trim($bible['character_md']);
+        if (trim($bible['timeline_md']) !== '')  $parts[] = "## 主线时间线\n" . trim($bible['timeline_md']);
+        if (!$parts) return '';
+        return "【全书圣经（权威设定，必须严格遵守，不得与之矛盾）】\n"
+            . implode("\n\n", $parts) . "\n\n";
+    }
+
+    /**
+     * v41 文风范本（few-shot）：取本书评分最高的已写章节片段作风格锚，让模型"照着写"而非"按规则写"。
+     * 自举——用本书自己写得最好的段落当标杆，无需外部素材；明确禁止照抄情节。
+     */
+    private function buildStyleExemplarSection(): string
+    {
+        if (!getSystemSetting('ws_style_exemplar_enabled', true, 'bool')) return '';
+        try {
+            $row = DB::fetch(
+                "SELECT chapter_number, content, quality_score FROM chapters
+                 WHERE novel_id=? AND status='completed' AND quality_score IS NOT NULL
+                   AND content IS NOT NULL AND content <> ''
+                   AND chapter_number < ? AND chapter_number <> ?
+                 ORDER BY quality_score DESC, chapter_number DESC LIMIT 1",
+                [(int)$this->novel['id'], $this->chNum, $this->chNum - 1]
+            );
+            if (!$row) return '';
+            // 取高分章节正文中段一段（避开开头的"黄金三行"模板，更能体现常态文风）
+            $content = trim((string)$row['content']);
+            $start = min((int)(mb_strlen($content) * 0.15), 400);
+            $excerpt = trim(mb_substr($content, $start, 460));
+            if (mb_strlen($excerpt) < 120) $excerpt = mb_substr($content, 0, 460);
+            if (mb_strlen($excerpt) < 120) return '';
+            $maxLen = max(200, (int)getSystemSetting('ws_style_exemplar_len', 460, 'int'));
+            $excerpt = mb_substr($excerpt, 0, $maxLen);
+            return "【✍️ 文风范本（本书第{$row['chapter_number']}章高分片段）】\n"
+                . "请学习以下片段的**句式节奏、描写质感、对话语气、叙事密度**，本章保持同样的文笔水准；"
+                . "但**严禁照抄**其情节、句子或意象，只借鉴「写法」：\n"
+                . "“……{$excerpt}……”\n\n";
+        } catch (\Throwable $e) {
+            return '';
+        }
+    }
+
     private function buildKBContextSection(): string
     {
         try {

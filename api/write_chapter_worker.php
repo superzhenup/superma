@@ -41,20 +41,10 @@ $_SERVER['REQUEST_URI'] = '/api/write_chapter.php';
 // 模拟已登录状态（write_start.php 已验证登录）
 $_SESSION['logged_in'] = true;
 
+// 仅先加载 config.php 拿到 CFG_PROGRESS_DIR；重型依赖(ai/write_engine)留到上报 'writing' 之后再加载。
 require_once dirname(__DIR__) . '/config.php';
-require_once dirname(__DIR__) . '/includes/db.php';
-require_once dirname(__DIR__) . '/includes/ai.php';
-require_once dirname(__DIR__) . '/includes/functions.php';
-require_once dirname(__DIR__) . '/includes/write_engine.php';
 
-// config.php 加载后方可使用其常量
-set_time_limit(CFG_TIME_UNLIMITED);  // CLI 模式不限时
-ignore_user_abort(true);
-
-$workerStartTime = time();
-$workerGlobalTimeout = 1800;
-
-// CLI 参数
+// CLI 参数（提前解析，供尽早写入 'writing' 状态用）
 $novelId   = (int)($argv[1] ?? 0);
 $chapterId = (int)($argv[2] ?? 0);
 $taskId    = preg_replace('/[^a-zA-Z0-9_]/', '', $argv[3] ?? '');
@@ -75,6 +65,7 @@ if (!file_exists($asyncProgressFile)) {
     exit(1);
 }
 
+// 致命错误兜底：在加载重型依赖之前就注册，确保 require 阶段的 fatal 也能写回 'error'（不会让前端卡死）
 register_shutdown_function(function() {
     global $asyncProgressFile, $asyncTaskId;
     $err = error_get_last();
@@ -100,6 +91,35 @@ register_shutdown_function(function() {
     fclose($fp);
     error_log("[write_worker] 致命错误: {$errMsg}");
 });
+
+// 关键：尽早把状态置为 'writing'，让 write_start 立刻确认 worker 已启动。
+// 必须在加载 ai.php / write_engine.php 等重型依赖之前——CLI（通常无 OPcache）冷启动编译这些大文件
+// 可能耗时较久；若拖过 write_start 的确认窗口，会被误判为“启动失败”而回退到 SSE（无实时输出）。
+(function() use ($asyncProgressFile) {
+    $fp = @fopen($asyncProgressFile, 'r+');
+    if (!$fp) return;
+    flock($fp, LOCK_EX);
+    $d = json_decode(stream_get_contents($fp), true) ?: [];
+    $d['status'] = 'writing';
+    $d['pid'] = getmypid();
+    $d['updated_at'] = time();
+    fseek($fp, 0); ftruncate($fp, 0);
+    fwrite($fp, json_encode($d, JSON_UNESCAPED_UNICODE));
+    flock($fp, LOCK_UN); fclose($fp);
+})();
+
+// 重型依赖（编译较慢，但此前已上报 'writing'，write_start 不会误判为启动失败）
+require_once dirname(__DIR__) . '/includes/db.php';
+require_once dirname(__DIR__) . '/includes/ai.php';
+require_once dirname(__DIR__) . '/includes/functions.php';
+require_once dirname(__DIR__) . '/includes/write_engine.php';
+
+// config.php 加载后方可使用其常量
+set_time_limit(CFG_TIME_UNLIMITED);  // CLI 模式不限时
+ignore_user_abort(true);
+
+$workerStartTime = time();
+$workerGlobalTimeout = 1800;
 
 // ---- 引入 write_chapter.php 的核心逻辑 ----
 // 不能直接 require，因为 headers 已发。我们只复用函数定义。
@@ -161,8 +181,25 @@ function updateAsyncProgress(array $updates): void {
 function sendHeartbeatWrite(): void {
     global $lastHeartbeat, $asyncTaskId, $chunkBuffer, $chunkBufferCount, $lastFlushTime, $_writingChapterId;
     global $workerStartTime, $workerGlobalTimeout, $novelId, $ch;
+    global $lastContentTime;  // v2 fix: 追踪最后一次收到 chunk 的时间
     $now = microtime(true);
+
+    // 每次调用都刷新章节 updated_at（防止 Watchdog 误杀）
+    // 必须在间隔检查之前：深度思考模型可能长时间无 chunk，心跳间隔不稳定
+    if ($_writingChapterId > 0) {
+        try {
+            DB::query('UPDATE chapters SET updated_at = NOW() WHERE id = ? AND status = "writing"', [$_writingChapterId]);
+        } catch (\Throwable) {}
+    }
+
     if ($workerStartTime > 0 && (time() - $workerStartTime) > $workerGlobalTimeout) {
+        // 如果近期有内容产出（AI 仍在工作），自动延长超时而非误杀
+        // $lastContentTime 在 sseChunkWrite 中更新
+        if (isset($lastContentTime) && (time() - $lastContentTime) < 120) {
+            $workerGlobalTimeout += 600;  // 额外给10分钟
+            addLog($novelId, 'warn', '全局超时但AI仍在产出内容，自动延长600秒');
+            return;
+        }
         flushChunkBuffer();
         $elapsed = time() - $workerStartTime;
         error_log("[write_worker] 全局超时（{$elapsed}s > {$workerGlobalTimeout}s），强制退出");
@@ -179,17 +216,14 @@ function sendHeartbeatWrite(): void {
         flushChunkBuffer();
     }
     if ($now - $lastHeartbeat < 10) return;
-    if ($_writingChapterId > 0) {
-        try {
-            DB::query('UPDATE chapters SET updated_at = NOW() WHERE id = ? AND status = "writing"', [$_writingChapterId]);
-        } catch (\Throwable) {}
-    }
     updateAsyncProgress(['status' => 'writing', 'heartbeat' => $now]);
     $lastHeartbeat = $now;
 }
 
 function sseChunkWrite(string $chunk): void {
     global $asyncProgressFile, $asyncMessages, $chunkBuffer, $chunkBufferCount, $lastFlushTime;
+    global $lastContentTime;  // v2 fix: 追踪最后一次内容产出时间
+    $lastContentTime = time();
     // 缓冲 token，减少磁盘 I/O
     $chunkBuffer .= $chunk;
     $chunkBufferCount++;
@@ -284,8 +318,21 @@ try {
 
 updateAsyncProgress(['chapter_id' => $ch['id'], 'chapter_number' => (int)$ch['chapter_number']]);
 
+$preAiClient = null;
 try {
-    $memResult = WriteEngine::initMemory($novelId, $ch);
+    $preAiClient = getAIClient($novel['model_id'] ? (int)$novel['model_id'] : null);
+    if ($preAiClient->is1MContext()) {
+        addLog($novelId, 'info', '检测到1M上下文模型，将使用完整上下文模式');
+        if (defined('CFG_TIME_LONG_1M')) {
+            set_time_limit(CFG_TIME_LONG_1M);
+        }
+    }
+} catch (Throwable $e) {
+    // 忽略，后续模型调用会按原有 fallback 逻辑重试。
+}
+
+try {
+    $memResult = WriteEngine::initMemory($novelId, $ch, $preAiClient);
     $engine    = $memResult['engine'];
     $memoryCtx = $memResult['memoryCtx'];
 } catch (Throwable $e) {
@@ -319,7 +366,9 @@ try {
         function(array $payload) { sseMsgWrite($payload); },
         function() { sendHeartbeatWrite(); },
         function(string $reasoning) { sseThinkingWrite($reasoning); },
-        $novel['model_id'] ? (int)$novel['model_id'] : null
+        $novel['model_id'] ? (int)$novel['model_id'] : null,
+        (int)$ch['chapter_number'],
+        (int)$novel['target_chapters']
     );
     $fullContent       = $result['content'];
     $usedModel         = $result['model'];
@@ -353,30 +402,57 @@ try {
         'words'      => $words,
         'model_used' => $usedModel?->modelLabel,
         'messages'   => array_merge($asyncMessages, [[
-            'stats'      => "第{$ch['chapter_number']}章《{$ch['title']}》完成，共 {$words} 字{$modelInfo}",
-            'chapter_id' => $ch['id'],
-            'words'      => $words,
-            'done'       => $allDone,
-            'model_used' => $usedModel?->modelLabel,
+            'stats'            => "第{$ch['chapter_number']}章《{$ch['title']}》完成，共 {$words} 字{$modelInfo}",
+            'chapter_id'       => $ch['id'],
+            'words'            => $words,
+            'done'             => $allDone,
+            'model_used'       => $usedModel?->modelLabel,
+            'next_chapter_id'  => $saveResult['next_chapter_id'] ?? null,
+            'next_chapter_num' => $saveResult['next_chapter_num'] ?? null,
         ]]),
     ]);
 
-} catch (Throwable $e) {
+} catch (WriteEngineValidationException $e) {
+    $errMsg = $e->getMessage();
+    addLog($novelId, 'error', 'P0 strict validation blocked chapter save: ' . $errMsg);
+    DB::update('chapters', ['status' => 'outlined'], 'id=? AND status="writing"', [$ch['id']]);
+    DB::update('novels', ['status' => 'paused'], 'id=?', [$novelId]);
+    updateAsyncProgress(['status' => 'error', 'error' => $errMsg, 'validation_blocked' => true]);
+    exit(1);
+} catch (WriteEnginePersistenceException $e) {
     $errMsg = $e->getMessage();
     if ($errMsg === 'canceled') {
         updateAsyncProgress(['status' => 'error', 'error' => '用户已取消写作', 'canceled' => true]);
         exit(1);
     }
     addLog($novelId, 'error', '落盘异常：' . $errMsg);
+    $backupSaved = false;
     if (!empty($fullContent)) {
         $currentCh = DB::fetch('SELECT status FROM chapters WHERE id=?', [$ch['id']]);
         if ($currentCh && $currentCh['status'] === 'writing') {
             $words = countWords($fullContent);
             DB::update('chapters', ['content' => $fullContent, 'words' => $words, 'status' => 'completed'], 'id=?', [$ch['id']]);
             updateNovelStats($novelId);
+            $backupSaved = true;
         }
     }
-    updateAsyncProgress(['status' => 'error', 'error' => '正文已保存但落盘异常：' . $errMsg]);
+    if ($backupSaved) {
+        updateAsyncProgress(['status' => 'completed', 'error' => '正文已保存但落盘异常：' . $errMsg]);
+    } else {
+        updateAsyncProgress(['status' => 'error', 'error' => $errMsg]);
+        exit(1);
+    }
+} catch (Throwable $e) {
+    $errMsg = $e->getMessage();
+    if ($errMsg === 'canceled') {
+        updateAsyncProgress(['status' => 'error', 'error' => '用户已取消写作', 'canceled' => true]);
+        exit(1);
+    }
+    addLog($novelId, 'error', 'Unexpected save failure: ' . $errMsg);
+    DB::update('chapters', ['status' => 'outlined'], 'id=? AND status="writing"', [$ch['id']]);
+    DB::update('novels', ['status' => 'paused'], 'id=?', [$novelId]);
+    updateAsyncProgress(['status' => 'error', 'error' => $errMsg]);
+    exit(1);
 }
 
 // ---- Phase 6: WriteEngine 后处理 ----

@@ -1,28 +1,187 @@
 <?php
 defined('APP_LOADED') or die('Direct access denied.');
 
+require_once __DIR__ . '/cache.php';
+
 // ================================================================
 // data.php — 数据访问层（仅操作数据库，不调用 AI）
 // 包含：小说/章节读写、日志、人物状态、伏笔追踪、版本管理
 // ================================================================
 
 // ----------------------------------------------------------------
-// 基础读取
+// 缓存管理
+// ----------------------------------------------------------------
+
+/**
+ * 清除指定小说的所有相关缓存
+ * 
+ * @param int $novelId 小说ID
+ */
+function clearNovelCache(int $novelId): void
+{
+    // 清除小说信息缓存
+    Cache::delete("novel:{$novelId}");
+    
+    // 清除章节列表缓存
+    Cache::delete("novel_chapters:{$novelId}:all");
+    Cache::delete("novel_chapter_count:{$novelId}");
+    
+    // 清除小说设置缓存（如果存在）
+    Cache::delete("novel_settings:{$novelId}");
+}
+
+/**
+ * 清除指定章节的缓存
+ * 
+ * @param int $chapterId 章节ID
+ * @param int $novelId 小说ID（用于清除章节列表缓存）
+ */
+function clearChapterCache(int $chapterId, int $novelId): void
+{
+    // 清除章节缓存
+    Cache::delete("chapter:{$chapterId}");
+    
+    // 清除章节列表缓存（因为章节信息已变更）
+    if ($novelId > 0) {
+        Cache::delete("novel_chapters:{$novelId}:all");
+    }
+}
+
+/**
+ * 更新章节数据并自动清除缓存
+ * 
+ * @param int $chapterId 章节ID
+ * @param int $novelId 小说ID
+ * @param array $data 要更新的数据
+ * @return int 受影响的行数
+ */
+function updateChapter(int $chapterId, int $novelId, array $data): int {
+    $affected = DB::update('chapters', $data, 'id=?', [$chapterId]);
+    
+    // 清除相关缓存
+    if ($affected > 0) {
+        clearChapterCache($chapterId, $novelId);
+    }
+    
+    return $affected;
+}
+
+/**
+ * 批量更新章节状态
+ * 
+ * @param int $novelId 小说ID
+ * @param string $status 新状态
+ * @param string $where 附加条件
+ * @param array $params 参数
+ * @return int 受影响的行数
+ */
+function updateChapterStatus(int $novelId, string $status, string $where = '', array $params = []): int {
+    $data = ['status' => $status];
+    $whereClause = 'novel_id=?';
+    $allParams = array_merge([$novelId], $params);
+    
+    if ($where) {
+        $whereClause .= ' AND ' . $where;
+    }
+    
+    $affected = DB::update('chapters', $data, $whereClause, $allParams);
+    
+    // 清除相关缓存
+    if ($affected > 0) {
+        clearNovelCache($novelId);
+    }
+    
+    return $affected;
+}
+
+// ----------------------------------------------------------------
+// 基础读取（带缓存优化）
 // ----------------------------------------------------------------
 
 function getNovel(int $id): array|false {
-    return DB::fetch('SELECT * FROM novels WHERE id=?', [$id]);
+    // 尝试从缓存获取
+    $cacheKey = "novel:{$id}";
+    $cached = Cache::get($cacheKey);
+    if ($cached !== null) {
+        return $cached;
+    }
+    
+    $novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$id]);
+    
+    // 缓存5分钟
+    if ($novel) {
+        Cache::set($cacheKey, $novel, 300);
+    }
+    
+    return $novel;
 }
 
 function getChapter(int $id): array|false {
-    return DB::fetch('SELECT * FROM chapters WHERE id=?', [$id]);
+    // 尝试从缓存获取
+    $cacheKey = "chapter:{$id}";
+    $cached = Cache::get($cacheKey);
+    if ($cached !== null) {
+        return $cached;
+    }
+    
+    $chapter = DB::fetch('SELECT * FROM chapters WHERE id=?', [$id]);
+    
+    // 缓存5分钟
+    if ($chapter) {
+        Cache::set($cacheKey, $chapter, 300);
+    }
+    
+    return $chapter;
 }
 
-function getNovelChapters(int $novelId): array {
+function getNovelChapters(int $novelId, int $page = 0, int $pageSize = 0): array {
+    // 如果未指定分页，返回所有章节（向后兼容）
+    if ($pageSize <= 0) {
+        // 尝试从缓存获取
+        $cacheKey = "novel_chapters:{$novelId}:all";
+        $cached = Cache::get($cacheKey);
+        if ($cached !== null) {
+            return $cached;
+        }
+        
+        $chapters = DB::fetchAll(
+            'SELECT * FROM chapters WHERE novel_id=? ORDER BY chapter_number ASC',
+            [$novelId]
+        );
+        
+        // 缓存5分钟
+        Cache::set($cacheKey, $chapters, 300);
+        
+        return $chapters;
+    }
+    
+    // 分页查询
+    $offset = ($page - 1) * $pageSize;
     return DB::fetchAll(
-        'SELECT * FROM chapters WHERE novel_id=? ORDER BY chapter_number ASC',
+        'SELECT * FROM chapters WHERE novel_id=? ORDER BY chapter_number ASC LIMIT ? OFFSET ?',
+        [$novelId, $pageSize, $offset]
+    );
+}
+
+/**
+ * 获取小说章节总数（用于分页）
+ */
+function getNovelChapterCount(int $novelId): int {
+    $cacheKey = "novel_chapter_count:{$novelId}";
+    $cached = Cache::get($cacheKey);
+    if ($cached !== null) {
+        return (int)$cached;
+    }
+    
+    $count = (int)DB::fetchColumn(
+        'SELECT COUNT(*) FROM chapters WHERE novel_id=?',
         [$novelId]
     );
+    
+    // 缓存5分钟
+    Cache::set($cacheKey, $count, 300);
+    
+    return $count;
 }
 
 // ----------------------------------------------------------------
@@ -42,27 +201,34 @@ function updateNovelStats(int $novelId): void {
         'current_chapter' => (int)($row['cnt']   ?? 0),
         'total_words'     => (int)($row['total'] ?? 0),
     ], 'id=?', [$novelId]);
+    
+    // 清除小说缓存（因为统计信息已变更）
+    clearNovelCache($novelId);
 }
 
 /**
  * 写入写作日志，并自动保留最新 200 条（防止无限膨胀）
  */
 function addLog(int $novelId, string $action, string $message, ?int $chapterId = null): void {
-    DB::insert('writing_logs', [
+    $insertId = (int)DB::insert('writing_logs', [
         'novel_id'   => $novelId,
         'chapter_id' => $chapterId,
         'action'     => $action,
         'message'    => $message,
     ]);
-    // 每部小说只保留最近 200 条日志，多余的自动删除
-    DB::execute(
-        'DELETE FROM writing_logs WHERE novel_id=? AND id NOT IN (
-            SELECT id FROM (
-                SELECT id FROM writing_logs WHERE novel_id=? ORDER BY id DESC LIMIT 200
-            ) t
-        )',
-        [$novelId, $novelId]
-    );
+    // [v41] 1000章优化：原先每条日志都跑一次带子查询的 DELETE（postProcess 每章调用 30+ 次，
+    // 1000 章即 3 万次无谓删除）。改为每约 25 条才裁剪一次，保留上限放宽到 220（200+缓冲）。
+    // 用插入 id 取模触发，确定性、无随机、与日志量自然挂钩。
+    if ($insertId > 0 && $insertId % 25 === 0) {
+        DB::execute(
+            'DELETE FROM writing_logs WHERE novel_id=? AND id NOT IN (
+                SELECT id FROM (
+                    SELECT id FROM writing_logs WHERE novel_id=? ORDER BY id DESC LIMIT 200
+                ) t
+            )',
+            [$novelId, $novelId]
+        );
+    }
 }
 
 // ----------------------------------------------------------------

@@ -80,10 +80,22 @@ try {
     $chapterId = (int)($input['chapter_id'] ?? 0);
     
     if (!$novelId) throw new Exception('缺少小说ID');
-    
-    $novel = DB::fetch('SELECT id, status FROM novels WHERE id=?', [$novelId]);
-    if (!$novel) throw new Exception('小说不存在');
-    
+
+    // Pre-Phase 0: 对 novels 行加排他锁（FOR UPDATE），防止并发启动竞态
+    // 两个同时到达的请求不能同时通过"无运行中任务"检查
+    $pdo = DB::connect();
+    $pdo->beginTransaction();
+    try {
+        $locked = DB::fetch('SELECT id, status FROM novels WHERE id=? FOR UPDATE', [$novelId]);
+        if (!$locked) throw new Exception('小说不存在');
+    } catch (Exception $e) {
+        try { $pdo->rollBack(); } catch (Throwable) {}
+        throw $e;
+    }
+    // 事务保持打开直到进度文件创建完成，确保并发安全
+
+    $novel = $locked;
+
     // 检查该小说是否已有写作任务在运行
     $progressDir = CFG_PROGRESS_DIR;
     if (!is_dir($progressDir)) @mkdir($progressDir, 0755, true);
@@ -121,13 +133,21 @@ try {
         $isStale    = ($refTime > 0 && (time() - $refTime) > $staleTimeout);
 
         // 额外检测：有 PID 且进程已死（exec 可用时才检测）
+        // 宝塔默认 disable_functions 会禁用 exec；调用被禁用的函数等同调用未定义函数，
+        // 会触发致命 Error 且 @ 无法抑制。故 Windows 分支必须先 function_exists('exec') 守卫，
+        // exec 不可用时无法用 tasklist 探测存活，退回到纯时间僵死判定。
         if (!$isStale && !empty($p['pid'])) {
             $pid = (int)$p['pid'];
             if ($pid > 0) {
-                $isDead = PHP_OS_FAMILY === 'Windows'
-                    ? (function() use ($pid) { $out = []; @exec("tasklist /FI \"PID eq {$pid}\" /NH 2>nul", $out); return empty($out) || !preg_match('/\b' . $pid . '\b/', implode('', $out)); })()
-                    : !file_exists("/proc/{$pid}");
-                if ($isDead) $isStale = true;
+                if (PHP_OS_FAMILY === 'Windows') {
+                    if (function_exists('exec')) {
+                        $out = [];
+                        @exec("tasklist /FI \"PID eq {$pid}\" /NH 2>nul", $out);
+                        if (empty($out) || !preg_match('/\b' . $pid . '\b/', implode('', $out))) $isStale = true;
+                    }
+                } else {
+                    if (!file_exists("/proc/{$pid}")) $isStale = true;
+                }
             }
         }
 
@@ -179,23 +199,37 @@ try {
         'started_at' => time(),
         'updated_at' => time(),
     ], JSON_UNESCAPED_UNICODE), LOCK_EX);
-    
+
+    // 进度文件已安全创建，提交 DB 事务释放排他锁
+    // 此时其他并发请求会发现进度文件中已有运行中任务而被拒绝
+    try { $pdo->commit(); } catch (Throwable) {}
+
     // 启动 CLI worker 后台进程
     $phpBin = PHP_BINARY ?: 'php';
+    // Windows：Web 请求下 PHP_BINARY 多为 php-cgi.exe（nginx/FastCGI 的 SAPI），它**不能**当 CLI 跑 worker：
+    //   - PHP_SAPI=cgi-fcgi，会被 write_chapter_worker.php 的「非 cli 即 403」硬校验立刻拒绝；
+    //   - $argv 为 null，novel_id/task_id 全部丢失。
+    // 必须替换为同目录的 php.exe（CLI）。路径模式可靠，open_basedir 不影响纯字符串替换。
+    if (PHP_OS_FAMILY === 'Windows' && preg_match('#php-cgi\.exe$#i', $phpBin)) {
+        $phpBin = preg_replace('#php-cgi\.exe$#i', 'php.exe', $phpBin);
+    }
     // PHP-FPM 不能执行 CLI 脚本，需替换为 php CLI 二进制
     // 宝塔路径示例：/www/server/php/82/sbin/php-fpm → /www/server/php/82/bin/php
     // 注意：宝塔 open_basedir 限制会阻止 file_exists() 检查非项目路径，因此用 exec 绕过
     if (PHP_OS_FAMILY !== 'Windows' && preg_match('#/php-fpm\d*$#', $phpBin)) {
         $found = false;
-        // exec 不受 open_basedir 限制，优先用 which 查找
-        @exec('which php 2>/dev/null', $whichOut, $whichCode);
-        if ($whichCode === 0 && !empty($whichOut[0])) {
-            $candidate = trim($whichOut[0]);
-            // 确认候选路径真的可以执行 PHP 脚本
-            @exec(escapeshellarg($candidate) . ' -r "echo 1;" 2>/dev/null', $rTest, $rCode);
-            if ($rCode === 0) {
-                $phpBin = $candidate;
-                $found = true;
+        // exec 不受 open_basedir 限制，优先用 which 查找；但宝塔默认禁用 exec，
+        // 调用被禁用函数会致命错误，故须 function_exists('exec') 守卫，不可用时直接走路径盲替换。
+        if (function_exists('exec')) {
+            @exec('which php 2>/dev/null', $whichOut, $whichCode);
+            if (($whichCode ?? 1) === 0 && !empty($whichOut[0])) {
+                $candidate = trim($whichOut[0]);
+                // 确认候选路径真的可以执行 PHP 脚本
+                @exec(escapeshellarg($candidate) . ' -r "echo 1;" 2>/dev/null', $rTest, $rCode);
+                if (($rCode ?? 1) === 0) {
+                    $phpBin = $candidate;
+                    $found = true;
+                }
             }
         }
         // 兜底：宝塔路径模式盲替换（路径模式非常可靠，不能因 open_basedir 而卡死）
@@ -207,27 +241,25 @@ try {
     $logFilePath = $progressDir . '/' . $taskId . '.log';
     
     if (PHP_OS_FAMILY === 'Windows') {
+        // 关键修复：Windows 后台进程必须用 start /B 启动“分离”进程。
+        // 若直接 proc_open("php worker ...") 后 proc_close()，proc_close 会**阻塞到 worker
+        // 写完整章**（数分钟），异步设计完全失效、请求挂死直至 Web 服务器超时。
+        // start /B 让 worker 脱离父进程独立运行，外层命令瞬间返回，proc_close()/pclose() 不再阻塞。
+        // 宝塔默认 disable_functions 禁用 exec/popen、仅保留 proc_open，故优先 proc_open。
+        $winCmd = 'start /B "" "' . $phpBin . '" ' . $workerScript
+                . " {$novelId} {$chapterId} {$taskId}"
+                . ' >> ' . escapeshellarg($logFilePath) . ' 2>&1';
         if ($procOpenOk) {
-            // 使用 proc_open，比 start /B + popen 更可靠
-            $descriptorspec = [
-                0 => ['pipe', 'r'],
-                1 => ['file', $logFilePath, 'a'],
-                2 => ['file', $logFilePath, 'a'],
-            ];
-            $process = @proc_open(
-                "\"{$phpBin}\" {$workerScript} {$novelId} {$chapterId} {$taskId}",
-                $descriptorspec,
-                $pipes
-            );
+            $descriptorspec = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+            $process = @proc_open($winCmd, $descriptorspec, $pipes);
             if ($process !== false) {
-                fclose($pipes[0]);
-                proc_close($process);
+                foreach ($pipes as $pp) { if (is_resource($pp)) fclose($pp); }
+                proc_close($process);  // start 已返回，此处不阻塞
             }
-        } else {
-            // 兜底：start /B + popen（部分环境可用）
-            $logFile = escapeshellarg($logFilePath);
-            $cmd = "start /B \"\" \"{$phpBin}\" {$workerScript} {$novelId} {$chapterId} {$taskId} >> {$logFile} 2>&1";
-            pclose(popen($cmd, 'r'));
+        } elseif ($popenOk) {
+            pclose(popen($winCmd, 'r'));
+        } elseif ($execOk) {
+            @exec($winCmd);  // start /B 立即返回，exec 不阻塞
         }
     } else {
         // Linux: Shell wrapper 双壳隔离
@@ -241,7 +273,20 @@ try {
             " >> " . escapeshellarg($logFilePath) . " 2>&1\n"
         );
         @chmod($workerSh, 0755);
-        exec(escapeshellarg($workerSh) . " > /dev/null 2>&1 &");
+        $launchCmd = escapeshellarg($workerSh) . " > /dev/null 2>&1 &";
+        if ($execOk) {
+            exec($launchCmd);
+        } elseif ($procOpenOk) {
+            // exec 被宝塔禁用时的兜底：用 proc_open 后台启动 sh。命令以 & 结尾，
+            // 外层 sh -c 立即返回、wrapper.sh 被重定向到 init 独立运行，proc_close 不阻塞。
+            $descriptorspec = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+            $process = @proc_open('/bin/sh ' . $launchCmd, $descriptorspec, $pipes);
+            if ($process !== false) {
+                foreach ($pipes as $pp) { if (is_resource($pp)) fclose($pp); }
+                proc_close($process);
+            }
+        }
+        // exec 与 proc_open 都不可用时：下方轮询检测不到进度，自动返回 fallback_sse
         // wrapper.sh 在 worker 完成后随进度文件一起清理（僵死检测）
     }
     
@@ -344,8 +389,7 @@ try {
     ], JSON_UNESCAPED_UNICODE);
     
 } catch (Exception $e) {
-    echo json_encode([
-        'ok'  => false,
-        'msg' => $e->getMessage(),
-    ], JSON_UNESCAPED_UNICODE);
+    // 释放可能持有的排他锁（无论异常发生在事务内还是事务外）
+    try { $pdo->rollBack(); } catch (Throwable) {}
+    echo json_encode(safe_api_error_payload($e, '写作启动失败，请稍后重试'), JSON_UNESCAPED_UNICODE);
 }

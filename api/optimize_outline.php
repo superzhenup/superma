@@ -46,6 +46,7 @@ require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
+require_once dirname(__DIR__) . '/includes/OutlineQualityGuard.php';
 requireLoginApi();
 session_write_close();
 
@@ -100,7 +101,7 @@ if (empty($chapters)) {
 }
 
 try { getModelFallbackList($novel['model_id'] ?: null, 'structured'); }
-catch (RuntimeException $e) { sse('error', ['msg' => $e->getMessage()]); sseDone(); exit; }
+catch (RuntimeException $e) { sse('error', safe_sse_error_payload($e, '模型不可用，请稍后重试')); sseDone(); exit; }
 
 $totalChapters = count($chapters);
 sse('progress', ['msg' => "开始优化 {$totalChapters} 章大纲逻辑...", 'total' => $totalChapters]);
@@ -223,6 +224,7 @@ for ($i = $startBatchIndex; $i < $totalChapters; $i += $batchSize) {
 
     // 前批大纲作为上下文（最多前2批，增强长距离连贯性）
     $prevContext = '';
+    $prev2Batch = [];
     if ($i > 0) {
         $prevLines = [];
         $prev2Start = max(0, $i - $batchSize * 2);
@@ -334,8 +336,8 @@ EOT
         // AI API 调用完成后立即发送心跳
         sendHeartbeatOptimize();
     } catch (RuntimeException $e) {
-        sse('error', ['msg' => "第{$batchFrom}～{$batchTo}章优化失败：" . $e->getMessage()]);
-        continue;
+            sse('error', safe_sse_error_payload($e, "第{$batchFrom}～{$batchTo}章优化失败"));
+            continue;
     }
 
     // 解析并入库
@@ -344,6 +346,16 @@ EOT
         sse('error', ['msg' => "第{$batchFrom}～{$batchTo}章：AI返回解析失败，跳过"]);
         continue;
     }
+
+    $qualityResult = repairOutlineBatchWithGuard(
+        $novel,
+        $optimized,
+        $prev2Batch,
+        function (string $event, array $payload): void {
+            sse($event, $payload);
+        }
+    );
+    $optimized = $qualityResult['outlines'];
 
     $changedCount = 0;
     foreach ($optimized as $item) {

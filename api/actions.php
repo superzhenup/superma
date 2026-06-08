@@ -291,6 +291,20 @@ try {
             ]);
             break;
 
+        case 'get_fullbook_audits':
+            // v41: 取全书一致性体检报告（最近 N 条）
+            $novelId = (int)($input['novel_id'] ?? 0);
+            if (!getNovel($novelId)) throw new RuntimeException('小说不存在');
+            require_once dirname(__DIR__) . '/includes/FullBookAudit.php';
+            $limit = max(1, min(20, (int)($input['limit'] ?? 10)));
+            $audits = FullBookAudit::recent($novelId, $limit);
+            foreach ($audits as &$a) {
+                $a['issues'] = $a['issues'] ? (json_decode($a['issues'], true) ?: []) : [];
+            }
+            unset($a);
+            jsonResponse(true, ['audits' => $audits]);
+            break;
+
         case 'reset_writing_chapter':
             // SSE 连接中断时重置章节状态：writing → outlined
             // 同时清理僵死的进度文件，确保异步 worker 能找到待写章节
@@ -531,6 +545,63 @@ try {
             break;
 
         // -----------------------------------------------------------
+        // 重新生成并重置（原子操作）：合并 regenerate_chapter + reset_chapter
+        case 'regenerate_and_reset':
+            $chapterId = (int)($input['chapter_id'] ?? 0);
+            $ch = getChapter($chapterId);
+            if (!$ch) throw new RuntimeException('章节不存在');
+
+            $novel = getNovel($ch['novel_id']);
+            if (!$novel) throw new RuntimeException('小说不存在');
+
+            $outline   = trim($input['outline']   ?? $ch['outline'] ?? '');
+            $hook      = trim($input['hook']      ?? $ch['hook']    ?? '');
+            $keyPoints = $input['key_points']     ?? (json_decode($ch['key_points'] ?? '[]', true) ?? []);
+
+            if (empty($outline) && empty($keyPoints)) {
+                throw new RuntimeException('请先填写大纲概要或关键情节点');
+            }
+            if (!is_array($keyPoints)) $keyPoints = [];
+            $keyPoints = array_values(array_filter(
+                array_map(fn($p) => trim((string)$p), $keyPoints),
+                fn($p) => $p !== ''
+            ));
+
+            // 事务包裹：保存大纲 + 备份版本 + 重置状态，三步原子执行
+            $pdo = DB::getPdo();
+            $pdo->beginTransaction();
+            try {
+                // 1. 保存新大纲
+                DB::update('chapters', [
+                    'outline'    => $outline,
+                    'hook'       => $hook,
+                    'key_points' => $keyPoints ? json_encode($keyPoints, JSON_UNESCAPED_UNICODE) : null,
+                ], 'id=?', [$chapterId]);
+
+                // 2. 版本备份（重置前保存当前内容）
+                backupChapterVersion($ch);
+
+                // 3. 清空内容并重置状态为 outlined
+                DB::update('chapters', [
+                    'content' => '',
+                    'words'   => 0,
+                    'status'  => 'outlined',
+                ], 'id=?', [$chapterId]);
+
+                $pdo->commit();
+                addLog($ch['novel_id'], 'regenerate', "第{$ch['chapter_number']}章大纲更新并重置（原子操作）");
+                jsonResponse(true, [
+                    'chapter_id'   => $chapterId,
+                    'novel_id'     => $ch['novel_id'],
+                    'should_write' => true,
+                ], '大纲已保存，章节已重置');
+            } catch (Throwable $e) {
+                $pdo->rollBack();
+                throw $e;
+            }
+            break;
+
+        // -----------------------------------------------------------
         case 'clear_all_chapters':
             $novelId = (int)($input['novel_id'] ?? 0);
             $novel   = getNovel($novelId);
@@ -595,7 +666,8 @@ try {
                 jsonResponse(true, ['novel_id' => $novelId], '已清空所有章节');
             } catch (Exception $e) {
                 $pdo->rollBack();
-                throw new RuntimeException('清空失败：' . $e->getMessage());
+                error_log('actions clearChapters: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+                throw new RuntimeException('清空失败，请稍后重试');
             }
             break;
 
@@ -655,7 +727,8 @@ try {
                     ], "已添加 {$count} 个空章节（第{$startNum}-{$endNum}章）");
                 } catch (Exception $e) {
                     $pdo->rollBack();
-                    throw new RuntimeException('添加失败：' . $e->getMessage());
+                    error_log('actions addChapters: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+                    throw new RuntimeException('添加失败，请稍后重试');
                 }
             } else {
                 jsonResponse(true, [
@@ -741,7 +814,8 @@ EOT;
                     }
                 );
             } catch (RuntimeException $e) {
-                throw new RuntimeException('标题生成失败：' . $e->getMessage());
+                error_log('actions generateTitle failed: ' . $e->getMessage());
+                throw new RuntimeException('标题生成失败，请稍后重试');
             }
 
             $title = trim($title, " \t\n\r\0\x0B\"'《》");
@@ -757,7 +831,13 @@ EOT;
             throw new RuntimeException("未知操作：$action");
     }
 } catch (RuntimeException $e) {
-    jsonResponse(false, null, $e->getMessage());
+    // 业务异常：消息通常是已知业务错误（缺少参数、无效操作等），可直接展示；
+    // 但仍统一带 request_id 以便关联服务端日志。
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] actions RuntimeException: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
+    jsonResponse(false, null, $e->getMessage(), 'business_error:' . $rid);
 } catch (Throwable $e) {
-    jsonResponse(false, null, '服务器错误：' . $e->getMessage());
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] actions Throwable: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
+    jsonResponse(false, null, '操作失败，请稍后重试', 'internal_error:' . $rid);
 }

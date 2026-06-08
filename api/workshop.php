@@ -35,8 +35,10 @@ try {
             throw new Exception('无效的操作');
     }
 } catch (Exception $e) {
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] workshop: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
     header('Content-Type: application/json; charset=utf-8');
-    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+    echo json_encode(['success' => false, 'error' => '操作失败，请稍后重试', 'request_id' => $rid]);
 }
 
 /**
@@ -186,7 +188,8 @@ function generateIdeaStream() {
             }, 'structured');
         } catch (Exception $e) {
             $streamError = $e;
-            sendEvent('debug', ['message' => '流式请求失败: ' . $e->getMessage()]);
+            error_log('Workshop 流式请求失败: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+            sendEvent('debug', safe_sse_error_payload($e, '流式请求失败，已切换到普通模式'));
         }
         
         // 如果流式失败或没有收到内容，回退到非流式
@@ -210,8 +213,8 @@ function generateIdeaStream() {
         
     } catch (Exception $e) {
         // 记录详细错误信息
-        error_log("Workshop Stream Error: " . $e->getMessage());
-        sendEvent('error', ['message' => $e->getMessage()]);
+        error_log("Workshop Stream Error: " . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        sendEvent('error', safe_sse_error_payload($e, 'AI 响应失败，请稍后重试'));
     }
 }
 

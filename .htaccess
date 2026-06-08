@@ -1,0 +1,39 @@
+# ============================================================
+# 基础安全加固（Apache）
+# ============================================================
+
+# 关闭目录列举
+Options -Indexes
+
+# 拒绝直接访问敏感文件类型
+<FilesMatch "(?i)\.(lock|log|sh|sql|bak|ini|sample|md)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# 保护主配置文件（纵深防御：万一 PHP 处理器失效也不泄露源码/密钥）
+<Files "config.php">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</Files>
+
+# 隐藏点文件（.git/.env 等）
+<FilesMatch "^\.">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>

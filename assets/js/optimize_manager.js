@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 优化大纲统一入口
  * 根据配置自动选择 SSE 或 AJAX 方案
  */
@@ -11,7 +11,7 @@ let optimizeMode = 'ajax';  // 默认 AJAX 方案
  */
 async function initOptimizeConfig() {
     try {
-        const response = await fetch('api/get_optimize_config.php');
+        const response = await fetch('/api/index.php?route=get_optimize_config');
         const config = await response.json();
         optimizeMode = config.mode || 'ajax';
         console.log('优化方案:', optimizeMode);

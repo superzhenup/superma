@@ -13,16 +13,22 @@ define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 requireLoginApi();
+requireHttpMethod('POST');
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/embedding.php';
 require_once dirname(__DIR__) . '/includes/memory/MemoryEngine.php';
 
-header('Content-Type: text/event-stream; charset=utf-8');
-header('Cache-Control: no-cache');
-header('X-Accel-Buffering: no');
+$input = json_decode(file_get_contents('php://input'), true) ?: [];
+$novelId = (int)($input['novel_id'] ?? $_POST['novel_id'] ?? 0);
+$mode = $input['mode'] ?? $_POST['mode'] ?? 'full';
+$outputMode = $input['output_mode'] ?? $_POST['output_mode'] ?? 'sse';
 
 if ($outputMode === 'json') {
     header('Content-Type: application/json; charset=utf-8');
+} else {
+    header('Content-Type: text/event-stream; charset=utf-8');
+    header('Cache-Control: no-cache');
+    header('X-Accel-Buffering: no');
 }
 
 function sse(string $event, $data): void {
@@ -32,12 +38,6 @@ function sse(string $event, $data): void {
     ob_flush();
     flush();
 }
-
-$input = json_decode(file_get_contents('php://input'), true);
-// 也支持 GET 参数（方便浏览器直接访问诊断）
-$novelId = (int)($input['novel_id'] ?? $_GET['novel_id'] ?? 0);
-$mode = $input['mode'] ?? $_GET['mode'] ?? 'full';
-$outputMode = $input['output_mode'] ?? $_GET['output_mode'] ?? 'sse';  // 'sse' 或 'json'
 
 if (!$novelId) {
     sse('error', ['error' => '缺少小说ID']);
@@ -85,10 +85,11 @@ try {
                     'stats' => $stats,
                 ]);
             } catch (Throwable $e) {
-                $errors[] = "第{$ch['chapter_number']}章: " . $e->getMessage();
+                error_log("rebuild_embeddings 第{$ch['chapter_number']}章失败: " . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+                $errors[] = "第{$ch['chapter_number']}章处理失败";
                 sse('progress', [
-                    'step' => "第{$ch['chapter_number']}章失败: " . mb_substr($e->getMessage(), 0, 80),
-                    'pct' => (int)(($i + 1) / $total * 80),
+                    'step' => "第{$ch['chapter_number']}章失败",
+                    'pct'  => (int)(($i + 1) / $total * 80),
                 ]);
             }
         }
@@ -140,8 +141,10 @@ try {
         ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     }
 } catch (Throwable $e) {
-    sse('error', ['error' => $e->getMessage()]);
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] rebuild_embeddings: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
+    sse('error', safe_sse_error_payload($e, '重建向量失败，请稍后重试'));
     if ($outputMode === 'json') {
-        echo json_encode(['success' => false, 'error' => $e->getMessage()], JSON_UNESCAPED_UNICODE);
+        echo json_encode(safe_api_error_payload($e, '重建向量失败，请稍后重试'), JSON_UNESCAPED_UNICODE);
     }
 }

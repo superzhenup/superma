@@ -79,7 +79,9 @@ try {
     http_response_code(400);
     echo json_encode([
         'success' => false,
-        'error' => $e->getMessage(),
+        'error'   => '操作失败，请稍后重试',
+        'code'    => 'internal_error',
+        'request_id' => error_trace_id(),
     ]);
 }
 
@@ -288,8 +290,8 @@ function updateIterativeConfig(int $novelId, array $input)
         return true;
     } catch (\Throwable $e) {
         try { DB::rollBack(); } catch (\Throwable) {}
-        error_log('更新迭代配置失败：' . $e->getMessage());
-        return '更新失败：' . $e->getMessage();
+        error_log('更新迭代配置失败：' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        return '更新失败，请稍后重试';
     }
 }
 
@@ -397,6 +399,23 @@ function saveSetting(int $novelId, string $key, array $values): void
                 'setting_value' => $aiPatternsEnabled ? '1' : '0',
             ]);
         }
+
+        // v2: 重写专用模型 ID（0=使用正文模型，消除自审盲区）
+        $rewriteModelId = (int)($settingValue['rewrite_model_id'] ?? 0);
+        $existingRwModel = DB::fetch(
+            'SELECT setting_key FROM system_settings WHERE setting_key=?',
+            ['ws_rewrite_model_id']
+        );
+        if ($existingRwModel) {
+            DB::update('system_settings', [
+                'setting_value' => (string)$rewriteModelId,
+            ], 'setting_key=?', ['ws_rewrite_model_id']);
+        } elseif ($rewriteModelId > 0) {
+            DB::insert('system_settings', [
+                'setting_key' => 'ws_rewrite_model_id',
+                'setting_value' => (string)$rewriteModelId,
+            ]);
+        }
     }
 }
 
@@ -449,8 +468,8 @@ function getRewriteHistoryStats(int $novelId): array
             }, array_slice($chapters, 0, 10)),
         ];
     } catch (Exception $e) {
-        error_log('获取重写历史失败：' . $e->getMessage());
-        return ['error' => '获取数据失败：' . $e->getMessage()];
+        error_log('获取重写历史失败：' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        return ['error' => '获取数据失败，请稍后重试'];
     }
 }
 

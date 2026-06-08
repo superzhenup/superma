@@ -44,6 +44,16 @@ class DB {
         'foreshadowing_mention_log',
         // v1.11.5: 金句回调日志表（支持重写回滚）
         'catchphrase_callback_log',
+        // v1.8: 高阶写作向导表
+        'novel_wizard_progress', 'novel_wizard_chats',
+        // v41: 全书圣经（1000章长程记忆）
+        'novel_bible',
+        // v41: 全书一致性体检
+        'novel_audits',
+        // v1.8: 导入续写会话表
+        'novel_import_sessions',
+        // v1.8: 短篇小说
+        'short_stories', 'short_story_versions',
     ];
 
     /**
@@ -141,7 +151,7 @@ class DB {
      * 避免每次 PHP 请求都执行 9 次 information_schema 查询 + 5 次 CREATE TABLE IF NOT EXISTS。
      * 每次有结构变更时，递增 SCHEMA_VERSION 即可触发重新迁移。
      */
-    private const SCHEMA_VERSION = 36;
+    private const SCHEMA_VERSION = 43;
 
     private static function migrate(): void {
         // 优先使用数据库记录迁移状态，避免文件权限问题
@@ -310,6 +320,9 @@ class DB {
             // [v34] chapters 表新增认知负荷字段（信息密度管理）
             ['chapters', 'cognitive_load',
              "ALTER TABLE `chapters` ADD COLUMN `cognitive_load` JSON DEFAULT NULL COMMENT '认知负荷分析：新元素数量、累计趋势' AFTER `rewrite_time`"],
+            // [v34.1] StyleGuard 风格漂移检测报告（AgentCoordinator 写入）
+            ['chapters', 'style_drift_report',
+             "ALTER TABLE `chapters` ADD COLUMN `style_drift_report` JSON DEFAULT NULL COMMENT 'StyleGuard风格漂移检测结果' AFTER `cognitive_load`"],
             // [v35] v1.11.5 重写日志子表（foreshadowing_mention_log + catchphrase_callback_log）
             // 此处仅升级 SCHEMA_VERSION 触发 Schema::applyAll() 自动建表，无字段 ALTER 需求
             // [v36] novel_state 表新增场景位置追踪字段（解决"主角在村里突然看到市区街边"的场景跳跃问题）
@@ -319,6 +332,53 @@ class DB {
              "ALTER TABLE `novel_state` ADD COLUMN `location_chapter` INT UNSIGNED DEFAULT NULL COMMENT '位置所在章节号' AFTER `current_location`"],
             ['novel_state', 'location_transition',
              "ALTER TABLE `novel_state` ADD COLUMN `location_transition` VARCHAR(300) DEFAULT NULL COMMENT '到达当前位置的方式描写' AFTER `location_chapter`"],
+
+            // [v37] 高阶写作向导：novels 表新增向导模式字段
+            ['novels', 'narrative_structure',
+             "ALTER TABLE `novels` ADD COLUMN `narrative_structure` VARCHAR(50) DEFAULT NULL COMMENT '叙事结构' AFTER `target_reader`"],
+            ['novels', 'narrative_method',
+             "ALTER TABLE `novels` ADD COLUMN `narrative_method` VARCHAR(50) DEFAULT NULL COMMENT '叙事方法' AFTER `narrative_structure`"],
+            ['novels', 'narrative_pov',
+             "ALTER TABLE `novels` ADD COLUMN `narrative_pov` VARCHAR(50) DEFAULT NULL COMMENT '叙事视角' AFTER `narrative_method`"],
+            ['novels', 'literary_genre',
+             "ALTER TABLE `novels` ADD COLUMN `literary_genre` VARCHAR(100) DEFAULT NULL COMMENT '文学流派' AFTER `narrative_pov`"],
+            ['novels', 'world_setting_era',
+             "ALTER TABLE `novels` ADD COLUMN `world_setting_era` VARCHAR(100) DEFAULT NULL COMMENT '世界设定（时代）' AFTER `literary_genre`"],
+            ['novels', 'novel_types',
+             "ALTER TABLE `novels` ADD COLUMN `novel_types` JSON DEFAULT NULL COMMENT '小说类型多选' AFTER `world_setting_era`"],
+            ['novels', 'writing_tone',
+             "ALTER TABLE `novels` ADD COLUMN `writing_tone` JSON DEFAULT NULL COMMENT '文风多选' AFTER `novel_types`"],
+            ['novels', 'protagonist_traits',
+             "ALTER TABLE `novels` ADD COLUMN `protagonist_traits` JSON DEFAULT NULL COMMENT '主角设定多选' AFTER `writing_tone`"],
+            ['novels', 'core_conflicts',
+             "ALTER TABLE `novels` ADD COLUMN `core_conflicts` JSON DEFAULT NULL COMMENT '核心冲突多选' AFTER `protagonist_traits`"],
+            ['novels', 'appeal_points',
+             "ALTER TABLE `novels` ADD COLUMN `appeal_points` JSON DEFAULT NULL COMMENT '爽点多选' AFTER `core_conflicts`"],
+            ['novels', 'taboos',
+             "ALTER TABLE `novels` ADD COLUMN `taboos` JSON DEFAULT NULL COMMENT '禁忌多选' AFTER `appeal_points`"],
+            ['novels', 'opening_type',
+             "ALTER TABLE `novels` ADD COLUMN `opening_type` VARCHAR(50) DEFAULT NULL COMMENT '开篇类型' AFTER `taboos`"],
+            ['novels', 'protagonist_entrance',
+             "ALTER TABLE `novels` ADD COLUMN `protagonist_entrance` VARCHAR(50) DEFAULT NULL COMMENT '主角出场' AFTER `opening_type`"],
+            ['novels', 'custom_settings',
+             "ALTER TABLE `novels` ADD COLUMN `custom_settings` TEXT DEFAULT NULL COMMENT '自定义设定' AFTER `protagonist_entrance`"],
+            ['novels', 'chapter_word_target',
+             "ALTER TABLE `novels` ADD COLUMN `chapter_word_target` INT DEFAULT NULL COMMENT '单章字数目标' AFTER `custom_settings`"],
+
+            // [v40] 短篇分章节写作支持
+            ['short_stories', 'chapter_count',
+             "ALTER TABLE `short_stories` ADD COLUMN `chapter_count` TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '章节数量,1=单篇模式' AFTER `structure_type`"],
+            ['short_stories', 'chapters_json',
+             "ALTER TABLE `short_stories` ADD COLUMN `chapters_json` JSON DEFAULT NULL COMMENT '章节数组' AFTER `beats_json`"],
+            ['short_story_versions', 'chapters_json',
+             "ALTER TABLE `short_story_versions` ADD COLUMN `chapters_json` JSON DEFAULT NULL AFTER `beats_json`"],
+
+            // [v41] 提示词缓存命中埋点（1000章优化：验证前缀缓存命中率）
+            ['chapters', 'cache_hit_tokens',
+             "ALTER TABLE `chapters` ADD COLUMN `cache_hit_tokens` INT NOT NULL DEFAULT 0 COMMENT '本章命中的提示词缓存token数' AFTER `tokens_used`"],
+            // [v43] 钩子回收闭环：本章是否回收了上一章的章末钩子（NULL=未检测/首章, 1=已回收, 0=悬挂）
+            ['chapters', 'hook_resolved',
+             "ALTER TABLE `chapters` ADD COLUMN `hook_resolved` TINYINT(1) DEFAULT NULL COMMENT '本章是否回收上章钩子(1是/0悬挂/NULL未检测)' AFTER `hook_type`"],
         ];
 
         foreach ($columns as [$table, $col, $sql]) {
@@ -765,6 +825,18 @@ class DB {
             $stmtImg->execute([$key, $val]);
         }
 
+        // [v41] 热门选题默认配置
+        $hotNovelDefaults = [
+            'hot_novels_ingest_key'             => '',
+            'hot_novels_ingest_enabled'         => '1',
+            'hot_novels_unsupported_categories' => '奇闻异事,游戏,体育,古风世情',
+            'hot_novels_min_confidence'         => '50',
+        ];
+        $stmtHot = $pdo->prepare("INSERT IGNORE INTO `system_settings` (`setting_key`, `setting_value`) VALUES (?, ?)");
+        foreach ($hotNovelDefaults as $key => $val) {
+            $stmtHot->execute([$key, $val]);
+        }
+
         // [v14] 补全 memory_atoms.atom_type ENUM：添加 cool_point（v8迁移遗漏）
         try {
             $enumStmt = $pdo->query(
@@ -980,6 +1052,29 @@ class DB {
             INDEX `idx_evaluated_at` (`evaluated_at`),
             INDEX `idx_quality_change` (`quality_change`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent指令效果反馈表'");
+
+        // [v41] 全书圣经（1000章长程记忆）
+        $pdo->exec("CREATE TABLE IF NOT EXISTS `novel_bible` (
+            `novel_id` INT UNSIGNED PRIMARY KEY,
+            `world_md` MEDIUMTEXT,
+            `character_md` MEDIUMTEXT,
+            `timeline_md` MEDIUMTEXT,
+            `updated_chapter` INT UNSIGNED NOT NULL DEFAULT 0,
+            `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='全书圣经'");
+
+        // [v41] 全书一致性体检报告
+        $pdo->exec("CREATE TABLE IF NOT EXISTS `novel_audits` (
+            `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            `novel_id` INT UNSIGNED NOT NULL,
+            `chapter_number` INT UNSIGNED NOT NULL,
+            `score` DECIMAL(3,1) DEFAULT NULL,
+            `verdict` VARCHAR(60) DEFAULT NULL,
+            `report` MEDIUMTEXT,
+            `issues` JSON DEFAULT NULL,
+            `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX `idx_novel` (`novel_id`, `chapter_number`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='全书一致性体检'");
 
         // [v21] Schema 单一真理源兜底——确保 Schema::tables() 中所有表都存在
         // 即使上面 CREATE TABLE 列表漏了某张表，Schema::applyAll 也会补上。

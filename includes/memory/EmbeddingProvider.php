@@ -155,6 +155,10 @@ final class EmbeddingProvider
                 CURLOPT_TIMEOUT        => CFG_CURL_TIMEOUT_EMBED,
                 CURLOPT_RETURNTRANSFER => true,
             ]);
+            // CLI（异步 worker）下 php.ini 未配 curl.cainfo 时补 CA 包，否则 embedding 的 HTTPS 调用也会失败
+            if (class_exists('AIClient') && ($caBundle = AIClient::caBundle())) {
+                curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
+            }
             $resp = curl_exec($ch);
             $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $err  = curl_error($ch);

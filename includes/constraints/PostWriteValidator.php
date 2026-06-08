@@ -123,29 +123,23 @@ class PostWriteValidator
      */
     private function checkTitleBlacklist(): void
     {
-        $title     = $this->chapter['title'] ?? '';
-        $banned    = ConstraintConfig::bannedWords();
-        $maxUsage  = ConstraintConfig::maxBannedWordUsage();
+        $title  = $this->chapter['title'] ?? '';
+        $banned = ConstraintConfig::bannedWords();
 
+        // 正常落盘路径下，TitleSanitizer 已在校验前自动改写标题，此处不会再命中。
+        // 残留命中（自定义禁用词无法安全改写 / forceRun 人工审核旧章）一律记 P1 提示——
+        // 标题措辞绝不升级为可阻断落盘的 P0，避免严格模式下整本书被一个标题卡死。
+        //
+        // 关键修复：此判定只看「标题本身是否含禁用词」，不再借用正文词频
+        // （banned_word_usage）。否则「真相」等正文高频词会凭空耗尽标题预算
+        // （如 18/15），把首个用到该词的标题误判为 P0、阻断落盘并形成死锁。
         foreach ($banned as $word) {
             if (mb_strpos($title, $word) !== false) {
-                // 检查全书累计使用次数
-                $usage = $this->stateDB ? $this->stateDB->getBannedWordUsage() : [];
-                $count = ($usage[$word] ?? 0) + 1;
-
-                if ($count >= $maxUsage) {
-                    $this->addIssue(
-                        'P0', 'structure', 'banned_word_exceeded',
-                        "标题含禁用词「{$word}」（全书已用{$count}/{$maxUsage}次）",
-                        false
-                    );
-                } else {
-                    $this->addIssue(
-                        'P1', 'structure', 'banned_word_in_title',
-                        "标题含禁用词「{$word}」（全书累计{$count}/{$maxUsage}次）",
-                        false
-                    );
-                }
+                $this->addIssue(
+                    'P1', 'structure', 'banned_word_in_title',
+                    "标题含禁用词「{$word}」（建议改写为非套路化表述）",
+                    false
+                );
             }
         }
     }

@@ -103,8 +103,7 @@ try {
     ], JSON_UNESCAPED_UNICODE);
     
 } catch (Exception $e) {
-    echo json_encode([
-        'ok'  => false,
-        'msg' => $e->getMessage(),
-    ], JSON_UNESCAPED_UNICODE);
+    $rid = error_trace_id();
+    error_log(sprintf('[%s] write_poll: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
+    echo json_encode(safe_api_error_payload($e, '进度查询失败，请稍后重试'), JSON_UNESCAPED_UNICODE);
 }
