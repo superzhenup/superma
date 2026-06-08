@@ -2,7 +2,7 @@
 
 <img width="1055" height="1491" alt="ed465bef8d0dd0baf1c0b309d376214e" src="https://github.com/user-attachments/assets/351c8a95-414c-42bf-97e7-fd758c72ffbf" />
 
-## UI预览
+## 产品特性
 <img width="1122" height="1402" alt="9751309bfb84c9f2b74b8bfb385efdc9" src="https://github.com/user-attachments/assets/af89efef-65d2-4f0a-9e6f-2fa87f12d628" />
 <p> <p>
 <img width="1122" height="1402" alt="41c4ebb6767398e4edbb54688d3220be" src="https://github.com/user-attachments/assets/9bc76bd9-9310-4063-a3d1-3aa03afdcb0e" />
