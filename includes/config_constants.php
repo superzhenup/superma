@@ -1,0 +1,286 @@
+<?php
+/**
+ * 集中配置常量 — 全局唯一的配置权威来源
+ * 
+ * 所有业务/技术常量、写作参数默认值统一在此文件定义，
+ * 由 config.php 统一引入，确保全局只有一份定义。
+ * 
+ * 命名规范：
+ *   RT_*       — 模型回退/重试策略
+ *   CFG_TIME_* — 执行时间限制
+ *   CFG_CURL_* — CURL 超时
+ *   CFG_SSE_*  — SSE / 心跳
+ *   CFG_PATH_* — 路径相关
+ *   CFG_ZOMBIE_* — 僵死/Lock 检测
+ *   CFG_TOKEN_* — Token 估算
+ *   CFG_WORD_*  — 字数/收尾相关
+ *   CFG_POST_*  — 后处理阈值
+ *   CFG_OPTIMIZE_* — 大纲优化
+ */
+
+defined('APP_LOADED') or die('Direct access denied.');
+
+// ============================================================
+// 零、system_settings 请求级缓存（审计 2026-06-10 P2-C，台账条目 25）
+//
+// getSystemSetting() 原先每次调用 = 1 条 DB 查询；全库 117 处调用点，
+// 写章热路径（write_engine / ChapterPromptBuilder / prompt.php）单章可达
+// 50~150 次琐碎往返。system_settings 是百余行小表，首次调用一次性载入，
+// 此后纯数组查找。任何 system_settings 写入后须调用 clearSystemSettingsCache()。
+//
+// 放在本文件（而非 config.php）的原因：已部署站点的 config.php 由安装向导
+// 生成、升级代码不会重写；本文件随代码分发且新旧 config.php 都会 require，
+// 因此写点可以无条件调用 clearSystemSettingsCache() 而不致命。
+// （旧 config.php 的 getSystemSetting 不认识本缓存，行为不变=逐键直查。）
+// ============================================================
+if (!function_exists('_systemSettingsAll')) {
+    /**
+     * 整表载入 system_settings 到请求级 static 缓存。
+     *
+     * @param bool $reset true=清空缓存（写入后失效用）
+     * @return array<string,string>|null null=载入不可用（DB 未连接/查询失败），调用方应回退单键直查
+     */
+    function _systemSettingsAll(bool $reset = false): ?array {
+        static $all = null;
+        if ($reset) { $all = null; return null; }
+        if ($all !== null) return $all;
+        if (!class_exists('DB', false)) return null;
+        try {
+            $rows = DB::fetchAll('SELECT setting_key, setting_value FROM system_settings');
+        } catch (\Throwable $e) {
+            return null;
+        }
+        $all = array_column($rows, 'setting_value', 'setting_key');
+        return $all;
+    }
+}
+
+if (!function_exists('clearSystemSettingsCache')) {
+    /** system_settings 写入后调用：失效请求级缓存，下次读取重新载入整表。 */
+    function clearSystemSettingsCache(): void {
+        _systemSettingsAll(true);
+    }
+}
+
+// ============================================================
+// 一、模型回退/重试策略（RT_*）
+// 原分散在 write_chapter.php / daemon_write.php / write_engine.php
+// 使用 if(!defined) 允许调用方提前覆盖
+// ============================================================
+if (!defined('RT_NONTHINKING_TIMEOUT')) define('RT_NONTHINKING_TIMEOUT', 50);
+if (!defined('RT_THINKING_TIMEOUT'))     define('RT_THINKING_TIMEOUT', 90);
+if (!defined('RT_SAME_MODEL_MAX'))       define('RT_SAME_MODEL_MAX', 3);
+if (!defined('RT_MODEL_ERR_MAX'))        define('RT_MODEL_ERR_MAX', 5);
+if (!defined('RT_RETRY_DELAY'))          define('RT_RETRY_DELAY', 15);
+if (!defined('RT_POLL_INTERVAL'))        define('RT_POLL_INTERVAL', 5);
+
+// ============================================================
+// 二、执行时间限制（原分散在 10+ 个 API 文件的 set_time_limit()）
+// ============================================================
+if (!defined('CFG_TIME_LONG'))           define('CFG_TIME_LONG', 600);   // 写作/大纲生成
+if (!defined('CFG_TIME_LONG_1M'))       define('CFG_TIME_LONG_1M', 1200); // 1M上下文模式（更长超时）
+if (!defined('CFG_TIME_MEDIUM'))         define('CFG_TIME_MEDIUM', 300); // 压缩/润色/分析
+if (!defined('CFG_TIME_SHORT'))          define('CFG_TIME_SHORT', 120);  // 同步请求
+if (!defined('CFG_TIME_UNLIMITED'))      define('CFG_TIME_UNLIMITED', 0); // CLI Worker / 重建
+// v1.6: 动态超时 — 静默超时时间（有输出时重置，只有连续静默才触发超时）
+if (!defined('CFG_TIME_SILENCE_TIMEOUT')) define('CFG_TIME_SILENCE_TIMEOUT', 180); // 静默超时（秒）
+if (!defined('CFG_TIME_SILENCE_1M'))      define('CFG_TIME_SILENCE_1M', 600);      // 1M模式静默超时
+
+// ============================================================
+// 三、CURL 超时（原硬编码在 ai.php / EmbeddingProvider.php）
+// ============================================================
+if (!defined('CFG_CURL_TIMEOUT_STREAM')) define('CFG_CURL_TIMEOUT_STREAM', 600);
+if (!defined('CFG_CURL_TIMEOUT_SYNC'))   define('CFG_CURL_TIMEOUT_SYNC', 120);
+if (!defined('CFG_CURL_TIMEOUT_EMBED'))  define('CFG_CURL_TIMEOUT_EMBED', 60);
+
+// ============================================================
+// 四、SSE / 心跳（原分散在多处且有重复定义）
+// v1.5.3: 语义化命名 — 旧常量保留兼容，新常量含义更清晰
+// ============================================================
+// 语义化命名（推荐使用）
+if (!defined('CFG_SSE_CLIENT_PING_INTERVAL'))  define('CFG_SSE_CLIENT_PING_INTERVAL', 10);  // 向前端发送心跳间隔（秒），防止连接超时
+if (!defined('CFG_SSE_AI_SILENCE_THRESHOLD'))  define('CFG_SSE_AI_SILENCE_THRESHOLD', 30);  // AI无响应判定阈值（秒），超时视为异常
+if (!defined('CFG_SSE_AI_CHUNK_INTERVAL'))     define('CFG_SSE_AI_CHUNK_INTERVAL', 5);      // 检测AI数据流的轮询间隔（秒）
+// 兼容旧命名（映射到新常量）
+if (!defined('CFG_SSE_HEARTBEAT'))             define('CFG_SSE_HEARTBEAT', CFG_SSE_CLIENT_PING_INTERVAL);
+if (!defined('CFG_SSE_SILENCE'))               define('CFG_SSE_SILENCE', CFG_SSE_AI_SILENCE_THRESHOLD);
+if (!defined('CFG_SSE_AI_CHECK'))              define('CFG_SSE_AI_CHECK', CFG_SSE_AI_CHUNK_INTERVAL);
+// ============================================================
+// 五、路径（原在 6+ 个文件中拼写相同字符串）
+// ============================================================
+if (!defined('CFG_PROGRESS_DIR'))        define('CFG_PROGRESS_DIR',
+    defined('BASE_PATH')
+        ? BASE_PATH . '/storage/write_progress'
+        : dirname(__DIR__) . '/storage/write_progress'
+);
+
+// ============================================================
+// 六、僵死/Lock 超时检测（原在各文件中不一致）
+// ============================================================
+if (!defined('CFG_ZOMBIE_PROGRESS'))     define('CFG_ZOMBIE_PROGRESS', 600);  // 允许预处理/Embedding/长思考阶段无正文输出；PID 检查仍会立即回收已退出进程
+if (!defined('CFG_ZOMBIE_DB'))           define('CFG_ZOMBIE_DB', 300);        // DB 章节僵死阈值（秒）
+if (!defined('CFG_LOCK_TTL'))            define('CFG_LOCK_TTL', 300);         // Lock 文件过期（秒）
+if (!defined('CFG_PROGRESS_STALE'))      define('CFG_PROGRESS_STALE', 300);   // 过期进度文件清理（秒）
+
+// ============================================================
+// 七、Token 估算（原在 write_engine.php / daemon_write.php 不一致）
+// ============================================================
+if (!defined('CFG_TOKEN_RATIO'))         define('CFG_TOKEN_RATIO', 2.2);     // 字 → token 换算系数
+if (!defined('CFG_TOKEN_BUFFER'))        define('CFG_TOKEN_BUFFER', 600);    // 额外缓冲
+
+// ============================================================
+// 八、字数/收尾控制（原硬编码在 prompt.php 中）
+// ============================================================
+if (!defined('CFG_EARLY_FINISH_RATIO'))  define('CFG_EARLY_FINISH_RATIO', 0.85); // 单章提前收尾触发比例
+if (!defined('CFG_TOLERANCE_MIN'))       define('CFG_TOLERANCE_MIN', 80);        // 容差兜底最小值（字）
+if (!defined('CFG_TOLERANCE_RATIO'))     define('CFG_TOLERANCE_RATIO', 0.03);   // 容差兜底比例
+if (!defined('CFG_ENDING_START_RATIO'))  define('CFG_ENDING_START_RATIO', 0.90); // 全书收尾触发比例（进度≥90%时注入收尾指令）
+
+// ============================================================
+// 九、后处理阈值
+// ============================================================
+if (!defined('CFG_MEMORY_TOKEN_BUDGET'))  define('CFG_MEMORY_TOKEN_BUDGET', 12000); // 记忆上下文 token 预算
+if (!defined('CFG_KB_PREVIEW_CHARS'))     define('CFG_KB_PREVIEW_CHARS', 3000);    // 知识库预览字数
+if (!defined('CFG_VERSIONS_KEEP'))        define('CFG_VERSIONS_KEEP', 10);         // 版本保留数
+if (!defined('CFG_CANCEL_CHECK_FREQ'))    define('CFG_CANCEL_CHECK_FREQ', 50);     // 取消检测频率（token）
+// 审计优化 P1-3（2026-06-16）：章节列表全量分支硬上限，防止千章书单次拉取数十 MB
+if (!defined('CFG_CHAPTER_LIST_MAX'))     define('CFG_CHAPTER_LIST_MAX', 500);     // getNovelChapters 全量分支最大返回行数
+// 审计优化 P2-7（2026-06-16）：慢查询/慢 AI 调用监控阈值
+if (!defined('CFG_SLOW_QUERY_MS'))        define('CFG_SLOW_QUERY_MS', 200);        // 慢 SQL 阈值（毫秒），0 关闭
+if (!defined('CFG_SLOW_AI_SEC'))          define('CFG_SLOW_AI_SEC', 30);           // 慢 AI 调用阈值（秒），0 关闭
+
+// 审计修复 A03（2026-06-16）：章节版本备份最小字数阈值
+// 低于此字数的章节不备份到 chapter_versions（与 write_engine.php 原硬编码 100 一致）
+if (!defined('CFG_CHAPTER_VERSION_MIN_WORDS')) define('CFG_CHAPTER_VERSION_MIN_WORDS', 100);
+
+// 审计修复 B11（2026-06-16）：记忆引擎向量召回/扫描阈值常量化
+// 原 MemoryEngine.semanticSearch 中硬编码 0.3 / 1500 / 300，调优困难
+if (!defined('CFG_VECTOR_SIM_THRESHOLD'))  define('CFG_VECTOR_SIM_THRESHOLD', 0.3);   // 向量余弦相似度最低阈值
+if (!defined('CFG_KB_SCAN_LIMIT'))         define('CFG_KB_SCAN_LIMIT', 1500);         // KB 向量候选池扫描上限（千章书护栏）
+if (!defined('CFG_FORESHADOW_SCAN_LIMIT')) define('CFG_FORESHADOW_SCAN_LIMIT', 300);   // 未回收伏笔向量候选池上限
+
+// ============================================================
+// 十、大纲优化（原 config_optimize.php，现统一至此）
+// ============================================================
+if (!defined('CFG_OPTIMIZE_MODE'))       define('CFG_OPTIMIZE_MODE', 'ajax');
+if (!defined('CFG_OPTIMIZE_BATCH'))      define('CFG_OPTIMIZE_BATCH', 10);
+if (!defined('CFG_OPTIMIZE_AJAX_DELAY')) define('CFG_OPTIMIZE_AJAX_DELAY', 500);
+
+// ============================================================
+// 十一、章节摘要字数联动参数
+// ============================================================
+if (!defined('CFG_SYNOPSIS_MIN_RATIO')) define('CFG_SYNOPSIS_MIN_RATIO', 0.05); // 摘要最小比例
+if (!defined('CFG_SYNOPSIS_MAX_RATIO')) define('CFG_SYNOPSIS_MAX_RATIO', 0.08); // 摘要最大比例
+if (!defined('CFG_SYNOPSIS_MIN_WORDS')) define('CFG_SYNOPSIS_MIN_WORDS', 150);   // 摘要最小字数
+if (!defined('CFG_SYNOPSIS_MAX_WORDS')) define('CFG_SYNOPSIS_MAX_WORDS', 400);   // 摘要最大字数
+
+// ============================================================
+// 十二、写作参数默认值 — 全局唯一来源
+// 原在 config.php / db.php / writing_settings.php / install.php 四处重复
+// ============================================================
+function getWritingDefaults(): array
+{
+    return [
+        // ── 基础生成参数 ──
+        'ws_chapter_words'               => ['default' => 2000,    'type' => 'int'],
+        'ws_chapter_word_tolerance'      => ['default' => 150,     'type' => 'int'],
+        'ws_outline_batch'               => ['default' => 5,       'type' => 'int'],
+        'ws_outline_batch_1m'            => ['default' => 30,      'type' => 'int'],
+        'ws_context_mode'                => ['default' => 'auto',  'type' => 'string'],
+        'ws_auto_write_interval'         => ['default' => 2,       'type' => 'int'],
+        // ── 爽点调度参数 ──
+        'ws_cool_point_density_target'   => ['default' => 0.88,    'type' => 'float'],
+        'ws_cool_point_hunger_threshold' => ['default' => 0.6,     'type' => 'float'],
+        'ws_double_coolpoint_gap'        => ['default' => 3,       'type' => 'int'],
+        // ── 章节结构参数 ──
+        'ws_segment_ratio_setup'         => ['default' => 20,      'type' => 'int'],
+        'ws_segment_ratio_rising'        => ['default' => 30,      'type' => 'int'],
+        'ws_segment_ratio_climax'        => ['default' => 35,      'type' => 'int'],
+        'ws_segment_ratio_hook'          => ['default' => 15,      'type' => 'int'],
+        // ── 伏笔与记忆参数 ──
+        'ws_foreshadowing_lookback'      => ['default' => 10,      'type' => 'int'],
+        'ws_foreshadow_urgency_enabled'  => ['default' => true,    'type' => 'bool'],
+        'ws_foreshadow_critical_keep'    => ['default' => 3,       'type' => 'int'],
+        'ws_returning_character_enabled' => ['default' => true,    'type' => 'bool'],
+        'ws_returning_character_gap'     => ['default' => 15,      'type' => 'int'],
+        'ws_returning_character_limit'   => ['default' => 3,       'type' => 'int'],
+        'ws_memory_lookback'             => ['default' => 5,       'type' => 'int'],
+        'ws_embedding_top_k'             => ['default' => 5,       'type' => 'int'],
+        // ── AI 生成参数 ──
+        'ws_temperature_outline'         => ['default' => 0.3,     'type' => 'float'],
+        'ws_temperature_chapter'         => ['default' => 0.8,     'type' => 'float'],
+        'ws_max_tokens_outline'          => ['default' => 4096,    'type' => 'int'],
+        'ws_max_tokens_chapter'          => ['default' => 8192,    'type' => 'int'],
+        // ── 质量检查参数 ──
+        'ws_quality_check_enabled'       => ['default' => true,    'type' => 'bool'],
+        'ws_quality_min_score'           => ['default' => 6.0,     'type' => 'float'],  // 1-10分制，代码×10转百分制
+
+        // ── 写作质量增强（v1.9 盲点修复）──
+        'ws_rewrite_enabled'             => ['default' => false,   'type' => 'bool'],
+        'ws_rewrite_threshold'           => ['default' => 70,      'type' => 'int'],
+        'ws_rewrite_min_gain'            => ['default' => 10,      'type' => 'int'],
+        'ws_critic_enabled'              => ['default' => true,    'type' => 'bool'],
+        'ws_style_guard_enabled'         => ['default' => true,    'type' => 'bool'],
+        'ws_ai_patterns_check_enabled'   => ['default' => true,    'type' => 'bool'],
+
+        // ── Agent 决策系统 ──
+        'agent.enabled'                  => ['default' => true,    'type' => 'bool'],
+        'agent.strategy_agent.enabled'   => ['default' => true,    'type' => 'bool'],
+        'agent.strategy_agent.check_interval' => ['default' => 10, 'type' => 'int'],
+        'agent.quality_agent.enabled'    => ['default' => true,    'type' => 'bool'],
+        'agent.quality_agent.check_interval' => ['default' => 5,   'type' => 'int'],
+        'agent.quality_agent.auto_fix'   => ['default' => true,    'type' => 'bool'],
+        'agent.optimization_agent.enabled' => ['default' => true,  'type' => 'bool'],
+        'agent.optimization_agent.optimization_interval' => ['default' => 20, 'type' => 'int'],
+
+        // ── 迭代精炼系统 ──
+        'ir_max_iterations'              => ['default' => 3,       'type' => 'int'],
+        'ir_target_score'                => ['default' => 80,      'type' => 'int'],
+        'ir_min_improvement'             => ['default' => 5.0,     'type' => 'float'],
+        'ir_quality_decline_threshold'   => ['default' => 3.0,     'type' => 'float'],
+
+        // ── 短篇小说模块 ──
+        'short_story_default_words'      => ['default' => 3000,    'type' => 'int'],
+        'short_story_min_words'          => ['default' => 800,     'type' => 'int'],
+        'short_story_max_words'          => ['default' => 20000,   'type' => 'int'],
+        'short_story_quality_threshold'  => ['default' => 75,      'type' => 'int'],
+    ];
+}
+
+/**
+ * 约束框架默认配置 — 全局唯一来源
+ * @return array
+ */
+function getConstraintDefaults(): array
+{
+    return [
+        // ── 总开关 ──
+        'cf_enabled'                     => ['default' => '1',     'type' => 'bool'],
+        'cf_strict_mode'                 => ['default' => '0',     'type' => 'bool'],
+        // ── 角色约束（预留，当前无消费逻辑，不生效）──
+        'cf_combat_ratio_min'            => ['default' => '40',    'type' => 'int'],
+        'cf_combat_ratio_max'            => ['default' => '60',    'type' => 'int'],
+        'cf_speed_factor'                => ['default' => '10',    'type' => 'int'],
+        'cf_rival_factor'                => ['default' => '0.8',   'type' => 'float'],
+        // ── 情节约束 ──
+        'cf_max_same_conflict'           => ['default' => '1',     'type' => 'int'], // 预留，当前无消费逻辑
+        'cf_max_coincidences'            => ['default' => '5',     'type' => 'int'],
+        // ── 信息/伏笔约束（预留，当前无消费逻辑，不生效）──
+        'cf_foreshadowing_recovery_min'  => ['default' => '70',    'type' => 'int'],
+        'cf_max_new_info_per_ch'         => ['default' => '2',     'type' => 'int'],
+        // ── 节奏约束（预留，当前无消费逻辑，不生效）──
+        'cf_min_buffer_release'          => ['default' => '2',     'type' => 'int'],
+        'cf_cooldown_after_climax'       => ['default' => '1',     'type' => 'int'],
+        // ── 语言/风格约束 ──
+        'cf_max_banned_word_usage'       => ['default' => '15',    'type' => 'int'], // 预留，当前无消费逻辑
+        'cf_banned_words'                => ['default' => '绝境,反杀,真相,背水,逆袭', 'type' => 'string'],
+    ];
+}
+
+// ============================================================
+// 诊断/调试工具开关
+// ============================================================
+// 生产环境默认关闭；在 config.php 中定义 CFG_DIAGNOSTIC_ENABLED = true 可开启
+if (!defined('CFG_DIAGNOSTIC_ENABLED')) {
+    define('CFG_DIAGNOSTIC_ENABLED', false);
+}

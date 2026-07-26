@@ -1,0 +1,85 @@
+# ============================================================
+# 基础安全加固（Apache）
+# ============================================================
+
+# 关闭目录列举
+Options -Indexes
+
+# 安全响应头
+<IfModule mod_headers.c>
+    # 防止 MIME 嗅探
+    Header set X-Content-Type-Options "nosniff"
+    # 防止点击劫持
+    Header set X-Frame-Options "SAMEORIGIN"
+    # 禁用旧版 IE XSS 过滤器（现代做法：让浏览器不尝试主动过滤）
+    Header set X-XSS-Protection "0"
+    # HSTS（仅 HTTPS 部署时生效）
+    Header set Strict-Transport-Security "max-age=63072000; includeSubDomains"
+    # CSP：限制资源加载来源（纵深防御 XSS）
+    # unsafe-inline 用于兼容页面内嵌的 <script>（主题切换等），后续可迁移至 nonce 模式
+    Header set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'self'"
+</IfModule>
+
+# 拒绝直接访问敏感文件类型
+<FilesMatch "(?i)\.(lock|log|sh|ps1|sql|bak|ini|sample|md|zip|7z|rar|tar|gz|tgz)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# 保护主配置文件（纵深防御：万一 PHP 处理器失效也不泄露源码/密钥）
+<Files "config.php">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</Files>
+
+# 隐藏点文件（.git/.env 等）
+<FilesMatch "^\.">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# ============================================================
+# 审计修复 H-2（2026-07-01）：阻止直接访问 api/ 下的独立 PHP 文件
+# 所有 API 请求必须通过 api/index.php 路由器，防止双入口鉴权风险
+# ============================================================
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # CLI maintenance entry points are never valid over HTTP.
+    RewriteRule ^bin/ - [F,L,NC]
+
+    # Uploaded author works are private source documents; serve them only through authenticated PHP flows.
+    RewriteRule ^storage/author_works/ - [F,L]
+
+    # M-6：HTTP → HTTPS 强制重定向
+    RewriteCond %{HTTPS} off
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+    # H-2：阻止直接访问 api/ 子目录下的 PHP 文件（仅允许 api/index.php）
+    # 例外：hot_novels_ingest.php（外部 Agent 推送）、daemon_write.php（Cron 定时任务）
+    # RewriteRule 在 .htaccess 中匹配相对当前应用目录的路径，因此同时覆盖
+    # 域名根目录和 /some/subdir/ 子目录部署。
+    RewriteRule ^api/(?!index\.php$|hot_novels_ingest\.php$|daemon_write\.php$).+\.php(?:/.*)?$ - [F,L,NC]
+</IfModule>
+
+# ============================================================
+# 审计修复 L-5（2026-07-01）：添加 Referrer-Policy 安全头
+# ============================================================
+<IfModule mod_headers.c>
+    Header set Referrer-Policy "strict-origin-when-cross-origin"
+</IfModule>

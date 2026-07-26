@@ -1,0 +1,22 @@
+# 拒绝所有直接访问（除封面目录外）
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    # 仅允许 /storage/covers/ 下的文件直接访问
+    RewriteRule ^covers/ - [L]
+    # 其余全部拒绝
+    RewriteRule .* - [F]
+</IfModule>
+
+<IfModule !mod_rewrite.c>
+    <IfModule mod_authz_core.c>
+        # Apache 2.4
+        <DirectoryMatch "^.*$">
+            Require all denied
+        </DirectoryMatch>
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        # Apache 2.2
+        Order Allow,Deny
+        Deny from all
+    </IfModule>
+</IfModule>

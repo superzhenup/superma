@@ -1,0 +1,1620 @@
+<?php
+define('APP_LOADED', true);
+require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/includes/auth.php';
+requireLogin();
+require_once __DIR__ . '/includes/db.php';
+require_once __DIR__ . '/includes/functions.php';
+require_once __DIR__ . '/includes/layout.php';
+
+$id      = (int)($_GET['id'] ?? 0);
+$chapter = getChapter($id);
+if (!$chapter) { header('Location: index.php'); exit; }
+
+$novel   = getNovel($chapter['novel_id']);
+if (!$novel) { header('Location: index.php'); exit; }
+// 审计修复 P2-14（2026-07-12）：页面级归属权校验，防止越权访问
+$novel = requireNovelAccess($novel);
+
+$prev = DB::fetch(
+    'SELECT id, chapter_number, title FROM chapters WHERE novel_id=? AND chapter_number=? LIMIT 1',
+    [$novel['id'], $chapter['chapter_number'] - 1]
+);
+$next = DB::fetch(
+    'SELECT id, chapter_number, title FROM chapters WHERE novel_id=? AND chapter_number=? LIMIT 1',
+    [$novel['id'], $chapter['chapter_number'] + 1]
+);
+
+$gmModels = DB::fetchAll(
+    "SELECT id, name, model_name, is_default FROM ai_models ORDER BY is_default DESC, id ASC"
+);
+$gmModelsJson = json_encode(array_map(function($m) {
+    return [
+        'id'         => (int)$m['id'],
+        'name'       => $m['name'],
+        'model_name' => $m['model_name'] ?? '',
+        'is_default' => (int)($m['is_default'] ?? 0),
+    ];
+}, $gmModels), JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+
+pageHeader("第{$chapter['chapter_number']}章 - {$novel['title']}", 'home');
+?>
+
+<!-- Breadcrumb -->
+<nav class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="index.php" class="text-muted">书库</a></li>
+    <li class="breadcrumb-item"><a href="novel.php?id=<?= $novel['id'] ?>" class="text-muted"><?= h($novel['title']) ?></a></li>
+    <li class="breadcrumb-item active text-light"><?= $chapter['chapter_number'] ?>章</li>
+  </ol>
+</nav>
+
+<style>
+.inline-edit-bar {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    z-index: 100;
+    padding: 8px 12px;
+    background: linear-gradient(135deg, #1e2230, #242836);
+    border: 1px solid #6366f1;
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    animation: inlineSlideDown 0.2s ease;
+    user-select: none;
+    -webkit-user-select: none;
+}
+.inline-edit-bar #inline-edit-instruction::placeholder {
+    color: #6c757d;
+    font-size: .78rem;
+}
+@keyframes inlineSlideDown {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.inline-edit-bar .btn-warning {
+    white-space: nowrap;
+    font-size: .8rem;
+}
+</style>
+
+<div class="row g-4">
+  <!-- Main content -->
+  <div class="col-12 col-xl-8">
+    <div class="page-card">
+      <div class="page-card-header d-flex justify-content-between align-items-center">
+        <div>
+          <span class="text-muted small"><?= $chapter['chapter_number'] ?>章</span>
+          <h5 class="mb-0 mt-1 text-light" id="chapter-title-display"><?= h($chapter['title']) ?></h5>
+        </div>
+        <div class="d-flex gap-2">
+          <?= statusBadge($chapter['status']) ?>
+          <button class="btn btn-sm btn-outline-warning" onclick="toggleEdit()">
+            <i class="bi bi-pencil"></i> 编辑
+          </button>
+          <button class="btn btn-sm btn-outline-info" onclick="showVersionHistory()">
+            <i class="bi bi-clock-history"></i> 版本
+          </button>
+          <?php if ($chapter['status'] !== 'completed' && $chapter['status'] === 'outlined'): ?>
+          <button class="btn btn-sm btn-primary" id="btn-rewrite" data-chapter="<?= $id ?>">
+            <i class="bi bi-arrow-repeat me-1"></i>重新写作
+          </button>
+          <?php endif; ?>
+        </div>
+      </div>
+
+      <!-- Read mode -->
+      <div id="read-mode" class="p-4"<?php if (isset($_GET['edit']) && $_GET['edit'] === '1') echo ' style="display:none"'; ?>>
+        <?php if ($chapter['content']): ?>
+        <div class="chapter-content">
+          <?= nl2br(h($chapter['content'])) ?>
+        </div>
+        <div class="d-flex justify-content-between text-muted small mt-4 pt-3 border-top border-secondary">
+          <span><i class="bi bi-file-text me-1"></i><?= number_format($chapter['words']) ?> 字</span>
+          <span>更新于<?= h($chapter['updated_at']) ?></span>
+        </div>
+        <?php else: ?>
+        <div class="empty-state py-5">
+          <div class="empty-icon"><i class="bi bi-file-earmark-text"></i></div>
+          <h6>本章暂无内容</h6>
+          <?php if ($chapter['status'] === 'outlined'): ?>
+          <p class="text-muted small">大纲已生成，点击「开始写作」让 AI 创作，或点击「手动编辑」自己撰写。</p>
+          <div class="d-flex gap-2 justify-content-center">
+            <button class="btn btn-primary btn-sm" id="btn-rewrite" data-chapter="<?= $id ?>">
+              <i class="bi bi-magic me-1"></i>开始写作
+            </button>
+            <button class="btn btn-outline-warning btn-sm" onclick="toggleEdit()">
+              <i class="bi bi-pencil me-1"></i>手动编辑
+            </button>
+          </div>
+          <?php else: ?>
+          <p class="text-muted small">尚未生成大纲，可以直接手动撰写本章内容。</p>
+          <button class="btn btn-warning btn-sm" onclick="toggleEdit()">
+            <i class="bi bi-pencil me-1"></i>手动编辑
+          </button>
+          <?php endif; ?>
+        </div>
+        <?php endif; ?>
+      </div>
+
+      <!-- Edit mode -->
+      <div id="edit-mode" class="p-4"<?php if (!isset($_GET['edit']) || $_GET['edit'] !== '1') echo ' style="display:none"'; ?>>
+        <div class="mb-3">
+          <div class="d-flex justify-content-between align-items-center mb-1">
+            <label class="form-label mb-0" for="edit-title">章节标题</label>
+            <button type="button"
+                    class="btn btn-outline-info btn-sm"
+                    id="btn-optimize-title"
+                    onclick="optimizeChapterTitle(<?= $id ?>)"
+                    title="根据本章大纲概要、关键情节点、结尾钩子优化原来的标题">
+              <i class="bi bi-stars me-1"></i>AI标题优化
+            </button>
+          </div>
+          <input type="text" id="edit-title" class="form-control" value="<?= h($chapter['title']) ?>">
+        </div>
+        <div class="mb-1" style="position:relative">
+          <label class="form-label">章节内容</label>
+          <textarea id="edit-content" class="form-control chapter-editor" oninput="updateWordCount()"><?= h($chapter['content']) ?></textarea>
+
+          <!-- 选中文字优化工具栏 -->
+          <div id="inline-edit-bar" class="inline-edit-bar" style="display:none">
+            <div class="d-flex align-items-center gap-2">
+              <i class="bi bi-highlighter text-warning small"></i>
+              <input type="text" id="inline-edit-instruction"
+                     class="form-control form-control-sm"
+                     placeholder="输入优化指令（留空默认润色）"
+                     style="min-width:220px;background:#2d3239;border-color:#495057;color:#e9ecef;font-size:.8rem">
+              <button class="btn btn-warning btn-sm" id="btn-inline-polish" onclick="polishSelection()">
+                <i class="bi bi-magic me-1"></i>优化
+              </button>
+              <button class="btn btn-outline-secondary btn-sm" onclick="hideInlineBar()">
+                <i class="bi bi-x"></i>
+              </button>
+            </div>
+          </div>
+
+          <!-- 字数统计栏 -->
+          <div class="d-flex justify-content-between align-items-center mt-1">
+            <span id="word-count-bar" class="small" style="color:#28a745;">
+              当前 <span id="wc-current"><?= number_format((int)$chapter['words']) ?></span> 字 / 目标 <?= number_format((int)$novel['chapter_words']) ?> 字
+            </span>
+            <button class="btn btn-outline-warning btn-sm" id="btn-compress" onclick="compressChapter(<?= $id ?>)" title="AI压缩到目标字数" style="font-size:.75rem;">
+              <i class="bi bi-arrows-angle-contract me-1"></i>AI压缩
+            </button>
+          </div>
+        </div>
+        <div class="d-flex gap-2 align-items-center">
+          <button class="btn btn-outline-info btn-sm" id="btn-polish" onclick="polishChapter(<?= $id ?>)">
+            <i class="bi bi-magic me-1"></i>一键润色
+          </button>
+          <button class="btn btn-success btn-sm" onclick="saveChapter(<?= $id ?>)">
+            <i class="bi bi-check-circle me-1"></i>保存
+          </button>
+          <div class="ms-auto"></div>
+          <button class="btn btn-secondary btn-sm" onclick="toggleEdit()">取消</button>
+        </div>
+      </div>
+
+      <!-- Navigation -->
+      <div class="d-flex justify-content-between align-items-center p-3 border-top border-secondary">
+        <?php if ($prev): ?>
+        <a href="chapter.php?id=<?= $prev['id'] ?>" class="btn btn-outline-secondary btn-sm">
+          <i class="bi bi-chevron-left me-1"></i><?= $prev['chapter_number'] ?>章<        </a>
+        <?php else: ?>
+        <span></span>
+        <?php endif; ?>
+        <a href="novel.php?id=<?= $novel['id'] ?>" class="btn btn-outline-secondary btn-sm">
+          <i class="bi bi-list-ul me-1"></i>目录
+        </a>
+        <?php if ($next): ?>
+        <a href="chapter.php?id=<?= $next['id'] ?>&edit=1" class="btn btn-outline-secondary btn-sm">
+          <?= $next['chapter_number'] ?>章<i class="bi bi-chevron-right ms-1"></i>
+        </a>
+        <?php else: ?>
+        <span></span>
+        <?php endif; ?>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sidebar: outline & info -->
+  <div class="col-12 col-xl-4">
+    <!-- Outline -->
+    <div class="page-card mb-3">
+      <div class="page-card-header"><i class="bi bi-file-earmark-text me-2"></i>本章大纲</div>
+      <div class="p-3">
+        <?php
+          // 预处理 key_points：数据库里是 JSON，前端用“每行一个”的纯文本编辑
+          $pts      = $chapter['key_points'] ? (json_decode($chapter['key_points'], true) ?? []) : [];
+          $ptsText  = is_array($pts) ? implode("\n", $pts) : '';
+        ?>
+
+        <!-- 大纲概要 -->
+        <div class="mb-3">
+          <label class="small text-muted mb-1 fw-semibold d-block">大纲概要</label>
+          <textarea id="outline-outline"
+                    class="form-control form-control-sm bg-dark border-secondary text-light"
+                    rows="4"
+                    placeholder="输入本章大纲概要..."><?= h($chapter['outline']) ?></textarea>
+        </div>
+
+        <!-- 关键情节点（每行一个） -->
+        <div class="mb-3">
+          <label class="small text-muted mb-1 fw-semibold d-block">
+            关键情节点 <span class="text-muted" style="font-weight:normal">（每行一个）</span>
+          </label>
+          <textarea id="outline-keypoints"
+                    class="form-control form-control-sm bg-dark border-secondary text-light"
+                    rows="4"
+                    placeholder="输入关键情节点，每行一个..."><?= h($ptsText) ?></textarea>
+        </div>
+
+        <!-- 结尾钩子 -->
+        <div class="mb-3">
+          <label class="small text-muted mb-1 fw-semibold d-block">结尾钩子</label>
+          <textarea id="outline-hook"
+                    class="form-control form-control-sm bg-dark border-secondary text-light"
+                    rows="2"
+                    style="background:rgba(99,102,241,.05) !important;"
+                    placeholder="输入结尾钩子..."><?= h($chapter['hook']) ?></textarea>
+        </div>
+
+        <!-- 操作按钮 -->
+        <div class="d-flex justify-content-between">
+          <button type="button" class="btn btn-outline-warning btn-sm" id="btn-regenerate"
+                  title="用 AI 重新生成本章大纲概要、关键情节点、结尾钩子，填入上方文本框供检查后保存">
+            <i class="bi bi-arrow-repeat me-1"></i>重新生成
+          </button>
+          <button type="button" class="btn btn-primary btn-sm" id="btn-save-outline">
+            <i class="bi bi-check-circle me-1"></i>保存大纲
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 质量检测仪表盘 -->
+    <div class="page-card mb-3" id="quality-dashboard">
+      <div class="page-card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-clipboard-check me-2"></i>质量检测</span>
+        <?php if ($chapter['status'] === 'completed' && !empty($chapter['content'])): ?>
+        <button class="btn btn-sm btn-outline-primary" onclick="runQualityCheck()">
+          <i class="bi bi-play-circle me-1"></i>一键检测
+        </button>
+        <?php endif; ?>
+      </div>
+      <div class="p-3" id="quality-body">
+        <?php
+          $qScore = $chapter['quality_score'] ?? null;
+          $gResults = $chapter['gate_results'] ? json_decode($chapter['gate_results'], true) : null;
+        ?>
+        <?php if ($qScore !== null): ?>
+        <!-- 已有检测结果 -->
+        <div class="text-center mb-3">
+          <div class="d-inline-flex align-items-center justify-content-center rounded-circle" 
+               style="width:80px;height:80px;background:<?php
+                 echo $qScore >= 80 ? 'rgba(40,167,69,.2)' : ($qScore >= 60 ? 'rgba(255,193,7,.2)' : 'rgba(220,53,69,.2)');
+               ?>">
+            <span style="font-size:1.8rem;font-weight:700;<?php
+              echo $qScore >= 80 ? 'color:#28a745' : ($qScore >= 60 ? 'color:#ffc107' : 'color:#dc3545');
+            ?>"><?= number_format($qScore, 0) ?></span>
+          </div>
+          <div class="text-muted small mt-1">综合评分 /100</div>
+        </div>
+
+        <!-- 五关详情 -->
+        <?php if (!empty($gResults) && is_array($gResults)): ?>
+        <div id="gate-details">
+          <?php foreach ($gResults as $gate): $gs = $gate['score'] ?? 0; $pass = !empty($gate['status']); ?>
+          <div class="d-flex align-items-center mb-2 p-2 rounded" style="background:<?php echo $pass ? 'rgba(40,167,69,.08)' : 'rgba(220,53,69,.08)' ?>;">
+            <span class="me-2"><?php echo $pass ? '✓' : '⚠️'; ?></span>
+            <small class="flex-grow-1 text-truncate"><?php echo h($gate['name']); ?></small>
+            <strong class="ms-2 small" style="color:<?php echo $gs >= 70 ? '#28a745' : '#dc3545' ?>"><?= $gs ?></strong>
+            <span class="text-muted small ms-1">分</span>
+          </div>
+          <?php if (!$pass && !empty($gate['issues'])): ?>
+          <div class="small text-danger mb-2 ps-4" style="font-size:.7rem;line-height:1.4;">
+            <?php foreach (array_slice($gate['issues'], 0, 3) as $issue): ?>
+            <div><?= h($issue) ?></div>
+            <?php endforeach; ?>
+          </div>
+          <?php endif; ?>
+          <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+
+        <div class="text-muted small mt-2 text-center" id="quality-summary">
+          <?php if ($qScore >= 80): ?><span class="text-success">本章质量优秀</span><?php elseif ($qScore >= 60): ?><span class="text-warning">有改进空间</span><?php else: ?><span class="text-danger">建议修改</span><?php endif; ?>
+        </div>
+        <?php else: ?>
+        <!-- 尚未检测 -->
+        <div class="text-center py-3 text-muted small">
+          <?php if ($chapter['status'] === 'completed'): ?>
+          <i class="bi bi-clipboard-check d-block fs-3 mb-2 opacity-50"></i>
+          点击「一键检测」运行五关质量流水线<br>
+          <span class="opacity-50">结构 · 角色 · 描写 · 爽点 · 连贯性</span>
+          <?php else: ?>
+          <i class="bi bi-hourglass-split d-block fs-3 mb-2 opacity-50"></i>
+          完成写作后可进行质量检测
+          <?php endif; ?>
+        </div>
+        <?php endif; ?>
+      </div>
+      <!-- 检测中 spinner（默认隐藏）-->
+      <div class="p-3 text-center" id="quality-loading" style="display:none;">
+        <div class="spinner-border spinner-border-sm text-primary me-2"></div>
+        <span class="text-muted small">正在执行五关检测...</span>
+      </div>
+    </div>
+
+    <!-- Novel Info -->
+    <div class="page-card">
+      <div class="page-card-header"><i class="bi bi-book me-2"></i><?= h($novel['title']) ?></div>
+      <div class="p-3">
+        <div class="small text-muted mb-1">主角</div>
+        <div class="small text-light mb-2"><?= h($novel['protagonist_name'] ?: '未设置') ?></div>
+        <div class="small text-muted mb-1">写作进度</div>
+        <div class="d-flex justify-content-between small mb-1">
+          <span class="text-light"><?= $novel['current_chapter'] ?>/<?= $novel['target_chapters'] ?> 章</span>
+          <span class="text-muted"><?= number_format($novel['total_words']) ?> 字</span>
+        </div>
+        <div class="progress" style="height:4px">
+          <?php $p = $novel['target_chapters']>0 ? round($novel['current_chapter']/$novel['target_chapters']*100) : 0 ?>
+          <div class="progress-bar" style="width:<?= $p ?>%;background:<?= h($novel['cover_color']) ?>"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Version History Modal -->
+<div class="modal fade" id="versionModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content bg-dark text-light">
+      <div class="modal-header border-secondary">
+        <h5 class="modal-title"><i class="bi bi-clock-history me-2"></i>版本历史</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div id="versionList" class="list-group"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Version Preview Modal -->
+<div class="modal fade" id="versionPreviewModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content bg-dark text-light">
+      <div class="modal-header border-secondary">
+        <h5 class="modal-title">版本预览</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <pre id="versionPreviewContent" class="text-light" style="white-space:pre-wrap;word-break:break-all;"></pre>
+      </div>
+      <div class="modal-footer border-secondary">
+        <button class="btn btn-danger btn-sm" id="btnRollback">
+          <i class="bi bi-arrow-counterclockwise me-1"></i>回滚到此版本
+        </button>
+        <button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Rewrite modal -->
+<div class="modal fade" id="rewriteModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content bg-dark text-light">
+      <div class="modal-header border-secondary">
+        <h5 class="modal-title">AI 正在写作第<?= $chapter['chapter_number'] ?>章...</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div id="rewriteContent" class="chapter-content-preview"></div>
+        <div id="rewriteSpinner" class="text-center py-3">
+          <div class="spinner-border text-primary"></div>
+        </div>
+      </div>
+      <div class="modal-footer border-secondary">
+        <span class="text-muted small" id="rewriteStats"></span>
+        <button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// HTML转义函数（防止XSS）
+function escapeHtml(text) {
+    if (!text) return '';
+    return String(text).replace(/[&<>"']/g, m => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+    }[m]));
+}
+
+// ================================================================
+// 最优先：直接在 window 上定义 toggleEdit/saveChapter
+// 确保即使后续代码出错，inline onclick 也能找到这两个函数
+// ================================================================
+window.toggleEdit = function toggleEdit(forceEdit) {
+    var r = document.getElementById('read-mode');
+    var e = document.getElementById('edit-mode');
+    if (!r || !e) return;
+    var shouldEdit = forceEdit === true || r.style.display !== 'none';
+    if (shouldEdit) {
+        r.style.display = 'none';
+        e.style.display = '';
+    } else {
+        r.style.display = '';
+        e.style.display = 'none';
+    }
+};
+
+window.saveChapter = async function saveChapter(chapterId) {
+    var titleEl   = document.getElementById('edit-title');
+    var contentEl = document.getElementById('edit-content');
+    if (!titleEl || !contentEl) return;
+    try {
+        var data = await apiPost('actions', {
+            action: 'save_chapter',
+            chapter_id: chapterId,
+            title: titleEl.value,
+            content: contentEl.value
+        });
+        if (data.ok) {
+            location.reload();
+        } else {
+            alert('保存失败：' + (data.msg || '未知错误'));
+        }
+    } catch (err) {
+        alert('保存失败：' + err.message);
+    }
+};
+
+window.optimizeChapterTitle = async function optimizeChapterTitle(chapterId) {
+    var titleEl = document.getElementById('edit-title');
+    var outlineEl = document.getElementById('outline-outline');
+    var keyPointsEl = document.getElementById('outline-keypoints');
+    var hookEl = document.getElementById('outline-hook');
+    var btn = document.getElementById('btn-optimize-title');
+
+    if (!titleEl) return;
+
+    var payload = {
+        chapter_id: chapterId,
+        current_title: titleEl.value || '',
+        outline: outlineEl ? outlineEl.value : '',
+        key_points: keyPointsEl ? keyPointsEl.value : '',
+        hook: hookEl ? hookEl.value : ''
+    };
+
+    if (!payload.current_title.trim() && !payload.outline.trim() && !payload.key_points.trim() && !payload.hook.trim()) {
+        alert('请先填写原标题或本章大纲信息');
+        return;
+    }
+
+    var originalHtml = btn ? btn.innerHTML : '';
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>优化中...';
+    }
+
+    try {
+        var data = await apiPost('optimize_chapter_title', payload);
+        if (!data.ok) {
+            throw new Error(data.msg || data.error || '标题优化失败');
+        }
+
+        var title = (data.data && data.data.title) ? data.data.title : '';
+        if (!title) {
+            throw new Error('AI没有返回可用标题');
+        }
+
+        titleEl.value = title;
+        var displayEl = document.getElementById('chapter-title-display');
+        if (displayEl) {
+            displayEl.textContent = title;
+        }
+        titleEl.focus();
+        titleEl.select();
+    } catch (err) {
+        alert('标题优化失败：' + err.message);
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = originalHtml;
+        }
+    }
+};
+
+// URL 参数 ?edit=1 时自动进入编辑模式
+(function autoEnterEditMode() {
+    try {
+        var params = new URLSearchParams(window.location.search);
+        if (params.get('edit') !== '1') return;
+        var run = function() {
+            var r = document.getElementById('read-mode');
+            var e = document.getElementById('edit-mode');
+            if (r && e) {
+                r.style.display = 'none';
+                e.style.display = '';
+                e.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                var c = document.getElementById('edit-content');
+                if (c) c.focus();
+            }
+        };
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', run);
+        } else {
+            run();
+        }
+    } catch (err) {}
+})();
+
+// ================================================================
+// 以下代码如果出错，不影响上面已经暴露的编辑功能
+// ================================================================
+const CHAPTER_ID = <?= $id ?>;
+const NOVEL_ID   = <?= $novel['id'] ?>;
+window.GM_CHAPTER_ID = <?= $id ?>;
+window.GM_NOVEL_ID = <?= $novel['id'] ?>;
+window.GM_MODELS = <?= $gmModelsJson ?>;
+let selectedVersionId = null;
+
+// ========== 版本历史功能 ==========
+async function showVersionHistory() {
+    const data = await apiGet('chapter_versions', { chapter_id: CHAPTER_ID, action: 'list' });
+    if (!data.ok) { alert(data.msg); return; }
+
+    const listEl = document.getElementById('versionList');
+    listEl.innerHTML = '';
+
+    // 当前版本
+    listEl.innerHTML += `
+        <div class="list-group-item list-group-item-action bg-primary text-white border-secondary">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <strong>当前版本</strong>
+                    <span class="badge bg-light text-dark ms-2">${data.data.chapter.current_words}字</span>
+                </div>
+                <small class="text-white-50">最新</small>
+            </div>
+            <small class="text-white-50">${escapeHtml(data.data.chapter.current_content)}</small>
+        </div>
+    `;
+
+    // 历史版本
+    if (data.data.versions.length === 0) {
+        listEl.innerHTML += '<div class="text-center text-muted py-3">暂无历史版本</div>';
+    } else {
+        data.data.versions.forEach(v => {
+            listEl.innerHTML += `
+                <div class="list-group-item list-group-item-action bg-dark text-light border-secondary" 
+                     style="cursor:pointer" onclick="previewVersion(${v.id})">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <strong>v${v.version}</strong>
+                            <span class="badge bg-secondary ms-2">${v.words}字</span>
+                        </div>
+                        <small class="text-muted">${v.created_at}</small>
+                    </div>
+                </div>
+            `;
+        });
+    }
+
+    const modal = new bootstrap.Modal(document.getElementById('versionModal'));
+    modal.show();
+}
+
+async function previewVersion(versionId) {
+    const data = await apiGet('chapter_versions', {
+        chapter_id: CHAPTER_ID,
+        action: 'preview',
+        version_id: versionId
+    });
+    if (!data.ok) { alert(data.msg); return; }
+
+    document.getElementById('versionPreviewContent').textContent = data.data.content;
+    selectedVersionId = versionId;
+
+    const modal = new bootstrap.Modal(document.getElementById('versionPreviewModal'));
+    modal.show();
+}
+
+// 版本历史函数也暴露到 window，供 inline onclick 使用
+window.showVersionHistory = showVersionHistory;
+window.previewVersion     = previewVersion;
+
+// btnRollback 绑定（容错）
+(function bindRollback() {
+    const btn = document.getElementById('btnRollback');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+        if (!selectedVersionId) return;
+        if (!confirm('确定要回滚到此版本吗？当前内容将被备份为新版本。')) return;
+
+        try {
+            const data = await apiPost('chapter_versions', {
+                chapter_id: CHAPTER_ID,
+                action: 'rollback',
+                version_id: selectedVersionId
+            });
+            if (data.ok) {
+                alert('回滚成功');
+                location.reload();
+            } else {
+                alert('回滚失败：' + data.msg);
+            }
+        } catch (err) {
+            alert('回滚失败：' + err.message);
+        }
+    });
+})();
+
+// Rewrite button（开始写作 / 重新写作）
+(function bindRewrite() {
+    document.querySelectorAll('#btn-rewrite').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const modalEl = document.getElementById('rewriteModal');
+            if (!modalEl) { alert('缺少写作对话框'); return; }
+            const modal = new bootstrap.Modal(modalEl);
+            modal.show();
+            const contentEl = document.getElementById('rewriteContent');
+            const spinnerEl = document.getElementById('rewriteSpinner');
+            const statsEl   = document.getElementById('rewriteStats');
+            if (contentEl) contentEl.textContent = '正在初始化写作引擎...';
+            if (spinnerEl) spinnerEl.style.display = '';
+            if (statsEl)   statsEl.textContent = '';
+
+            try {
+                if (typeof streamWriteChapter !== 'function') {
+                    throw new Error('写作客户端未加载，请刷新页面后重试');
+                }
+                if (contentEl) contentEl.textContent = '';
+                const cursorEl = document.createElement('span');
+                cursorEl.className = 'outline-stream-cursor';
+                if (contentEl) contentEl.appendChild(cursorEl);
+                const generated = await streamWriteChapter(
+                    NOVEL_ID,
+                    CHAPTER_ID,
+                    (statsText) => {
+                        if (statsEl) statsEl.textContent = statsText;
+                        if (spinnerEl) spinnerEl.style.display = 'none';
+                    },
+                    contentEl,
+                    cursorEl
+                );
+                if (generated && generated.length > 0) {
+                    window._contentUpdated = true;
+                } else if (contentEl) {
+                    contentEl.textContent = '⚠️ 未收到生成内容，请检查 AI 模型配置和 API 连接，然后重试。';
+                    if (statsEl) statsEl.textContent = '';
+                }
+            } catch(err) {
+                console.error('[SSE-写入] 连接异常:', err);
+                if (contentEl) contentEl.textContent = '写作失败：' + err.message;
+                if (spinnerEl) spinnerEl.style.display = 'none';
+            }
+        });
+    });
+})();
+
+// ================================================================
+// 保存大纲 / 关键情节点 / 结尾钩子
+// ================================================================
+(function bindSaveOutline() {
+    const btn = document.getElementById('btn-save-outline');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+        const outlineEl = document.getElementById('outline-outline');
+        const kpEl      = document.getElementById('outline-keypoints');
+        const hookEl    = document.getElementById('outline-hook');
+        if (!outlineEl || !kpEl || !hookEl) return;
+
+        const origHtml = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>保存中...';
+
+        try {
+            // 关键情节点：按行拆分，去空行去空格
+            const keyPoints = kpEl.value.split('\n')
+                .map(s => s.trim())
+                .filter(s => s.length > 0);
+
+            const data = await apiPost('actions', {
+                action:      'save_chapter_outline',
+                chapter_id:  CHAPTER_ID,
+                outline:     outlineEl.value,
+                key_points:  keyPoints,
+                hook:        hookEl.value
+            });
+            if (data.ok) {
+                btn.innerHTML = '<i class="bi bi-check-circle-fill me-1"></i>已保存';
+                btn.classList.remove('btn-primary');
+                btn.classList.add('btn-success');
+                setTimeout(() => {
+                    btn.innerHTML = origHtml;
+                    btn.classList.remove('btn-success');
+                    btn.classList.add('btn-primary');
+                    btn.disabled = false;
+                }, 1500);
+            } else {
+                alert('保存失败：' + (data.msg || '未知错误'));
+                btn.innerHTML = origHtml;
+                btn.disabled = false;
+            }
+        } catch (err) {
+            alert('保存失败：' + err.message);
+            btn.innerHTML = origHtml;
+            btn.disabled = false;
+        }
+    });
+})();
+
+// ========== Phase 4: 质量检测功能 ==========
+async function runQualityCheck() {
+    const bodyEl = document.getElementById('quality-body');
+    const loadEl = document.getElementById('quality-loading');
+    if (!bodyEl || !loadEl) return;
+
+    // 显示 loading
+    bodyEl.style.display = 'none';
+    loadEl.style.display = '';
+
+    try {
+        const data = await apiPost('validate_consistency', {
+            novel_id: NOVEL_ID,
+            chapter_id: CHAPTER_ID
+        });
+
+        if (data.error) {
+            bodyEl.innerHTML = '<div class="text-center text-danger py-3 small">' + escapeHtml(data.error) + '</div>';
+            bodyEl.style.display = '';
+            loadEl.style.display = 'none';
+            return;
+        }
+
+        // 渲染结果
+        const score = data.total_score ?? 0;
+        const passColor = score >= 80 ? '#28a745' : (score >= 60 ? '#ffc107' : '#dc3545');
+        const bgColor  = score >= 80 ? 'rgba(40,167,69,.2)' : (score >= 60 ? 'rgba(255,193,7,.2)' : 'rgba(220,53,69,.2)');
+
+        let html = '';
+
+        // 圆形评分
+        html += '<div class="text-center mb-3">';
+        html += '<div class="d-inline-flex align-items-center justify-content-center rounded-circle" style="width:80px;height:80px;background:' + bgColor + '">';
+        html += '<span style="font-size:1.8rem;font-weight:700;color:' + passColor + '">' + Math.round(score) + '</span>';
+        html += '</div>';
+        html += '<div class="text-muted small mt-1">综合评分 /100</div>';
+        html += '</div>';
+
+        // 五关详情
+        if (data.gates && data.gates.length) {
+            html += '<div id="gate-details">';
+            data.gates.forEach(function(gate) {
+                var gs = gate.score || 0;
+                var ok  = !!gate.status;
+                var bg  = ok ? 'rgba(40,167,69,.08)' : 'rgba(220,53,69,.08)';
+                var clr = gs >= 70 ? '#28a745' : '#dc3545';
+                html += '<div class="d-flex align-items-center mb-2 p-2 rounded" style="background:' + bg + '">';
+                html += '<span class="me-2">' + (ok ? '&#x2705;' : '&#x26A0;&#xFE0F;') + '</span>';
+                html += '<small class="flex-grow-1 text-truncate">' + escapeHtml(gate.name) + '</small>';
+                html += '<strong class="ms-2 small" style="color:' + clr + '">' + gs + '</strong>';
+                html += '<span class="text-muted small ms-1">分</span></div>';
+
+                if (!ok && gate.issues && gate.issues.length) {
+                    html += '<div class="small text-danger mb-2 ps-4" style="font-size:.7rem;line-height:1.4;">';
+                    gate.issues.slice(0, 3).forEach(function(issue) {
+                        html += '<div>' + escapeHtml(issue) + '</div>';
+                    });
+                    html += '</div>';
+                }
+            });
+            html += '</div>';
+        }
+
+        // 汇总
+        html += '<div class="text-muted small mt-2">';
+        if (data.passes) {
+            html += '<span class="text-success">✅ 全部通过：' + escapeHtml(data.summary || '') + '</span>';
+        } else {
+            html += '<span>' + escapeHtml(data.summary || '') + '</span>';
+        }
+        html += '</div>';
+
+        bodyEl.innerHTML = html;
+        bodyEl.style.display = '';
+        loadEl.style.display = 'none';
+
+    } catch(err) {
+        bodyEl.innerHTML = '<div class="text-center text-danger py-3 small">检测失败：' + escapeHtml(err.message) + '</div>';
+        bodyEl.style.display = '';
+        loadEl.style.display = 'none';
+    }
+}
+
+// 暴露到 window
+window.runQualityCheck = runQualityCheck;
+
+// ================================================================
+// 写作/润色 Modal 关闭后自动刷新（确保编辑器内容同步）
+// ================================================================
+(function bindModalRefresh() {
+    var modalEl = document.getElementById('rewriteModal');
+    if (!modalEl) return;
+    modalEl.addEventListener('hidden.bs.modal', function() {
+        // 如果内容已更新（润色或写作完成），刷新页面
+        if (window._contentUpdated) {
+            location.reload();
+        }
+    });
+})();
+window._contentUpdated = false;
+
+// ================================================================
+// 一键润色功能（流式 SSE + 质量检测反馈驱动）
+// ================================================================
+window.polishChapter = async function polishChapter(chapterId) {
+    var contentEl = document.getElementById('edit-content');
+    if (!contentEl || !contentEl.value.trim()) {
+        alert('章节内容为空，无法润色');
+        return;
+    }
+    if (!confirm('确认用 AI 润色当前章节吗？\n\n系统将先自动运行质量检测，根据⚠️问题定向润色。\n润色结果将替换现有内容（可通过版本历史回滚）。')) return;
+
+    // 禁用润色按钮
+    var btn = document.getElementById('btn-polish');
+    var origBtnHtml = btn ? btn.innerHTML : '';
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>检测中...';
+    }
+
+    // ---- 第一步：自动运行质量检测 ----
+    var qualityFeedback = '';
+    var qualityScore = 0;
+    try {
+        var checkData = await apiPost('validate_consistency', {
+            novel_id: NOVEL_ID,
+            chapter_id: chapterId
+        });
+
+        if (checkData.gates && checkData.gates.length > 0) {
+            qualityScore = checkData.total_score || 0;
+            var feedbackLines = [];
+
+            for (var g = 0; g < checkData.gates.length; g++) {
+                var gate = checkData.gates[g];
+                var gateName = gate.name || '未知';
+                var passed = !!gate.status;
+                var issues = gate.issues || [];
+
+                if (!passed) {
+                    // ⚠️ 未通过的关卡：所有 issues 都是改进项
+                    for (var j = 0; j < issues.length; j++) {
+                        feedbackLines.push('- [' + gateName + '] ' + issues[j]);
+                    }
+                } else {
+                    // 通过但含⚠️的 issues
+                    for (var j = 0; j < issues.length; j++) {
+                        if (/⚠️|❌|偏低|过低|超长|偏长|未达标|过于平淡/.test(issues[j])) {
+                            feedbackLines.push('- [' + gateName + '] ' + issues[j]);
+                        }
+                    }
+                }
+            }
+
+            qualityFeedback = feedbackLines.join('\n');
+
+            // 同步更新质量检测仪表盘 UI
+            updateQualityDashboard(checkData);
+
+            if (btn) btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>润色中...';
+        }
+    } catch(err) {
+        // 质量检测失败不影响润色，继续走通用润色
+        console.warn('质量检测失败，使用通用润色：', err);
+        if (btn) btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>润色中...';
+    }
+
+    // ---- 第二步：打开写作 Modal 显示流式润色结果 ----
+    var modalEl = document.getElementById('rewriteModal');
+    if (!modalEl) { alert('缺少写作对话框'); return; }
+    var modal = new bootstrap.Modal(modalEl);
+    modal.show();
+
+    // 修改 modal 标题为润色模式
+    var modalTitle = modalEl.querySelector('.modal-title');
+    var origTitle = modalTitle ? modalTitle.textContent : '';
+    if (modalTitle) {
+        modalTitle.textContent = qualityFeedback
+            ? 'AI 润色中（基于质量检测反馈）...'
+            : 'AI 润色中...';
+    }
+
+    var streamContent = document.getElementById('rewriteContent');
+    var spinnerEl     = document.getElementById('rewriteSpinner');
+    var statsEl       = document.getElementById('rewriteStats');
+    if (streamContent) streamContent.textContent = '';
+    if (spinnerEl)     spinnerEl.style.display = '';
+    if (statsEl)       statsEl.textContent = qualityFeedback
+        ? '质量评分 ' + Math.round(qualityScore) + '/100，发现 ' + qualityFeedback.split('\n').length + ' 个改进项'
+        : '';
+
+    var _polishDone = false;
+
+    try {
+        var response = await fetch(apiRouteUrl('polish_chapter'), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json', 'X-CSRF-Token': window.CSRF_TOKEN || ''},
+            body: JSON.stringify({
+                chapter_id: chapterId,
+                quality_feedback: qualityFeedback
+            })
+        });
+        if (!response.ok) {
+            var errText = await response.text();
+            throw new Error('HTTP ' + response.status + ': ' + errText.slice(0, 200));
+        }
+        if (!response.body) {
+            throw new Error('浏览器不支持流式读取（ReadableStream）');
+        }
+        var reader  = response.body.getReader();
+        var decoder = new TextDecoder();
+        var fullText = '';
+        var sseBuf2 = '';
+        if (spinnerEl) spinnerEl.style.display = 'none';
+
+        while (true) {
+            var result = await reader.read();
+            if (result.done) break;
+            sseBuf2 += decoder.decode(result.value, { stream: true });
+            var events2 = sseBuf2.split('\n\n');
+            sseBuf2 = events2.pop();
+            for (var ei2 = 0; ei2 < events2.length; ei2++) {
+                var dataLine2 = '';
+                var elines2 = events2[ei2].split('\n');
+                for (var li2 = 0; li2 < elines2.length; li2++) {
+                    if (elines2[li2].startsWith('data: ')) dataLine2 = elines2[li2];
+                }
+                if (!dataLine2) continue;
+                var payload2 = dataLine2.slice(6).trim();
+                if (payload2 === '[DONE]') { _polishDone = true; break; }
+                try {
+                    var d = JSON.parse(payload2);
+                    if (d.chunk && streamContent) {
+                        fullText += d.chunk;
+                        streamContent.textContent = fullText;
+                        streamContent.scrollTop = streamContent.scrollHeight;
+                    }
+                    if (d.stats && statsEl) {
+                        statsEl.textContent = d.stats;
+                    }
+                    if (d.error) {
+                        alert('润色失败：' + d.error);
+                    }
+                } catch(e) {}
+            }
+        }
+
+        // 润色完成后提示用户
+        if (_polishDone && statsEl) {
+            statsEl.textContent += '（关闭对话框后将刷新页面）';
+            window._contentUpdated = true;
+        }
+    } catch(err) {
+        if (streamContent) streamContent.textContent = '润色失败：' + err.message;
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = origBtnHtml; }
+        // 恢复 modal 标题
+        if (modalTitle) modalTitle.textContent = origTitle;
+    }
+};
+
+/**
+ * 同步更新质量检测仪表盘 UI（润色前自动检测后调用）
+ */
+function updateQualityDashboard(data) {
+    var bodyEl = document.getElementById('quality-body');
+    var loadEl = document.getElementById('quality-loading');
+    if (!bodyEl) return;
+
+    var score = data.total_score ?? 0;
+    var passColor = score >= 80 ? '#28a745' : (score >= 60 ? '#ffc107' : '#dc3545');
+    var bgColor  = score >= 80 ? 'rgba(40,167,69,.2)' : (score >= 60 ? 'rgba(255,193,7,.2)' : 'rgba(220,53,69,.2)');
+
+    var html = '';
+
+    // 圆形评分
+    html += '<div class="text-center mb-3">';
+    html += '<div class="d-inline-flex align-items-center justify-content-center rounded-circle" style="width:80px;height:80px;background:' + bgColor + '">';
+    html += '<span style="font-size:1.8rem;font-weight:700;color:' + passColor + '">' + Math.round(score) + '</span>';
+    html += '</div>';
+    html += '<div class="text-muted small mt-1">综合评分 /100</div>';
+    html += '</div>';
+
+    // 五关详情
+    if (data.gates && data.gates.length) {
+        html += '<div id="gate-details">';
+        data.gates.forEach(function(gate) {
+            var gs = gate.score || 0;
+            var ok  = !!gate.status;
+            var bg  = ok ? 'rgba(40,167,69,.08)' : 'rgba(220,53,69,.08)';
+            var clr = gs >= 70 ? '#28a745' : '#dc3545';
+            html += '<div class="d-flex align-items-center mb-2 p-2 rounded" style="background:' + bg + '">';
+            html += '<span class="me-2">' + (ok ? '&#x2705;' : '&#x26A0;&#xFE0F;') + '</span>';
+            html += '<small class="flex-grow-1 text-truncate">' + escapeHtml(gate.name) + '</small>';
+            html += '<strong class="ms-2 small" style="color:' + clr + '">' + gs + '</strong>';
+            html += '<span class="text-muted small ms-1">分</span></div>';
+
+            if (!ok && gate.issues && gate.issues.length) {
+                html += '<div class="small text-danger mb-2 ps-4" style="font-size:.7rem;line-height:1.4;">';
+                gate.issues.slice(0, 3).forEach(function(issue) {
+                    html += '<div>' + escapeHtml(issue) + '</div>';
+                });
+                html += '</div>';
+            }
+        });
+        html += '</div>';
+    }
+
+    // 汇总
+    html += '<div class="text-muted small mt-2">';
+    if (data.passes) {
+        html += '<span class="text-success">&#x2705; 全部通过：' + escapeHtml(data.summary || '') + '</span>';
+    } else {
+        html += '<span>' + escapeHtml(data.summary || '') + '</span>';
+    }
+    html += '</div>';
+
+    bodyEl.innerHTML = html;
+    bodyEl.style.display = '';
+    if (loadEl) loadEl.style.display = 'none';
+}
+window.updateQualityDashboard = updateQualityDashboard;
+
+// ================================================================
+// 字数统计实时更新（编辑模式下）
+// ================================================================
+function countChapterWords(text) {
+    text = String(text || '');
+    // 与 includes/helpers.php::countWords() 保持一致：
+    // 中文按单字计，非中文部分按英文单词计，忽略空白、标点和纯数字。
+    var chinese = text.match(/[\u4e00-\u9fa5]/g);
+    var nonChinese = text.replace(/[\u4e00-\u9fa5]/g, ' ');
+    var english = nonChinese.match(/[A-Za-z]+(?:['-][A-Za-z]+)*/g);
+    return (chinese ? chinese.length : 0) + (english ? english.length : 0);
+}
+
+window.updateWordCount = function updateWordCount() {
+    var contentEl = document.getElementById('edit-content');
+    var barEl     = document.getElementById('word-count-bar');
+    var currentEl = document.getElementById('wc-current');
+    if (!contentEl || !barEl || !currentEl) return;
+
+    var text = contentEl.value || '';
+    var wc = countChapterWords(text);
+    currentEl.textContent = wc.toLocaleString();
+
+    // 目标字数
+    var target = <?= (int)$novel['chapter_words'] ?>;
+    var overLimit = target > 0 && wc > target + 500;
+
+    if (overLimit) {
+        barEl.style.color = '#dc3545';  // 红色
+        barEl.style.fontWeight = '700';
+        barEl.title = '已超过目标字数 500 字以上';
+    } else {
+        barEl.style.color = '#28a745';  // 绿色
+        barEl.style.fontWeight = '400';
+        barEl.title = '字数正常';
+    }
+};
+
+// 页面加载时初始化字数显示
+(function initWordCount() {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', window.updateWordCount);
+    } else {
+        window.updateWordCount();
+    }
+})();
+
+// ================================================================
+// AI压缩功能（流式 SSE，实时更新 textarea）
+// ================================================================
+window.compressChapter = async function compressChapter(chapterId) {
+    var contentEl = document.getElementById('edit-content');
+    if (!contentEl || !contentEl.value.trim()) {
+        alert('章节内容为空，无法压缩');
+        return;
+    }
+
+    var targetWords = <?= (int)$novel['chapter_words'] ?>;
+    if (!confirm('确认用 AI 压缩当前章节到目标字数 ' + targetWords + ' 字吗？\n\n压缩结果将替换现有内容（可通过版本历史回滚）。')) return;
+
+    var btn = document.getElementById('btn-compress');
+    var origBtnHtml = btn ? btn.innerHTML : '';
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>压缩中...';
+    }
+
+    // 打开 Modal 显示流式预览
+    var modalEl = document.getElementById('rewriteModal');
+    if (!modalEl) { alert('缺少写作对话框'); return; }
+    var modal = new bootstrap.Modal(modalEl);
+    modal.show();
+
+    var modalTitle = modalEl.querySelector('.modal-title');
+    var origTitle = modalTitle ? modalTitle.textContent : '';
+    if (modalTitle) modalTitle.textContent = 'AI 压缩中...';
+
+    var streamContent = document.getElementById('rewriteContent');
+    var spinnerEl     = document.getElementById('rewriteSpinner');
+    var statsEl       = document.getElementById('rewriteStats');
+    if (streamContent) streamContent.textContent = '';
+    if (spinnerEl)     spinnerEl.style.display = '';
+    if (statsEl)       statsEl.textContent = '目标字数：' + targetWords + ' 字，实时更新编辑框...';
+
+    var _compressDone = false;
+    var _compressedContent = '';
+
+    try {
+        console.log('[SSE-压缩] 开始连接 compress_chapter.php (chapter_id=' + chapterId + ', target=' + targetWords + ')');
+        var response = await fetch(apiRouteUrl('compress_chapter'), {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-CSRF-Token': window.CSRF_TOKEN || ''},
+            body: JSON.stringify({
+                chapter_id: chapterId,
+                target_words: targetWords
+            })
+        });
+        console.log('[SSE-压缩] HTTP 状态', response.status, response.ok);
+        if (!response.ok) {
+            var errText = await response.text();
+            throw new Error('HTTP ' + response.status + ': ' + errText.slice(0, 200));
+        }
+        if (!response.body) {
+            throw new Error('浏览器不支持流式读取（ReadableStream）');
+        }
+        var reader  = response.body.getReader();
+        var decoder = new TextDecoder();
+        var fullText = '';
+        var sseBuffer = '';          // SSE 分片缓冲
+        var firstEvent = false;
+        var hasError = false;
+
+        while (true) {
+            var result = await reader.read();
+            if (result.done) { console.log('[SSE-压缩] 流结束'); break; }
+            sseBuffer += decoder.decode(result.value, { stream: true });
+
+            // 按 SSE 标准双换行分割事件块
+            var events = sseBuffer.split('\n\n');
+            sseBuffer = events.pop(); // 最后一段可能不完整，留到下次
+            for (var ei = 0; ei < events.length; ei++) {
+                var eventBlock = events[ei];
+                // 找 data: 行（一个事件块可能含多行，取最后一个 data:）
+                var dataLine = '';
+                var eventLines = eventBlock.split('\n');
+                for (var li = 0; li < eventLines.length; li++) {
+                    if (eventLines[li].startsWith('data: ')) dataLine = eventLines[li];
+                }
+                if (!dataLine) continue;
+                var payload = dataLine.slice(6).trim();
+                if (payload === '[DONE]') { console.log('[SSE-压缩] 收到 [DONE]'); if (!hasError) _compressDone = true; break; }
+                try {
+                    var d = JSON.parse(payload);
+                    if (!firstEvent) { if (spinnerEl) spinnerEl.style.display = 'none'; firstEvent = true; }
+                    if (d.error) {
+                        console.error('[SSE-压缩] 服务端错误', d.error);
+                        hasError = true;
+                        if (statsEl) statsEl.textContent = '错误：' + d.error;
+                        _compressDone = false;
+                    }
+                    if (d.warning) {
+                        console.warn('[SSE-压缩] 警告:', d.warning);
+                        if (statsEl) statsEl.textContent = '⚠️ ' + d.warning;
+                    }
+                    if (d.model_switch) {
+                        console.log('[SSE-压缩] 模型切换:', d.to, d.reason);
+                        if (statsEl) statsEl.textContent = '🔄 切换到模型 ' + d.to + (d.reason ? ' (' + d.reason + ')' : '');
+                    }
+                    if (d.status === 'compressing' && statsEl) {
+                        statsEl.textContent = '开始压缩：' + d.from_words + ' 字 → 目标 ' + d.target_words + ' 字...';
+                    }
+                    if (d.chunk && !hasError) {
+                        fullText += d.chunk;
+                    }
+                    if (d.content && !hasError) {
+                        // 非流式模式：一次性收到完整内容
+                        fullText = d.content;
+                    }
+                    // 实时同步到预览区
+                    if (fullText && streamContent && !hasError) {
+                        streamContent.textContent = fullText;
+                        streamContent.scrollTop = streamContent.scrollHeight;
+                    }
+                    if (d.stats && statsEl && !hasError) {
+                        statsEl.textContent = d.stats;
+                    }
+                    if (d.version_saved) {
+                        console.log('[SSE-压缩] 版本已备份 v' + d.version, d.words + '字');
+                    }
+                } catch(e) { console.warn('[SSE-压缩] JSON解析失败:', payload.slice(0, 100)); }
+            }
+        }
+
+        if (_compressDone && fullText && fullText.trim().length > 0) {
+            if (contentEl) contentEl.value = fullText;
+            if (typeof updateWordCount === 'function') updateWordCount();
+            if (statsEl) statsEl.textContent = '压缩完成！已更新编辑框，请点击「保存」持久化';
+            if (modalTitle) modalTitle.textContent = '压缩完成';
+            window._contentUpdated = true;
+        } else if (!hasError && (!fullText || fullText.trim().length === 0)) {
+            // 仅在服务端未发送错误详情时才显示兜底消息
+            if (statsEl) statsEl.textContent = '压缩失败：所有模型均未返回有效内容，请检查 API 配置';
+        }
+    } catch(err) {
+        console.error('[SSE-压缩] 连接异常:', err);
+        if (streamContent) streamContent.textContent = '压缩失败：' + err.message;
+        if (spinnerEl) spinnerEl.style.display = 'none';
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = origBtnHtml; }
+    }
+};
+
+// ================================================================
+// 重新生成功能：AI 重新生成本章「大纲概要 / 关键情节点 / 结尾钩子」并填入文本框，
+// 由用户检查后点「保存大纲」落库（非破坏性，保存前可改回）。
+// ================================================================
+(function bindRegenerate() {
+    var btn = document.getElementById('btn-regenerate');
+    if (!btn) return;
+
+    btn.addEventListener('click', async function() {
+        var outlineEl = document.getElementById('outline-outline');
+        var kpEl      = document.getElementById('outline-keypoints');
+        var hookEl    = document.getElementById('outline-hook');
+        if (!outlineEl || !kpEl || !hookEl) return;
+
+        // 仅当已有内容时确认，避免误覆盖未保存的手动编辑
+        var hasContent = outlineEl.value.trim() || kpEl.value.trim() || hookEl.value.trim();
+        if (hasContent && !confirm('重新生成将替换上方「大纲概要 / 关键情节点 / 结尾钩子」的当前内容（保存前可改回）。确定？')) return;
+
+        var origHtml = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>生成中...';
+
+        try {
+            var data = await apiPost('actions', {
+                action: 'regenerate_chapter_outline',
+                chapter_id: CHAPTER_ID
+            });
+
+            if (!data.ok) {
+                var emsg = data.error || data.msg || '未知错误';
+                if (typeof showToast === 'function') showToast('生成失败：' + emsg, 'error');
+                else alert('生成失败：' + emsg);
+                return;
+            }
+
+            var d = data.data || {};
+            outlineEl.value = d.outline || '';
+            kpEl.value      = Array.isArray(d.key_points) ? d.key_points.join('\n') : '';
+            hookEl.value    = d.hook || '';
+
+            if (typeof showToast === 'function') showToast('大纲已重新生成，请检查后点击「保存大纲」', 'success');
+        } catch(err) {
+            console.error('[重新生成大纲] 失败:', err);
+            if (typeof showToast === 'function') showToast('重新生成失败：' + err.message, 'error');
+            else alert('重新生成失败：' + err.message);
+        } finally {
+            btn.innerHTML = origHtml;
+            btn.disabled = false;
+        }
+    });
+})();
+
+// ========== 选中文字优化功能 ==========
+(function() {
+    var contentEl = document.getElementById('edit-content');
+    var barEl = document.getElementById('inline-edit-bar');
+    var instructionEl = document.getElementById('inline-edit-instruction');
+    var polishBtn = document.getElementById('btn-inline-polish');
+
+    if (!contentEl || !barEl) return;
+
+    var lastSelection = { start: 0, end: 0, text: '' };
+
+    function getSelection() {
+        var start = contentEl.selectionStart;
+        var end = contentEl.selectionEnd;
+        if (start === end) return null;
+        var text = contentEl.value.substring(start, end);
+        if (text.trim().length < 10) return null;
+        return { start: start, end: end, text: text };
+    }
+
+    function getContext(sel, chars) {
+        var before = contentEl.value.substring(Math.max(0, sel.start - chars), sel.start);
+        var after = contentEl.value.substring(sel.end, Math.min(contentEl.value.length, sel.end + chars));
+        return { before: before, after: after };
+    }
+
+    function calcBarPosition(sel) {
+        var textBefore = contentEl.value.substring(0, sel.end);
+        var textareaStyle = window.getComputedStyle(contentEl);
+        var lineHeight = parseFloat(textareaStyle.lineHeight) || 20;
+        var paddingTop = parseFloat(textareaStyle.paddingTop) || 0;
+
+        var width = contentEl.clientWidth;
+        var cols = contentEl.cols || 80;
+        var charWidth = width / cols;
+
+        var totalLines = 1;
+        var lines = textBefore.split('\n');
+        for (var i = 0; i < lines.length; i++) {
+            var lineChars = lines[i].length;
+            var wrappedLines = Math.max(1, Math.ceil(lineChars * charWidth / width));
+            totalLines += (i === lines.length - 1) ? wrappedLines : 1;
+        }
+
+        return paddingTop + (totalLines * lineHeight);
+    }
+
+    function showBar() {
+        var sel = getSelection();
+        if (!sel) {
+            sel = lastSelection;
+            if (!sel || !sel.text) return;
+            sel.start = lastSelection.start;
+            sel.end = lastSelection.end;
+        }
+        lastSelection = sel;
+        barEl.style.display = '';
+        barEl.style.top = calcBarPosition(sel) + 'px';
+        instructionEl.value = '';
+    }
+
+    function hideBar() {
+        barEl.style.display = 'none';
+        instructionEl.value = '';
+        lastSelection = { start: 0, end: 0, text: '' };
+    }
+
+    window.hideInlineBar = hideBar;
+
+    contentEl.addEventListener('mouseup', function() {
+        setTimeout(function() {
+            var sel = getSelection();
+            if (sel) {
+                showBar();
+            } else {
+                if (!lastSelection.text) return;
+                if (document.activeElement !== contentEl && !barEl.contains(document.activeElement)) {
+                    hideBar();
+                }
+            }
+        }, 10);
+    });
+
+    contentEl.addEventListener('keyup', function(e) {
+        if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
+        var sel = getSelection();
+        if (sel) {
+            showBar();
+        } else {
+            if (!lastSelection.text) return;
+            if (!barEl.contains(document.activeElement)) {
+                hideBar();
+            }
+        }
+    });
+
+    instructionEl.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            polishSelection();
+        }
+        if (e.key === 'Escape') {
+            hideBar();
+            contentEl.focus();
+        }
+    });
+
+    window.polishSelection = async function() {
+        var sel = lastSelection;
+        if (!sel || !sel.text) return;
+
+        var instruction = instructionEl.value.trim();
+        var context = getContext(sel, 200);
+
+        var origBtnHtml = polishBtn.innerHTML;
+        polishBtn.disabled = true;
+        polishBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>优化中...';
+
+        try {
+            var data = await apiPost('polish_selection', {
+                chapter_id: CHAPTER_ID,
+                selected_text: sel.text,
+                instruction: instruction,
+                context_before: context.before,
+                context_after: context.after
+            });
+
+            if (!data.success) {
+                alert('优化失败：' + (data.error || '未知错误'));
+                return;
+            }
+
+            var optimized = data.optimized_text;
+            var full = contentEl.value;
+            contentEl.value = full.substring(0, sel.start) + optimized + full.substring(sel.end);
+
+            if (typeof updateWordCount === 'function') updateWordCount();
+
+            hideBar();
+            contentEl.focus();
+            contentEl.setSelectionRange(sel.start, sel.start + optimized.length);
+
+        } catch (err) {
+            alert('网络错误：' + err.message);
+        } finally {
+            polishBtn.disabled = false;
+            polishBtn.innerHTML = origBtnHtml;
+        }
+    };
+
+    // 点击 textarea 其他位置：重新选中时更新，否则关闭
+    contentEl.addEventListener('click', function() {
+        if (lastSelection.text) {
+            setTimeout(function() {
+                var sel = getSelection();
+                if (!sel) {
+                    hideBar();
+                } else if (sel.start !== lastSelection.start || sel.end !== lastSelection.end) {
+                    showBar();
+                }
+            }, 10);
+        }
+    });
+
+    // 点击工具栏外部关闭
+    document.addEventListener('click', function(e) {
+        if (barEl.style.display === 'none') return;
+        if (!barEl.contains(e.target) && e.target !== contentEl) {
+            hideBar();
+        }
+    });
+})();
+</script>
+
+<!-- Good Moling（墨灵）智能创作助手 -->
+<style>
+.gm-panel .offcanvas-body { display:flex; flex-direction:column; padding:0!important; min-height:0; }
+.gm-preset-bar { padding:10px 14px; border-bottom:1px solid #2d2d4e; background:#12122a; }
+.gm-preset-bar .btn { font-size:.75rem; padding:3px 8px; }
+.gm-chat-list { flex:1; overflow-y:auto; padding:12px 14px; background:#0f0f1a; }
+.gm-msg { margin-bottom:12px; }
+.gm-msg-user { text-align:right; }
+.gm-bubble { display:inline-block; max-width:90%; padding:8px 12px; border-radius:12px; font-size:.9rem; line-height:1.7; word-break:break-word; text-align:left; }
+.gm-bubble-user { background:#6366f1; color:#fff; border-bottom-right-radius:4px; }
+.gm-bubble-ai { background:#1e2230; color:#e8e8ff; border:1px solid #2d2d4e; border-bottom-left-radius:4px; }
+.gm-msg-actions { margin-top:4px; display:flex; gap:6px; }
+.gm-msg-actions .btn { font-size:.7rem; padding:2px 8px; }
+.gm-thinking { display:inline-flex; align-items:center; gap:8px; color:#adb5bd; }
+.gm-dots span { display:inline-block; width:6px; height:6px; border-radius:50%; background:#6366f1; animation:gm-blink 1.2s infinite; }
+.gm-dots span:nth-child(2) { animation-delay:.2s; }
+.gm-dots span:nth-child(3) { animation-delay:.4s; }
+@keyframes gm-blink { 0%,80%,100%{opacity:.3} 40%{opacity:1} }
+.gm-thinking-label { font-size:.85rem; }
+.gm-patch-start { background:#2d2440; border-left:3px solid #ffc107; padding:4px 10px; margin:6px 0; border-radius:0 6px 6px 0; font-weight:600; color:#ffc107; }
+.gm-input-bar { padding:10px 14px; border-top:1px solid #2d2d4e; background:#1a1a2e; }
+.gm-input-bar textarea { resize:none; }
+.gm-ctx-bar { padding:6px 14px; border-bottom:1px solid #2d2d4e; background:#12122a; font-size:.75rem; }
+.gm-ctx-bar label { color:#adb5bd; cursor:pointer; }
+.gm-fab { position:fixed; bottom:24px; right:24px; z-index:1040; width:80px; height:80px; border:none; background:transparent; cursor:pointer; padding:0; outline:none; }
+.gm-spirit { position:relative; width:80px; height:80px; display:flex; align-items:center; justify-content:center; }
+.gm-spirit-body { width:56px; height:56px; border-radius:50% 50% 50% 50% / 60% 60% 40% 40%; background:linear-gradient(135deg,#6366f1,#8b5cf6,#a78bfa); position:relative; box-shadow:0 0 20px rgba(99,102,241,.5),0 0 40px rgba(139,92,246,.3); animation:gm-float 3s ease-in-out infinite; }
+.gm-spirit-body::before { content:''; position:absolute; top:8px; left:10px; width:12px; height:14px; background:rgba(255,255,255,.9); border-radius:50%; box-shadow:20px 0 0 rgba(255,255,255,.9); }
+.gm-spirit-body::after { content:''; position:absolute; top:12px; left:14px; width:5px; height:6px; background:#1a1a2e; border-radius:50%; box-shadow:20px 0 0 #1a1a2e; }
+.gm-spirit-mouth { position:absolute; bottom:16px; left:50%; transform:translateX(-50%); width:10px; height:5px; border-bottom:2px solid rgba(255,255,255,.7); border-radius:0 0 50% 50%; }
+.gm-spirit-ink { position:absolute; bottom:-2px; left:50%; transform:translateX(-50%); width:8px; height:8px; background:radial-gradient(circle,#6366f1,transparent); border-radius:50%; animation:gm-ink-drip 2.5s ease-in-out infinite; opacity:.6; }
+.gm-spirit-glow { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:80px; height:80px; border-radius:50%; background:radial-gradient(circle,rgba(99,102,241,.25),transparent 70%); animation:gm-glow-pulse 3s ease-in-out infinite; pointer-events:none; }
+.gm-spirit-label { position:absolute; bottom:-20px; left:50%; transform:translateX(-50%); font-size:.7rem; color:#a78bfa; white-space:nowrap; text-shadow:0 0 8px rgba(99,102,241,.6); font-weight:600; letter-spacing:1px; }
+.gm-fab:hover .gm-spirit-body { box-shadow:0 0 28px rgba(99,102,241,.7),0 0 56px rgba(139,92,246,.4); animation:gm-float-hover 1.5s ease-in-out infinite; }
+.gm-fab:hover .gm-spirit-label { color:#c4b5fd; }
+@keyframes gm-float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-6px)} }
+@keyframes gm-float-hover { 0%,100%{transform:translateY(0) scale(1.05)} 50%{transform:translateY(-8px) scale(1.05)} }
+@keyframes gm-glow-pulse { 0%,100%{opacity:.5;transform:translate(-50%,-50%) scale(1)} 50%{opacity:1;transform:translate(-50%,-50%) scale(1.15)} }
+@keyframes gm-ink-drip { 0%,100%{transform:translateX(-50%) translateY(0);opacity:.6} 50%{transform:translateX(-50%) translateY(4px);opacity:.2} }
+</style>
+
+<button class="gm-fab" data-bs-toggle="offcanvas" data-bs-target="#gmPanel" title="Good Moling（墨灵）">
+  <div class="gm-spirit">
+    <div class="gm-spirit-glow"></div>
+    <div class="gm-spirit-body">
+      <div class="gm-spirit-mouth"></div>
+      <div class="gm-spirit-ink"></div>
+    </div>
+    <span class="gm-spirit-label">墨灵</span>
+  </div>
+</button>
+
+<div class="offcanvas offcanvas-end bg-dark text-light gm-panel" tabindex="-1" id="gmPanel" style="width:460px;max-width:100vw;">
+  <div class="offcanvas-header border-bottom border-secondary pb-0">
+    <div class="w-100">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h5 class="offcanvas-title mb-0"><i class="bi bi-stars me-2 text-primary"></i>Good Moling（墨灵）</h5>
+        <div class="d-flex gap-2">
+          <button class="btn btn-sm btn-outline-secondary" id="gm-clear-btn" title="清空对话">
+            <i class="bi bi-trash"></i>
+          </button>
+          <button class="btn btn-sm btn-outline-secondary" id="gm-stop-btn" title="停止生成" style="display:none">
+            <i class="bi bi-stop-circle"></i>
+          </button>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="offcanvas"></button>
+        </div>
+      </div>
+      <div class="d-flex align-items-center gap-2 mb-2">
+        <label class="small text-muted mb-0" style="min-width:36px;">模型</label>
+        <select id="gm-model-select" class="form-select form-select-sm bg-dark text-light border-secondary">
+          <option value="">加载中...</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <div class="gm-preset-bar">
+    <div class="d-flex flex-wrap gap-2">
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="analyze_chapter"><i class="bi bi-clipboard-check me-1"></i>分析章节</button>
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="polish_chapter"><i class="bi bi-magic me-1"></i>优化文风</button>
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="continue_write"><i class="bi bi-arrow-right-circle me-1"></i>续写一段</button>
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="generate_outline"><i class="bi bi-signpost-split me-1"></i>下章大纲</button>
+      <button class="btn btn-sm btn-outline-warning gm-preset-btn" data-preset="strengthen_conflict"><i class="bi bi-lightning me-1"></i>加强冲突</button>
+      <button class="btn btn-sm btn-outline-warning gm-preset-btn" data-preset="check_logic"><i class="bi bi-shield-check me-1"></i>检查逻辑</button>
+      <button class="btn btn-sm btn-outline-warning gm-preset-btn" data-preset="optimize_character"><i class="bi bi-person-lines-fill me-1"></i>优化角色</button>
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="extract_highlights"><i class="bi bi-star me-1"></i>提炼爽点</button>
+      <button class="btn btn-sm btn-outline-info gm-preset-btn" data-preset="generate_title"><i class="bi bi-type me-1"></i>生成标题</button>
+      <button class="btn btn-sm btn-outline-warning gm-preset-btn" data-preset="suggest_revision"><i class="bi bi-pencil-square me-1"></i>修改建议</button>
+      <button class="btn btn-sm btn-outline-warning gm-preset-btn" data-preset="rewrite"><i class="bi bi-highlighter me-1"></i>改写选段</button>
+    </div>
+  </div>
+
+  <div class="gm-ctx-bar">
+    <div class="d-flex flex-wrap gap-3">
+      <label><input type="checkbox" class="gm-ctx-cb" data-ctx="content" checked> 本章正文</label>
+      <label><input type="checkbox" class="gm-ctx-cb" data-ctx="outline" checked> 本章大纲</label>
+    </div>
+  </div>
+
+  <div class="gm-chat-list" id="gm-chat-list">
+    <div class="text-center text-muted small py-4" id="gm-chat-empty">
+      <i class="bi bi-chat-quote" style="font-size:32px;opacity:.4"></i>
+      <p class="mt-2 mb-0">提问、要求改写，或点上方快捷指令开始</p>
+    </div>
+  </div>
+
+  <div class="gm-input-bar">
+    <div class="position-relative">
+      <textarea id="gm-chat-input" class="form-control bg-dark text-light border-secondary" rows="3"
+                placeholder="问问题，或直接说“把开头改紧凑一些”..." style="resize:none;padding-right:52px;"></textarea>
+      <button id="gm-send-btn" class="btn btn-primary btn-sm position-absolute" style="right:6px;bottom:6px;">
+        <i class="bi bi-send"></i>
+      </button>
+    </div>
+    <div class="d-flex justify-content-between align-items-center mt-1">
+      <span id="gm-status" class="small text-muted">就绪</span>
+      <span class="small text-muted"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> 发送</span>
+    </div>
+  </div>
+</div>
+
+<script src="assets/js/good_moling.js"></script>
+
+<?php pageFooter(); ?>

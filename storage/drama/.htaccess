@@ -1,0 +1,51 @@
+# 漫剧媒体目录：允许静态媒体访问，禁止任何脚本执行与目录列表
+
+# 关闭 PHP 引擎
+<IfModule mod_php_module>
+    php_flag engine off
+</IfModule>
+
+# 禁止目录列表
+Options -Indexes
+
+# 拒绝 PHP 系列扩展
+<FilesMatch "\.ph(p[3457s]?|t|tml)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# 拒绝其他脚本类型
+<FilesMatch "\.(asp|cgi|pl|py|sh|bash|jsp)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# 白名单：仅放行媒体扩展名（^[^.]+ 前缀阻挡双扩展名）
+<FilesMatch "^[^.]+\.(jpg|jpeg|png|webp|gif|mp4|webm|mov|zip)$">
+    <IfModule mod_authz_core.c>
+        Require all granted
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Allow from all
+    </IfModule>
+</FilesMatch>
+
+# 兜底：默认拒绝一切
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>
+<IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+</IfModule>

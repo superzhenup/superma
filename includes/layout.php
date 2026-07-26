@@ -1,0 +1,228 @@
+<?php
+defined('APP_LOADED') or die('Direct access denied.');
+
+// 产品版本单一来源：layout 会渲染 APP_VERSION，故自身兜底加载，
+// 不依赖调用方是否已通过 config.php 引入（兼容旧版安装生成的 config.php）。
+require_once __DIR__ . '/version.php';
+
+/**
+ * 静态资源路径解析函数（已弃用）
+ * 当前版本强制使用CDN加载Bootstrap资源，确保最新版本和最佳性能。
+ * 如需恢复本地资源支持，可取消注释以下函数并修改pageHeader/pageFooter中的引用。
+ */
+// function assetUrl(string $localPath, string $cdnUrl): string {
+//     $base    = defined('BASE_PATH') ? BASE_PATH : dirname(__DIR__);
+//     $absPath = $base . '/' . ltrim($localPath, '/');
+//     return file_exists($absPath) ? $localPath : $cdnUrl;
+// }
+
+/**
+ * 静态资源缓存戳：以文件 mtime 作为版本号，文件更新后浏览器自动重新加载。
+ * （审计 2026-06-10 P3-E：原先仅 app.js 带版本号，其余 JS/CSS 部署后会被浏览器
+ * 旧缓存命中，表现为"修复看似不生效"——与整改台账条目 20 的 app.js 同类问题。）
+ */
+function assetVersion(string $relPath): string {
+    $abs = (defined('BASE_PATH') ? BASE_PATH : dirname(__DIR__)) . '/' . ltrim($relPath, '/');
+    return (string)(@filemtime($abs) ?: time());
+}
+
+function sendSecurityHeaders(): void {
+    if (headers_sent()) return;
+    header('X-Frame-Options: SAMEORIGIN');
+    header('X-Content-Type-Options: nosniff');
+    header('Referrer-Policy: strict-origin-when-cross-origin');
+    // 安全加固（S2）：检测真实协议（兼容反向代理 X-Forwarded-Proto）
+    $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
+        || ((int)($_SERVER['SERVER_PORT'] ?? 0) === 443);
+    if ($isHttps) {
+        header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+    } elseif (defined('FORCE_HTTPS') && FORCE_HTTPS === true) {
+        // 配置开启强制 HTTPS：301 跳转到 https
+        $host = $_SERVER['HTTP_HOST'] ?? '';
+        $uri  = $_SERVER['REQUEST_URI'] ?? '/';
+        if ($host !== '') {
+            header('Location: https://' . $host . $uri, true, 301);
+            exit;
+        }
+    }
+}
+
+function pageHeader(string $title = '', string $activeNav = ''): void {
+    sendSecurityHeaders();
+    $siteTitle = defined('SITE_NAME') ? SITE_NAME : 'AI小说创作系统';
+    $pageTitle = $title ? "$title - $siteTitle" : $siteTitle;
+    // 确保 session 中有 CSRF token
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    ?>
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">  
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- CSRF token: 仅通过 JS 变量暴露，不放入 DOM meta 标签 -->
+<script>window.CSRF_TOKEN = '<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES) ?>';</script>
+<title><?= h($pageTitle) ?></title>
+<link rel="stylesheet" href="assets/vendor/bootstrap.min.css">
+<link rel="stylesheet" href="assets/vendor/bootstrap-icons.min.css">
+<link rel="stylesheet" href="assets/css/style.css?v=<?= assetVersion('assets/css/style.css') ?>">
+<!-- 立即读取主题，避免闪烁 -->
+<script>
+(function(){
+  var t = 'dark';
+  try { t = localStorage.getItem('novel-theme') || 'dark'; } catch(e) {}
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
+<!-- 全局 CSRF 拦截：为同源的写请求自动附加 X-CSRF-Token 头 -->
+<script>
+(function(){
+  var CSRF_TOKEN = window.CSRF_TOKEN || '';
+  if (!CSRF_TOKEN) return;
+
+  var SAFE_METHODS = { GET:1, HEAD:1, OPTIONS:1 };
+  var origFetch = window.fetch.bind(window);
+
+  window.fetch = function(input, init){
+    init = init || {};
+    var method = (init.method || (input && input.method) || 'GET').toUpperCase();
+    if (SAFE_METHODS[method]) return origFetch(input, init);
+
+    // 仅对同源请求注入（跨域请求不动，避免破坏第三方 API 调用）
+    var url = typeof input === 'string' ? input : (input && input.url) || '';
+    try {
+      var u = new URL(url, window.location.href);
+      if (u.origin !== window.location.origin) return origFetch(input, init);
+    } catch(e) { /* 相对路径视为同源，继续注入 */ }
+
+    // 合并 headers
+    var headers = new Headers(init.headers || {});
+    if (!headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', CSRF_TOKEN);
+    init.headers = headers;
+    return origFetch(input, init);
+  };
+
+  // 兼容老式 XHR（如 FormData 上传场景）
+  var origOpen = XMLHttpRequest.prototype.open;
+  var origSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(method, url){
+    this.__csrfMethod = (method || 'GET').toUpperCase();
+    try {
+      var u = new URL(url, window.location.href);
+      this.__csrfSameOrigin = (u.origin === window.location.origin);
+    } catch(e) { this.__csrfSameOrigin = true; }
+    return origOpen.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function(body){
+    if (!SAFE_METHODS[this.__csrfMethod] && this.__csrfSameOrigin) {
+      try { this.setRequestHeader('X-CSRF-Token', CSRF_TOKEN); } catch(e){}
+    }
+    return origSend.apply(this, arguments);
+  };
+})();
+</script>
+</head>
+<body>
+
+<!-- Sidebar -->
+<div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
+<div class="sidebar" id="sidebar">
+  <div class="sidebar-brand">
+    <span class="brand-icon">✦</span>
+    <span class="brand-text">Super Ma AI小说创作系统</span>
+  </div>
+  <nav class="sidebar-nav">
+    <a href="index.php"    class="nav-item <?= $activeNav==='home'     ? 'active':'' ?>">
+      <i class="bi bi-house-door"></i> 我的书库 </a>
+    <a href="start.php"    class="nav-item <?= $activeNav==='start'     ? 'active':'' ?>">
+      <i class="bi bi-stars"></i> 开始创作 </a>
+    <a href="workshop.php" class="nav-item <?= $activeNav==='workshop' ? 'active':'' ?>">
+      <i class="bi bi-lightbulb"></i> 创意工坊 </a>
+    <a href="analyze.php"  class="nav-item <?= $activeNav==='analyze'  ? 'active':'' ?>">
+      <i class="bi bi-search-heart"></i> 拆书分析 </a>
+    <a href="shorts.php"   class="nav-item <?= $activeNav==='shorts'   ? 'active':'' ?>">
+      <i class="bi bi-journal-text"></i> 短篇创作 </a>
+    <a href="dramas.php"   class="nav-item <?= $activeNav==='dramas'   ? 'active':'' ?>">
+      <i class="bi bi-film"></i> 漫剧制作 </a>
+    <a href="hot_topics.php" class="nav-item <?= $activeNav==='hot_topics' ? 'active':'' ?>">
+      <i class="bi bi-fire"></i> 热门选题 </a>
+    <a href="settings.php" class="nav-item <?= $activeNav==='settings' ? 'active':'' ?>">
+      <i class="bi bi-cpu"></i> 模型设置 </a>
+    <a href="writing_settings.php" class="nav-item <?= $activeNav==='writing_settings' ? 'active':'' ?>">
+      <i class="bi bi-sliders"></i> 写作参数 </a>
+  </nav>
+  <div class="sidebar-footer">
+    <small>Super Ma Pro Agents v<?= htmlspecialchars(APP_VERSION, ENT_QUOTES, 'UTF-8') ?></small>
+  </div>
+</div>
+
+<!-- Main content -->
+<div class="main-content">
+  <div class="topbar">
+    <button class="sidebar-toggle" onclick="toggleSidebar()">
+      <i class="bi bi-list fs-5"></i>
+    </button>
+    <h5 class="topbar-title mb-0"><?= h($title ?: $siteTitle) ?></h5>
+
+    <!-- 主题切换 -->
+    <button class="theme-toggle" id="theme-toggle" title="切换亮/暗主题">
+      <i class="bi bi-moon-stars icon-moon"></i>
+      <i class="bi bi-sun icon-sun"></i>
+      <span class="label" id="theme-label">暗色</span>
+    </button>
+
+    <!-- 用户信息 & 退出 -->
+    <?php if (!empty($_SESSION['username'])): ?>
+    <div class="d-flex align-items-center gap-2 ms-2">
+      <span class="text-muted small d-none d-md-inline">
+        <i class="bi bi-person-circle me-1"></i><?= htmlspecialchars($_SESSION['username']) ?>
+      </span>
+      <form action="logout.php" method="post" class="m-0" onsubmit="return confirm('确定退出登录？')">
+        <input type="hidden" name="_token" value="<?= h(csrf_token()) ?>">
+        <button type="submit" class="btn btn-sm btn-outline-secondary py-1 px-2" title="退出登录">
+          <i class="bi bi-box-arrow-right"></i>
+          <span class="d-none d-md-inline ms-1">退出</span>
+        </button>
+      </form>
+    </div>
+    <?php endif; ?>
+  </div>
+  <div class="content-area">
+<?php
+}
+
+function pageFooter(): void {
+    ?>
+  </div><!-- .content-area -->
+</div><!-- .main-content -->
+
+<script src="assets/vendor/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"
+        integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a"
+        crossorigin="anonymous"
+        referrerpolicy="no-referrer"></script>
+<script src="assets/js/app.js?v=<?= assetVersion('assets/js/app.js') ?>"></script>
+<script src="assets/js/app-export-import.js?v=<?= assetVersion('assets/js/app-export-import.js') ?>"></script>
+<!-- 优化大纲 AJAX 方案 -->
+<script src="assets/js/optimize_outline_ajax.js?v=<?= assetVersion('assets/js/optimize_outline_ajax.js') ?>"></script>
+<script src="assets/js/optimize_manager.js?v=<?= assetVersion('assets/js/optimize_manager.js') ?>"></script>
+<script>
+function toggleSidebar() {
+  var sidebar = document.getElementById('sidebar');
+  var overlay = document.getElementById('sidebar-overlay');
+  if (!sidebar) return;
+  var isMobile = window.innerWidth <= 768;
+  if (isMobile) {
+    sidebar.classList.toggle('mobile-open');
+    if (overlay) overlay.classList.toggle('active');
+  } else {
+    sidebar.classList.toggle('collapsed');
+  }
+}
+</script>
+</body>
+</html>
+<?php
+}

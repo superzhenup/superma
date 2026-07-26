@@ -1,0 +1,121 @@
+============================================================================
+  Super-Ma AI 小说创作系统 (Super-Ma AI Novel Creation System)
+  Copyright (C) 2026  Kianxu <v@goloo.cc>
+============================================================================
+
+                          GNU GENERAL PUBLIC LICENSE
+                             Version 3, 29 June 2007
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+============================================================================
+                  ADDITIONAL TERMS / 附加条款
+                (Section 7 of GPLv3 / GPLv3 第7条)
+============================================================================
+
+1. PERSONAL & EDUCATIONAL USE / 个人学习研究用途
+   ENGLISH: This software is freely available for personal use, academic
+   research, and educational purposes. You may study, modify, and run
+   the software for non-commercial purposes without restriction.
+   CHINESE: 本软件免费授权用于个人使用、学术研究和教育目的。您可以在
+   非商业场景下自由学习、修改和运行本软件，无需额外授权。
+
+2. COMMERCIAL USE RESTRICTION / 商业使用限制
+   ENGLISH: ANY COMMERCIAL USE of this software — including but not
+   limited to providing paid services, integrating into commercial
+   products, reselling, or deriving direct/indirect revenue from its
+   operation — is STRICTLY PROHIBITED without prior written permission
+   from the copyright holder.
+   CHINESE: 未经著作权人事先书面许可，严禁将本软件用于任何商业用途，
+   包括但不限于：提供付费服务、集成到商业产品中、转售、或通过其运行
+   直接或间接收取费用。
+
+3. COMMERCIAL LICENSE INQUIRIES / 商业授权咨询
+   For commercial use authorization, please contact:
+   如需商业使用授权，请联系：
+       Email: v@goloo.cc
+
+4. ATTRIBUTION / 署名要求
+   ENGLISH: Any redistribution or derivative work must retain this
+   license notice, the above copyright notice, and all additional terms.
+   CHINESE: 任何再分发或衍生作品必须完整保留本许可声明、上述版权声明
+   及全部附加条款。
+
+5. DISCLAIMER / 免责声明
+   ENGLISH: THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+   KIND. THE COPYRIGHT HOLDER SHALL NOT BE LIABLE FOR ANY DAMAGES
+   ARISING FROM THE USE OF THIS SOFTWARE.
+   CHINESE: 本软件按"原样"提供，不作任何形式的明示或默示保证。著作权人
+   对因使用本软件产生的任何直接或间接损失不承担责任。
+
+6. COMPLIANCE / 合规声明
+   ENGLISH: If any provision of these Additional Terms conflicts with
+   mandatory local law, it shall be interpreted to the minimum extent
+   necessary to comply while preserving its intended effect.
+   CHINESE: 如本附加条款中任何规定与当地强制性法律冲突，应在保持其
+   原有意图的前提下进行最小限度的调整以符合法律规定。
+
+============================================================================
+
+  The full text of the GNU General Public License v3 can be found at:
+  GPLv3 完整原文请访问：
+       https://www.gnu.org/licenses/gpl-3.0.txt
+
+============================================================================
+
+================================================================================
+  Super-Ma AI 小说创作系统 (Super-Ma AI Novel Creation System)
+  Copyright (C) 2026  作者: Kianxu <v@goloo.cc>
+================================================================================
+
+                      GNU 通用公共许可证第三版
+                     2017年6月29日发布
+
+  本程序是自由软件：您可以依据自由软件基金会发布的 GNU 通用公共许可证
+  条款（第三版或您选择的任何更新版本）对其进行再分发和/或修改。
+
+  分发本程序的目的是希望它有用，但没有任何担保；甚至没有适销性或特定
+  目的适用性的隐含担保。详情参见 GNU 通用公共许可证。
+
+  您应当已随本程序收到一份 GNU 通用公共许可证的副本。
+  如果没有，请访问 <https://www.gnu.org/licenses/>。
+
+================================================================================
+                      附加条款（GPLv3 第7条）
+================================================================================
+
+  本软件仅授权用于个人学习、学术研究和教育目的。未经著作权人事先书面
+  许可，严禁将本软件或基于本软件的衍生作品用于任何商业用途。
+
+  商业使用包括但不限于以下情形：
+  a) 将本软件或其修改版作为商业产品或服务的一部分进行销售、许可或分发；
+  b) 利用本软件向第三方提供付费服务；
+  c) 将本软件集成到以盈利为目的的系统中；
+  d) 通过本软件的运行直接或间接获取商业利益。
+
+  如需获取商业使用授权，请联系著作权人：
+      电子邮箱：v@goloo.cc
+
+  任何再分发或衍生作品必须完整保留本许可声明、版权声明及全部附加条款。
+
+  本软件按"原样"提供，不作任何形式的明示或默示保证。著作权人在任何
+  情况下均不对因使用或无法使用本软件而产生的任何直接、间接、偶然、
+  特殊或后果性损害承担责任，即使已被告知发生此类损害的可能性。
+
+  如本附加条款中任何规定与当地强制性法律冲突，应在保持其原有意图的
+  前提下进行最小限度的调整以符合法律规定。
+
+================================================================================
+
+  GPLv3 完整原文请访问：https://www.gnu.org/licenses/gpl-3.0.txt

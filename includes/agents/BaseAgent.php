@@ -1,0 +1,496 @@
+<?php
+/**
+ * Agent基类
+ * 
+ * 提供Agent决策的通用功能:
+ * - 决策日志记录
+ * - 历史决策查询
+ * - 决策执行跟踪
+ * 
+ * @package NovelWritingSystem
+ * @version 1.0.0
+ */
+
+defined('APP_LOADED') or die('Direct access denied.');
+
+abstract class BaseAgent
+{
+    /** @var string Agent类型标识 */
+    protected $agentType;
+    
+    /** @var int 小说ID（0=全局） */
+    protected $novelId = 0;
+    
+    /** @var array 内存中的决策历史 */
+    protected $decisionHistory = [];
+    
+    /** @var int 决策历史最大保留数 */
+    protected $maxHistorySize = 100;
+
+    /** @var int 本轮决策实际作用的章节号；由协调器显式注入 */
+    protected int $currentChapterNumber = 0;
+
+    /** @var int 单次决策超时秒数 */
+    protected const DECISION_TIMEOUT = 50;
+    
+    /**
+     * 构造函数
+     * 
+     * @param string $agentType Agent类型
+     * @param int $novelId 小说ID（0=全局）
+     */
+    public function __construct(string $agentType, int $novelId = 0)
+    {
+        $this->agentType = $agentType;
+        $this->novelId   = $novelId;
+    }
+    
+    /**
+     * 子类必须实现的决策方法
+     * 
+     * @param array $context 决策上下文
+     * @return array 决策结果
+     */
+    abstract public function decide(array $context): array;
+
+    /**
+     * 设置本轮 Agent 指令的准确目标章节。
+     * 章节大纲通常会预建全书，绝不能用 MAX(chapter_number)+1 推导进度。
+     */
+    public function setCurrentChapterNumber(int $chapterNumber): void
+    {
+        $this->currentChapterNumber = max(0, $chapterNumber);
+    }
+    
+    /**
+     * 记录决策日志
+     * 
+     * @param array $decision 决策数据
+     * @return bool 是否记录成功
+     */
+    protected function logDecision(array $decision): bool
+    {
+        $logEntry = [
+            'agent_type' => $this->agentType,
+            'decision' => $decision,
+            'timestamp' => date('Y-m-d H:i:s'),
+            'memory_usage' => memory_get_usage(true),
+        ];
+        
+        // 保存到内存历史
+        $this->decisionHistory[] = $logEntry;
+        
+        // 限制历史大小
+        if (count($this->decisionHistory) > $this->maxHistorySize) {
+            array_shift($this->decisionHistory);
+        }
+        
+        // 检查DB类是否存在
+        if (!class_exists('DB')) {
+            error_log("Agent决策日志记录失败: DB类不存在");
+            return false;
+        }
+        
+        // 写入数据库
+        try {
+            // 检查JSON编码是否成功
+            $jsonData = json_encode($decision, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+            if ($jsonData === false) {
+                error_log("Agent决策日志JSON编码失败: " . json_last_error_msg());
+                $jsonData = '{}';
+            }
+            
+            $result = DB::insert('agent_decision_logs', [
+                'novel_id'   => $this->novelId,
+                'agent_type' => $this->agentType,
+                'decision_data' => $jsonData,
+                'created_at' => date('Y-m-d H:i:s'),
+            ]);
+            
+            return $result !== false;
+        } catch (\Throwable $e) {
+            error_log("Agent决策日志记录失败: " . $e->getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * 获取历史决策(从数据库)
+     * 
+     * @param int $limit 限制数量
+     * @return array 历史决策列表
+     */
+    public function getDecisionHistory(int $limit = 10): array
+    {
+        // 检查DB类是否存在
+        if (!class_exists('DB')) {
+            error_log("获取Agent决策历史失败: DB类不存在");
+            return [];
+        }
+        
+        try {
+            $logs = DB::fetchAll(
+                'SELECT * FROM agent_decision_logs 
+                 WHERE agent_type = ? AND novel_id = ?
+                 ORDER BY created_at DESC 
+                 LIMIT ?',
+                [$this->agentType, $this->novelId, $limit]
+            );
+            
+            // 检查返回值是否有效
+            if (empty($logs) || !is_array($logs)) {
+                return [];
+            }
+            
+            // 解析JSON数据
+            foreach ($logs as &$log) {
+                $log['decision_data'] = json_decode($log['decision_data'], true);
+            }
+            
+            return $logs;
+        } catch (\Throwable $e) {
+            error_log("获取Agent决策历史失败: " . $e->getMessage());
+            return [];
+        }
+    }
+    
+    /**
+     * 获取内存中的决策历史
+     * 
+     * @param int $limit 限制数量
+     * @return array 内存中的决策历史
+     */
+    public function getMemoryHistory(int $limit = 10): array
+    {
+        $history = array_slice($this->decisionHistory, -$limit);
+        return array_reverse($history);
+    }
+    
+    /**
+     * 清空内存中的决策历史
+     * 
+     * @return void
+     */
+    public function clearMemoryHistory(): void
+    {
+        $this->decisionHistory = [];
+    }
+    
+    /**
+     * 记录动作执行日志
+     * 
+     * @param int $novelId 小说ID
+     * @param string $action 动作名称
+     * @param string $status 执行状态
+     * @param array $params 动作参数
+     * @return bool 是否记录成功
+     */
+    protected function logAction(int $novelId, string $action, string $status, array $params = []): bool
+    {
+        // 检查DB类是否存在
+        if (!class_exists('DB')) {
+            error_log("Agent动作日志记录失败: DB类不存在");
+            return false;
+        }
+        
+        try {
+            // 检查JSON编码是否成功
+            $jsonData = json_encode($params, JSON_UNESCAPED_UNICODE);
+            if ($jsonData === false) {
+                error_log("Agent动作日志JSON编码失败: " . json_last_error_msg());
+                $jsonData = '{}';
+            }
+            
+            return DB::insert('agent_action_logs', [
+                'novel_id' => $novelId,
+                'agent_type' => $this->agentType,
+                'action' => $action,
+                'status' => $status,
+                'params' => $jsonData,
+                'created_at' => date('Y-m-d H:i:s'),
+            ]) !== false;
+        } catch (\Throwable $e) {
+            error_log("Agent动作日志记录失败: " . $e->getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * 获取Agent统计信息
+     * 
+     * @param int $hours 统计时间范围(小时)
+     * @return array 统计信息
+     */
+    public function getStatistics(int $hours = 24): array
+    {
+        // 检查DB类是否存在
+        if (!class_exists('DB')) {
+            error_log("获取Agent统计信息失败: DB类不存在");
+            return [
+                'agent_type' => $this->agentType,
+                'decision_count' => 0,
+                'action_count' => 0,
+                'success_rate' => 0,
+            ];
+        }
+        
+        try {
+            $stats = DB::fetch(
+                'SELECT
+                    COUNT(*) as decision_count,
+                    MIN(created_at) as first_decision,
+                    MAX(created_at) as last_decision
+                 FROM agent_decision_logs
+                 WHERE agent_type = ? AND novel_id = ?
+                 AND created_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)',
+                [$this->agentType, $this->novelId, $hours]
+            );
+
+            $actionStats = DB::fetch(
+                'SELECT
+                    COUNT(*) as action_count,
+                    SUM(CASE WHEN status = "success" THEN 1 ELSE 0 END) as success_count,
+                    SUM(CASE WHEN status = "failed" THEN 1 ELSE 0 END) as failed_count
+                 FROM agent_action_logs
+                 WHERE agent_type = ? AND novel_id = ?
+                 AND created_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)',
+                [$this->agentType, $this->novelId, $hours]
+            );
+            
+            // 防止除零错误
+            $actionCount = (int)($actionStats['action_count'] ?? 0);
+            $successCount = (int)($actionStats['success_count'] ?? 0);
+            
+            return [
+                'agent_type' => $this->agentType,
+                'decision_count' => (int)($stats['decision_count'] ?? 0),
+                'action_count' => $actionCount,
+                'success_rate' => $actionCount > 0 ? $successCount / $actionCount : 0,
+                'first_decision' => $stats['first_decision'] ?? null,
+                'last_decision' => $stats['last_decision'] ?? null,
+            ];
+        } catch (\Throwable $e) {
+            error_log("获取Agent统计信息失败: " . $e->getMessage());
+            return [
+                'agent_type' => $this->agentType,
+                'decision_count' => 0,
+                'action_count' => 0,
+                'success_rate' => 0,
+            ];
+        }
+    }
+    
+    /**
+     * 验证决策上下文
+     * 
+     * @param array $context 决策上下文
+     * @param array $requiredFields 必需字段
+     * @return array [是否有效, 缺失字段列表]
+     */
+    protected function validateContext(array $context, array $requiredFields): array
+    {
+        $missing = [];
+        
+        foreach ($requiredFields as $field) {
+            if (!isset($context[$field])) {
+                $missing[] = $field;
+            }
+        }
+        
+        return [
+            'valid' => empty($missing),
+            'missing' => $missing,
+        ];
+    }
+    
+    /**
+     * 获取Agent类型
+     * 
+     * @return string Agent类型
+     */
+    public function getAgentType(): string
+    {
+        return $this->agentType;
+    }
+    
+    /**
+     * 批量执行动作
+     * 
+     * @param int $novelId 小说ID
+     * @param array $actions 动作列表
+     * @return array 执行结果
+     */
+    protected function executeActions(int $novelId, array $actions): array
+    {
+        $results = [];
+        
+        foreach ($actions as $action) {
+            $result = $this->executeSingleAction($novelId, $action);
+            $results[] = $result;
+        }
+        
+        return $results;
+    }
+    
+    /**
+     * 执行单个动作(子类可重写)
+     * 
+     * @param int $novelId 小说ID
+     * @param array $action 动作配置
+     * @return array 执行结果
+     */
+    protected function executeSingleAction(int $novelId, array $action): array
+    {
+        return [
+            'action' => $action['name'] ?? 'unknown',
+            'status' => 'skipped',
+            'message' => '子类未实现此动作',
+        ];
+    }
+
+    protected function writeDirective(string $type, string $directive, int $applyRange = 8, ?int $expiresInHours = 72): void
+    {
+        try {
+            require_once __DIR__ . '/AgentDirectives.php';
+            $nextChapter = $this->currentChapterNumber > 0
+                ? $this->currentChapterNumber
+                : $this->getCurrentChapterNumber();
+            AgentDirectives::add(
+                $this->novelId,
+                $nextChapter,
+                $type,
+                $directive,
+                $applyRange,
+                $expiresInHours
+            );
+        } catch (\Throwable $e) {
+            error_log("写入Agent指令失败: " . $e->getMessage());
+        }
+    }
+
+    protected function getCurrentChapterNumber(): int
+    {
+        try {
+            $result = DB::fetch(
+                'SELECT chapter_number AS next_chapter
+                 FROM chapters
+                 WHERE novel_id = ? AND status IN ("outlined", "skipped")
+                 ORDER BY chapter_number ASC LIMIT 1',
+                [$this->novelId]
+            );
+            if ($result) return (int)$result['next_chapter'];
+
+            $completed = DB::fetch(
+                'SELECT COALESCE(MAX(chapter_number), 0) + 1 AS next_chapter
+                 FROM chapters WHERE novel_id = ? AND status = "completed"',
+                [$this->novelId]
+            );
+            return (int)($completed['next_chapter'] ?? 1);
+        } catch (\Throwable $e) {
+            return 1;
+        }
+    }
+
+    protected function decideWithTimeout(array $context): array
+    {
+        $timeout = static::DECISION_TIMEOUT;
+        $startTime = microtime(true);
+        $result = [];
+
+        // 修复：原代码每次调用都 register_shutdown_function，累积闭包（持有 $this 引用）。
+        // 改为静态标志只注册一次；真正的超时中断应依赖子类 decide() 内的
+        // AI curl timeout / PDO timeout，set_time_limit 仅作兜底防止进程永久挂起。
+        static $shutdownRegistered = false;
+        if (!$shutdownRegistered) {
+            $shutdownRegistered = true;
+            register_shutdown_function(function () {
+                $err = error_get_last();
+                if ($err && in_array($err['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+                    error_log("Agent 决策致命错误: {$err['message']} in {$err['file']}:{$err['line']}");
+                }
+            });
+        }
+
+        $prevHandler = set_error_handler(function ($s, $m, $f, $l) {
+            if (!(error_reporting() & $s)) return false;
+            throw new \ErrorException($m, 0, $s, $f, $l);
+        });
+
+        // H-4 修复（2026-07-25）：原 set_time_limit(max(60, $timeout+10)) 会重置全局计时器，
+        // 多个 Agent 串行调用时每次重置，总请求时间可远超预期；且超时为致命终止，catch 无法执行。
+        // 改为：仅在当前 max_execution_time 不足以容纳本次决策时才上调，且上限为本决策所需时间。
+        // 真正的超时控制由 decide() 内的 curl CURLOPT_TIMEOUT / PDO ATTR_TIMEOUT 负责。
+        $currentLimit = (int)ini_get('max_execution_time');
+        // $currentLimit=0 表示无限制（CLI 环境），无需调整
+        if ($currentLimit > 0) {
+            $elapsedBefore = (int)($startTime - ($_SERVER['REQUEST_TIME_FLOAT'] ?? $startTime));
+            $remaining = $currentLimit - $elapsedBefore;
+            $needed = $timeout + 10; // 决策时间 + catch 块缓冲
+            if ($remaining < $needed) {
+                // 仅在剩余不足时扩展，且扩展到刚好容纳本次决策（非重置到满额）
+                set_time_limit($needed);
+            }
+        }
+
+        try {
+            $result = $this->decide($context);
+        } catch (\Throwable $e) {
+            // H-3 修复（2026-07-25）：原条件 $elapsed >= $timeout - 2 会把截止前 2 秒内的
+            // 任何异常（DB 错误、逻辑错误等）误标为 timeout。改为：优先检查异常类型/消息是否
+            // 明确指示超时（curl 28、PDO HY000、消息含 timeout/timed out）；
+            // 仅在无明确超时特征且 elapsed 接近 timeout 时才按超时处理。
+            $elapsed = microtime(true) - $startTime;
+            $msg = $e->getMessage();
+            $isTimeoutException = $this->isTimeoutException($e);
+            $isNearTimeout = $elapsed >= $timeout * 0.9; // 提升阈值至 90%，减少误判
+
+            if ($isTimeoutException || $isNearTimeout) {
+                $reason = $isTimeoutException ? 'timeout' : 'near_timeout';
+                error_log("Agent[{$this->agentType}] 决策超时({$timeout}s, 实际" . round($elapsed, 2) . "s, reason={$reason})，已跳过: {$msg}");
+                $result = [
+                    'skipped' => true,
+                    'reason'  => $reason,
+                    'timeout' => $timeout,
+                    'error'   => $msg,
+                ];
+            } else {
+                error_log("Agent[{$this->agentType}] 决策异常({$elapsed}s): " . $msg);
+                $result = [
+                    'skipped' => true,
+                    'reason'  => 'error',
+                    'error'   => $msg,
+                ];
+            }
+        } finally {
+            restore_error_handler();
+        }
+
+        return $result;
+    }
+
+    /**
+     * H-3 修复：判断异常是否明确指示超时（基于异常类型与消息特征）
+     */
+    private function isTimeoutException(\Throwable $e): bool
+    {
+        // curl CURLE_OPERATION_TIMEDOUT (28)
+        if ($e instanceof \RuntimeException) {
+            $msg = strtolower($e->getMessage());
+            if (strpos($msg, 'timed out') !== false ||
+                strpos($msg, 'timeout') !== false ||
+                strpos($msg, 'curl error 28') !== false ||
+                strpos($msg, 'operation timed out') !== false) {
+                return true;
+            }
+        }
+        // PDO 超时 (SQLSTATE HY000 with timeout message)
+        if ($e instanceof \PDOException) {
+            $msg = strtolower($e->getMessage());
+            if (strpos($msg, 'timeout') !== false ||
+                strpos($msg, 'timed out') !== false) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
