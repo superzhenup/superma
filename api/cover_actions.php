@@ -7,7 +7,7 @@
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
@@ -166,7 +166,7 @@ function requestImageApi(string $endpoint, string $apiKey, ?array $payload, int 
 
 function coverSafeErrorMessage(Throwable $e): string {
     $message = $e->getMessage();
-    $exact = ['无效的操作', '缺少小说ID', '小说不存在', '文件超过 10MB 限制', '仅支持 JPG、PNG、WebP 格式'];
+    $exact = ['无效的操作', '缺少小说ID', '小说不存在', '文件超过 10MB 限制', '图片超过 5MB 限制', '仅支持 JPG、PNG、WebP 格式'];
     if (in_array($message, $exact, true)) return $message;
     foreach ([
         '图片生成 API URL', '图片生成 API 端口', '图片生成 API 连接失败',
@@ -260,7 +260,7 @@ function uploadCover(): void {
     if (!$novelId) throw new RuntimeException('缺少小说ID');
 
     // 审计 P0（2026-06-12）：归属校验
-    $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    $userId = currentUserId();
     checkNovelOwnership($novelId, $userId);
 
     $novel = DB::fetch('SELECT id, cover_image FROM novels WHERE id=?', [$novelId]);
@@ -386,7 +386,7 @@ function generateCover(array $input): void {
     $author  = trim($input['author'] ?? '');
 
     // 审计 P0（2026-06-12）：归属校验
-    $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    $userId = currentUserId();
     checkNovelOwnership($novelId, $userId);
 
     if (!$novelId) throw new RuntimeException('缺少小说ID');
@@ -486,6 +486,8 @@ function generateCover(array $input): void {
         $imgContent = false;
         $dlHttpCode = 0;
         $dlErr = '';
+        $dlOk = false;
+        $tooLarge = false;
 
         if (function_exists('curl_init')) {
             $bytes = 0;
@@ -506,9 +508,12 @@ function generateCover(array $input): void {
                 CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) CoverDownloader',
                 CURLOPT_PROTOCOLS      => CURLPROTO_HTTPS,
                 CURLOPT_RESOLVE        => $resolveEntries,
-                CURLOPT_WRITEFUNCTION  => function ($ch, string $chunk) use (&$imgContent, &$bytes) {
+                CURLOPT_WRITEFUNCTION  => function ($ch, string $chunk) use (&$imgContent, &$bytes, &$tooLarge) {
                     $bytes += strlen($chunk);
-                    if ($bytes > COVER_MAX_BYTES) return 0;
+                    if ($bytes > COVER_MAX_BYTES) {
+                        $tooLarge = true;
+                        return 0;
+                    }
                     $imgContent = ($imgContent === false ? '' : $imgContent) . $chunk;
                     return strlen($chunk);
                 },
@@ -517,13 +522,16 @@ function generateCover(array $input): void {
                 $downloadOptions[CURLOPT_CAINFO] = $caBundle;
             }
             curl_setopt_array($dlCh, $downloadOptions);
-            curl_exec($dlCh);
+            $dlOk = curl_exec($dlCh);
             $dlHttpCode = (int)curl_getinfo($dlCh, CURLINFO_HTTP_CODE);
             $dlErr = curl_error($dlCh);
             curl_close($dlCh);
         }
 
-        if (!$imgContent || $dlHttpCode < 200 || $dlHttpCode >= 300) {
+        if ($tooLarge) {
+            throw new RuntimeException('图片超过 5MB 限制');
+        }
+        if ($dlOk === false || $dlErr !== '' || !$imgContent || $dlHttpCode < 200 || $dlHttpCode >= 300) {
             error_log("cover download failed: HTTP {$dlHttpCode}, {$dlErr}, URL: " . parse_url($imageUrl, PHP_URL_HOST));
             throw new RuntimeException('下载图片失败，请稍后重试');
         }
@@ -594,7 +602,7 @@ function deleteCover(array $input): void {
     if (!$novelId) throw new RuntimeException('缺少小说ID');
 
     // 审计 P0（2026-06-12）：归属校验
-    $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    $userId = currentUserId();
     checkNovelOwnership($novelId, $userId);
 
     $novel = DB::fetch('SELECT id, cover_image FROM novels WHERE id=?', [$novelId]);

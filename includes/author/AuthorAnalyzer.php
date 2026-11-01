@@ -3,6 +3,7 @@
  * 作者画像分析引擎 - 作者画像系统核心
  * 协调各维度分析器，生成完整作者画像
  */
+defined('APP_LOADED') or die('Direct access denied.');
 
 require_once __DIR__ . '/WritingHabitAnalyzer.php';
 require_once __DIR__ . '/NarrativeAnalyzer.php';

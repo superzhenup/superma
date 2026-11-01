@@ -3,6 +3,7 @@
  * 叙事手法分析器 - 作者画像系统
  * 分析叙事视角、节奏特征、篇章结构等叙事手法
  */
+defined('APP_LOADED') or die('Direct access denied.');
 
 class NarrativeAnalyzer
 {
@@ -128,7 +129,7 @@ class NarrativeAnalyzer
             $text = $chapter['content'] ?? '';
 
             $actionCount += preg_match_all('/(?:打|战斗|冲|跳|跑|追|杀|攻击|防御|躲闪)/u', $text);
-            $dialogueCount += preg_match_all('/["""\'].*?["""\']/u', $text);
+            $dialogueCount += preg_match_all('/[“‘"\'].*?[”’"\']/u', $text);
             $descriptionCount += preg_match_all('/(?:只见|望着|看着|周围是|这里有)/u', $text);
         }
 
@@ -307,7 +308,7 @@ class NarrativeAnalyzer
             $totalChars += mb_strlen($text);
 
             $monologueCount += preg_match_all('/(?:心想|暗想|想着|思忖|思索|思考|想到|思索着|内心)/u', $text);
-            $monologueCount += preg_match_all('/(?:他(?:自己)?(?:的)?|她(?:自己)?(?:的)?)?(?:心想|暗想|思索|思忖)：?["""\']([^"""\']+)["""\']/u', $text);
+            $monologueCount += preg_match_all('/(?:他(?:自己)?(?:的)?|她(?:自己)?(?:的)?)?(?:心想|暗想|思索|思忖)：?[“‘"\']([^“”‘’"\']+)[”’"\']/u', $text);
         }
 
         if ($totalChars === 0) return 0;

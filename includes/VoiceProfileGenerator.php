@@ -90,7 +90,7 @@ class VoiceProfileGenerator
                     'subtext_signals'  => array_slice(array_values(array_filter(array_map('strval', (array)($vp['subtext_signals'] ?? [])))), 0, 3),
                 ];
                 if ($clean['dialogue_style'] === '' && empty($clean['catchphrases'])) continue;
-                $repo->upsert($c['name'], ['voice_profile' => $clean], $chNum);
+                $repo->upsert($c['name'], ['voice_profile' => $clean], $chNum, 'chapter');
                 $n++;
             }
 

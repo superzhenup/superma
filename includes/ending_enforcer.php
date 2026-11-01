@@ -391,19 +391,32 @@ class EndingEnforcer
         }
         
         // 检测是否引入了新伏笔关键词
-        $foreshadowKeywords = [
-            '伏笔', '暗示', '埋下', '暗中', '似乎有什么',
-            '神秘', '未完待续', '后续', '将来', '某天',
-        ];
-        
-        foreach ($foreshadowKeywords as $keyword) {
+        // 审计修复 M7（2026-09-27）：原清单含「神秘/后续/将来/暗中/暗示/某天」
+        // 等正常叙事高频词（如既有的"神秘组织"反派名、"后续几日"时间过渡），
+        // 收尾期正文几乎必然命中 → passed=false 大量误报（80% 之后的章节
+        // 几乎必然被标记"引入新伏笔"不合规）。硬拦（issues/passed=false）只
+        // 保留高置信度自指词——叙事正文中出现即几乎必然是元话语或真的在
+        // 自指伏笔；通用叙事词降为软警告（提示优先回收既有伏笔，不构成
+        // 硬性不合规）。
+        $foreshadowHardKeywords = ['伏笔', '未完待续'];
+        $foreshadowSoftKeywords = ['埋下', '暗示', '暗中', '似乎有什么', '神秘', '后续', '将来', '某天'];
+
+        $isEndingStage = $stage === 'resolve' || $stage === 'ending';
+        foreach ($foreshadowHardKeywords as $keyword) {
             if (mb_strpos($content, $keyword) !== false) {
-                if ($stage === 'tighten' || $stage === 'ending') {
-                    $result['issues'][] = "收尾期检测到新伏笔关键词：「{$keyword}」——应回收而非埋设新伏笔";
+                if ($isEndingStage) {
+                    $result['issues'][] = "收尾期检测到新伏笔自指标记：「{$keyword}」——应回收而非埋设新伏笔";
                     $result['passed'] = false;
                 } else {
                     $result['warnings'][] = "检测到可能的伏笔关键词：「{$keyword}」";
                 }
+            }
+        }
+        foreach ($foreshadowSoftKeywords as $keyword) {
+            if (mb_strpos($content, $keyword) !== false) {
+                $result['warnings'][] = $isEndingStage
+                    ? "收尾期出现叙事词「{$keyword}」——请确认在回收既有伏笔而非埋设新伏笔"
+                    : "检测到可能的伏笔关键词：「{$keyword}」";
             }
         }
         
@@ -414,7 +427,7 @@ class EndingEnforcer
         
         foreach ($newCharacterPatterns as $pattern) {
             if (preg_match($pattern, $content)) {
-                if ($stage === 'tighten' || $stage === 'ending') {
+                if ($stage === 'resolve' || $stage === 'ending') {
                     $result['issues'][] = "收尾期不应引入新角色";
                     $result['passed'] = false;
                 } else {

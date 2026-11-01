@@ -17,7 +17,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  *   apply_review     POST JSON — 应用用户确认后的补丁（白名单+类型复校验，仅增/改不删）
  *   get_progress     GET — 进度查询
  */
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 
 while (ob_get_level()) ob_end_clean();
 ini_set('display_errors', '0');
@@ -40,10 +40,11 @@ require_once dirname(__DIR__) . '/includes/wizard/context.php';
 requireLoginApi();
 if ($_SERVER['REQUEST_METHOD'] === 'POST') csrf_verify_api();
 
-ensureWizardTables();
+// 向导表（novel_wizard_progress / novel_wizard_chats / volume_outlines）与列由统一迁移
+// 建立（Schema + ColumnMigrations v71），请求内不再执行 DDL。
 wizardEnsureSchema();
 
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 if ($userId <= 0) jsonOut(['ok' => false, 'msg' => '未登录']);
 
 $action = $_GET['action'] ?? $_POST['action'] ?? '';
@@ -55,6 +56,7 @@ try {
         case 'chat':             handleChat($userId); break;
         case 'save_doc':         handleSaveDoc($userId); break;
         case 'save_char':        handleSaveChar($userId); break;
+        case 'save_golden_finger': handleSaveGoldenFinger($userId); break;
         case 'delete_char':      handleDeleteChar($userId); break;
         case 'save_volumes':     handleSaveVolumes($userId); break;
         case 'save_stage':       handleSaveStage($userId); break;
@@ -82,45 +84,6 @@ function jsonOut(array $payload): void {
     }
     echo json_encode($payload, JSON_UNESCAPED_UNICODE);
     exit;
-}
-
-function ensureWizardTables(): void {
-    DB::execute("CREATE TABLE IF NOT EXISTS `novel_wizard_progress` (
-        `novel_id` INT UNSIGNED PRIMARY KEY,
-        `current_stage` VARCHAR(20) NOT NULL DEFAULT 'topic',
-        `completed_stages` JSON DEFAULT NULL,
-        `metadata` JSON DEFAULT NULL,
-        `started_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        `last_active` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-
-    DB::execute("CREATE TABLE IF NOT EXISTS `novel_wizard_chats` (
-        `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-        `novel_id` INT UNSIGNED NOT NULL,
-        `stage` VARCHAR(20) NOT NULL,
-        `role` ENUM('user','assistant','system') NOT NULL,
-        `content` MEDIUMTEXT NOT NULL,
-        `model_id` INT UNSIGNED DEFAULT NULL,
-        `tokens` INT UNSIGNED DEFAULT 0,
-        `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        INDEX `idx_novel_stage` (`novel_id`, `stage`, `created_at`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-
-    DB::execute("CREATE TABLE IF NOT EXISTS `volume_outlines` (
-        `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-        `novel_id` INT UNSIGNED NOT NULL,
-        `volume_index` INT UNSIGNED NOT NULL,
-        `title` VARCHAR(200) DEFAULT '',
-        `theme` TEXT DEFAULT NULL,
-        `chapter_from` INT UNSIGNED DEFAULT 1,
-        `chapter_to` INT UNSIGNED DEFAULT 50,
-        `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX `idx_novel` (`novel_id`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-
-    // 迁移逻辑见 includes/wizard/schema.php（单一来源）
-    wizardMigrateVolumeOutlines();
 }
 
 function markStage(int $novelId, string $stage, string $next = ''): void {
@@ -184,11 +147,22 @@ function buildStageSystemPrompt(string $stage, array $novel, array $extra = []):
                    . "  - planning         策划文档整体（替换）\n"
                    . "  - world            世界观文档整体（替换）\n"
                    . "  - volume:N:theme   第 N 卷主题（替换）\n"
-                   . "  - extra_settings   额外设定（替换）\n\n"
+                   . "  - extra_settings   额外设定（替换）\n"
+                   . "  - golden_finger    金手指设计（结构化 JSON，格式见下方模板）\n\n"
                    . "规则：一次回复最多 2-3 个 APPLY 块，内容必须完整、自洽。";
 
     switch ($stage) {
         case 'blueprint':
+            // 审计功能（2026-08-16 P3-金手指设计模板）：附加金手指设计模板段。
+            // mandatory = 标签含「金手指」或本次用户消息提及（handleChat 检测后经 extra 传入）；
+            // 模板与设计三原则单一来源 GoldenFinger::blueprintPromptTemplate()。
+            $gfSection = '';
+            try {
+                require_once dirname(__DIR__) . '/includes/GoldenFinger.php';
+                $gfSection = GoldenFinger::blueprintPromptTemplate((bool)($extra['gf_mandatory'] ?? false));
+            } catch (\Throwable $e) {
+                error_log('blueprint golden finger template failed: ' . $e->getMessage());
+            }
             return $base . "\n本阶段任务：**同时生成两份完整文档**——策划 + 世界观。\n\n"
                  . "**必须严格按以下结构输出**（顺序固定，每份用对应 APPLY 标记包装）：\n\n"
                  . "先一句话开场说明你将生成两份文档，然后：\n\n"
@@ -213,6 +187,7 @@ function buildStageSystemPrompt(string $stage, array $novel, array $extra = []):
                  . "（地理、势力、历史关键事件）\n"
                  . "<<<END>>>\n\n"
                  . "最后一句话简短总结你的设计思路。"
+                 . $gfSection
                  . $applyProtocol;
 
         case 'content':
@@ -273,8 +248,7 @@ function handleSaveTopic(int $userId): void {
         'genre' => $genre,
         'extra_settings'      => $idea,
         'target_chapters'     => $targetChapters,
-        'chapter_word_target' => $wordTarget,
-    ];
+    ] + wizardChapterWordFields($wordTarget);
 
     $row = wizardApplyTopicTags($body, $row);
 
@@ -289,6 +263,26 @@ function handleSaveTopic(int $userId): void {
         $row = wizardFilterNovelRow($row);
         $novelId = (int)DB::insert('novels', $row);
         if ($novelId <= 0) jsonOut(['ok' => false, 'msg' => '创建小说失败']);
+    }
+
+    // 审计修复（2026-08-17 写作逻辑 E）：向导「严格拦截」开关——只写本书的小说级
+    // cf_strict_mode 覆盖（novel_settings），全局默认保持关，存量书不受影响。
+    if (array_key_exists('strict_intercept', $body) && $novelId > 0) {
+        try {
+            if (!class_exists('ConfigCenter', false)) {
+                require_once dirname(__DIR__) . '/includes/config_center.php';
+            }
+            if (class_exists('ConfigCenter', false)) {
+                ConfigCenter::setNovel(
+                    $novelId,
+                    'cf_strict_mode',
+                    !empty($body['strict_intercept']) ? '1' : '0',
+                    'bool'
+                );
+            }
+        } catch (\Throwable $strictSaveError) {
+            error_log('wizard strict_intercept save failed: ' . $strictSaveError->getMessage());
+        }
     }
 
     markStage($novelId, 'topic', 'blueprint');
@@ -352,8 +346,7 @@ function handleSaveTopicDraft(int $userId): void {
     $row = [
         'extra_settings'      => $idea,
         'target_chapters'     => max(10, min(2000, (int)($get('target_chapters') ?? 100))),
-        'chapter_word_target' => max(800, min(10000, (int)($get('chapter_word_target') ?? 2500))),
-    ];
+    ] + wizardChapterWordFields((int)($get('chapter_word_target') ?? 2500));
     if ($title !== '') $row['title'] = $title;
     if ($genre !== '') $row['genre'] = $genre;
 
@@ -383,6 +376,38 @@ function handleSaveTopicDraft(int $userId): void {
     if (function_exists('clearNovelCache')) clearNovelCache($novelId);
 
     jsonOut(['ok' => true, 'novel_id' => $novelId, 'created' => $created]);
+}
+
+/**
+ * 审计功能（2026-08-16 P3-金手指设计模板）：保存/清除金手指设定。
+ * 空名称 = 删除既有设定（prev_name 指定被删者）；progression_lines 为多行
+ * 「档位名|起始章|结束章|能力描述」，经 GoldenFinger::parseProgressionLines 解析。
+ */
+function handleSaveGoldenFinger(int $userId): void {
+    $body = json_decode(file_get_contents('php://input'), true) ?? [];
+    $novelId = (int)($body['novel_id'] ?? 0);
+    assertNovelOwned($userId, $novelId);
+
+    require_once dirname(__DIR__) . '/includes/GoldenFinger.php';
+    $gf = new GoldenFinger($novelId);
+
+    $name = trim((string)($body['name'] ?? ''));
+    if ($name === '') {
+        $prevName = trim((string)($body['prev_name'] ?? ''));
+        $ok = $prevName === '' ? true : $gf->delete($prevName);
+        jsonOut(['ok' => $ok, 'msg' => $ok ? '' : '金手指设定删除失败']);
+    }
+
+    $ok = $gf->save([
+        'name'            => $name,
+        'acquire_chapter' => (int)($body['acquire_chapter'] ?? 1),
+        'acquire_scene'   => trim((string)($body['acquire_scene'] ?? '')),
+        'progression'     => GoldenFinger::parseProgressionLines((string)($body['progression_lines'] ?? '')),
+        'cost'            => trim((string)($body['cost'] ?? '')),
+        'limit'           => trim((string)($body['limit'] ?? '')),
+        'summary'         => trim((string)($body['summary'] ?? '')),
+    ]);
+    jsonOut(['ok' => $ok, 'msg' => $ok ? '' : '金手指设定保存失败（请检查名称与升级路线格式：每行 档位|起始章|结束章|能力）']);
 }
 
 function handleChat(int $userId): void {
@@ -422,7 +447,21 @@ function handleChat(int $userId): void {
     };
 
     try {
-        $sys = buildStageSystemPrompt($stage, $novel);
+        // 审计功能（2026-08-16 P3-金手指设计模板）：金手指模板硬性触发检测——
+        // 标签 appeal_points 含「金手指」或本次消息提及金手指/系统/外挂。
+        $gfMandatory = false;
+        try {
+            $ap = $novel['appeal_points'] ?? '';
+            $apArr = is_string($ap) ? (json_decode($ap, true) ?: []) : (array)$ap;
+            $apText = implode(',', array_map('strval', is_array($apArr) ? $apArr : []));
+            if (mb_strpos($apText . (string)$ap, '金手指') !== false) $gfMandatory = true;
+            if (!$gfMandatory) {
+                foreach (['金手指', '系统', '外挂'] as $kw) {
+                    if (mb_strpos($message, $kw) !== false) { $gfMandatory = true; break; }
+                }
+            }
+        } catch (\Throwable) { /* 检测失败按可选处理 */ }
+        $sys = buildStageSystemPrompt($stage, $novel, ['gf_mandatory' => $gfMandatory]);
         $messages = [['role' => 'system', 'content' => $sys]];
 
         $hist = DB::fetchAll(
@@ -518,6 +557,7 @@ function handleSaveChar(int $userId): void {
     if ($name === '') jsonOut(['ok' => false, 'msg' => '角色姓名不能为空']);
 
     $role        = trim((string)($body['title'] ?? '普通配角'));
+    $realm       = trim((string)($body['realm'] ?? ''));
     $personality = trim((string)($body['personality'] ?? $body['desc'] ?? ''));
     $background  = trim((string)($body['background'] ?? ''));
     $appearance  = trim((string)($body['appearance'] ?? ''));
@@ -531,6 +571,10 @@ function handleSaveChar(int $userId): void {
         }
     }
     $attrs['角色类型'] = $role;
+    // 审计修复（2026-08-16 P1，B5）：补写 attributes['realm']（英文键）。
+    // PowerSystem::getProtagonistRealm / MemoryEngine 境界跳级检测均读该键，
+    // 此前向导只写中文键（性格/背景/外貌），反派等级对标在向导链路上永不生效。
+    if ($realm !== '') $attrs['realm'] = $realm; else unset($attrs['realm']);
     if ($personality !== '') $attrs['性格'] = $personality; else unset($attrs['性格']);
     if ($background !== '')  $attrs['背景'] = $background;  else unset($attrs['背景']);
     if ($appearance !== '')  $attrs['外貌'] = $appearance;  else unset($attrs['外貌']);
@@ -579,38 +623,115 @@ function handleDeleteChar(int $userId): void {
     jsonOut(['ok' => true]);
 }
 
+/**
+ * 审计修复（2026-08-17 P3）：卷章节范围 clamp。
+ * chapter_from/chapter_to 原仅 (int) 强转，可能倒置（from>to）、为 0/负、或超出
+ * novels.target_chapters。统一收敛到 [1, target_chapters] 且保证 from<=to。
+ * 返回 [clamp 后 from, clamp 后 to]。
+ */
+function wizard_clamp_volume_range(int $from, int $to, int $targetChapters): array {
+    $from = max(1, min($from, max(1, $targetChapters)));
+    $to = max($from, min($to, max(1, $targetChapters)));
+    return [$from, $to];
+}
+
 function handleSaveVolumes(int $userId): void {
     $body = json_decode(file_get_contents('php://input'), true) ?? [];
     $novelId = (int)($body['novel_id'] ?? 0);
-    assertNovelOwned($userId, $novelId);
+    $novel = assertNovelOwned($userId, $novelId);
+    // 审计修复（2026-08-17 P3）：卷章节范围 clamp 上限（见 wizard_clamp_volume_range）
+    $targetChapters = (int)($novel['target_chapters'] ?? 0);
 
-    wizardMigrateVolumeOutlines();
     $cols = wizardVolumeOutlinesColumns();
 
     $volumes = $body['volumes'] ?? [];
-    DB::execute('DELETE FROM volume_outlines WHERE novel_id = ?', [$novelId]);
 
+    // 审计修复（2026-08-02 H6）：原实现 DELETE 全表再只重插 title/theme/章节范围，
+    // 会把 generate_volume_outline 生成的 summary/key_events/conflict/foreshadowing
+    // 等 AI 富字段静默清空（不可恢复数据丢失），且无事务保护。
+    // 改为按 (novel_id, volume_index) upsert：更新仅覆盖向导可编辑的基础字段，
+    // AI 富字段保留；删除仅针对「不在请求中且无任何 AI 内容」的空卷。
+    $keepIndexes = [];
+    $indexSeen   = [];
     foreach ($volumes as $v) {
         $vi = (int)($v['volume_index'] ?? 0);
-        $cf = (int)($v['chapter_from'] ?? 1);
-        $ct = (int)($v['chapter_to'] ?? 50);
-        $row = [
-            'novel_id'     => $novelId,
-            'volume_index' => $vi,
-            'title'        => trim((string)($v['title'] ?? '')),
-            'theme'        => trim((string)($v['theme'] ?? '')),
-            'chapter_from' => $cf,
-            'chapter_to'   => $ct,
-        ];
-        // 兼容旧列：把同样的值写到 install.php 老 schema 的 NOT NULL 列
-        if (in_array('volume_number', $cols, true)) $row['volume_number'] = $vi;
-        if (in_array('start_chapter', $cols, true)) $row['start_chapter'] = $cf;
-        if (in_array('end_chapter',   $cols, true)) $row['end_chapter']   = $ct;
-        // 过滤掉表中不存在的列
-        $row = array_intersect_key($row, array_flip($cols));
-        DB::insert('volume_outlines', $row);
+        if ($vi <= 0) continue;                    // 跳过无效/空占位行
+        if (isset($indexSeen[$vi])) continue;      // 请求内重复卷号只处理第一条
+        $indexSeen[$vi] = true;
+        $keepIndexes[] = $vi;
     }
 
+    // 审计修复（2026-10-31 B5）：嵌套时 DB::beginTransaction() 静默返回 false，旧实现
+    // 忽略返回值继续执行，其后的 commit/rollBack 会误提交/回滚外层事务。fail closed。
+    if (!DB::beginTransaction()) {
+        throw new RuntimeException('卷大纲保存事务开启失败（已存在活动事务）');
+    }
+    try {
+        foreach ($volumes as $v) {
+            $vi = (int)($v['volume_index'] ?? 0);
+            if ($vi <= 0) continue;
+            if (isset($indexSeen[$vi]) && !$indexSeen[$vi]) continue;
+            $indexSeen[$vi] = false; // 已处理标记，防止后续重复行再进入
+
+            $cf = (int)($v['chapter_from'] ?? 1);
+            $ct = (int)($v['chapter_to'] ?? 50);
+            // 审计修复（2026-08-17 P3）：章节范围 clamp，防止倒置/为0/超出 target_chapters
+            [$cf, $ct] = wizard_clamp_volume_range($cf, $ct, $targetChapters);
+            $row = [
+                'novel_id'     => $novelId,
+                'volume_index' => $vi,
+                'title'        => trim((string)($v['title'] ?? '')),
+                'theme'        => trim((string)($v['theme'] ?? '')),
+                'chapter_from' => $cf,
+                'chapter_to'   => $ct,
+            ];
+            // 兼容旧列：把同样的值写到 install.php 老 schema 的 NOT NULL 列
+            if (in_array('volume_number', $cols, true)) $row['volume_number'] = $vi;
+            if (in_array('start_chapter', $cols, true)) $row['start_chapter'] = $cf;
+            if (in_array('end_chapter',   $cols, true)) $row['end_chapter']   = $ct;
+            if (in_array('volume_goals', $cols, true) && array_key_exists('volume_goals', $v)) {
+                $goals = $v['volume_goals'];
+                $row['volume_goals'] = is_string($goals) ? $goals : json_encode($goals, JSON_UNESCAPED_UNICODE);
+            }
+            // 过滤掉表中不存在的列
+            $row = array_intersect_key($row, array_flip($cols));
+
+            $existing = DB::fetch(
+                'SELECT id FROM volume_outlines WHERE novel_id=? AND volume_index=? LIMIT 1',
+                [$novelId, $vi]
+            );
+            if ($existing) {
+                unset($row['novel_id']);
+                DB::update('volume_outlines', $row, 'id=?', [$existing['id']]);
+            } else {
+                DB::insert('volume_outlines', $row);
+            }
+        }
+
+        // 清理「向导中已移除、且无任何 AI 富内容」的空卷；
+        // 有概要、事件、冲突、伏笔等 AI 内容的卷即使不在向导列表也保留。
+        // 向导简表可能没有这些可选列，清理条件必须与实际表结构一致。
+        $emptyGuard = wizardEmptyVolumeGuard($cols);
+        if (empty($keepIndexes)) {
+            DB::execute("DELETE FROM volume_outlines WHERE novel_id=? AND {$emptyGuard}", [$novelId]);
+        } else {
+            $ph = implode(',', array_fill(0, count($keepIndexes), '?'));
+            DB::execute(
+                "DELETE FROM volume_outlines WHERE novel_id=? AND volume_index NOT IN ({$ph}) AND {$emptyGuard}",
+                array_merge([$novelId], $keepIndexes)
+            );
+        }
+
+        DB::commit();
+    } catch (\Throwable $e) {
+        DB::rollBack();
+        // 审计 P0：安全错误负载（内部细节只写日志，客户端仅收友好文案）
+        $payload = safe_api_error_payload($e, '保存卷大纲失败，请稍后重试');
+        jsonOut($payload);
+        return;
+    }
+
+    clearNovelCache($novelId);
     jsonOut(['ok' => true]);
 }
 
@@ -865,11 +986,15 @@ function handleReviewPatch(int $userId): void {
             //   - 无异常但空内容 → 多半是推理模型把 token 额度耗在思考链上。
             $reason = $aiErr ? $aiErr->getMessage() : '模型返回了空内容（多为“深度思考/推理”型模型把 token 额度耗在思考链上）';
             error_log("[{$rid}] review_patch: 所有模型均未返回内容 — " . $reason);
+            // 审计修复（2026-08-17 P3）：出站响应脱敏。AI 异常原文可能含 API key / 内部 URL /
+            // provider 错误 JSON（约定同 daemon_write.php 的 sanitizeAiErrorMessage 用法）；
+            // error_log 保留原文供服务端排错，仅客户端可见字段改用脱敏值。
+            $safeReason = sanitizeAiErrorMessage($reason);
             jsonOut([
                 'ok'         => false,
                 'request_id' => $rid,
-                'detail'     => safe_substr($reason, 0, 300),
-                'msg'        => 'AI 生成采纳方案失败：' . safe_substr($reason, 0, 160)
+                'detail'     => safe_substr($safeReason, 0, 300),
+                'msg'        => 'AI 生成采纳方案失败：' . safe_substr($safeReason, 0, 160)
                     . '。若为“深度思考/推理”型模型或响应过慢，请在【模型设置】中关闭其深度思考、或改用更快的普通模型；也可用右侧对话逐项沟通修改。',
             ]);
         }
@@ -976,7 +1101,9 @@ function handleApplyReview(int $userId): void {
     try {
         $body = json_decode(file_get_contents('php://input'), true) ?? [];
         $novelId = (int)($body['novel_id'] ?? 0);
-        assertNovelOwned($userId, $novelId);
+        $novel = assertNovelOwned($userId, $novelId);
+        // 审计修复（2026-08-17 P3）：卷章节范围 clamp 上限（见 wizard_clamp_volume_range）
+        $targetChapters = (int)($novel['target_chapters'] ?? 0);
         $changes = is_array($body['changes'] ?? null) ? $body['changes'] : [];
         if (!$changes) jsonOut(['ok' => false, 'msg' => '没有要应用的改动']);
 
@@ -1045,16 +1172,21 @@ function handleApplyReview(int $userId): void {
                 $vi = (int)($c['volume_index'] ?? 0);
                 if ($vi <= 0) continue;
                 $new = is_array($c['new'] ?? null) ? $c['new'] : [];
-                wizardMigrateVolumeOutlines();
                 $cols = wizardVolumeOutlinesColumns();
 
                 if ($op === 'update') {
-                    if (!DB::fetch("SELECT id FROM volume_outlines WHERE novel_id = ? AND volume_index = ?", [$novelId, $vi])) continue;
+                    $exist = DB::fetch("SELECT id, chapter_from, chapter_to FROM volume_outlines WHERE novel_id = ? AND volume_index = ?", [$novelId, $vi]);
+                    if (!$exist) continue;
                     $row = [];
                     if (trim((string)($new['title'] ?? '')) !== '') $row['title'] = trim((string)$new['title']);
                     if (trim((string)($new['theme'] ?? '')) !== '') $row['theme'] = trim((string)$new['theme']);
-                    if (isset($new['chapter_from'])) $row['chapter_from'] = (int)$new['chapter_from'];
-                    if (isset($new['chapter_to']))   $row['chapter_to']   = (int)$new['chapter_to'];
+                    // 审计修复（2026-08-17 P3）：章节范围 clamp。字段可能只来一个，
+                    // 缺省侧用现有行对应值组合后再整体 clamp，防止半更新导致 from>to 或越界。
+                    if (isset($new['chapter_from']) || isset($new['chapter_to'])) {
+                        $curFrom = isset($new['chapter_from']) ? (int)$new['chapter_from'] : (int)($exist['chapter_from'] ?? 1);
+                        $curTo   = isset($new['chapter_to'])   ? (int)$new['chapter_to']   : (int)($exist['chapter_to'] ?? 1);
+                        [$row['chapter_from'], $row['chapter_to']] = wizard_clamp_volume_range($curFrom, $curTo, $targetChapters);
+                    }
                     if (isset($row['chapter_from']) && in_array('start_chapter', $cols, true)) $row['start_chapter'] = $row['chapter_from'];
                     if (isset($row['chapter_to'])   && in_array('end_chapter', $cols, true))   $row['end_chapter']   = $row['chapter_to'];
                     $row = array_intersect_key($row, array_flip($cols));
@@ -1063,6 +1195,8 @@ function handleApplyReview(int $userId): void {
                     if (DB::fetch("SELECT id FROM volume_outlines WHERE novel_id = ? AND volume_index = ?", [$novelId, $vi])) continue; // 已存在则跳过，避免重复
                     $cf = (int)($new['chapter_from'] ?? 1);
                     $ct = (int)($new['chapter_to'] ?? 50);
+                    // 审计修复（2026-08-17 P3）：新增卷章节范围同样 clamp
+                    [$cf, $ct] = wizard_clamp_volume_range($cf, $ct, $targetChapters);
                     $row = ['novel_id' => $novelId, 'volume_index' => $vi, 'title' => trim((string)($new['title'] ?? '')), 'theme' => trim((string)($new['theme'] ?? '')), 'chapter_from' => $cf, 'chapter_to' => $ct];
                     if (in_array('volume_number', $cols, true)) $row['volume_number'] = $vi;
                     if (in_array('start_chapter', $cols, true)) $row['start_chapter'] = $cf;
@@ -1075,6 +1209,9 @@ function handleApplyReview(int $userId): void {
         }
 
         if ($novelUpdate) {
+            if (isset($novelUpdate['chapter_word_target'])) {
+                $novelUpdate['chapter_words'] = (int)$novelUpdate['chapter_word_target'];
+            }
             DB::update('novels', $novelUpdate, 'id = ?', [$novelId]);
             if (function_exists('clearNovelCache')) clearNovelCache($novelId); // 让向导刷新后读到新值
         }

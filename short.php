@@ -27,6 +27,38 @@ $statusMap = [
 
 pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-short-select-chapter', function (event, element) { selectChapter(Number(element.dataset.idx)); });
+AppEvents.register('page-short-rollback', function (event, element) { rollbackVersion(Number(element.dataset.versionId)); });
+AppEvents.register('page-short-export-short-1', function (event, element) { exportShort(); });
+AppEvents.register('page-short-show-version-modal-2', function (event, element) { showVersionModal(); });
+AppEvents.register('page-short-save-brief-edit-3', function (event, element) { saveBriefEdit(); });
+AppEvents.register('page-short-cancel-brief-edit-4', function (event, element) { cancelBriefEdit(); });
+AppEvents.register('page-short-toggle-brief-edit-5', function (event, element) { toggleBriefEdit(); });
+AppEvents.register('page-short-generate-brief-6', function (event, element) { generateBrief(); });
+AppEvents.register('page-short-save-beats-edit-7', function (event, element) { saveBeatsEdit(); });
+AppEvents.register('page-short-cancel-beats-edit-8', function (event, element) { cancelBeatsEdit(); });
+AppEvents.register('page-short-toggle-beats-edit-9', function (event, element) { toggleBeatsEdit(); });
+AppEvents.register('page-short-generate-beats-10', function (event, element) { generateBeats(); });
+AppEvents.register('page-short-toggle-chapters-edit-11', function (event, element) { toggleChaptersEdit(); });
+AppEvents.register('page-short-write-all-chapters-12', function (event, element) { writeAllChapters(); });
+AppEvents.register('page-short-save-chapters-edit-13', function (event, element) { saveChaptersEdit(); });
+AppEvents.register('page-short-cancel-chapters-edit-14', function (event, element) { cancelChaptersEdit(); });
+AppEvents.register('page-short-generate-chapters-15', function (event, element) { generateChapters(); });
+AppEvents.register('page-short-switch-edit-mode-16', function (event, element) { switchEditMode('chapter'); });
+AppEvents.register('page-short-switch-edit-mode-17', function (event, element) { switchEditMode('full'); });
+AppEvents.register('page-short-stop-draft-18', function (event, element) { stopDraft(); });
+AppEvents.register('page-short-save-content-19', function (event, element) { saveContent(); });
+AppEvents.register('page-short-write-current-chapter-20', function (event, element) { writeCurrentChapter(); });
+AppEvents.register('page-short-write-draft-21', function (event, element) { writeDraft(); });
+AppEvents.register('page-short-polish-short-22', function (event, element) { polishShort('full'); });
+AppEvents.register('page-short-polish-short-23', function (event, element) { polishShort('opening'); });
+AppEvents.register('page-short-polish-short-24', function (event, element) { polishShort('ending'); });
+AppEvents.register('page-short-polish-short-25', function (event, element) { polishShort('dialogue'); });
+AppEvents.register('page-short-optimize-title-26', function (event, element) { optimizeTitle(); });
+AppEvents.register('page-short-check-quality-27', function (event, element) { checkQuality(); });
+</script>
+
 
 <style>
 .wb-layout { display: grid; grid-template-columns: 280px 1fr 280px; gap: 1rem; min-height: calc(100vh - 120px); }
@@ -154,8 +186,8 @@ pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
     <span class="status-badge status-<?= h($story['status']) ?>"><?= h($statusMap[$story['status']] ?? $story['status']) ?></span>
   </div>
   <div class="d-flex gap-2">
-    <button class="btn btn-outline-success btn-sm" onclick="exportShort()"><i class="bi bi-download me-1"></i>导出TXT</button>
-    <button class="btn btn-outline-info btn-sm" onclick="showVersionModal()"><i class="bi bi-clock-history me-1"></i>版本历史</button>
+    <button class="btn btn-outline-success btn-sm" data-csp-click="page-short-export-short-1"><i class="bi bi-download me-1"></i>导出TXT</button>
+    <button class="btn btn-outline-info btn-sm" data-csp-click="page-short-show-version-modal-2"><i class="bi bi-clock-history me-1"></i>版本历史</button>
   </div>
 </div>
 
@@ -186,17 +218,17 @@ pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
           <div class="mb-1"><span class="bl">结尾回响：</span><input type="text" class="form-control form-control-sm" id="editEcho" value="<?= h($b['ending_echo'] ?? '') ?>"></div>
           <div class="mb-1"><span class="bl">文风：</span><input type="text" class="form-control form-control-sm" id="editTone" value="<?= h($b['tone'] ?? '') ?>"></div>
           <div class="d-flex gap-1 mt-2">
-            <button class="btn btn-success btn-sm flex-fill" onclick="saveBriefEdit()">保存</button>
-            <button class="btn btn-outline-secondary btn-sm flex-fill" onclick="cancelBriefEdit()">取消</button>
+            <button class="btn btn-success btn-sm flex-fill" data-csp-click="page-short-save-brief-edit-3">保存</button>
+            <button class="btn btn-outline-secondary btn-sm flex-fill" data-csp-click="page-short-cancel-brief-edit-4">取消</button>
           </div>
         </div>
       </div>
-      <button class="wb-btn" onclick="toggleBriefEdit()" id="btnEditBrief"><i class="bi bi-pencil"></i>编辑概要</button>
+      <button class="wb-btn" data-csp-click="page-short-toggle-brief-edit-5" id="btnEditBrief"><i class="bi bi-pencil"></i>编辑概要</button>
       <?php else: ?>
       <div class="text-muted small">尚未生成概要</div>
       <?php endif; ?>
     </div>
-    <button class="wb-btn" onclick="generateBrief()" id="btnBrief">
+    <button class="wb-btn" data-csp-click="page-short-generate-brief-6" id="btnBrief">
       <i class="bi bi-stars"></i>生成概要
     </button>
 
@@ -223,16 +255,16 @@ pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
         </div>
         <?php endforeach; ?>
         <div class="d-flex gap-1 mt-2">
-          <button class="btn btn-success btn-sm flex-fill" onclick="saveBeatsEdit()">保存</button>
-          <button class="btn btn-outline-secondary btn-sm flex-fill" onclick="cancelBeatsEdit()">取消</button>
+          <button class="btn btn-success btn-sm flex-fill" data-csp-click="page-short-save-beats-edit-7">保存</button>
+          <button class="btn btn-outline-secondary btn-sm flex-fill" data-csp-click="page-short-cancel-beats-edit-8">取消</button>
         </div>
       </div>
-      <button class="wb-btn" onclick="toggleBeatsEdit()" id="btnEditBeats"><i class="bi bi-pencil"></i>编辑节拍</button>
+      <button class="wb-btn" data-csp-click="page-short-toggle-beats-edit-9" id="btnEditBeats"><i class="bi bi-pencil"></i>编辑节拍</button>
       <?php else: ?>
       <div class="text-muted small">尚未生成节拍</div>
       <?php endif; ?>
     </div>
-    <button class="wb-btn" onclick="generateBeats()" id="btnBeats" <?= empty($story['brief_json']) ? 'disabled' : '' ?>>
+    <button class="wb-btn" data-csp-click="page-short-generate-beats-10" id="btnBeats" <?= empty($story['brief_json']) ? 'disabled' : '' ?>>
       <i class="bi bi-list-ol"></i>生成节拍
     </button>
 
@@ -247,7 +279,7 @@ pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
           $st = $ch['status'] ?? 'pending';
           $stLabel = $st === 'written' ? '已写' : ($st === 'polished' ? '已润色' : '未写');
         ?>
-        <div class="chapter-item" data-idx="<?= $i ?>" onclick="selectChapter(<?= $i ?>)">
+        <div class="chapter-item" data-idx="<?= $i ?>" data-csp-click="page-short-select-chapter">
           <div style="flex:1;min-width:0;">
             <div class="ch-title">第<?= (int)($ch['order'] ?? ($i+1)) ?>章 · <?= h($ch['title'] ?? '') ?></div>
             <div class="ch-meta">
@@ -258,8 +290,8 @@ pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
         </div>
         <?php endforeach; ?>
       </div>
-      <button class="wb-btn mt-2" onclick="toggleChaptersEdit()" id="btnEditChapters"><i class="bi bi-pencil"></i>编辑章节大纲</button>
-      <button class="wb-btn" onclick="writeAllChapters()" id="btnWriteAll"><i class="bi bi-lightning-charge"></i>按顺序写全部章节</button>
+      <button class="wb-btn mt-2" data-csp-click="page-short-toggle-chapters-edit-11" id="btnEditChapters"><i class="bi bi-pencil"></i>编辑章节大纲</button>
+      <button class="wb-btn" data-csp-click="page-short-write-all-chapters-12" id="btnWriteAll"><i class="bi bi-lightning-charge"></i>按顺序写全部章节</button>
 
       <div id="chaptersEdit" style="display:none">
         <?php foreach ($story['chapters_json'] as $i => $ch): ?>
@@ -279,15 +311,15 @@ pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
         </div>
         <?php endforeach; ?>
         <div class="d-flex gap-1 mt-2">
-          <button class="btn btn-success btn-sm flex-fill" onclick="saveChaptersEdit()">保存</button>
-          <button class="btn btn-outline-secondary btn-sm flex-fill" onclick="cancelChaptersEdit()">取消</button>
+          <button class="btn btn-success btn-sm flex-fill" data-csp-click="page-short-save-chapters-edit-13">保存</button>
+          <button class="btn btn-outline-secondary btn-sm flex-fill" data-csp-click="page-short-cancel-chapters-edit-14">取消</button>
         </div>
       </div>
       <?php else: ?>
       <div class="text-muted small">尚未生成章节大纲</div>
       <?php endif; ?>
     </div>
-    <button class="wb-btn" onclick="generateChapters()" id="btnChapters" <?= empty($story['beats_json']) ? 'disabled' : '' ?>>
+    <button class="wb-btn" data-csp-click="page-short-generate-chapters-15" id="btnChapters" <?= empty($story['beats_json']) ? 'disabled' : '' ?>>
       <i class="bi bi-stars"></i>生成章节大纲
     </button>
     <?php endif; ?>
@@ -298,8 +330,8 @@ pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
     <?php $isChapterMode = (int)($story['chapter_count'] ?? 1) >= 2; ?>
     <?php if ($isChapterMode): ?>
     <div class="mode-tabs">
-      <div class="mode-tab active" id="tabChapter" onclick="switchEditMode('chapter')">分章模式</div>
-      <div class="mode-tab" id="tabFull" onclick="switchEditMode('full')">全文预览</div>
+      <div class="mode-tab active" id="tabChapter" data-csp-click="page-short-switch-edit-mode-16">分章模式</div>
+      <div class="mode-tab" id="tabFull" data-csp-click="page-short-switch-edit-mode-17">全文预览</div>
     </div>
     <div id="chapterHeader" class="chapter-header" style="display:none">
       <span id="chapterHeaderTitle">选择左侧章节开始编辑</span>
@@ -317,20 +349,18 @@ pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
       <textarea id="editorContent" placeholder="<?= $isChapterMode ? '选择左侧章节,或点击「写本章」生成...' : '在这里写作,或点击右侧按钮生成初稿...' ?>"><?= h($story['content'] ?? '') ?></textarea>
       <div id="ssePreview" style="display:none;white-space:pre-wrap;color:#e8e8ff;font-size:.95rem;line-height:1.8;"></div>
     </div>
+    <div id="editorSaveNotice" class="small px-3 py-2" role="status" aria-live="polite" hidden></div>
     <div class="wb-status-bar">
       <span id="wordCount" data-target="<?= $story['target_words'] ?>">字数：<?= number_format($story['word_count'] ?? 0) ?> / <?= number_format($story['target_words']) ?></span>
       <span>
-        <button class="btn btn-outline-danger btn-sm me-1" onclick="stopDraft()" id="btnStop" style="display:none"><i class="bi bi-stop-fill me-1"></i>停止</button>
-        <button class="btn btn-outline-primary btn-sm me-1" onclick="saveContent()" id="btnSave"><i class="bi bi-save me-1"></i>保存</button>
+        <button class="btn btn-outline-danger btn-sm me-1" data-csp-click="page-short-stop-draft-18" id="btnStop" style="display:none"><i class="bi bi-stop-fill me-1"></i>停止</button>
+        <button class="btn btn-outline-primary btn-sm me-1" data-csp-click="page-short-save-content-19" id="btnSave"><i class="bi bi-save me-1"></i>保存</button>
         <?php if ($isChapterMode): ?>
-        <button class="btn btn-primary btn-sm" onclick="writeCurrentChapter()" id="btnWriteChapter" disabled>
+        <button class="btn btn-primary btn-sm" data-csp-click="page-short-write-current-chapter-20" id="btnWriteChapter" disabled>
           <i class="bi bi-pencil-square me-1"></i>写本章
         </button>
-        <button class="btn btn-outline-warning btn-sm ms-1" onclick="writeDraft()" id="btnDraft" <?= empty($story['beats_json']) ? 'disabled' : '' ?> title="单篇模式用：一次生成整篇,不分章节">
-          <i class="bi bi-pencil-square me-1"></i>生成初稿（单篇）
-        </button>
         <?php else: ?>
-        <button class="btn btn-primary btn-sm" onclick="writeDraft()" id="btnDraft" <?= empty($story['beats_json']) ? 'disabled' : '' ?> title="单篇模式：一次生成整篇,不分章节">
+        <button class="btn btn-primary btn-sm" data-csp-click="page-short-write-draft-21" id="btnDraft" <?= empty($story['beats_json']) ? 'disabled' : '' ?> title="单篇模式：一次生成整篇,不分章节">
           <i class="bi bi-pencil-square me-1"></i>生成初稿（单篇模式用）
         </button>
         <?php endif; ?>
@@ -341,14 +371,15 @@ pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
   <!-- Right: AI Actions & Quality -->
   <div class="wb-panel">
     <h6><i class="bi bi-magic me-1"></i>AI 助手</h6>
-    <button class="wb-btn" onclick="polishShort('full')"><i class="bi bi-brush"></i>全文润色</button>
-    <button class="wb-btn" onclick="polishShort('opening')"><i class="bi bi-skip-start-fill"></i>强化开头</button>
-    <button class="wb-btn" onclick="polishShort('ending')"><i class="bi bi-skip-end-fill"></i>强化结尾</button>
-    <button class="wb-btn" onclick="polishShort('dialogue')"><i class="bi bi-chat-quote"></i>优化对话</button>
-    <button class="wb-btn" onclick="optimizeTitle()"><i class="bi bi-type-bold"></i>优化标题</button>
+    <?php if ($isChapterMode): ?><p class="small text-muted">润色仅作用于当前选中的章节。</p><?php endif; ?>
+    <button class="wb-btn" data-csp-click="page-short-polish-short-22"><i class="bi bi-brush"></i><?= $isChapterMode ? '润色当前章' : '全文润色' ?></button>
+    <button class="wb-btn" data-csp-click="page-short-polish-short-23"><i class="bi bi-skip-start-fill"></i><?= $isChapterMode ? '强化本章开头' : '强化开头' ?></button>
+    <button class="wb-btn" data-csp-click="page-short-polish-short-24"><i class="bi bi-skip-end-fill"></i><?= $isChapterMode ? '强化本章结尾' : '强化结尾' ?></button>
+    <button class="wb-btn" data-csp-click="page-short-polish-short-25"><i class="bi bi-chat-quote"></i><?= $isChapterMode ? '优化本章对话' : '优化对话' ?></button>
+    <button class="wb-btn" data-csp-click="page-short-optimize-title-26"><i class="bi bi-type-bold"></i>优化标题</button>
 
     <h6 class="mt-3"><i class="bi bi-shield-check me-1"></i>质量检测</h6>
-    <button class="wb-btn" onclick="checkQuality()"><i class="bi bi-clipboard-check"></i>运行检测</button>
+    <button class="wb-btn" data-csp-click="page-short-check-quality-27"><i class="bi bi-clipboard-check"></i>运行检测</button>
     <div id="qualityArea" class="mt-2">
       <?php if (!empty($story['quality_report'])): ?>
       <div class="quality-box">
@@ -384,7 +415,7 @@ pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
             <span class="ms-2"><?= h($v['note'] ?? '') ?></span>
             <span class="ms-2 text-muted" style="font-size:.72rem"><?= h($v['created_at']) ?></span>
           </div>
-          <button class="btn btn-outline-warning btn-sm" style="font-size:.72rem" onclick="rollbackVersion(<?= $v['id'] ?>)">回滚</button>
+          <button class="btn btn-outline-warning btn-sm" style="font-size:.72rem" data-csp-click="page-short-rollback" data-version-id="<?= (int)$v['id'] ?>">回滚</button>
         </div>
         <?php endforeach; ?>
         <?php if (empty($versions)): ?>
@@ -408,14 +439,14 @@ pageHeader('短篇工作台 - ' . ($story['title'] ?: '未命名'), 'shorts');
   </div>
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 window.SHORT_STORY_ID = <?= $id ?>;
 window.SHORT_STORY_MODEL_ID = <?= $story['model_id'] ?? 'null' ?>;
 window.SHORT_STORY_CHAPTER_COUNT = <?= (int)($story['chapter_count'] ?? 1) ?>;
 window.SHORT_STORY_CHAPTERS = <?= json_encode($story['chapters_json'] ?? [], JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
 </script>
 <script src="assets/js/short_story.js?v=<?= @filemtime(__DIR__ . '/assets/js/short_story.js') ?: time() ?>"></script>
-<script>
+<script nonce="<?= cspNonce() ?>">
 initShortStoryWordCount();
 </script>
 

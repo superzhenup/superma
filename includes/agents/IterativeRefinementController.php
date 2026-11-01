@@ -1,5 +1,6 @@
 <?php
 defined('APP_LOADED') or die('Direct access denied.');
+require_once dirname(__DIR__) . '/quality/ChapterGenerationIntegrity.php';
 
 /**
  * IterativeRefinementController — 迭代改进控制器
@@ -30,6 +31,7 @@ class IterativeRefinementController
     private int $chapterId;
 
     private int $maxIterations;
+    private ?int $frozenMaxIterations = null;
     private float $minImprovementThreshold;
     private float $targetScore;
     private float $qualityDeclineThreshold;
@@ -37,6 +39,20 @@ class IterativeRefinementController
     private array $iterationHistory = [];
     private array $improvementTrend = [];
     private array $evaluationCache = [];
+    // Keep the last literal model output separate from the controller's
+    // historical "best/fallback content" result.  RewriteAgent uses this
+    // diagnostic channel to freeze every actual generation attempt as a
+    // Candidate before the canonical quality gate decides its disposition.
+    private bool $generationAttempted = false;
+    private ?string $rawGeneratedContent = null;
+    private ?string $rawFinishReason = null;
+    private ?string $rawGenerationError = null;
+    /**
+     * 审计修复 F07（2026-11-01）：每个被采用的改写稿按正文 sha256 绑定它自己那一次
+     * 生成的完成证据。raw* 字段只描述末次尝试，不能拿来证明回选的历史最优稿。
+     * @var array<string,array{finish_reason:?string,generation_error:?string}>
+     */
+    private array $candidateEvidence = [];
     private array $performanceMetrics = [
         'total_api_calls' => 0,
         'cache_hits' => 0,
@@ -45,20 +61,31 @@ class IterativeRefinementController
         'rewrite_time_ms' => 0,
     ];
 
-    public function __construct(int $novelId, int $chapterId = 0)
+    public function __construct(int $novelId, int $chapterId = 0, ?int $frozenMaxIterations = null)
     {
         $this->novelId = $novelId;
         $this->chapterId = $chapterId;
 
-        $this->loadConfiguration();
+        $this->loadConfiguration($frozenMaxIterations);
     }
 
     /**
      * 加载配置参数
      */
-    private function loadConfiguration(): void
+    private function loadConfiguration(?int $frozenMaxIterations = null): void
     {
-        $this->maxIterations = (int)getSetting('iterative_refinement.max_iterations', 3, $this->novelId);
+        // 审计修复（2026-08-17 P3）修复6：max_iterations 加下限 clamp。
+        // 配置为 0/负数时 refine() 的 for 循环体一次不执行、返回 success=false，
+        // 迭代改进静默失效。max(1, ...) 保证至少跑一轮。
+        if ($frozenMaxIterations === null) {
+            $this->maxIterations = max(1, (int)getSetting('iterative_refinement.max_iterations', 3, $this->novelId));
+        } else {
+            if ($frozenMaxIterations < 1 || $frozenMaxIterations > 5) {
+                throw new InvalidArgumentException('Frozen rewrite limit must be between 1 and 5.');
+            }
+            $this->frozenMaxIterations = $frozenMaxIterations;
+            $this->maxIterations = $frozenMaxIterations;
+        }
         $this->minImprovementThreshold = (float)getSetting('iterative_refinement.min_improvement', 5.0, $this->novelId);
         $this->targetScore = (float)getSetting('iterative_refinement.target_score', 80.0, $this->novelId);
         $this->qualityDeclineThreshold = (float)getSetting('iterative_refinement.quality_decline_threshold', 3.0, $this->novelId);
@@ -70,18 +97,34 @@ class IterativeRefinementController
      * @param string $initialContent 初始章节内容
      * @param array $chapterInfo 章节基本信息
      * @param array $context 完整上下文
-     * @return array{success: bool, final_content: string, iterations_used: int, total_improvement: float, history: array}
+     * @return array{
+     *   success:bool,
+     *   final_content:string,
+     *   final_score:float,
+     *   iterations_used:int,
+     *   total_improvement:float,
+     *   history:array,
+     *   generation_attempted:bool,
+     *   raw_content:?string
+     * }
      */
     public function refine(string $initialContent, array $chapterInfo, array $context = []): array
     {
         $startTime = microtime(true);
-        $timeBudget = 300;
+        // 批次二（2026-08-16）：预算可配置化。原 300s 硬编码，慢模型对长章节做
+        // 3 轮流式全章重写极易超时，中途放弃已完成轮次（best 回溯保内容但轮次浪费）。
+        $timeBudget = max(60, (int)getSetting('iterative_refinement.time_budget', 300, $this->novelId));
         $currentContent = $initialContent;
         $bestContent = $currentContent;
         $bestScore = 0;
 
         $this->iterationHistory = [];
         $this->improvementTrend = [];
+        $this->generationAttempted = false;
+        $this->rawGeneratedContent = null;
+        $this->rawFinishReason = null;
+        $this->rawGenerationError = null;
+        $this->candidateEvidence = [];
 
         $iterationResults = [];
 
@@ -115,6 +158,12 @@ class IterativeRefinementController
                 $iteration, $this->maxIterations, $currentScore, $this->targetScore
             ));
 
+            // P2-2 修复（2026-08-09）：在重新评估前保存上一轮结束时的分数，
+            // 用于 target_reached 条目计算 improvement。原代码无 $prevScore 追踪，
+            // target_reached 条目缺 after_score/improvement 字段，
+            // saveIterationHistory 的 M-6 回退逻辑无法准确反映首尾分数。
+            $prevScore = $currentScore;
+
             // Step 1: 质量评估
             // C-2 修复：首轮复用循环前的初始评估，避免重复 AI 调用
             if ($iteration === 1) {
@@ -140,6 +189,11 @@ class IterativeRefinementController
                     'action' => 'target_reached',
                     'before_score' => $initialScore,
                     'score' => $currentScore,
+                    // P2-2 修复：补齐 after_score / improvement，与其他条目结构一致。
+                    // target_reached 不再应用改进，故 after_score = 当前分；
+                    // improvement = 当前分相对上一轮结束分的增量（首轮即达标时为 0）。
+                    'after_score' => $currentScore,
+                    'improvement' => $currentScore - $prevScore,
                     'stop_reason' => '已达到目标分数',
                 ];
                 addLog($this->novelId, 'iterative_refine', sprintf(
@@ -175,9 +229,32 @@ class IterativeRefinementController
             // Step 6: 验证改进效果
             $newEvaluation = $this->evaluateQuality($improvedContent, $chapterInfo, $context, $iteration, true);
             $newScore = $newEvaluation['overall_score'];
-            // H-7 修复：改进后评估也失败时不计入改进趋势
+            // H-7 修复 + 审计修复 M1（2026-09-27 对称化）：改进后评估失败（五关
+            // 检测异常）时，与 pre-check 失败（上方 eval_failed_skip 分支）对称
+            // 处理——本轮改进稿未经验证，不得把 currentContent/currentScore
+            // 切到它。原实现仍切换（newScore=0 成为当前分），下一轮被
+            // shouldTerminateEarly 误判"质量下降超过阈值"提前终止，且
+            // after_score=0 污染迭代历史、误导统计分析。现在：按
+            // "改进未验证"记录本轮（不保存未验证稿），内容与分数保持上轮，
+            // 立即终止。
             $newEvalFailed = !empty($newEvaluation['eval_failed']);
-            $improvement = $newEvalFailed ? 0.0 : ($newScore - $currentScore);
+            if ($newEvalFailed) {
+                $iterationTime = (microtime(true) - $iterationStartTime) * 1000;
+                $iterationResults[] = [
+                    'iteration' => $iteration,
+                    'action' => 'improvement_unverified_discarded',
+                    'before_score' => $currentScore,
+                    'after_score' => $currentScore,
+                    'improvement' => 0.0,
+                    'issues_addressed' => count($issues),
+                    'suggestions_count' => count($suggestions),
+                    'execution_time_ms' => $iterationTime,
+                    'stop_reason' => '改进后评估失败，本轮改进未验证被丢弃',
+                ];
+                addLog($this->novelId, 'iterative_refine', '改进后评估失败（五关检测异常），丢弃未验证改进稿并终止本轮迭代');
+                break;
+            }
+            $improvement = $newScore - $currentScore;
 
             // 更新最佳内容
             if ($newScore > $bestScore) {
@@ -206,6 +283,25 @@ class IterativeRefinementController
                 '第 %d 轮迭代完成：%.1f → %.1f（%+.1f），耗时 %.0fms',
                 $iteration, $currentScore, $newScore, $improvement, $iterationTime
             ));
+
+            // 批次二（2026-08-16）：采纳联动提前收割。
+            // RewriteAgent 的采纳门槛是 min_gain（默认10分）：bestScore 相对初始分
+            // 已赚到 ≥ 门槛后，继续迭代不会改变"被采纳"的结论，仅当本轮边际收益
+            // 仍高（还可能冲更高分）时才值得继续。已达门槛 + 边际收益低于一轮改进
+            // 阈值 → 立即收割，省一轮全章重写 AI 调用。
+            $adoptionGain = (float)($context['adoption_gain'] ?? 0);
+            if ($adoptionGain > 0
+                && ($bestScore - $initialScore) >= $adoptionGain
+                && $improvement < $this->minImprovementThreshold) {
+                $iterationResults[count($iterationResults) - 1]['stop_reason'] = sprintf(
+                    '已达采纳增益（%.1f≥%d）且边际收益低（%+.1f），提前收割',
+                    $bestScore - $initialScore,
+                    (int)$adoptionGain,
+                    $improvement
+                );
+                addLog($this->novelId, 'iterative_refine', '已达采纳增益门槛，提前停止迭代');
+                break;
+            }
 
             // 检查是否应该提前终止
             if ($this->shouldTerminateEarly($iteration, $improvement, $newScore, $iterationResults)) {
@@ -277,7 +373,40 @@ class IterativeRefinementController
             'history' => $iterationResults,
             'reached_target' => $bestScore >= $this->targetScore,
             'performance_metrics' => $this->performanceMetrics,
+            // final_content deliberately keeps the legacy best/fallback
+            // semantics. raw_content is the last literal AI rewrite output,
+            // including an empty/short/low-scoring attempt.
+            'generation_attempted' => $this->generationAttempted,
+            'raw_content' => $this->generationAttempted
+                ? ($this->rawGeneratedContent ?? '')
+                : null,
+            'generation_integrity' => [
+                'finish_reason' => $this->rawFinishReason,
+                'generation_error' => $this->rawGenerationError,
+            ],
+            // Evidence of the generation that produced final_content itself (null = unknown).
+            'final_content_integrity' => $this->finalContentIntegrity($finalContent, $initialContent),
         ];
+    }
+
+    /**
+     * 审计修复 F07：final_content 的完成证据取自生成它的那一轮。
+     * - 某轮采用的改写稿：返回该轮绑定的 finish_reason / generation_error；
+     * - 未被改写的原稿：不是模型输出，没有生成完整性问题（调用方按同 hash 跳过提交）；
+     * - 找不到来源（不应发生）：返回 null，调用方保留末次尝试的证据，失败关闭。
+     *
+     * @return array{finish_reason:?string,generation_error:?string}|null
+     */
+    private function finalContentIntegrity(string $finalContent, string $initialContent): ?array
+    {
+        $evidence = $this->candidateEvidence[hash('sha256', $finalContent)] ?? null;
+        if ($evidence !== null) {
+            return $evidence;
+        }
+        if (hash_equals(hash('sha256', $initialContent), hash('sha256', $finalContent))) {
+            return ['finish_reason' => null, 'generation_error' => null];
+        }
+        return null;
     }
 
     /**
@@ -285,13 +414,39 @@ class IterativeRefinementController
      */
     private function evaluateQuality(string $content, array $chapterInfo, array $context, int $iteration, bool $isPostCheck = false): array
     {
-        // 生成缓存键（基于内容哈希和检测模式）
-        $cacheKey = md5($content . ($isPostCheck ? '_quick' : '_full'));
+        // 审计优化（2026-08-16 批次一）：M3-2 已统一 pre/post 评估公式（完整五关、
+        // overall 恒等于 gateScore、critic 参与只取决于 $iteration 而非 $isPostCheck），
+        // 缓存键不再按 $isPostCheck 分裂——原 _quick/_full 双键导致第 N 轮 post-check
+        // 与第 N+1 轮 pre-check 对同一正文重复跑全量五关（末轮还多一次 critic AI 调用）。
+        // 统一后同内容直接命中缓存，每轮迭代省一次全量评估。
+        $cacheKey = md5($content);
 
         // 检查缓存
         if (isset($this->evaluationCache[$cacheKey])) {
             $this->performanceMetrics['cache_hits']++;
-            return $this->evaluationCache[$cacheKey];
+            $cached = $this->evaluationCache[$cacheKey];
+            // 审计修复（2026-08-17 P3）修复5：md5($content) 缓存键不含 critic 维度——
+            // 第2轮（无critic）post-check 的缓存会被第3轮（=maxIterations，应含critic）
+            // pre-check 命中，critic 弱项丢失。命中后若本次应含 critic（同修复4条件：
+            // 首末轮 且 rewrite.use_critic_agent 开关开）而缓存结果中 critic 数据缺失
+            // （critic_available 为空；eval_failed 的缓存除外，五关都挂了补 critic 无意义），
+            // 仅补跑 getCriticScore 合并进结果并回写缓存，五关不重跑。
+            $criticExpected = ($iteration == 1 || $iteration == $this->maxIterations)
+                && (bool)($context['use_critic_agent'] ?? true);
+            if ($criticExpected && empty($cached['critic_available']) && empty($cached['eval_failed'])) {
+                $this->performanceMetrics['total_api_calls']++;
+                $criticReview = $this->getCriticScore($content, $chapterInfo, $context);
+                $cached['critic_score'] = $criticReview['avg'] ?? 0;
+                $cached['critic_weak_dims'] = $criticReview['weak_dims'] ?? [];
+                // H-8 同语义：区分"critic 调用失败（score=0）"与"未调用 critic"
+                $cached['critic_available'] = isset($criticReview['avg']) && $criticReview['avg'] > 0;
+                // 与主路径同公式：overall_score 恒等于 gate 分不变，critic 综合分单独存储
+                $cached['overall_with_critic'] = $cached['critic_available']
+                    ? round($cached['gate_score'] * 0.7 + $cached['critic_score'] * 10 * 0.3, 1)
+                    : null;
+                $this->evaluationCache[$cacheKey] = $cached;
+            }
+            return $cached;
         }
 
         $this->performanceMetrics['cache_misses']++;
@@ -336,12 +491,18 @@ class IterativeRefinementController
         $criticWeakDims = [];
         $criticAvailable = false;
         if ($iteration == 1 || $iteration == $this->maxIterations) {
-            $this->performanceMetrics['total_api_calls']++;
-            $criticReview = $this->getCriticScore($content, $chapterInfo, $context);
-            $criticScore = $criticReview['avg'] ?? 0;
-            $criticWeakDims = $criticReview['weak_dims'] ?? [];
-            // H-8 修复：区分"critic 调用失败（score=0）"与"未调用 critic"
-            $criticAvailable = isset($criticReview['avg']) && $criticReview['avg'] > 0;
+            // 审计修复（2026-08-17 P3）修复4：rewrite.use_critic_agent 开关此前失效——
+            // RewriteAgent 把配置放进 $context['use_critic_agent'] 但控制器不消费，
+            // critic 调用只看轮次。追加开关判断（缺省 true 保持外部调用兼容）：
+            // 轮次条件满足 且 开关开启 才调用 critic。
+            if ((bool)($context['use_critic_agent'] ?? true)) {
+                $this->performanceMetrics['total_api_calls']++;
+                $criticReview = $this->getCriticScore($content, $chapterInfo, $context);
+                $criticScore = $criticReview['avg'] ?? 0;
+                $criticWeakDims = $criticReview['weak_dims'] ?? [];
+                // H-8 修复：区分"critic 调用失败（score=0）"与"未调用 critic"
+                $criticAvailable = isset($criticReview['avg']) && $criticReview['avg'] > 0;
+            }
         }
 
         // H-5/H-8 修复（2026-07-25）：原公式在 criticScore>0 时用加权、=0（失败）时用纯 gate，
@@ -404,6 +565,7 @@ class IterativeRefinementController
             $results[] = checkGate3_Description(null, $content);
             $results[] = checkGate4_CoolPoint($content, $chapterInfo['outline'] ?? null);
             $results[] = checkGate5_Consistency($chapterInfo['id'] ?? 0, $this->novelId, $content);
+            $results[] = checkGate6_OutlineAdherence($chapterInfo, $content);
 
             return $results;
         } catch (\Throwable $e) {
@@ -646,6 +808,20 @@ class IterativeRefinementController
         // v1.11.2 Bug #8 修复：拉取长篇关键上下文，避免重写时破坏全局一致性
         $contextSection = $this->buildContextSection((int)$chNum);
 
+        // 审计修复（2026-08-09 R11-3）：精炼重写也须带铁律
+        $isFinal = false;
+        try {
+            $tc = (int)(DB::fetch(
+                'SELECT target_chapters FROM novels WHERE id=?',
+                [$this->novelId]
+            )['target_chapters'] ?? 0);
+            $isFinal = $tc > 0 && (int)$chNum >= $tc;
+        } catch (\Throwable) { /* ignore */ }
+        if (!function_exists('rewriteIronRulesSnippet')) {
+            require_once dirname(__DIR__) . '/helpers.php';
+        }
+        $iron = rewriteIronRulesSnippet($isFinal);
+
         $system = <<<EOT
 你是一位资深网文编辑，擅长将初稿改写成高质量章节。
 按以下规则重写：
@@ -653,8 +829,9 @@ class IterativeRefinementController
 2. 保持原有的人物性格、情节走向、对话风格
 3. 保持原有字数范围（±10%）
 4. 严格遵循下文提供的人物状态/情绪状态/POV/前情摘要等上下文
-5. 直接输出重写后的完整章节正文，不要加任何前缀或解释
-6. 这是第 {$iteration} 轮迭代改进，要有针对性但不要过度修改
+5. {$iron}
+6. 直接输出重写后的完整章节正文，不要加任何前缀或解释
+7. 这是第 {$iteration} 轮迭代改进，要有针对性但不要过度修改
 EOT;
 
         $user = <<<EOT
@@ -680,12 +857,27 @@ EOT;
                 $modelId,
                 function (AIClient $ai) use ($system, $user) {
                     $collected = '';
-                    $ai->chatStream([
-                        ['role' => 'system', 'content' => $system],
-                        ['role' => 'user',   'content' => $user],
-                    ], function ($chunk) use (&$collected) {
-                        $collected .= $chunk;
-                    }, 'creative');
+                    $this->generationAttempted = true;
+                    $this->rawFinishReason = null;
+                    $this->rawGenerationError = null;
+                    try {
+                        $ai->chatStream([
+                            ['role' => 'system', 'content' => $system],
+                            ['role' => 'user',   'content' => $user],
+                        ], function ($chunk) use (&$collected) {
+                            $collected .= $chunk;
+                        }, 'creative');
+                        ChapterGenerationIntegrity::assertComplete($ai->lastFinishReason);
+                    } catch (\Throwable $exception) {
+                        $this->rawGenerationError = $exception->getMessage();
+                        throw $exception;
+                    } finally {
+                        // Preserve even an empty or partial stream. A fallback
+                        // model invocation overwrites this with its own, newer
+                        // attempt, so the field always names the last attempt.
+                        $this->rawGeneratedContent = $collected;
+                        $this->rawFinishReason = $ai->lastFinishReason;
+                    }
                     return $collected;
                 }
             ));
@@ -716,19 +908,22 @@ EOT;
 
             // 统一使用动态容忍度计算（与 WriteEngine 保持一致）
             require_once dirname(__DIR__) . '/prompt.php';   // includes/prompt.php（原多了一个 /.. 指向了不存在的根目录 prompt.php）
-            $tol = calculateDynamicTolerance($origWords);
+            $tol = calculateDynamicTolerance($origWords, $this->novelId);
             $maxAllowed = $tol['max'];
 
             if ($rewrittenWords > $maxAllowed) {
-                require_once dirname(__DIR__) . '/helpers.php';
-                $rewritten = truncateToWordLimitPreservingHook($rewritten, $maxAllowed);
-                $afterTrim = countWords($rewritten);
                 addLog($this->novelId, 'iterative_refine', sprintf(
-                    '重写后超字（%d字 → %d字，原始%d字，容忍度±%d），已自动压缩至 %d 字',
-                    $rewrittenWords, $maxAllowed, $origWords, $tol['tolerance'], $afterTrim
+                    '重写后超字（%d字，上限%d字），保留完整候选供质量门审阅',
+                    $rewrittenWords, $maxAllowed
                 ));
             }
 
+            // 返回到这里的稿件来自通过 assertComplete 的那次调用（失败调用会抛出），
+            // 此刻的 raw* 证据正描述它；按正文 hash 绑定，供回选历史最优稿时使用。
+            $this->candidateEvidence[hash('sha256', $rewritten)] = [
+                'finish_reason' => $this->rawFinishReason,
+                'generation_error' => $this->rawGenerationError,
+            ];
             return $rewritten;
         } catch (\Throwable $e) {
             error_log('IterativeRefinementController::applyImprovements 失败：' . $e->getMessage());
@@ -775,15 +970,33 @@ EOT;
 
             // 2. 主角当前状态摘要（最新 character_card）
             if ($protagonist) {
+                // character_cards 没有 realm/role 列：身份在 title，境界在 attributes JSON。
+                // 原查询恒报 Unknown column，被外层 catch 吞掉后整个上下文段返回空，
+                // 迭代重写因此丢失视角约束、情绪状态与前情摘要。
+                // 重写旧章时卡片可能已被后续章节更新，此时不注入未来状态。
                 $card = DB::fetch(
-                    "SELECT realm, role, status, attributes FROM character_cards
-                     WHERE novel_id = ? AND name = ? LIMIT 1",
-                    [$this->novelId, $protagonist]
+                    "SELECT title, status, attributes FROM character_cards
+                     WHERE novel_id = ? AND name = ?
+                       AND (last_updated_chapter IS NULL OR last_updated_chapter <= ?)
+                     LIMIT 1",
+                    [$this->novelId, $protagonist, $chNum]
                 );
                 if ($card) {
+                    $attrs = is_string($card['attributes'] ?? null)
+                        ? json_decode($card['attributes'], true)
+                        : ($card['attributes'] ?? null);
+                    $realm = '';
+                    if (is_array($attrs)) {
+                        foreach (['realm', 'level', '境界'] as $realmKey) {
+                            if (is_scalar($attrs[$realmKey] ?? null) && trim((string)$attrs[$realmKey]) !== '') {
+                                $realm = trim((string)$attrs[$realmKey]);
+                                break;
+                            }
+                        }
+                    }
                     $parts = [];
-                    if (!empty($card['realm']))  $parts[] = "境界：{$card['realm']}";
-                    if (!empty($card['role']))   $parts[] = "身份：{$card['role']}";
+                    if ($realm !== '')            $parts[] = "境界：{$realm}";
+                    if (!empty($card['title']))  $parts[] = "身份：{$card['title']}";
                     if (!empty($card['status'])) $parts[] = "处境：{$card['status']}";
                     if ($parts) {
                         $sections[] = "【主角当前状态】" . implode('；', $parts);
@@ -842,31 +1055,19 @@ EOT;
             }
         }
 
-        // 检查边际收益是否递减（优化：改为OR逻辑，任一条件满足即终止）
-        if (count($this->improvementTrend) >= 2) {
-            $recentImprovement = end($this->improvementTrend);
-            $prevImprovement = $this->improvementTrend[count($this->improvementTrend) - 2];
-
-            // 改进幅度降至前轮的30%以下，或低于阈值的一半，任一满足即终止
-            if ($recentImprovement < $prevImprovement * 0.3 || $recentImprovement < $this->minImprovementThreshold * 0.5) {
-                $this->terminationReason = sprintf(
-                    '边际收益递减（当前+%.1f，前轮+%.1f），停止迭代',
-                    $recentImprovement,
-                    $prevImprovement
-                );
-                return true;
-            }
-        }
-
-        // M-5 修复（2026-07-25）：原注释"连续两轮改进均很小"与代码 min(...) 不符。
-        // min 触发条件是"近两轮中任一轮改进很小或为负"，用于捕获"前轮下降、本轮回升"等
-        // 不稳定模式（此类模式上一轮的边际收益检查因 prev 为负可能漏判）。
-        // 修正注释以反映真实语义。
+        // 批次二修复（2026-08-16）：原两段判定（"边际收益 OR 逻辑" + "min 近两轮"）
+        // 语义重叠且均为"单轮低改进即终止"——默认阈值 5.0×0.5=2.5 分（百分制）过于
+        // 敏感，第 2 轮起任何单轮改进 <2.5 分就停止，maxIterations=3 形同虚设，
+        // 单轮评估噪声即可扼杀后续迭代（如 +2 后 +8 的回升形态也会被 min 捕杀）。
+        // 改为"连续两轮均低于阈值"才判定收益枯竭：单轮低改进可能是噪声，
+        // 持续低改进才是真实收敛信号。
         if (count($this->improvementTrend) >= 2) {
             $lastTwoImprovements = array_slice($this->improvementTrend, -2);
-            if (min($lastTwoImprovements) < $this->minImprovementThreshold * 0.5) {
+            $diminishingThreshold = $this->minImprovementThreshold * 0.5;
+            if (max($lastTwoImprovements) < $diminishingThreshold) {
                 $this->terminationReason = sprintf(
-                    '近两轮中存在改进很小或为负的轮次（%.1f和%.1f），停止迭代',
+                    '连续两轮改进均低于%.1f分（%+.1f和%+.1f），收益枯竭，停止迭代',
+                    $diminishingThreshold,
                     $lastTwoImprovements[0],
                     $lastTwoImprovements[1]
                 );
@@ -956,7 +1157,7 @@ EOT;
     public function adjustConfiguration(array $newConfig): bool
     {
         try {
-            if (isset($newConfig['max_iterations'])) {
+            if ($this->frozenMaxIterations === null && isset($newConfig['max_iterations'])) {
                 $this->maxIterations = max(1, min(5, (int)$newConfig['max_iterations']));
             }
             if (isset($newConfig['min_improvement'])) {

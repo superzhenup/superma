@@ -129,6 +129,7 @@ final class CreativeAssistService
             checkGate3_Description($chapter['genre'] ?? '', $content),
             checkGate4_CoolPoint($content, $chapter['outline'] ?? ''),
             checkGate5_Consistency((int)$chapter['id'], $novelId, $content),
+            checkGate6_OutlineAdherence($chapter, $content),
         ];
 
         $scores = array_column($results, 'score');
@@ -219,10 +220,11 @@ final class CreativeAssistService
 
     private function getVolumeOutline(int $novelId, int $chapterNumber): ?array
     {
-        return $this->fetchOneSafe(
-            'SELECT * FROM volume_outlines WHERE novel_id=? AND start_chapter <= ? AND end_chapter >= ? LIMIT 1',
-            [$novelId, $chapterNumber, $chapterNumber]
-        );
+        if (!function_exists('fetchVolumeOutlinesOverlapping')) {
+            require_once __DIR__ . '/memory.php';
+        }
+        $row = fetchVolumeOutlinesOverlapping($novelId, $chapterNumber, $chapterNumber)[0] ?? null;
+        return is_array($row) ? $row : null;
     }
 
     private function getChapterSynopsis(int $novelId, int $chapterNumber): ?array
@@ -269,7 +271,8 @@ final class CreativeAssistService
     {
         if ($chapterNumber <= 1) return [];
         return $this->fetchAllSafe(
-            'SELECT character_name, emotion_state, intensity, summary, chapter_number
+            // 情绪表的成因列是 cause（无 summary 列），别名保持前端字段名不变。
+            'SELECT character_name, emotion_state, intensity, cause AS summary, chapter_number
              FROM character_emotion_history
              WHERE novel_id=? AND chapter_number < ?
              ORDER BY chapter_number DESC, id DESC

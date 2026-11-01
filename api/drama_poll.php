@@ -9,7 +9,7 @@
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
@@ -30,7 +30,7 @@ $jsonInput = json_decode(file_get_contents('php://input'), true) ?? [];
 $action = $jsonInput['action'] ?? $_GET['action'] ?? '';
 
 function dramaPollUserId(): int {
-    return (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    return currentUserId();
 }
 
 /** 无 worker 环境：内联驱动一个视频轮询周期。 */
@@ -54,16 +54,30 @@ try {
             dramaDriveVideoInline();
 
             $episodes = DramaService::listEpisodes($projectId);
-            foreach ($episodes as &$ep) {
-                $ep['stats'] = DB::fetch(
-                    "SELECT COUNT(*) AS total,
+            // N+1 修复：drama_shots 无 project_id 列，按本项目的 episode_id 集合
+            // 一条聚合查询统计全部剧集，替代循环内逐集 COUNT 查询。
+            $statsByEpisode = [];
+            if ($episodes) {
+                $epIds = array_map(static fn($ep) => (int)$ep['id'], $episodes);
+                $placeholders = implode(',', array_fill(0, count($epIds), '?'));
+                $statsRows = DB::fetchAll(
+                    "SELECT episode_id,
+                            COUNT(*) AS total,
                             SUM(status='image_ready') AS image_ready,
                             SUM(status='video_running') AS video_running,
                             SUM(status='video_done') AS video_done,
                             SUM(status='failed') AS failed
-                     FROM drama_shots WHERE episode_id=?",
-                    [(int)$ep['id']]
+                     FROM drama_shots WHERE episode_id IN ($placeholders)
+                     GROUP BY episode_id",
+                    $epIds
                 );
+                foreach ($statsRows as $row) {
+                    $statsByEpisode[(int)$row['episode_id']] = $row;
+                }
+            }
+            foreach ($episodes as &$ep) {
+                $ep['stats'] = $statsByEpisode[(int)$ep['id']]
+                    ?? ['total' => 0, 'image_ready' => 0, 'video_running' => 0, 'video_done' => 0, 'failed' => 0];
             }
             unset($ep);
 

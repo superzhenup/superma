@@ -8,12 +8,17 @@ require_once __DIR__ . '/includes/functions.php';
 require_once __DIR__ . '/includes/layout.php';
 require_once __DIR__ . '/includes/ShortStoryService.php';
 
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 $service = new ShortStoryService();
 $stories = $service->listStories($userId);
 
 pageHeader('短篇小说', 'shorts');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-shorts-open', function (event, element) { location.href = 'short.php?id=' + Number(element.dataset.storyId); });
+AppEvents.register('page-shorts-delete', function (event, element) { event.stopPropagation(); deleteShort(Number(element.dataset.storyId)); });
+</script>
+
 
 <style>
 .shorts-header {
@@ -91,7 +96,7 @@ pageHeader('短篇小说', 'shorts');
   $statusLabel = $statusMap[$s['status']] ?? $s['status'];
   $wordCount = $s['word_count'] ?? 0;
 ?>
-<div class="short-card" onclick="location.href='short.php?id=<?= $s['id'] ?>'">
+<div class="short-card" data-csp-click="page-shorts-open" data-story-id="<?= (int)$s['id'] ?>">
   <div class="sc-icon"><i class="bi bi-journal-text"></i></div>
   <div class="sc-body">
     <div class="sc-title"><?= h($s['title'] ?: '未命名短篇') ?></div>
@@ -103,7 +108,7 @@ pageHeader('短篇小说', 'shorts');
     </div>
   </div>
   <div class="sc-actions">
-    <button class="btn btn-outline-danger btn-sm" onclick="event.stopPropagation();deleteShort(<?= $s['id'] ?>)" title="删除">
+    <button class="btn btn-outline-danger btn-sm" data-csp-click="page-shorts-delete" data-story-id="<?= (int)$s['id'] ?>" title="删除">
       <i class="bi bi-trash3"></i>
     </button>
   </div>
@@ -113,7 +118,7 @@ pageHeader('短篇小说', 'shorts');
 
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 async function deleteShort(id) {
   if (!confirm('确定删除这篇短篇小说？此操作不可恢复。')) return;
   try {

@@ -14,6 +14,7 @@ defined('APP_LOADED') or die('Direct access denied.');
 // prompt.php 仅在 buildChapterPrompt() 函数体内惰性 require 本类（顶层无），
 // 故 require_once 幂等下无循环依赖。原有方法体内的惰性 require 保留为无害 no-op。
 require_once __DIR__ . '/prompt.php';
+require_once __DIR__ . '/memory/NarrativePosition.php';
 
 class ChapterPromptBuilder
 {
@@ -22,6 +23,12 @@ class ChapterPromptBuilder
     private ?array $resolverResult = null;
     private ?array $progressCache = null;
     private string $degradedHint = '';
+    private array $injectedAgentDirectives = [];
+
+    public function getInjectedAgentDirectives(): array
+    {
+        return $this->injectedAgentDirectives;
+    }
 
     public function __construct(
         private array  $novel,
@@ -33,6 +40,11 @@ class ChapterPromptBuilder
         // 审计修复 C-2（2026-06-17）：构造时集中消毒 novels 字段，
         // 后续 build*() 全部使用已消毒数据，杜绝 Prompt 注入。
         $this->novel = sanitizeNovelForPrompt($this->novel);
+        // 审计修复 M2（2026-09-27）：章节用户可编辑规划字段（title/outline/
+        // hook/key_points）同契约消毒——它们由用户在章节编辑页/向导直接编辑，
+        // 原样进入本章大纲段（强注意区）构成注入面。正文/上一章结尾等 AI
+        // 生成内容按 C-2 约定不过滤。
+        $this->chapter = sanitizeChapterForPrompt($this->chapter);
         $this->chNum = (int)($this->chapter['chapter_number'] ?? $this->chapter['chapter'] ?? 0);
         $this->genre = $this->novel['genre'] ?? '';
     }
@@ -196,14 +208,15 @@ class ChapterPromptBuilder
     private function isVolumeMidpointChapter(): bool
     {
         try {
-            $volume = \DB::fetch(
-                'SELECT start_chapter, end_chapter FROM volume_outlines WHERE novel_id=? AND start_chapter <= ? AND end_chapter >= ? LIMIT 1',
-                [(int)$this->novel['id'], $this->chNum, $this->chNum]
-            );
+            if (!function_exists('fetchVolumeOutlinesOverlapping')) {
+                require_once __DIR__ . '/memory.php';
+            }
+            $volume = fetchVolumeOutlinesOverlapping((int)$this->novel['id'], $this->chNum, $this->chNum)[0] ?? null;
             if (!$volume) return false;
 
-            $start = (int)$volume['start_chapter'];
-            $end = (int)$volume['end_chapter'];
+            $start = (int)($volume['chapter_from'] ?? $volume['start_chapter'] ?? 0);
+            $end = (int)($volume['chapter_to'] ?? $volume['end_chapter'] ?? 0);
+            if ($start < 1 || $end < $start) return false;
             $midpoint = (int)(($start + $end) / 2);
 
             // 在中点前后 2 章范围内触发（如卷为1-50章，中点为25章，则23-27章都会触发）
@@ -238,30 +251,15 @@ EOT;
     private function isVolumeStartChapter(): bool
     {
         try {
-            // 优先使用 start_chapter 列（新版）
-            $exists = \DB::fetch(
-                'SELECT 1 FROM volume_outlines WHERE novel_id=? AND start_chapter=? LIMIT 1',
-                [(int)$this->novel['id'], $this->chNum]
-            );
-            if (!empty($exists)) return true;
-            
-            // 回退：旧版可能使用 chapter_from 列
-            $exists = \DB::fetch(
-                'SELECT 1 FROM volume_outlines WHERE novel_id=? AND chapter_from=? LIMIT 1',
-                [(int)$this->novel['id'], $this->chNum]
-            );
-            return !empty($exists);
-        } catch (\Throwable $e) {
-            // 如果 start_chapter 列不存在，尝试 chapter_from
-            try {
-                $exists = \DB::fetch(
-                    'SELECT 1 FROM volume_outlines WHERE novel_id=? AND chapter_from=? LIMIT 1',
-                    [(int)$this->novel['id'], $this->chNum]
-                );
-                return !empty($exists);
-            } catch (\Throwable) {
-                return false;
+            if (!function_exists('fetchVolumeOutlinesOverlapping')) {
+                require_once __DIR__ . '/memory.php';
             }
+            $volume = fetchVolumeOutlinesOverlapping((int)$this->novel['id'], $this->chNum, $this->chNum)[0] ?? null;
+            if (!$volume) return false;
+            $from = (int)($volume['chapter_from'] ?? $volume['start_chapter'] ?? 0);
+            return $from === $this->chNum;
+        } catch (\Throwable $e) {
+            return false;
         }
     }
 
@@ -273,7 +271,7 @@ EOT;
     public function ironRules(): string
     {
         $targetWords = (int)$this->novel['chapter_words'];
-        $tol          = calculateDynamicTolerance($targetWords);
+        $tol          = calculateDynamicTolerance($targetWords, (int)($this->novel['id'] ?? 0) ?: null);
         $minWords     = $tol['min'];
         $maxWords     = $tol['max'];
         $earlyFinish  = $tol['early_finish'];
@@ -283,8 +281,10 @@ EOT;
             ? "\n9. 主角名锚定：本小说主角固定为「{$protagonistName}」，绝对不可更改、替换、省略或使用其他称呼作为主角，所有涉及主角的内容必须使用此名字"
             : '';
 
-        // v41: 场景连续性约束已移至用户消息动态区（buildUserPrompt），
-        // 使 system prompt 在同一 tier 内逐字节稳定 → 命中提示词前缀缓存。
+        // v41: 场景连续性约束已移至用户消息动态区（buildUserPrompt）。
+        // 审计修复（2026-08-09 R12）：hookGuidance 章级钩子类型、emotionVocabulary 章级
+        // pacing 倍率也已静态化/下移 user，同一 tier 的 system 至此才真正逐字节稳定
+        // （仅最终章切换一次收束文案）→ 可命中提示词前缀缓存。
 
         return <<<EOT
 【写作铁律 · 三级优先级——P0必须100%遵守，P1重点执行，P2参考执行】
@@ -333,7 +333,9 @@ EOT;
                 [(int)$this->novel['id'], $this->chNum - 1]
             );
         } catch (\Throwable $e) { return ''; }
-        $hook = trim((string)($prev['hook'] ?? ''));
+        // 审计修复 M2（2026-09-27）：上一章 hook 由 DB 另查（不经构造器的
+        // sanitizeChapterForPrompt），同契约消毒——2000 截断对短钩子足够。
+        $hook = trim(sanitizeForPrompt((string)($prev['hook'] ?? '')));
         if ($hook === '') return '';
         $typeName = '';
         $ht = trim((string)($prev['hook_type'] ?? ''));
@@ -395,48 +397,53 @@ EOT;
     public function fourSegmentRhythm(): string
     {
         $r = $this->getSegmentRatios();
+        // 审计修复（2026-08-09 R2）：终章豁免"制造强烈悬念"，与 hookGuidance/buildEndingContext 对齐
+        $tailSeg = $this->isFinalChapter()
+            ? "- 收束段(~{$r['hook']}%)：全书最终章，以圆满收束/余韵落幕，不设新悬念"
+            : "- 钩子段(~{$r['hook']}%)：使用指定钩子类型收尾，制造强烈悬念";
         return <<<EOT
 【📊 四段式节奏结构】
 - 铺垫段(~{$r['setup']}%)：承接上文、建立场景、引入新信息（≤200字纯环境描写）
 - 发展段(~{$r['rising']}%)：推进冲突、角色互动、信息揭露（对话密集区）
 - 高潮段(~{$r['climax']}%)：爽点释放、情绪顶点、反转或冲突升级
-- 钩子段(~{$r['hook']}%)：使用指定钩子类型收尾，制造强烈悬念
+{$tailSeg}
 ⚠️ 以上四段结构仅为内部节奏参考，绝对禁止在正文中输出"铺垫段""发展段""高潮段""钩子段"等段落标题或标记！正文需连续叙述，段落间自然过渡，不得出现任何结构化标注。
 EOT;
     }
 
+    /** @var array|null RhythmAdjuster 计算结果缓存（含按章节类型微调后的 segment_ratios） */
+    private ?array $rhythmContextCache = null;
+    /** @var bool rhythmContextCache 是否已解析（区分「未计算」与「计算失败=null」） */
+    private bool $rhythmContextResolved = false;
+
     /**
      * v1.5: segment_ratios 单一来源
-     * 优先使用 RhythmAdjuster 根据章节进度计算的动态比例（climax 期 15/30/40/15 等），
-     * RhythmAdjuster 不可用时回退到全局静态配置 ws_segment_ratio_*
-     * 解决双源冲突：之前 fourSegmentRhythm 读静态、buildRhythmSection 输出动态，AI 看到矛盾。
+     *
+     * 审计修复（2026-08-16 P2，C-1）：四段式比例双源统一。
+     * 此前 fourSegmentRhythm 走「calculateRhythm(空history) + adjustRatios」，
+     * 而紧随其后相邻注入的 buildRhythmSection 走「calculateRhythm(真实history)
+     * 且不做 adjustRatios」——两段"铺垫X%/高潮Y%"数字矛盾进入同一 prompt
+     * （战斗/对话/过渡章下尤甚），这正是 v1.5 注释声称已解决的双源冲突
+     * 在新增 ChapterTypeDetector 后的回归。
+     * 现统一为：一次 calculateRhythm（带真实爽点历史）→ 一次 adjustRatios
+     * （按本章大纲类型），两段消费同一份 computeRhythmContext() 结果。
      *
      * @return array{setup:int,rising:int,climax:int,hook:int}
      */
     private function getSegmentRatios(): array
     {
-        // 优先：RhythmAdjuster 动态比例（按章节进度阶段计算）
-        try {
-            require_once __DIR__ . '/rhythm_adjuster.php';
-            $adj = new RhythmAdjuster((int)$this->novel['id']);
-            $rhythm = $adj->calculateRhythm($this->chNum, []);
-            if (!empty($rhythm['segment_ratios'])) {
-                $base = [
-                    'setup'  => (int)($rhythm['segment_ratios']['setup']  ?? 20),
-                    'rising' => (int)($rhythm['segment_ratios']['rising'] ?? 30),
-                    'climax' => (int)($rhythm['segment_ratios']['climax'] ?? 35),
-                    'hook'   => (int)($rhythm['segment_ratios']['hook']   ?? 15),
-                ];
-                try {
-                    require_once __DIR__ . '/ChapterTypeDetector.php';
-                    return ChapterTypeDetector::adjustRatios($base, trim((string)($this->chapter['outline'] ?? '')));
-                } catch (\Throwable $e) { error_log('ChapterPromptBuilder adjustRatios failed: ' . $e->getMessage()); }
-                return $base;
-            }
-        } catch (\Throwable $e) {
-            // 回退到静态配置
+        // 优先：单一来源（动态阶段比例 + 章节类型微调，与 buildRhythmSection 同源）
+        $rhythm = $this->computeRhythmContext();
+        if ($rhythm !== null && !empty($rhythm['segment_ratios'])) {
+            return [
+                'setup'  => (int)($rhythm['segment_ratios']['setup']  ?: 20),
+                'rising' => (int)($rhythm['segment_ratios']['rising'] ?: 30),
+                'climax' => (int)($rhythm['segment_ratios']['climax'] ?: 35),
+                'hook'   => (int)($rhythm['segment_ratios']['hook']   ?: 15),
+            ];
         }
 
+        // 回退：RhythmAdjuster 不可用时用全局静态配置（仍过类型微调）
         $fallback = [
             'setup'  => (int)getSystemSetting('ws_segment_ratio_setup',  20, 'int'),
             'rising' => (int)getSystemSetting('ws_segment_ratio_rising', 30, 'int'),
@@ -452,6 +459,73 @@ EOT;
         }
     }
 
+    /**
+     * 节奏上下文单一计算源（P2 双源统一，实例级 memo）
+     *
+     * calculateRhythm（带真实爽点历史）→ segment_ratios 经 adjustRatios
+     * 按本章大纲类型微调。fourSegmentRhythm 与 buildRhythmSection 共享本结果，
+     * 保证同一 prompt 内两段比例数字一致。任一步失败返回 null，调用方回退。
+     */
+    private function computeRhythmContext(): ?array
+    {
+        if ($this->rhythmContextResolved) {
+            return $this->rhythmContextCache;
+        }
+        $this->rhythmContextResolved = true;
+
+        try {
+            require_once __DIR__ . '/rhythm_adjuster.php';
+            $adj = new RhythmAdjuster((int)$this->novel['id']);
+            $rhythm = $adj->calculateRhythm($this->chNum, $this->buildCoolPointHistory());
+            if (is_array($rhythm) && !empty($rhythm['segment_ratios'])) {
+                try {
+                    require_once __DIR__ . '/ChapterTypeDetector.php';
+                    $rhythm['segment_ratios'] = ChapterTypeDetector::adjustRatios(
+                        $rhythm['segment_ratios'],
+                        trim((string)($this->chapter['outline'] ?? ''))
+                    );
+                } catch (\Throwable $e) {
+                    error_log('ChapterPromptBuilder adjustRatios failed: ' . $e->getMessage());
+                }
+            }
+            $this->rhythmContextCache = is_array($rhythm) ? $rhythm : null;
+        } catch (\Throwable) {
+            $this->rhythmContextCache = null;
+        }
+
+        return $this->rhythmContextCache;
+    }
+
+    /**
+     * 近 20 章爽点历史（RhythmAdjuster 密度判定输入；actual 优先、计划兜底）
+     *
+     * 审计修复 M4（2026-09-27）：返回顺序改为升序（旧→新），与
+     * MemoryEngine::cool_point_history 的"最旧在前"约定一致。原实现以
+     * chapter_number DESC 顺序遍历构建（新→旧），而 RhythmAdjuster 全部
+     * 按升序消费：array_slice(-5) 本意取"最近 5 条"实取最旧 5 条当
+     * "近期已用"避开（防重复反向）；"最久未用优先"实取最近使用；gap 检测
+     * 也取到最旧爽点。查询仍取最近 20 章窗口，构建后反转恢复时间顺序。
+     */
+    private function buildCoolPointHistory(): array
+    {
+        $history = [];
+        $rcs = DB::fetchAll(
+            'SELECT chapter_number, cool_point_type, actual_cool_point_types FROM chapters WHERE novel_id=? AND chapter_number<? AND (cool_point_type IS NOT NULL OR actual_cool_point_types IS NOT NULL) ORDER BY chapter_number DESC LIMIT 20',
+            [(int)$this->novel['id'], $this->chNum]
+        );
+        foreach ($rcs as $rc) {
+            $actual = json_decode($rc['actual_cool_point_types'] ?? '[]', true);
+            if (!empty($actual) && is_array($actual)) {
+                foreach ($actual as $t) {
+                    if (is_string($t) && !empty($t)) $history[] = ['chapter'=>(int)$rc['chapter_number'],'type'=>$t];
+                }
+            } elseif (!empty($rc['cool_point_type'])) {
+                $history[] = ['chapter'=>(int)$rc['chapter_number'],'type'=>$rc['cool_point_type']];
+            }
+        }
+        return array_reverse($history);
+    }
+
     public function hookGuidance(): string
     {
         require_once __DIR__ . '/prompt.php';
@@ -462,19 +536,12 @@ EOT;
 本章是全书最后一章：以圆满收束/余韵代替章末悬念；可用平静有分量的落幕句，禁止再开新悬念线。
 EOT;
         }
-        $outlineHookType = trim($this->chapter['hook_type'] ?? '');
-        if ($outlineHookType !== '' && isset(HOOK_TYPES[$outlineHookType])) {
-            $cType = $outlineHookType;
-            $cDesc = HOOK_TYPES[$cType]['name'] . '：' . HOOK_TYPES[$cType]['desc'] . '（大纲已规划）';
-        } else {
-            $hook  = suggestHookType($this->chapter);
-            $cType = $hook['type'];
-            $cDesc = (HOOK_TYPES[$cType]['name'] ?? '') . '：' . ($hook['reason'] ?? '默认轮换');
-        }
+        // 审计修复（2026-08-09 R12）：本段原读取章级 hook_type/suggestHookType，
+        // 导致 system 每章变化、前缀缓存被打穿。章级具体类型由 user 侧
+        // buildUserHookSection 承载，system 只保留静态规则。
         return <<<EOT
-【🎣 章末钩子——必须使用以下指定类型】
-本章节尾钩子类型：{$cType}
-类型说明：{$cDesc}
+【🎣 章末钩子】
+章末必须以钩子收尾（悬念/反转/信息爆炸），具体类型以用户消息中的【章末钩子类型】段为准；禁止连续重复前三章的钩子类型。
 ⚠️ 绝对禁止以平静句结尾！（如"大家都睡了""夜深了""一切归于平静"等）
 EOT;
     }
@@ -501,30 +568,13 @@ EOT;
 
     public function emotionVocabulary(): string
     {
-        $pacing = trim($this->chapter['pacing'] ?? '中');
-        $multiplier = match($pacing) {
-            '快' => 1.3,
-            '慢' => 0.7,
-            default => 1.0,
-        };
-
-        $phaseNote = $pacing === '快'
-            ? '本章为快节奏章，情绪锚点宜加密，高潮段加倍'
-            : ($pacing === '慢'
-                ? '本章为慢节奏/铺垫章，情绪锚点适当降低，以细腻描写和氛围为主'
-                : '正常节奏，情绪锚点按建议执行');
-
-        // 原「次/万字」中值 ÷10 ≈「次/千字」，与中段重申、Gate 口径统一
-        $angryA = max(1, (int)round((15 * $multiplier + 20 * $multiplier) / 2 / 10));
-        $joyA   = max(1, (int)round((20 * $multiplier + 30 * $multiplier) / 2 / 10));
-        $surpA  = max(1, (int)round((10 * $multiplier + 15 * $multiplier) / 2 / 10));
-        $fearA  = max(1, (int)round((5 * $multiplier + 10 * $multiplier) / 2 / 10));
-        $sadA   = max(1, (int)round((5 * $multiplier + 10 * $multiplier) / 2 / 10));
-
+        // 审计修复（2026-08-09 R12）：原按章级 pacing 计算倍率，导致 system 每章变化、
+        // 前缀缓存被打穿。改为静态基准值（中速节奏，原「次/万字」中值 ÷10），
+        // 章级快/慢节奏的加减倍率由 user 侧 buildUserRulesSection 注入。
         return <<<EOT
 【😊 情绪锚点——统一按「次/千字」】
-· 愤怒约{$angryA}、喜悦约{$joyA}、惊讶约{$surpA}、恐惧约{$fearA}、悲伤约{$sadA}（每千字锚点数，不必精确计数）
-调整说明：{$phaseNote}
+· 愤怒约2、喜悦约3、惊讶约1、恐惧约1、悲伤约1（每千字锚点数，中速基准，不必精确计数）
+调整说明：快节奏章按约1.3倍加密，慢节奏章按约0.7倍降低（本章节奏见用户消息节奏指令）
 原则：自然融入、有起伏；高潮段加倍；禁止堆砌情绪词清单
 
 【🎭 表情/神态展示——"Show, Don't Tell"】
@@ -576,13 +626,14 @@ EOT;
                 $this->buildVoiceProfileSection(),      // 角色语音规则（半静态）
                 $this->buildRecurringMotifsSection(),   // 全书重复意象（半静态）
                 $this->buildStyleExemplarSection(),     // v41: 文风范本（本书高分片段，show not tell）
-                $this->buildUserDensitySection(),       // 描写密度（静态规则）
+                // 审计修复（2026-08-09 R13）：密度指南已在 system（densityStandards）注入，删除 user 侧重复副本
                 $this->buildPOVSection(),               // POV 视角约束（静态）
             ]));
             // ── 动态头：本章关键信息（强注意）──
             $dynHead = implode('', array_filter([
                 $this->buildQualityFeedbackSection(),
                 $this->buildCharacterSection(),
+                $this->buildGoldenFingerSection(),       // 审计功能（2026-08-16 P3-金手指）：档位/代价/限制约束
                 $this->buildReturningCharacterSection(),
                 $this->buildLocationSection(),
                 $this->buildPrevHookSection(),          // v41: 上章钩子待回收（强约束本章开头承接）
@@ -596,31 +647,40 @@ EOT;
                 $this->buildPreWriteChecklist(),
                 $this->buildSynopsisSection(),
             ]));
-            // ── 动态中部（弱注意区，可被裁剪）──
-            $middle = implode('', array_filter([
+            // ── 动态中部：连续性优先，超长时先丢可选参考 ──
+            // 审计修复 P1（2026-09-27）：全书进度与收尾铁律从 middleNice 升级为
+            // middleMust 首位。原顺序中它们排在 nice 列表最后，而截断从头保留、
+            // 尾部先丢——越接近完结 prompt 越长时，收尾约束反而最先被裁掉，
+            // 与收尾期目标直接冲突。must 超预算时从头保留也优先保住收尾铁律。
+            $middleMust = implode('', array_filter([
+                $this->buildProgressSection(),
+                $this->buildEndingContextSection(),
                 $this->buildPrevSection(),
                 $this->buildRecentChapterSection(),
-                $this->buildFullContextSection(),       // 显式 1M 能力：完整历史正文/大纲/状态
-                $this->buildMomentumSection(),
-                $this->buildCognitiveLoadSection(),
                 $this->buildEmotionStateSection(),
                 $this->buildEventsSection(),
                 $this->buildSemanticSection(),
                 $this->buildKBContextSection(),
+                $this->buildVolumeGoalSection(),
+            ]));
+            $middleNice = implode('', array_filter([
+                $this->buildFullContextSection(),
+                $this->buildMomentumSection(),
+                $this->buildCognitiveLoadSection(),
                 $this->buildCatchphraseSection(),
                 $this->buildHookHistorySection(),
                 $this->buildCoolPointHistorySection(),
                 $this->buildTropesSection(),
-                $this->buildVolumeGoalSection(),
-                $this->buildProgressSection(),
-                $this->buildEndingContextSection(),
             ]));
+            $middle = $middleMust . $middleNice;
             $head = $prefix . $dynHead;
             // ── 动态尾（强 recency）──
             $tail = implode('', array_filter([
                 $this->buildDegradedHintSection(),
                 $this->fourSegmentRhythm() . "\n\n",
                 $this->buildRhythmSection(),
+                $this->buildUserOpeningSection(),       // 审计修复 R8-3：开篇类型注入
+                $this->buildGoldenThreeSection(),       // 审计功能（2026-08-16 P3-黄金三章）：第1-3章里程碑指令
                 $this->buildUserHookSection(),
                 $this->buildEndingSection(),
                 $this->buildUserRulesSection(),         // 字数/主角名锚定（保留在尾部吃 recency）
@@ -632,6 +692,7 @@ EOT;
                 $this->buildAuthorProfileSection(),
                 $this->buildReaderProfileSection(),
                 $this->buildCharacterSection(),
+                $this->buildGoldenFingerSection(),       // 审计功能（2026-08-16 P3-金手指）：档位/代价/限制约束
                 $this->buildReturningCharacterSection(),
                 $this->buildLocationSection(),
                 $this->buildPrevHookSection(),          // v41: 上章钩子待回收
@@ -646,35 +707,39 @@ EOT;
                 $this->buildPreWriteChecklist(),
                 $this->buildSynopsisSection(),
             ]));
-            $middle = implode('', array_filter([
-                $this->buildNovelInfo(),
-                $this->buildArcChapterSection(),
-                $this->buildStoryOutlineSection(),
+            $middleMust = implode('', array_filter([
+                $this->buildProgressSection(),
+                $this->buildEndingContextSection(),
                 $this->buildPrevSection(),
                 $this->buildRecentChapterSection(),
-                $this->buildFullContextSection(),       // 显式 1M 能力：完整历史正文/大纲/状态
-                $this->buildMomentumSection(),
-                $this->buildStyleExemplarSection(),     // v41: 文风范本
-                $this->buildUserDensitySection(),
-                $this->buildPOVSection(),
-                $this->buildCognitiveLoadSection(),
                 $this->buildEmotionStateSection(),
                 $this->buildEventsSection(),
                 $this->buildSemanticSection(),
                 $this->buildKBContextSection(),
+                $this->buildVolumeGoalSection(),
+            ]));
+            $middleNice = implode('', array_filter([
+                $this->buildNovelInfo(),
+                $this->buildArcChapterSection(),
+                $this->buildStoryOutlineSection(),
+                $this->buildFullContextSection(),
+                $this->buildMomentumSection(),
+                $this->buildStyleExemplarSection(),
+                $this->buildPOVSection(),
+                $this->buildCognitiveLoadSection(),
                 $this->buildCatchphraseSection(),
                 $this->buildHookHistorySection(),
                 $this->buildCoolPointHistorySection(),
                 $this->buildRecurringMotifsSection(),
                 $this->buildTropesSection(),
-                $this->buildVolumeGoalSection(),
-                $this->buildProgressSection(),
-                $this->buildEndingContextSection(),
             ]));
+            $middle = $middleMust . $middleNice;
             $tail = implode('', array_filter([
                 $this->buildDegradedHintSection(),
                 $this->fourSegmentRhythm() . "\n\n",
                 $this->buildRhythmSection(),
+                $this->buildUserOpeningSection(),       // 审计修复 R8-3：开篇类型注入
+                $this->buildGoldenThreeSection(),       // 审计功能（2026-08-16 P3-黄金三章）：第1-3章里程碑指令
                 $this->buildUserHookSection(),
                 $this->buildEndingSection(),
                 $this->buildUserRulesSection(),
@@ -685,6 +750,12 @@ EOT;
         // tailPart = 尾部强约束 + Agent 指令 + 启动指令，必须完整保留（U 型注意力尾权重最高）
         $tailPart = $tail . $this->buildAgentSection() . "\n请开始写作：\n";
 
+        // 审计修复 P1（2026-09-27）：为 head 兜底截断保留静态前缀/动态头引用。
+        // 旧布局（ws_cache_prompt_layout=0）head 为混合排列、无干净的静态段边界，
+        // 不做 head 兜底（保持照发+日志），生产默认的缓存布局才有 prefix/dynHead。
+        $headPrefix = $prefix ?? '';
+        $headDyn = $dynHead ?? '';
+
         $isFullContext = (($this->memoryCtx['debug']['mode'] ?? '') === 'full_1m');
         if ($isFullContext) {
             $memoryBudget = (int)($this->memoryCtx['debug']['prompt_char_budget'] ?? 700000);
@@ -693,44 +764,31 @@ EOT;
         } else {
             $maxPromptLen = max(8000, (int)getSystemSetting('ws_max_prompt_len', 40000, 'int'));
         }
-        // 超长时只裁剪"中部"（弱注意区），永不动 head 与 tailPart，
-        // 确保大纲、节奏/钩子/铁律、"请开始写作" 不被切掉。
+        // 超长时只裁剪中部，永不动 head 与 tailPart。
+        // 连续性（近章/语义召回/事件/卷目标）优先于 tropes/进度等可选参考。
         $fixedLen = mb_strlen($head) + mb_strlen($tailPart);
+        $middleBudget = max(0, $maxPromptLen - $fixedLen);
         if ($fixedLen + mb_strlen($middle) > $maxPromptLen) {
-            $middleBudget = max(0, $maxPromptLen - $fixedLen);
-            $origMiddleLen = mb_strlen($middle);
-            if ($origMiddleLen > $middleBudget) {
-                $marker = "\n【上下文过长，已省略部分参考信息】\n";
-                // 预留闭合标签空间，保证尾部强指令不会因截断而落进
-                // historical_* 数据区块内部。
-                $envelopeReserve = 256;
-                $keep = max(0, $middleBudget - mb_strlen($marker) - $envelopeReserve);
-
-                // W-20 修复：按双换行段落边界切，避免撕碎章节标题/JSON 块/中文词。
-                // 顺序拼接段落直到超出 budget，丢弃最后未完整段。
-                if ($keep > 0) {
-                    $sections = preg_split('/(\n\n+)/u', $middle, -1, PREG_SPLIT_DELIM_CAPTURE);
-                    $assembled = '';
-                    $assembledLen = 0;
-                    foreach ($sections as $section) {
-                        $secLen = mb_strlen($section);
-                        if ($assembledLen + $secLen > $keep) break;
-                        $assembled .= $section;
-                        $assembledLen += $secLen;
-                    }
-                    // 退化保护：若按段落切出来一无所获（中部全是单段），回退到字符截断
-                    $truncatedMiddle = $assembled !== '' ? $assembled : mb_substr($middle, 0, $keep);
-                    $middle = self::closeHistoricalEnvelopes($truncatedMiddle) . $marker;
+            $middleMust = $middleMust ?? '';
+            $middleNice = $middleNice ?? '';
+            $middle = $this->fitMiddleToBudget($middleMust, $middleNice, $middleBudget);
+            if ($fixedLen > $maxPromptLen) {
+                // 审计修复 P1（2026-09-27）：head+tail 超预算必须兜底截断，原实现
+                // 仅记日志后照发——buildBibleSection 上限 20000 字，叠加 dynHead 后
+                // 可击穿 maxPromptLen，小上下文模型直接请求失败（400）。tailPart
+                // （启动指令/铁律/字数锚定）永不动；仅对 head 的静态参考前缀按
+                // 段落边界从尾部丢弃（POV/文风范本/意象/语音规则先丢，圣经/
+                // 故事线/小说信息锚点最后），本章关键段（大纲/人物/上章结尾）
+                // 所在的 dynHead 原样保留。
+                if ($headPrefix !== '' || $headDyn !== '') {
+                    $headBudget = max(0, $maxPromptLen - mb_strlen($tailPart));
+                    $head = $this->fitHeadToBudget($headPrefix, $headDyn, $headBudget);
+                    addLog((int)$this->novel['id'], 'warn', "prompt 过长：head 静态参考已按段落边界兜底截断至 {$headBudget} 字（原 {$fixedLen} 字），中部已全部省略，请精简上下文配置");
                 } else {
-                    $middle = '';
-                }
-
-                if ($fixedLen > $maxPromptLen) {
                     addLog((int)$this->novel['id'], 'warn', "prompt 过长：head+尾部强约束已达 {$fixedLen} 字（超 {$maxPromptLen}），中部已全部省略，请精简上下文配置");
-                } else {
-                    $cut = $origMiddleLen - mb_strlen($middle);
-                    addLog((int)$this->novel['id'], 'warn', "prompt 过长：中部已按段落边界裁剪 {$cut} 字（head/大纲/尾部指令完整保留）");
                 }
+            } else {
+                addLog((int)$this->novel['id'], 'warn', "prompt 过长：中部已按优先级裁剪（近章/语义召回优先保留）");
             }
         } elseif ($fixedLen + mb_strlen($middle) > 15000) {
             addLog((int)$this->novel['id'], 'warn', "prompt 偏长：" . ($fixedLen + mb_strlen($middle)) . " 字，建议检查上下文配置");
@@ -739,6 +797,97 @@ EOT;
         $userPrompt = $head . $middle . $tailPart;
 
         return $userPrompt;
+    }
+
+    /**
+     * head+tail 超预算时的兜底截断（审计修复 P1，2026-09-27）。
+     *
+     * 静态前缀按双换行段落边界从尾部丢弃：prefix 尾段恰好是 POV/文风范本/
+     * 重复意象/语音规则等小约束（裁剪代价最低），前段是小说信息/三幕结构/
+     * 圣经（锚点与知识主干，最后才轮到）。dynHead（本章大纲/人物/上章结尾
+     * 原文）与 tailPart 一样属于不可裁剪的连续性命脉，预算优先保它。
+     */
+    private function fitHeadToBudget(string $prefix, string $dynHead, int $budget): string
+    {
+        if ($budget <= 0) {
+            return $dynHead;
+        }
+        $dynLen = mb_strlen($dynHead);
+        $prefixBudget = $budget - $dynLen;
+        if ($prefixBudget <= 0) {
+            // 极端：本章关键段自身超预算。仍返回 dynHead——本章连续性优先
+            // 于静态参考；若仍超长，由上层模型 fallback 的上下文容量检查
+            // （streamWrite 的 safeInputLimit）给出明确诊断。
+            return $dynHead;
+        }
+        if (mb_strlen($prefix) <= $prefixBudget) {
+            return $prefix . $dynHead;
+        }
+        $marker = "\n【上下文过长，已省略部分背景参考】\n";
+        $keep = max(0, $prefixBudget - mb_strlen($marker));
+        if ($keep <= 0) {
+            return $marker . $dynHead;
+        }
+        $sections = preg_split('/(\n\n+)/u', $prefix, -1, PREG_SPLIT_DELIM_CAPTURE);
+        $assembled = '';
+        $assembledLen = 0;
+        foreach ($sections as $section) {
+            $secLen = mb_strlen($section);
+            if ($assembledLen + $secLen > $keep) break;
+            $assembled .= $section;
+            $assembledLen += $secLen;
+        }
+        $kept = $assembled !== '' ? $assembled : mb_substr($prefix, 0, $keep);
+        return $kept . $marker . $dynHead;
+    }
+
+    /**
+     * 超长中部按优先级裁剪：先丢可选参考，尽量保住近章正文与语义召回。
+     */
+    private function fitMiddleToBudget(string $must, string $nice, int $budget): string
+    {
+        if ($budget <= 0) {
+            return '';
+        }
+        $combined = $must . $nice;
+        if (mb_strlen($combined) <= $budget) {
+            return $combined;
+        }
+        $mustLen = mb_strlen($must);
+        if ($mustLen <= $budget) {
+            return $must . $this->truncatePromptSection($nice, $budget - $mustLen);
+        }
+        return $this->truncatePromptSection($must, $budget);
+    }
+
+    /**
+     * 按双换行段落边界截断，并闭合 historical_* 标签。
+     */
+    private function truncatePromptSection(string $text, int $budget): string
+    {
+        if ($budget <= 0 || $text === '') {
+            return '';
+        }
+        if (mb_strlen($text) <= $budget) {
+            return $text;
+        }
+        $marker = "\n【上下文过长，已省略部分参考信息】\n";
+        $envelopeReserve = 256;
+        $keep = max(0, $budget - mb_strlen($marker) - $envelopeReserve);
+        if ($keep <= 0) {
+            return '';
+        }
+        $sections = preg_split('/(\n\n+)/u', $text, -1, PREG_SPLIT_DELIM_CAPTURE);
+        $assembled = '';
+        $assembledLen = 0;
+        foreach ($sections as $section) {
+            $secLen = mb_strlen($section);
+            if ($assembledLen + $secLen > $keep) break;
+            $assembled .= $section;
+            $assembledLen += $secLen;
+        }
+        $truncated = $assembled !== '' ? $assembled : mb_substr($text, 0, $keep);
+        return self::closeHistoricalEnvelopes($truncated) . $marker;
     }
 
     // ── Memory 上下文段落 ────────────────────────────────────────
@@ -913,18 +1062,48 @@ EOT;
 
     private function buildArcChapterSection(): string
     {
+        // 审计功能（2026-08-16 P3-卷级摘要）：两级拼接——远期走卷级骨架
+        // （memoryCtx['L2_volume_summaries']，MemoryEngine Q3v 已按弧段窗口
+        // 起点去重），近期保持最近 5 段弧段照旧；顺手修复弧段 100 字截断
+        // （段目标 180-220 字，截 100 丢后半故事线，240 兜底防超长）。
+        // 卷级每行 240 字兜底：卷数覆盖优先于单卷全文（行宽受控换行数覆盖）。
         $arcSums = $this->memoryCtx['L2_arc_summaries'] ?? $this->memoryCtx['arc_summaries'] ?? [];
-        if (empty($arcSums)) return '';
+        $vols    = $this->memoryCtx['L2_volume_summaries'] ?? [];
+
         $lines = [];
         foreach ($arcSums as $arc) {
             if ((int)$arc['chapter_to'] < $this->chNum) {
-                $sum = safe_substr(trim((string)($arc['summary'] ?? '')), 0, 100);
+                $sum = safe_substr(trim((string)($arc['summary'] ?? '')), 0, 240);
                 $lines[] = "【第{$arc['chapter_from']}-{$arc['chapter_to']}章故事线】{$sum}";
             }
         }
-        if (!$lines) return '';
-        $lines = array_slice($lines, -5); // 审计优化：中部弱段只留最近5弧
-        return "【全书故事线回顾（必须与此保持一致，不得产生矛盾）】\n" . implode("\n\n", $lines) . "\n\n";
+        if ($lines) {
+            $lines = array_slice($lines, -5); // 审计优化：中部弱段只留最近5弧
+        }
+
+        $volLines = [];
+        foreach ($vols as $v) {
+            if (!is_array($v)) continue;
+            $n = (int)($v['volume_number'] ?? 0);
+            $f = (int)($v['chapter_from'] ?? 0);
+            $t = (int)($v['chapter_to'] ?? 0);
+            if ($n < 1 || $f < 1 || $t < $f || $t >= $this->chNum) continue;
+            $text = safe_substr(trim((string)($v['summary'] ?? '')), 0, 240);
+            if ($text === '') continue;
+            $volLines[] = "第{$n}卷（第{$f}-{$t}章）：{$text}";
+        }
+
+        if (!$lines && !$volLines) return '';
+
+        $parts = [];
+        if ($volLines) {
+            $parts[] = "〔远期·卷级〕\n" . implode("\n", $volLines);
+        }
+        if ($lines) {
+            $parts[] = "〔近期·弧段〕\n" . implode("\n\n", $lines);
+        }
+        return "【全书故事线回顾（必须与此保持一致，不得产生矛盾）】\n"
+             . implode("\n", $parts) . "\n\n";
     }
 
     private function buildPrevSection(): string
@@ -945,6 +1124,14 @@ EOT;
         $recents = $this->memoryCtx['L3_recent_chapters'] ?? [];
         if (empty($recents)) return '';
 
+        $recents = array_values(array_filter($recents, fn($row) =>
+            (int)($row['chapter_number'] ?? $row['chapter'] ?? 0) < $this->chNum
+        ));
+        usort($recents, static fn($a, $b) =>
+            (int)($a['chapter_number'] ?? $a['chapter'] ?? 0) <=> (int)($b['chapter_number'] ?? $b['chapter'] ?? 0)
+        );
+        $recents = array_slice($recents, -3);
+
         // 审计优化（2026-07-24）：中部弱段压到近3章，避免与强注意区大纲/钩子重复占 token
         $lines = [];
         $count = 0;
@@ -955,7 +1142,18 @@ EOT;
             $t  = $rc['title'] ?? '';
             $o  = safe_substr(trim($rc['outline'] ?? ''), 0, 80);
             $h  = !empty($rc['hook']) ? "  →钩子：{$rc['hook']}" : '';
-            $lines[] = "第{$rn}章《{$t}》：{$o}{$h}";
+            // 审计修复（2026-08-09 R8-3）：近章带开篇类型，辅助防重复
+            $op = trim((string)($rc['actual_opening_type'] ?? $rc['opening_type'] ?? ''));
+            $opHint = '';
+            if ($op !== '') {
+                try {
+                    require_once __DIR__ . '/prompt.php';
+                    if (isset(OPENING_TYPES[$op])) {
+                        $opHint = '  开篇：' . OPENING_TYPES[$op]['name'];
+                    }
+                } catch (\Throwable) { /* ignore */ }
+            }
+            $lines[] = "第{$rn}章《{$t}》：{$o}{$h}{$opHint}";
             $count++;
             if ($count >= 3) break;
         }
@@ -969,6 +1167,24 @@ EOT;
         return $this->previousTail
             ? "【前文衔接（上一章结尾原文，请自然衔接，不要重复这段文字）】\n……{$this->previousTail}\n\n"
             : '';
+    }
+
+    /**
+     * 金手指约束段（审计功能 2026-08-16 P3-金手指设计模板）：
+     * 章节感知四态（铺垫期/获得章/当前档位+下一档预告/超界回退）+ 代价/限制恒定段。
+     * 无设定或关闭返回空串；与 buildCharacterSection 的境界锚定相邻——
+     * 设定类强约束集中在动态头（章号相关，不进缓存前缀）。
+     */
+    private function buildGoldenFingerSection(): string
+    {
+        try {
+            require_once __DIR__ . '/GoldenFinger.php';
+            $s = (new GoldenFinger((int)($this->novel['id'] ?? 0)))->buildConstraint($this->chNum);
+            return $s === '' ? '' : $s . "\n";
+        } catch (\Throwable $e) {
+            error_log('buildGoldenFingerSection failed: ' . $e->getMessage());
+            return '';
+        }
     }
 
     private function buildCharacterSection(): string
@@ -1063,10 +1279,16 @@ EOT;
 
         // 已死亡/离场角色黑名单 — 防止 AI 在后期章节复活已死角色
         // MemoryEngine 仅查 alive=1，此处单独查询死亡角色
+        // 审计修复 P1-2（2026-08-08）：补章节边界。乱序补写历史章时，
+        // 在未来章节才死亡的角色对本章而言仍然存活，绝不能列入黑名单；
+        // last_updated_chapter 记录角色状态最后变更章（死亡即一次变更）。
         try {
             $deadCards = \DB::fetchAll(
-                'SELECT name FROM character_cards WHERE novel_id=? AND alive=0 ORDER BY name ASC',
-                [(int)$this->novel['id']]
+                'SELECT name FROM character_cards
+                 WHERE novel_id=? AND alive=0
+                   AND (last_updated_chapter IS NULL OR last_updated_chapter < ?)
+                 ORDER BY name ASC',
+                [(int)$this->novel['id'], $this->chNum]
             );
             if ($deadCards) {
                 $deadNames = array_column($deadCards, 'name');
@@ -1351,7 +1573,9 @@ EOT;
     {
         $hooks = $this->memoryCtx['recent_hook_types'] ?? [];
         if (empty($hooks)) return '';
-        $hooks = array_slice($hooks, 0, 6);
+        // 审计修复（2026-08-09 R7-2）：memory 存升序（旧→新），原 slice(0,6) 取的是最旧；
+        // 与爽点史 slice(-N) 对齐，取最近 6 条。
+        $hooks = array_slice($hooks, -6);
         $lines = array_map(fn($h) => "第{$h['chapter']}章：{$h['hook_type']}", $hooks);
         return "【近章钩子类型记录（避免连续重复）】\n" . implode("\n", $lines) . "\n\n";
     }
@@ -1517,16 +1741,17 @@ EOT;
     private function buildVolumeGoalSection(): string
     {
         try {
-            $vol = DB::fetch(
-                'SELECT volume_goals, must_resolve_foreshadowing, volume_number, title
-                 FROM volume_outlines WHERE novel_id=? AND start_chapter<=? AND end_chapter>=? LIMIT 1',
-                [(int)$this->novel['id'], $this->chNum, $this->chNum]
-            );
+            if (!function_exists('fetchVolumeOutlinesOverlapping')) {
+                require_once __DIR__ . '/memory.php';
+            }
+            $rows = fetchVolumeOutlinesOverlapping((int)$this->novel['id'], $this->chNum, $this->chNum);
+            $vol = $rows[0] ?? null;
             if (!$vol) return '';
             $goals  = json_decode($vol['volume_goals'] ?? '[]', true) ?: [];
             $musts  = json_decode($vol['must_resolve_foreshadowing'] ?? '[]', true) ?: [];
+            $volNo  = (int)($vol['volume_number'] ?? $vol['volume_index'] ?? 0);
             $s = '';
-            if ($goals)  $s .= "【第{$vol['volume_number']}卷《{$vol['title']}》写作目标（本章需推进）】\n" . implode("\n", array_map(fn($g) => "· {$g}", $goals)) . "\n\n";
+            if ($goals)  $s .= "【第{$volNo}卷《{$vol['title']}》写作目标（本章需推进）】\n" . implode("\n", array_map(fn($g) => "· {$g}", $goals)) . "\n\n";
             if ($musts)  $s .= "【本卷必须回收的伏笔（若本章是回收时机，请自然融入情节）】\n" . implode("\n", array_map(fn($f) => "· {$f}", $musts)) . "\n\n";
             return $s;
         } catch (\Throwable) { return ''; }
@@ -1562,22 +1787,14 @@ EOT;
         try {
             require_once __DIR__ . '/rhythm_adjuster.php';
             $adj = new RhythmAdjuster((int)$this->novel['id']);
-            $history = [];
-            $rcs = DB::fetchAll(
-                'SELECT chapter_number, cool_point_type, actual_cool_point_types FROM chapters WHERE novel_id=? AND chapter_number<? AND (cool_point_type IS NOT NULL OR actual_cool_point_types IS NOT NULL) ORDER BY chapter_number DESC LIMIT 20',
-                [(int)$this->novel['id'], $this->chNum]
-            );
-            foreach ($rcs as $rc) {
-                $actual = json_decode($rc['actual_cool_point_types'] ?? '[]', true);
-                if (!empty($actual) && is_array($actual)) {
-                    foreach ($actual as $t) {
-                        if (is_string($t) && !empty($t)) $history[] = ['chapter'=>(int)$rc['chapter_number'],'type'=>$t];
-                    }
-                } elseif (!empty($rc['cool_point_type'])) {
-                    $history[] = ['chapter'=>(int)$rc['chapter_number'],'type'=>$rc['cool_point_type']];
-                }
+            // 审计修复（2026-08-16 P2，C-1）：与 fourSegmentRhythm 共用同一份
+            // computeRhythmContext() 结果（含按章节类型微调后的 segment_ratios），
+            // 消除两段相邻注入矛盾比例的回归。单一来源失败时按原路径现算。
+            $rhythm = $this->computeRhythmContext();
+            if ($rhythm === null) {
+                $rhythm = $adj->calculateRhythm($this->chNum, $this->buildCoolPointHistory());
             }
-            return $adj->generateRhythmInstructions($adj->calculateRhythm($this->chNum, $history));
+            return $adj->generateRhythmInstructions($rhythm);
         } catch (\Throwable) { return ''; }
     }
 
@@ -1614,6 +1831,10 @@ EOT;
             if (!empty($sd['auditory']))   $parts[] = "听觉-{$sd['auditory']}";
             if (!empty($sd['atmosphere'])) $parts[] = "氛围-{$sd['atmosphere']}";
             $s .= "感官细节：" . implode(' ', $parts) . "\n\n";
+        }
+        // 审计修复（2026-08-09 R2）：终章不注入"结尾悬念"，避免与终章收束指令矛盾
+        if ($this->isFinalChapter()) {
+            return $s . "节奏：{$syn['pacing']}\n\n";
         }
         return $s . "节奏：{$syn['pacing']}  |  结尾悬念：{$syn['cliffhanger']}\n\n";
     }
@@ -1672,7 +1893,10 @@ EOT;
                         $details = [];
                         foreach ($density as $cat => $freq) {
                             if (is_array($freq)) $freq = array_sum($freq);
-                            if ((float)$freq > 0) $details[] = "{$cat}={$freq}次/万字";
+                            // 审计修复（2026-08-02 M2-3）：存储值口径为「次/万字」，与上方
+                            // 情绪锚点的「次/千字」相差 10 倍。直接展示会让 AI 把 10-30 误读为
+                            // 远高于锚点 1-3 的频率而写错密度，统一 ÷10 转「次/千字」。
+                            if ((float)$freq > 0) $details[] = "{$cat}=" . round((float)$freq / 10, 1) . "次/千字";
                         }
                         if ($details) $emoDetailLines[] = "第{$cn}章：" . implode('，', $details);
                     }
@@ -1687,10 +1911,8 @@ EOT;
                 }
             }
             if ($emoLowCount >= 2) {
-                $lines[] = "· 【情绪密度】近 {$emoLowCount} 章偏低，本章必须加大情绪词使用频率";
-                if ($emoDetailLines) {
-                    $lines[] = "  上章情绪词频：" . implode('；', $emoDetailLines);
-                }
+                // 审计修复（2026-08-09 R8 / R11-7）：禁止词频回灌——与 Show-don't-tell 矛盾
+                $lines[] = "· 【情绪密度】近 {$emoLowCount} 章偏低，本章增加可见情绪反应（微表情/肢体/生理），禁止直述情绪词";
             }
 
             $wordTarget = (int)($this->novel['chapter_words'] ?? 0);
@@ -1701,7 +1923,7 @@ EOT;
                 foreach ($recent as $rc) {
                     $actual = (int)($rc['words'] ?? 0);
                     if ($actual <= 0) continue;
-                    $tol = calculateDynamicTolerance($wordTarget);
+                    $tol = calculateDynamicTolerance($wordTarget, (int)($this->novel['id'] ?? 0) ?: null);
                     if ($actual > $tol['max']) $wordOvers++;
                     elseif ($actual < $tol['min']) $wordUnders++;
                     $wordTrend[] = "第{$rc['chapter_number']}章{$actual}字";
@@ -1758,7 +1980,7 @@ EOT;
                     $s .= "关键情节点：" . implode('；', array_slice($keyPoints, 0, 3)) . "\n";
                 }
 
-                return $s . "\n";
+                return $this->appendOutlineMeta($s) . "\n";
             }
 
             // 无 Synopsis 时，完整展示大纲
@@ -1772,29 +1994,37 @@ EOT;
                 }
             }
 
-            $hook = trim($this->chapter['hook'] ?? '');
-            if ($hook !== '') {
-                $s .= "章末钩子：{$hook}\n";
-            }
-
-            $pacing = trim($this->chapter['pacing'] ?? '');
-            if ($pacing !== '') {
-                $pacingLabel = ['快' => '快节奏——动作密集、冲突紧凑', '中' => '中等节奏——推进与过渡平衡', '慢' => '慢节奏——铺垫、描写、情感深化'];
-                $s .= "节奏要求：" . ($pacingLabel[$pacing] ?? $pacing) . "\n";
-            }
-
-            $suspense = trim($this->chapter['suspense'] ?? '');
-            if ($suspense === '有') {
-                $s .= "悬念标记：本章必须有悬念\n";
-            }
-
-            $coolType = trim($this->chapter['cool_point_type'] ?? '');
-            if ($coolType !== '' && isset(COOL_POINT_TYPES[$coolType])) {
-                $s .= "爽点类型：" . COOL_POINT_TYPES[$coolType]['name'] . "\n";
-            }
-
-            return $s . "\n";
+            return $this->appendOutlineMeta($s) . "\n";
         } catch (\Throwable) { return ''; }
+    }
+
+    /**
+     * 大纲元数据：爽点/节奏/悬念/钩子。有 synopsis 时也必须注入。
+     */
+    private function appendOutlineMeta(string $s): string
+    {
+        $hook = trim($this->chapter['hook'] ?? '');
+        if ($hook !== '' && !$this->isFinalChapter()) {
+            $s .= "章末钩子：{$hook}\n";
+        }
+
+        $pacing = trim($this->chapter['pacing'] ?? '');
+        if ($pacing !== '') {
+            $pacingLabel = ['快' => '快节奏——动作密集、冲突紧凑', '中' => '中等节奏——推进与过渡平衡', '慢' => '慢节奏——铺垫、描写、情感深化'];
+            $s .= "节奏要求：" . ($pacingLabel[$pacing] ?? $pacing) . "\n";
+        }
+
+        $suspense = trim($this->chapter['suspense'] ?? '');
+        if ($suspense === '有' && !$this->isFinalChapter()) {
+            $s .= "悬念标记：本章必须有悬念\n";
+        }
+
+        $coolType = trim($this->chapter['cool_point_type'] ?? '');
+        if ($coolType !== '' && isset(COOL_POINT_TYPES[$coolType])) {
+            $s .= "爽点类型：" . COOL_POINT_TYPES[$coolType]['name'] . "\n";
+        }
+
+        return $s;
     }
 
     /**
@@ -1824,10 +2054,15 @@ EOT;
         }
 
         // 从章节数据读取已有钩子类型，防止重复
-        $hookType = trim($this->chapter['hook_type'] ?? '');
-        $hookHint = $hookType
-            ? "本章指定钩子类型为「{$hookType}」，章末 3 段必须兑现"
-            : "章末必须制造悬念/反转/信息爆炸，让读者无法放下";
+        // 审计修复（2026-08-09 R2）：终章豁免钩子要求，与 hookGuidance 对齐
+        if ($this->isFinalChapter()) {
+            $hookHint = "本章是全书最终章：以圆满收束/余韵落幕，不设新悬念钩子";
+        } else {
+            $hookType = trim($this->chapter['hook_type'] ?? '');
+            $hookHint = $hookType
+                ? "本章指定钩子类型为「{$hookType}」，章末 3 段必须兑现"
+                : "章末必须制造悬念/反转/信息爆炸，让读者无法放下";
+        }
 
         // 收尾期检测（后 15% 章节）
         $targetChapters = (int)($this->novel['target_chapters'] ?? 0);
@@ -1856,11 +2091,26 @@ EOT;
 
     /**
      * 作者画像风格指导段
-     * 从 novels.ref_author / writing_style 提取，引导 AI 模仿指定作者风格
+     * 优先实时读取绑定的结构化画像；无绑定时回退 novels.ref_author / writing_style
      */
     private function buildAuthorProfileSection(): string
     {
         try {
+            $novelId = (int)($this->novel['id'] ?? 0);
+            if ($novelId > 0) {
+                require_once __DIR__ . '/author/ProfileIntegrator.php';
+                $integrator = ProfileIntegrator::getForNovel($novelId);
+                if ($integrator) {
+                    $live = trim($integrator->buildStyleSection());
+                    if ($live === '') {
+                        $live = trim($integrator->buildCompleteGuidance());
+                    }
+                    if ($live !== '') {
+                        return $live . "\n\n";
+                    }
+                }
+            }
+
             $refAuthor = trim($this->novel['ref_author'] ?? '');
             $style     = trim($this->novel['writing_style'] ?? '');
             if ($refAuthor === '' && $style === '') return '';
@@ -1919,17 +2169,56 @@ EOT;
         } catch (\Throwable) { return ''; }
     }
 
+    // 审计修复（2026-08-09 R13）：原 buildUserDensitySection 与 system 的 densityStandards
+    // 双份注入同一内容，已删除；密度指南单源自 system（getDensityGuidelines）。
+
     /**
-     * 描写密度段
-     * 委托给 prompt.php 的 getDensityGuidelines()
+     * 黄金三章写作指令（审计功能 2026-08-16 P3）：仅第1-3章注入。
+     * 引用本章落盘的 cool_point_type/hook 与 milestone 要求；规则与词表
+     * 单一来源 includes/GoldenThreeChapters.php。与 buildUserOpeningSection
+     * （黄金三行）引用不重述，第1章开篇方式承接由本段承载。
      */
-    private function buildUserDensitySection(): string
+    private function buildGoldenThreeSection(): string
+    {
+        try {
+            if ($this->chNum < 1 || $this->chNum > 3) return '';
+            require_once __DIR__ . '/GoldenThreeChapters.php';
+            if (!GoldenThreeChapters::enabled()) return '';
+            return GoldenThreeChapters::buildWritingDirective($this->chNum, $this->chapter, $this->novel) . "\n";
+        } catch (\Throwable $e) {
+            error_log('buildGoldenThreeSection failed: ' . $e->getMessage());
+            return '';
+        }
+    }
+
+    /**
+     * 开篇类型段（审计修复 2026-08-09 R8-3）
+     * 写作前注入推荐开篇五式，避免开篇同质化；对照近章 actual/opening 防重复。
+     */
+    private function buildUserOpeningSection(): string
     {
         try {
             require_once __DIR__ . '/prompt.php';
-            $guide = getDensityGuidelines($this->genre);
-            if (empty($guide)) return '';
-            return "【描写密度指南】\n{$guide}\n\n";
+            // 审计修复（2026-08-09 R9-4 / R10-2）：大纲已规划优先；默认轮换不注入硬推荐。
+            $outlineOpening = trim((string)($this->chapter['opening_type'] ?? ''));
+            if ($outlineOpening !== '' && isset(OPENING_TYPES[$outlineOpening])) {
+                $type = $outlineOpening;
+                $reason = '大纲已规划此开篇类型';
+            } else {
+                $suggestion = suggestOpeningType($this->chapter);
+                $type = $suggestion['type'] ?? '';
+                $reason = (string)($suggestion['reason'] ?? '');
+                if ($type === '' || strpos($reason, '默认轮换') !== false) {
+                    return "【开篇多样性】本章换一种开篇方式，前三行须含动作/感官/对话/异常/危机之一；禁止纯静态环境铺陈。\n\n";
+                }
+            }
+            if ($type === '' || !isset(OPENING_TYPES[$type])) return '';
+            $name = OPENING_TYPES[$type]['name'];
+            $desc = OPENING_TYPES[$type]['desc'];
+            $s = "【开篇五式】\n推荐开篇：{$name}（{$type}）——{$desc}";
+            if ($reason !== '') $s .= "\n推荐理由：{$reason}";
+            $s .= "\n禁止连续三章使用同一开篇类型；前三行须兑现该开篇意图，且服从黄金三行（动作/感官/对话/异常/危机）。";
+            return $s . "\n\n";
         } catch (\Throwable) { return ''; }
     }
 
@@ -1939,6 +2228,11 @@ EOT;
      */
     private function buildUserHookSection(): string
     {
+        // 审计修复（2026-08-02 M2-1）：最终章豁免钩子类型推荐。
+        // 四处（hookGuidance/结尾上下文/EndingEnforcer）都要求最终章"不设悬念钩子"，
+        // 但本段无 isFinalChapter 检查，会把 emotional_impact/sacrifice 等推荐注入，
+        // 与"最终章不设钩子"指令直接矛盾，导致 AI 行为随机漂移。
+        if ($this->isFinalChapter()) return '';
         try {
             require_once __DIR__ . '/prompt.php';
 
@@ -1950,20 +2244,12 @@ EOT;
             } else {
                 $suggestion = suggestHookType($this->chapter);
                 $type = $suggestion['type'] ?? '';
-                $reason = $suggestion['reason'] ?? '';
-                if (empty($type)) return '';
-                $typeNames = [
-                    'crisis_interrupt' => '危机中断型',
-                    'info_bomb'        => '信息爆炸型',
-                    'plot_twist'       => '情节反转型',
-                    'new_goal'         => '新目标型',
-                    'emotional_impact' => '情感冲击型',
-                    'upgrade_omen'     => '升级预兆型',
-                    'truth_reveal'     => '真相揭露型',
-                    'last_stand'       => '背水一战型',
-                    'sacrifice'        => '牺牲感动型',
-                ];
-                $typeName = $typeNames[$type] ?? HOOK_TYPES[$type]['name'] ?? $type;
+                $reason = (string)($suggestion['reason'] ?? '');
+                // 审计修复（2026-08-09 R10-2）：默认轮换不注入硬类型，仅软提醒留钩
+                if ($type === '' || strpos($reason, '默认轮换') !== false) {
+                    return "【章末钩子】本章须设置可追读的章末钩子（危机/反转/信息差/新目标之一），避免与近章同型机械轮换。\n\n";
+                }
+                $typeName = HOOK_TYPES[$type]['name'] ?? $type;
             }
 
             $s = "【章末钩子类型】\n推荐类型：{$typeName}（{$type}）";
@@ -1980,7 +2266,7 @@ EOT;
     {
         try {
             $targetWords = (int)$this->novel['chapter_words'];
-            $tol = calculateDynamicTolerance($targetWords);
+            $tol = calculateDynamicTolerance($targetWords, (int)($this->novel['id'] ?? 0) ?: null);
             $maxWords = $tol['max'];
             $minWords = $tol['min'];
             $protName = trim($this->novel['protagonist_name'] ?? '');
@@ -1998,6 +2284,13 @@ EOT;
             $lines[] = "5. 对话密度建议≥25句/千字；连续非对话叙述≤300字";
             if ($protName) {
                 $lines[] = "6. 主角名固定为「{$protName}」，不可更改";
+            }
+            // 审计修复（2026-08-09 R12）：pacing 情绪倍率从 system 移到此处（章级动态信息进 user）
+            $pacing = trim($this->chapter['pacing'] ?? '');
+            if ($pacing === '快') {
+                $lines[] = count($lines) . ". 本章快节奏：情绪锚点按基准约1.3倍加密，高潮段加倍";
+            } elseif ($pacing === '慢') {
+                $lines[] = count($lines) . ". 本章慢节奏：情绪锚点约0.7倍，以细腻描写和氛围为主";
             }
 
             return implode("\n", $lines) . "\n\n";
@@ -2027,20 +2320,13 @@ EOT;
             $actDiv = json_decode($storyOutline['act_division'] ?? '{}', true);
             if ($actDiv) {
                 $targetChapters = (int)($this->novel['target_chapters'] ?? 0);
-                $completedChapters = (int)(DB::fetch(
-                    'SELECT COUNT(*) as cnt FROM chapters WHERE novel_id=? AND status="completed"',
-                    [(int)$this->novel['id']]
-                )['cnt'] ?? 0);
-                $pct = $targetChapters > 0 ? $completedChapters / $targetChapters : 0;
+                $currentAct = NarrativePosition::currentAct($actDiv, $this->chNum, $targetChapters);
 
                 // 标注当前幕
                 foreach (['act1', 'act2', 'act3'] as $actKey) {
                     if (empty($actDiv[$actKey])) continue;
                     $a = $actDiv[$actKey];
-                    $isCurrent = false;
-                    if ($actKey === 'act1' && $pct <= 0.2) $isCurrent = true;
-                    elseif ($actKey === 'act2' && $pct > 0.2 && $pct <= 0.8) $isCurrent = true;
-                    elseif ($actKey === 'act3' && $pct > 0.8) $isCurrent = true;
+                    $isCurrent = $actKey === $currentAct;
 
                     $mark = $isCurrent ? ' ← 当前所在幕' : '';
                     $chapters = $a['chapters'] ?? '';
@@ -2068,7 +2354,7 @@ EOT;
         if (!getSystemSetting('ws_story_bible_enabled', true, 'bool')) return '';
         try {
             require_once __DIR__ . '/memory/StoryBible.php';
-            $bible = StoryBible::get((int)$this->novel['id']);
+            $bible = StoryBible::get((int)$this->novel['id'], $this->chNum);
         } catch (\Throwable $e) {
             return '';
         }
@@ -2176,19 +2462,19 @@ EOT;
 
 private function buildAgentSection(): string
     {
+        $this->injectedAgentDirectives = [];
         try {
             require_once __DIR__ . '/agents/AgentDirectives.php';
             $dirs = AgentDirectives::active((int)$this->novel['id'], $this->chNum);
             if (empty($dirs)) return '';
 
+            // 审计修复（2026-08-09 R7-5）：删除从未被生产端写入的死类型键
+            // （emotion_continuity/mainline/plot_pattern/cognitive_load）；
+            // 生产端实际只写 urgent/quality/strategy/optimization/global。
             $priority = [
                 'urgent' => 0,
                 'quality' => 1,
-                'emotion_continuity' => 1,
                 'strategy' => 2,
-                'mainline' => 2,
-                'plot_pattern' => 2,
-                'cognitive_load' => 2,
                 'optimization' => 3,
                 'global' => 5,
             ];
@@ -2228,9 +2514,12 @@ private function buildAgentSection(): string
                 $filtered = array_slice($filtered, 0, $maxDirectives);
             }
 
-            // v1.5.3: Token控制——单条指令最大200字，总指令最大800字
-            $maxDirectiveChars = 200;
-            $maxTotalChars = 800;
+            // v1.5.3: Token控制——单条指令最大400字，总指令最大1200字
+            // 审计修复（2026-08-16 批次一）：原单条 200 字会把生产端 critic 多弱项
+            // 合并指令（AgentCoordinator::runCriticStage 的 mb_substr($merged, 0, 400)）
+            // 的尾部弱项建议截掉；对齐到 400 字，总额相应放宽到 1200 字
+            $maxDirectiveChars = 400;
+            $maxTotalChars = 1200;
             $lines = [];
             $totalChars = 0;
 
@@ -2252,6 +2541,13 @@ private function buildAgentSection(): string
                 // 总长度控制
                 if ($totalChars + mb_strlen($line) > $maxTotalChars) break;
                 $lines[] = $line;
+                $this->injectedAgentDirectives[] = [
+                    'id' => (int)$d['id'],
+                    'type' => $d['type'],
+                    'version' => hash('sha256', $d['type'] . "\n" . $d['directive']),
+                    'directive' => $directive,
+                    'rendered' => $line,
+                ];
                 $totalChars += mb_strlen($line);
             }
 
@@ -2303,8 +2599,8 @@ private function buildAgentSection(): string
             $monitor = new CognitiveLoadMonitor((int)$this->novel['id']);
             $status = $monitor->getStatus($this->chNum);
 
-            // 只有在需要提醒时才注入
-            if ($status['recent_5_new_elements'] <= 8 && $status['trend'] !== 'increasing') {
+            // 审计修复（2026-08-09 R9-5）：阈值与 CognitiveLoadMonitor / Coordinator 统一为 12
+            if ($status['recent_5_new_elements'] <= 12 && $status['trend'] !== 'increasing') {
                 return '';
             }
 

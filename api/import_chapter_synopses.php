@@ -13,7 +13,7 @@ ini_set('log_errors', 1);
 ob_start();
 
 // 定义常量，允许直接访问
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/error_handler.php';
@@ -23,39 +23,11 @@ registerApiErrorHandlers();
 set_time_limit(CFG_TIME_MEDIUM);   // 5分钟超时
 ini_set('memory_limit', '512M');
 
-// 记录 PHP 配置和请求信息（用于调试）
-$logDir = defined('BASE_PATH') ? BASE_PATH . '/storage' : dirname(__DIR__) . '/storage';
-if (!is_dir($logDir)) {
-    @mkdir($logDir, 0755, true);
-}
-$logFile = $logDir . '/import_debug.log';
-$debugInfo = [
-    'time' => date('Y-m-d H:i:s'),
-    'type' => 'request_start',
-    'php_config' => [
-        'upload_max_filesize' => ini_get('upload_max_filesize'),
-        'post_max_size' => ini_get('post_max_size'),
-        'max_execution_time' => ini_get('max_execution_time'),
-        'memory_limit' => ini_get('memory_limit'),
-        'max_input_time' => ini_get('max_input_time'),
-        'file_uploads' => ini_get('file_uploads'),
-        'upload_tmp_dir' => ini_get('upload_tmp_dir'),
-    ],
-    'server' => [
-        'REQUEST_METHOD' => $_SERVER['REQUEST_METHOD'] ?? null,
-        'CONTENT_TYPE' => $_SERVER['CONTENT_TYPE'] ?? null,
-        'CONTENT_LENGTH' => $_SERVER['CONTENT_LENGTH'] ?? null,
-        'HTTP_X_REQUESTED_WITH' => $_SERVER['HTTP_X_REQUESTED_WITH'] ?? null,
-    ],
-    // 审计修复（2026-06-18）：仅记录非敏感字段，移除完整 $_POST / $_FILES 记录
-    // 避免调试日志泄露密码、token 等敏感信息
-    'novel_id' => $_POST['novel_id'] ?? null,
-    'import_mode' => $_POST['import_mode'] ?? null,
-    'file_name' => $_FILES['file']['name'] ?? null,
-    'file_size' => $_FILES['file']['size'] ?? null,
-    'file_error' => $_FILES['file']['error'] ?? null,
-];
-@file_put_contents($logFile, json_encode($debugInfo, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . PHP_EOL, FILE_APPEND);
+// 审计修复 M9（2026-08-16）：移除生产调试日志（storage/import_debug.log）。
+// 原实现在每次请求无条件追加含 php.ini 配置、文件名等信息的 JSON 日志，无开关、
+// 大部分路径无轮转，长期运行无限膨胀且泄露服务器环境信息。
+// 错误诊断统一走 error_log（PHP 错误日志自带轮转），本文件各错误路径均已保留
+// error_log 输出（含追踪号、异常类、堆栈），信息无损失。
 
 // 注册关闭函数，捕获致命错误
 register_shutdown_function(function () {
@@ -70,28 +42,8 @@ register_shutdown_function(function () {
             http_response_code(500);
             header('Content-Type: application/json; charset=utf-8');
         }
-        // 记录错误
-        error_log('import_chapter_synopses.php 致命错误: ' . $error['message'] . ' in ' . $error['file'] . ':' . $error['line']);
-        
-        // 写入调试日志到文件（审计修复 2026-06-18：移除 $_POST / $_FILES 完整记录）
-        $debugLog = [
-            'time' => date('Y-m-d H:i:s'),
-            'type' => 'shutdown_error',
-            'error' => $error['message'],
-            'file' => $error['file'],
-            'line' => $error['line'],
-            'novel_id' => $_POST['novel_id'] ?? null,
-            'file_name' => $_FILES['file']['name'] ?? null,
-            'file_size' => $_FILES['file']['size'] ?? null,
-            'file_error' => $_FILES['file']['error'] ?? null,
-        ];
-        $logDir = defined('BASE_PATH') ? BASE_PATH . '/storage' : dirname(__DIR__) . '/storage';
-        if (!is_dir($logDir)) {
-            @mkdir($logDir, 0755, true);
-        }
-        $logFile = $logDir . '/import_debug.log';
-        @file_put_contents($logFile, json_encode($debugLog, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . PHP_EOL, FILE_APPEND);
-        
+        // 记录错误（审计修复 M9：仅走 PHP 错误日志，不再写 import_debug.log）
+
         $rid = error_trace_id();
         error_log(sprintf('[%s] import_chapter_synopses shutdown: %s in %s:%d', $rid, $error['message'], $error['file'], $error['line']));
         echo json_encode([
@@ -106,6 +58,7 @@ require_once __DIR__ . '/../includes/auth.php';
 requireLoginApi();
 require_once __DIR__ . '/../includes/functions.php';
 require_once __DIR__ . '/../includes/db.php';
+require_once __DIR__ . '/../includes/ChapterSynopsisTextFormat.php';
 
 // 清空所有输出缓冲区
 while (ob_get_level() > 0) {
@@ -135,7 +88,7 @@ if (!$novelId) {
 }
 
 // 归属权校验
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 checkNovelOwnership($novelId, $userId);
 
 // 验证小说存在
@@ -160,27 +113,9 @@ $filePath = $file['tmp_name'];
 $fileName = $file['name'];
 $fileExt = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
 
-// 记录文件上传信息到日志
-$logDir = defined('BASE_PATH') ? BASE_PATH . '/storage' : dirname(__DIR__) . '/storage';
-if (!is_dir($logDir)) {
-    @mkdir($logDir, 0755, true);
-}
-$logFile = $logDir . '/import_debug.log';
-$logEntry = [
-    'time' => date('Y-m-d H:i:s'),
-    'type' => 'file_upload',
-    'novel_id' => $novelId,
-    'import_mode' => $importMode,
-    'file_name' => $fileName,
-    'file_ext' => $fileExt,
-    'file_size' => $file['size'],
-    'file_error' => $file['error'],
-    // 审计修复 M-08（2026-06-12）：日志中排除敏感字段（_token 等）
-    'post_keys' => array_keys(array_diff_key($_POST, ['_token' => ''])),
-];
-@file_put_contents($logFile, json_encode($logEntry, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . PHP_EOL, FILE_APPEND);
+// 审计修复 M9（2026-08-16）：移除 file_upload 调试日志写入（见文件头注释）
 
-// 根据文件扩展名解析
+// 根据文件类型解析
 try {
     // 记录请求参数，便于调试
     error_log('import_chapter_synopses.php 请求参数: novel_id=' . $novelId . ', import_mode=' . $importMode . ', file=' . $fileName . ', file_ext=' . $fileExt);
@@ -246,30 +181,10 @@ try {
     error_log(sprintf('[%s] import_chapter_synopses %s: %s in %s:%d',
         $rid, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine()));
     error_log('[' . $rid . '] 堆栈跟踪: ' . $e->getTraceAsString());
-    
-    // 写入调试日志到文件（审计修复 2026-06-18：移除 $_POST / $_FILES 完整记录 + 添加大小上限）
-    $debugLog = [
-        'time' => date('Y-m-d H:i:s'),
-        'error' => $e->getMessage(),
-        'file' => $e->getFile(),
-        'line' => $e->getLine(),
-        'novel_id' => $novelId ?? null,
-        'import_mode' => $importMode ?? null,
-        'file_name' => $_FILES['file']['name'] ?? null,
-        'file_size' => $_FILES['file']['size'] ?? null,
-        'file_error' => $_FILES['file']['error'] ?? null,
-    ];
-    $logDir = defined('BASE_PATH') ? BASE_PATH . '/storage' : dirname(__DIR__) . '/storage';
-    if (!is_dir($logDir)) {
-        @mkdir($logDir, 0755, true);
-    }
-    $logFile = $logDir . '/import_debug.log';
-    // 日志大小上限 1MB，超限则清空（防止无限增长）
-    if (is_file($logFile) && @filesize($logFile) > 1048576) {
-        @unlink($logFile);
-    }
-    @file_put_contents($logFile, json_encode($debugLog, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . PHP_EOL, FILE_APPEND);
-    
+
+    // 审计修复 M9（2026-08-16）：异常细节已完整写入 PHP 错误日志（上方两条 error_log），
+    // 不再冗余写 storage/import_debug.log（无轮转、泄露环境信息）。
+
     // 确保设置响应头
     if (!headers_sent()) {
         header('Content-Type: application/json; charset=utf-8');
@@ -424,60 +339,8 @@ function parseCsvFile(string $filePath): array {
  */
 function parseTxtFile(string $filePath): array {
     $content = file_get_contents($filePath);
-    $chapters = [];
-    
-    // 按章节分割（支持多种分隔符）
-    $lines = explode("\n", $content);
-    $currentChapter = null;
-    
-    foreach ($lines as $line) {
-        $line = trim($line);
-        
-        // 跳过空行和分隔线
-        if (empty($line) || strpos($line, '===') === 0 || strpos($line, '---') === 0) {
-            continue;
-        }
-        
-        // 检测章节标题
-        if (preg_match('/^【第(\d+)章】(.+)$/', $line, $matches)) {
-            // 保存上一章节
-            if ($currentChapter !== null) {
-                $chapters[] = $currentChapter;
-            }
-            
-            // 开始新章节
-            $currentChapter = [
-                'chapter_number' => intval($matches[1]),
-                'title' => trim($matches[2]),
-                'outline' => '',
-                'synopsis' => '',
-                'pacing' => '中',
-                'cliffhanger' => ''
-            ];
-        }
-        // 解析字段
-        elseif ($currentChapter !== null) {
-            if (strpos($line, '【大纲】') === 0) {
-                $currentChapter['outline'] = trim(substr($line, strlen('【大纲】')));
-            }
-            elseif (strpos($line, '【概要】') === 0) {
-                $currentChapter['synopsis'] = trim(substr($line, strlen('【概要】')));
-            }
-            elseif (strpos($line, '【节奏】') === 0) {
-                $currentChapter['pacing'] = trim(substr($line, strlen('【节奏】')));
-            }
-            elseif (strpos($line, '【悬念】') === 0) {
-                $currentChapter['cliffhanger'] = trim(substr($line, strlen('【悬念】')));
-            }
-        }
-    }
-    
-    // 保存最后一个章节
-    if ($currentChapter !== null) {
-        $chapters[] = $currentChapter;
-    }
-    
-    return $chapters;
+    if ($content === false) throw new RuntimeException('无法读取章节概要 TXT 文件');
+    return ChapterSynopsisTextFormat::decode($content);
 }
 
 /**

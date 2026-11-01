@@ -113,7 +113,9 @@ if (!StatsTracker::isEnabled()) {
         if ($error) {
             echo "cURL 错误: {$error}\n";
         }
-        echo "响应内容: {$response}\n";
+        // 审计修复 L2（2026-08-16）：外部服务器原始响应必须转义后再输出——
+        // 统计上报地址被篡改/劫持时，响应体可嵌入 </pre><script> 在本页上下文执行。
+        echo "响应内容: " . htmlspecialchars((string)$response, ENT_QUOTES, 'UTF-8') . "\n";
     }
 }
 
@@ -141,7 +143,8 @@ if ($serverUrl) {
     if ($error) {
         echo "cURL 错误: {$error}\n";
     }
-    echo "响应内容: " . mb_substr($response, 0, 500) . "\n";
+    // 审计修复 L2（2026-08-16）：同上，外部响应输出前转义
+    echo "响应内容: " . htmlspecialchars((string)mb_substr($response, 0, 500), ENT_QUOTES, 'UTF-8') . "\n";
 } else {
     echo "⚠️ STATS_SERVER_URL 未配置\n";
 }

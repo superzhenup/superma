@@ -9,7 +9,7 @@
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
@@ -34,7 +34,7 @@ $jsonInput = json_decode(file_get_contents('php://input'), true) ?? [];
 $action = $jsonInput['action'] ?? $_POST['action'] ?? '';
 
 function dramaGenUserId(): int {
-    return (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    return currentUserId();
 }
 
 /** 提交任务并尽量驱动执行；返回 {task_id(s), inline}。 */
@@ -141,7 +141,8 @@ try {
         // FFmpeg 拼接成片
         case 'compose_episode': {
             $episodeId = (int)($jsonInput['episode_id'] ?? 0);
-            [$episode] = DramaService::assertEpisodeAccess($episodeId, dramaGenUserId());
+            [$episode, $project] = DramaService::assertEpisodeAccess($episodeId, dramaGenUserId());
+            DramaComposer::compositionSnapshot($project, $episode);
             if (!DramaComposer::ffmpegAvailable()) throw new RuntimeException('服务器未检测到 FFmpeg，无法在线合成；请改用导出素材包');
             $result = dramaEnqueueAndDrive((int)$episode['project_id'], $episodeId, 'compose_episode', $episodeId, [], 2);
             echo json_encode(['ok' => true, 'msg' => '合成任务已提交', 'data' => $result], JSON_UNESCAPED_UNICODE);

@@ -9,7 +9,7 @@
  * POST JSON: { novel_id: 1, mode: "full"|"atoms_only" }
  * 返回 SSE 流式进度（方便前端显示进度）
  */
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
@@ -18,6 +18,7 @@ requireHttpMethod('POST');
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/embedding.php';
 require_once dirname(__DIR__) . '/includes/memory/MemoryEngine.php';
+require_once dirname(__DIR__) . '/includes/NovelProjectionFence.php';
 
 $input = json_decode(file_get_contents('php://input'), true) ?: [];
 $novelId = (int)($input['novel_id'] ?? $_POST['novel_id'] ?? 0);
@@ -29,7 +30,7 @@ if (!$novelId) {
     exit;
 }
 
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 checkNovelOwnership($novelId, $userId);
 
 if ($outputMode === 'json') {
@@ -64,11 +65,17 @@ if (!$cfg) {
     exit;
 }
 
+$txnActive = false;
+$projectionFence = null;
 try {
+    // Lock order: novel projection fence -> short cleanup transaction -> rows.
+    // Keep this fence for the complete rebuild so a newer Canon revision cannot
+    // race projection publication from the chapter snapshot below.
+    $projectionFence = NovelProjectionFence::acquire($novelId, 30);
+    try {
     $totalExtracted = 0;
     $totalAtoms = 0;
     $errors = [];
-    $txnActive = false;
 
     if ($mode === 'full') {
         // ====== 模式1：完整重建知识库 ======
@@ -176,6 +183,25 @@ try {
             'errors' => $errors,
             'message' => "完成！知识库向量={$embCount}，记忆原子向量={$atomVecCount}" . ($errors ? '（有部分错误）' : ''),
         ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+    }
+    } finally {
+        // A transaction must never outlive the named lock protecting its rows.
+        if ($txnActive) {
+            try {
+                DB::rollBack();
+            } catch (Throwable $rollbackError) {
+                error_log('rebuild_embeddings rollback before fence release failed: ' . $rollbackError->getMessage());
+            }
+            $txnActive = false;
+        }
+        if ($projectionFence !== null) {
+            try {
+                NovelProjectionFence::release($projectionFence);
+            } catch (Throwable $releaseError) {
+                error_log('rebuild_embeddings projection fence release failed: ' . $releaseError->getMessage());
+            }
+            $projectionFence = null;
+        }
     }
 } catch (Throwable $e) {
     // 审计修复 PERF-H4：若重建中途崩溃且回滚事务，恢复旧向量数据

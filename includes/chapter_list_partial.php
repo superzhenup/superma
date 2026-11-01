@@ -14,6 +14,55 @@ $totalChapterCount = (int)($totalChapterCount ?? 0);
 $chapters = is_array($chapters ?? null) ? $chapters : [];
 $synopsisMap = is_array($synopsisMap ?? null) ? $synopsisMap : [];
 $chapterTargetWords = (int)($novel['chapter_words'] ?? 0);
+// 审计修复（2026-08-17 写作逻辑 B0）：质检失败章原因摘要（chapter_id => 原因），
+// 由 novel.php / api/chapter_list.php 批量查询后传入；未传时退化为空（仅显示状态徽章）。
+$hardFailMap = is_array($hardFailMap ?? null) ? $hardFailMap : [];
+$candidateReviewMap = [];
+$branchWorkbenchEnabled = false;
+try {
+    require_once __DIR__ . '/harness/candidates/CandidateUiPolicy.php';
+    if (CandidateUiPolicy::enabledForNovel((int)$id)) {
+        $branchWorkbenchEnabled = true;
+        $visibleChapterIds = array_values(array_filter(array_map(
+            static fn(array $chapter): int => (int)($chapter['id'] ?? 0),
+            $chapters
+        )));
+        if ($visibleChapterIds !== []) {
+            $candidatePlaceholders = implode(',', array_fill(0, count($visibleChapterIds), '?'));
+            $candidateRows = DB::fetchAll(
+                "SELECT cc.chapter_id, COUNT(*) AS total,
+                        SUM(cc.lifecycle='quarantined') AS quarantined_total,
+                        SUM(cc.lifecycle='approved') AS approved_total,
+                        SUM(cc.source='branch_merge' AND cc.lifecycle='draft') AS merge_total
+                 FROM chapter_candidates cc
+                 WHERE cc.novel_id=? AND cc.chapter_id IN ({$candidatePlaceholders})
+                   AND (cc.lifecycle IN ('quarantined','approved')
+                        OR (cc.source='branch_merge' AND cc.lifecycle='draft'
+                            AND cc.gate_state='passed' AND EXISTS (
+                                SELECT 1 FROM approval_requests ar
+                                WHERE ar.candidate_id=cc.id
+                                  AND ar.action_type='branch_merge' AND ar.state='open'
+                            )))
+                 GROUP BY cc.chapter_id",
+                array_merge([(int)$id], $visibleChapterIds)
+            ) ?: [];
+            foreach ($candidateRows as $candidateRow) {
+                $candidateReviewMap[(int)$candidateRow['chapter_id']] = [
+                    'total' => (int)$candidateRow['total'],
+                    'quarantined' => (int)$candidateRow['quarantined_total'],
+                    'approved' => (int)$candidateRow['approved_total'],
+                    'merge' => (int)$candidateRow['merge_total'],
+                ];
+            }
+        }
+    }
+} catch (Throwable $candidateUiError) {
+    // Candidate UI is fail-closed: chapter rendering remains available but no
+    // review affordance is shown when rollout configuration or storage fails.
+    error_log('candidate review badge unavailable: ' . $candidateUiError->getMessage());
+    $candidateReviewMap = [];
+    $branchWorkbenchEnabled = false;
+}
 $pageUrl = fn($p) => 'novel.php?id=' . (int)$id . '&page=' . (int)$p;
 ?>
 <div id="chapter-list-ajax-root"
@@ -36,25 +85,31 @@ $pageUrl = fn($p) => 'novel.php?id=' . (int)$id . '&page=' . (int)$p;
           <i class="bi bi-download me-1"></i>导出章节概要
         </button>
         <ul class="dropdown-menu">
-          <li><a class="dropdown-item" href="javascript:void(0)" onclick="exportSynopses('json')">
+          <li><a class="dropdown-item" href="#" data-csp-click="novel.export-synopses" data-format="json">
             <i class="bi bi-filetype-json me-2"></i>导出为JSON
           </a></li>
-          <li><a class="dropdown-item" href="javascript:void(0)" onclick="exportSynopses('excel')">
+          <li><a class="dropdown-item" href="#" data-csp-click="novel.export-synopses" data-format="excel">
             <i class="bi bi-file-earmark-excel me-2"></i>导出为Excel
           </a></li>
-          <li><a class="dropdown-item" href="javascript:void(0)" onclick="exportSynopses('txt')">
+          <li><a class="dropdown-item" href="#" data-csp-click="novel.export-synopses" data-format="txt">
             <i class="bi bi-filetype-txt me-2"></i>导出为TXT
           </a></li>
         </ul>
       </div>
-      <button type="button" class="btn btn-sm btn-outline-primary" onclick="document.getElementById('import-file-input').click()">
+      <button type="button" class="btn btn-sm btn-outline-primary" data-csp-click="novel.choose-import">
         <i class="bi bi-upload me-1"></i>导入章节概要
       </button>
-      <input type="file" id="import-file-input" accept=".json,.csv,.txt" style="display:none" onchange="importSynopses(this.files[0])">
-      <button type="button" class="btn btn-sm btn-outline-success" onclick="openAddChaptersModal()" title="添加章节">
+      <input type="file" id="import-file-input" accept=".json,.csv,.txt" style="display:none" data-csp-change="novel.import-synopses">
+      <?php if ($branchWorkbenchEnabled): ?>
+      <button type="button" class="btn btn-sm btn-outline-info btn-branch-workbench"
+              title="管理非主线分支、隔离记忆和人工合并">
+        <i class="bi bi-diagram-3 me-1"></i>分支工作台
+      </button>
+      <?php endif; ?>
+      <button type="button" class="btn btn-sm btn-outline-success" data-csp-click="novel.add-chapters" title="添加章节">
         <i class="bi bi-plus-lg"></i>
       </button>
-      <button type="button" class="btn btn-sm btn-outline-danger" onclick="clearAllChapters()" title="清空所有章节内容">
+      <button type="button" class="btn btn-sm btn-outline-danger" data-csp-click="novel.clear-chapters" title="清空所有章节内容">
         <i class="bi bi-trash"></i>
       </button>
     </div>
@@ -89,6 +144,27 @@ $pageUrl = fn($p) => 'novel.php?id=' . (int)$id . '&page=' . (int)$p;
           <small class="text-muted"><?= h(mb_substr($synopsis['synopsis'], 0, 100)) ?><?= mb_strlen($synopsis['synopsis']) > 100 ? '…' : '' ?></small>
         </div>
         <?php endif; ?>
+        <?php
+          // 质检未过现仅提示：completed 警告章与旧版 failed 章都显示原因。
+          $failReason = (string)($hardFailMap[(int)$ch['id']] ?? '');
+        ?>
+        <?php if ($failReason !== '' || ($ch['status'] ?? '') === 'failed'): ?>
+        <div class="ch-hard-fail mt-1" title="<?= h($failReason) ?>">
+          <span class="badge bg-warning text-dark me-1">质检未过</span>
+          <?php if ($failReason !== ''): ?>
+          <small class="text-danger"><?= h(mb_substr($failReason, 0, 80)) ?><?= mb_strlen($failReason) > 80 ? '…' : '' ?></small>
+          <?php else: ?>
+          <small class="text-muted">未记录具体质检原因</small>
+          <?php endif; ?>
+        </div>
+        <?php endif; ?>
+        <?php $candidateReview = $candidateReviewMap[(int)$ch['id']] ?? null; ?>
+        <?php if (is_array($candidateReview)): ?>
+        <div class="ch-candidate-review mt-1">
+          <span class="badge bg-danger me-1">待审候选 <?= (int)$candidateReview['total'] ?></span>
+          <small class="text-warning">尚未进入正史，自动续写已阻断</small>
+        </div>
+        <?php endif; ?>
       </div>
       <div class="col-status"><?= statusBadge($ch['status']) ?></div>
       <div class="col-words">
@@ -103,6 +179,14 @@ $pageUrl = fn($p) => 'novel.php?id=' . (int)$id . '&page=' . (int)$p;
         ?>
       </div>
       <div class="col-action">
+        <?php if (isset($candidateReviewMap[(int)$ch['id']])): ?>
+        <button class="btn btn-xs btn-outline-danger btn-candidate-review"
+                data-chapter-id="<?= (int)$ch['id'] ?>"
+                data-chapter-num="<?= (int)$ch['chapter_number'] ?>"
+                title="预览并处理隔离候选稿">
+          <i class="bi bi-shield-exclamation"></i> 处理候选稿
+        </button>
+        <?php endif; ?>
         <?php if ($ch['status'] !== 'pending'): ?>
         <a href="chapter.php?id=<?= (int)$ch['id'] ?>&edit=1" class="btn btn-xs btn-outline-secondary" title="编辑章节">
           <i class="bi bi-pencil"></i> 编辑
@@ -120,8 +204,23 @@ $pageUrl = fn($p) => 'novel.php?id=' . (int)$id . '&page=' . (int)$p;
           <i class="bi bi-pencil"></i> 写作
         </button>
         <?php elseif ($ch['status'] === 'writing'): ?>
-        <button class="btn btn-xs btn-outline-warning" onclick="resetSingleChapter(<?= (int)$ch['id'] ?>)" title="取消并重置">
+        <button class="btn btn-xs btn-outline-warning" data-csp-click="novel.reset-chapter" data-chapter-id="<?= (int)$ch['id'] ?>" title="取消并重置">
           <i class="bi bi-x-circle"></i> 取消
+        </button>
+        <?php elseif ($ch['status'] === 'failed'): ?>
+        <?php
+          // 审计修复（2026-08-17 写作逻辑 B0）：failed 是「需介入」状态——
+          // 保留正文重写走显式 chapter_id 写作（不清空旧正文，失败原因随重写覆盖）；
+          // 清空重写沿用 reset_chapter（正文存历史版本后清空，恢复为已大纲）。
+        ?>
+        <button class="btn btn-xs btn-outline-primary btn-write-single"
+                data-novel="<?= (int)$id ?>" data-chapter="<?= (int)$ch['id'] ?>"
+                title="保留当前正文（自动存入历史版本），按失败原因重新生成本章">
+          <i class="bi bi-arrow-repeat"></i> 保留正文重写
+        </button>
+        <button class="btn btn-xs btn-outline-warning" data-csp-click="novel.reset-chapter" data-chapter-id="<?= (int)$ch['id'] ?>"
+                title="清空本章正文（存历史版本），恢复为已大纲状态">
+          <i class="bi bi-eraser"></i> 清空重写
         </button>
         <?php else: ?>
         <span class="ch-status-text">待大纲</span>

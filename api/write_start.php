@@ -19,7 +19,7 @@ ob_start();
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 
 require_once dirname(__DIR__) . '/config.php';
@@ -29,7 +29,10 @@ require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/write_engine.php';
+require_once dirname(__DIR__) . '/includes/NovelProjectionFence.php';
 require_once dirname(__DIR__) . '/includes/tasks/WritingTaskRepository.php';
+require_once dirname(__DIR__) . '/includes/quality/WritePolicySnapshotFactory.php';
+require_once dirname(__DIR__) . '/includes/harness/HarnessControlPlane.php';
 
 ob_end_clean();
 header('Content-Type: application/json; charset=utf-8');
@@ -80,6 +83,29 @@ if (!$execOk && !$popenOk && !$procOpenOk) {
 $taskId = null;
 $progressFile = null;
 $taskCommitted = false;
+$projectionFence = null;
+$harnessEventCursorForTask = static function (array $task): bool {
+    try {
+        $snapshot = WritingTaskRepository::optionalPolicySnapshotFromRow($task);
+        return $snapshot !== null
+            && HarnessControlPlane::allowsNewHarnessRun($snapshot->harnessMode());
+    } catch (Throwable $exception) {
+        error_log('write_start could not authenticate Harness cursor policy: ' . $exception->getMessage());
+        return false;
+    }
+};
+$releaseProjectionFence = static function () use (&$projectionFence): void {
+    if ($projectionFence === null) {
+        return;
+    }
+    $token = $projectionFence;
+    $projectionFence = null;
+    try {
+        NovelProjectionFence::release($token);
+    } catch (Throwable $releaseError) {
+        error_log('write_start projection fence release failed: ' . $releaseError->getMessage());
+    }
+};
 
 try {
     $input     = json_decode(file_get_contents('php://input'), true) ?? [];
@@ -90,18 +116,38 @@ try {
 
     // 审计修复 H1（2026-06-12）：写作端点必须先校验小说归属，
     // 否则任意已登录用户可对他人的 novel_id 发起后台 worker。
-    $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    $userId = currentUserId();
     checkNovelOwnership($novelId, $userId);
     if ($chapterId > 0) {
         checkChapterOwnership($chapterId, $userId);
     }
 
-    // Pre-Phase 0: 对 novels 行加排他锁（FOR UPDATE），防止并发启动竞态
-    // 两个同时到达的请求不能同时通过"无运行中任务"检查
+    // 在获取 novel 行锁前，先通过共享的 Canon-aware 恢复器回收真正过期的 claim。
+    // 该恢复器会排除仍有有效 writing/postprocess lease 的章节，且不会把 Canon
+    // rewrite claim 降级为 outlined。进入启动事务后只做冲突检测，不再盲重置。
+    WriteEngine::recoverStaleWritingChapters($novelId);
+
+    // 审计修复（2026-08-30 M-5）：stale pp_pending flag 必须在事务外清理。
+    // findActiveTask 的清理在持锁事务内会被主动跳过（不得改 DB/补跑后处理），
+    // 纯 Web 用户的 write_start 路径将永远无法清理 stale flag → 下一章
+    // waitForPostProcess 每次硬等 180 秒后失败，形成小说级死锁。
+    // 此处在获取行锁前显式清理，打破死循环。
+    WriteEngine::cleanStalePostProcessFlags($novelId);
+
+    // Pre-Phase 0: projection fence 必须先于事务/行锁；随后统一按
+    // chapters -> novels -> writing_tasks 加锁，避免启动与取消形成反序等待。
+    // 两个同时到达的请求也不能同时通过"无运行中任务"检查。
     $pdo = DB::connect();
-    $pdo->beginTransaction();
+    $projectionFence = NovelProjectionFence::acquire($novelId, 30);
+    if (!$pdo->beginTransaction()) {
+        throw new RuntimeException('无法启动写作任务事务');
+    }
     try {
-        $locked = DB::fetch('SELECT id, status FROM novels WHERE id=? FOR UPDATE', [$novelId]);
+        DB::fetchAll(
+            'SELECT id FROM chapters WHERE novel_id=? ORDER BY id FOR UPDATE',
+            [$novelId]
+        );
+        $locked = DB::fetch('SELECT id, status, chapter_words FROM novels WHERE id=? FOR UPDATE', [$novelId]);
         if (!$locked) throw new Exception('小说不存在');
     } catch (Exception $e) {
         try { $pdo->rollBack(); } catch (Throwable $e2) { error_log('write_start rollback failed: ' . $e2->getMessage()); }
@@ -120,6 +166,14 @@ try {
     // v53：数据库任务是并发所有权的真理源；进度文件仅保留流式内容兼容。
     $activeTask = null;
     $durableTask = WritingTaskRepository::findActiveForNovel($novelId);
+    if ($durableTask !== null) {
+        $durableState = (string)($durableTask['state'] ?? '');
+        $durableCanceled = (int)($durableTask['cancel_requested'] ?? 0) === 1;
+        // 生成中的任务被用户取消后不得再恢复轮询，否则前端会接上一条正在停写的旧任务。
+        if ($durableCanceled && in_array($durableState, ['queued', 'preparing', 'generating', 'validating'], true)) {
+            $durableTask = null;
+        }
+    }
     if ($durableTask !== null) {
         $durableTaskId = (string)$durableTask['task_id'];
         $durableProgressFile = $progressDir . '/' . $durableTaskId . '.json';
@@ -148,12 +202,28 @@ try {
         if ($activeOwnerUserId > 0 && $activeOwnerUserId !== $userId) {
             throw new Exception('该小说已有写作任务在运行中，请等待完成');
         }
+        // 审计修复 R2（2026-08-10）：任务恢复时校验 chapterId 一致性，
+        // 避免前端请求写章节 A 但章节 B 的任务在跑时被误导恢复到错误章节。
+        $activeChapterId = (int)($activeTask['chapter_id'] ?? 0);
+        if ($chapterId > 0 && $activeChapterId > 0 && $chapterId !== $activeChapterId) {
+            $pdo->commit();
+            $releaseProjectionFence();
+            echo json_encode([
+                'ok'                   => false,
+                'conflict'             => true,
+                'msg'                  => '已有其他章节的写作任务在运行中，请等待完成或取消后再试',
+                'active_chapter_id'    => $activeChapterId,
+                'requested_chapter_id' => $chapterId,
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
         $pdo->commit();
+        $releaseProjectionFence();
         if (!empty($activeTask['_db_only']) || $activeTaskId === '') {
             echo json_encode([
                 'ok'             => false,
                 'active_db_only' => true,
-                'msg'            => 'An active writing task exists in DB but has no resumable progress file.',
+                'msg'            => '已有写作任务在运行，但进度文件不可恢复。请先点取消，再重新写作。',
                 'chapter_id'     => $activeTask['chapter_id'] ?? $chapterId,
             ], JSON_UNESCAPED_UNICODE);
             exit;
@@ -162,20 +232,43 @@ try {
             'ok'             => true,
             'task_id'        => $activeTaskId,
             'resumed'        => true,
+            'harness_event_cursor' => $harnessEventCursorForTask($activeTask),
             'msg'            => '已有写作任务在运行，已恢复进度跟踪',
             'chapter_id'     => $activeTask['chapter_id'] ?? $chapterId,
         ], JSON_UNESCAPED_UNICODE);
         exit;
     }
     
-    // 兜底：重置该小说下所有卡在 writing 状态的章节
-    $writingChapters = DB::fetchAll(
-        'SELECT id FROM chapters WHERE novel_id=? AND status="writing"', [$novelId]
+    // 恢复后仍为 writing 的行属于活跃/受保护 claim。启动端没有该 claim 的
+    // fencing token，因此只能报告冲突，绝不能按 novel_id 批量回退章节。
+    $writingChapter = DB::fetch(
+        'SELECT id FROM chapters WHERE novel_id=? AND status="writing" ORDER BY chapter_number ASC LIMIT 1',
+        [$novelId]
     );
-    if (!empty($writingChapters)) {
-        DB::query('UPDATE chapters SET status="outlined" WHERE novel_id=? AND status="writing"', [$novelId]);
-        DB::update('novels', ['status' => 'draft'], 'id=? AND status=?', [$novelId, 'writing']);
+    if ($writingChapter) {
+        $pdo->commit();
+        $releaseProjectionFence();
+        echo json_encode([
+            'ok' => false,
+            'active_db_only' => true,
+            'msg' => '检测到仍受保护的写作或重写任务，请等待其完成或先执行取消。',
+            'chapter_id' => (int)$writingChapter['id'],
+        ], JSON_UNESCAPED_UNICODE);
+        exit;
     }
+
+    // M60: the queue boundary owns policy capture. Every later async phase
+    // restores this exact authenticated snapshot instead of rereading mutable
+    // controls. chapter_words is read from the already locked novel row.
+    $policyTargetWords = (int)($locked['chapter_words'] ?? 0);
+    if ($policyTargetWords < 500) {
+        $policyTargetWords = (int)getSystemSetting('ws_chapter_words', 2000, 'int');
+    }
+    $policyTargetWords = max(500, $policyTargetWords);
+    $writePolicySnapshot = WritePolicySnapshotFactory::captureForChapter(
+        $novelId,
+        $policyTargetWords
+    );
     
     // 生成任务 ID
     // 审计修复 H-4（2026-06-17）：task_id 绑定 user_id + novel_id 的 HMAC
@@ -202,7 +295,14 @@ try {
     if ($progressJson === false || file_put_contents($progressFile, $progressJson, LOCK_EX) === false) {
         throw new RuntimeException('无法创建写作进度文件');
     }
-    WritingTaskRepository::createQueued($taskId, $userId, $novelId, $chapterId ?: null);
+    WritingTaskRepository::createQueued(
+        $taskId,
+        $userId,
+        $novelId,
+        $chapterId ?: null,
+        120,
+        $writePolicySnapshot
+    );
 
     // 进度文件已安全创建，提交 DB 事务释放排他锁
     // 此时其他并发请求会发现进度文件中已有运行中任务而被拒绝
@@ -210,6 +310,7 @@ try {
         throw new RuntimeException('写作任务事务提交失败');
     }
     $taskCommitted = true;
+    $releaseProjectionFence();
 
     // 启动 CLI worker 后台进程
     $phpBin = PHP_BINARY ?: 'php';
@@ -379,19 +480,39 @@ try {
             $diag['log_file_exists'] = false;
         }
         
+        // Close only a still-unclaimed queued row. A worker may win the claim
+        // immediately after the last progress-file poll; if so, do not delete
+        // its progress file or reset its chapter/novel state.
+        $launchClosed = WritingTaskRepository::markLaunchFailed(
+            $taskId,
+            $workerError ?: 'Worker process did not acquire its startup lease',
+            'worker_start_failed'
+        );
+        if (!$launchClosed) {
+            $lateTask = WritingTaskRepository::findByTaskId($taskId);
+            $lateState = (string)($lateTask['state'] ?? '');
+            $lateLeaseToken = (string)($lateTask['lease_token'] ?? '');
+            $lateLeaseExpires = (string)($lateTask['lease_expires_at'] ?? '');
+            if (in_array($lateState, ['preparing','generating','validating','content_saved','postprocessing'], true)
+                && preg_match('/^[a-f0-9]{32}$/D', $lateLeaseToken) === 1
+                && $lateLeaseExpires >= gmdate('Y-m-d H:i:s')) {
+                echo json_encode([
+                    'ok' => true,
+                    'task_id' => $taskId,
+                    'resumed' => true,
+                    'harness_event_cursor' => $harnessEventCursorForTask($lateTask),
+                    'msg' => 'Worker acquired its durable lease during startup confirmation.',
+                    'chapter_id' => $lateTask['chapter_id'] ?? $chapterId,
+                ], JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+        }
+
         @unlink($progressFile);
         // 清理 wrapper.sh
         if (PHP_OS_FAMILY !== 'Windows') @unlink($workerSh);
-        // 同时重置章节/小说状态，避免 DB 中残留 writing 状态
-        DB::update('novels', ['status' => 'draft'], 'id=? AND status=?', [$novelId, 'writing']);
-        DB::query('UPDATE chapters SET status="outlined" WHERE novel_id=? AND status="writing"', [$novelId]);
-        WritingTaskRepository::markFailed(
-            $taskId,
-            $workerError ?: 'Worker process did not acquire its startup lease',
-            false,
-            false,
-            'worker_start_failed'
-        );
+        // worker 自己持有写入 fencing token，异常/退出恢复也只能由 worker 的精确
+        // claim 路径完成。启动监督器不得批量修改章节或小说状态。
         // 返回 fallback_sse 标志，让前端自动回退到 SSE 直连模式。
         // 审计 P3-C（2026-06-11）：诊断信息（服务器路径/worker 日志）始终写服务端日志，
         // 仅 APP_DEBUG 开启时随响应附带，与 import_chapter_synopses 的 debug 门控约定一致。
@@ -413,6 +534,9 @@ try {
     echo json_encode([
         'ok'      => true,
         'task_id' => $taskId,
+        'harness_event_cursor' => HarnessControlPlane::allowsNewHarnessRun(
+            $writePolicySnapshot->harnessMode()
+        ),
         'msg'     => '写作任务已启动',
     ], JSON_UNESCAPED_UNICODE);
     
@@ -422,6 +546,7 @@ try {
     // 释放可能持有的排他锁（无论异常发生在事务内还是事务外；$pdo 可能尚未定义）
     try { if (isset($pdo) && $pdo instanceof \PDO && $pdo->inTransaction()) $pdo->rollBack(); }
     catch (\Throwable $e2) { error_log('write_start rollback(catch) failed: ' . $e2->getMessage()); }
+    $releaseProjectionFence();
     if (!$taskCommitted && is_string($progressFile) && $progressFile !== '') {
         @unlink($progressFile);
         @unlink($progressFile . '.content');

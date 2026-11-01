@@ -15,9 +15,8 @@ Options -Indexes
     Header set X-XSS-Protection "0"
     # HSTS（仅 HTTPS 部署时生效）
     Header set Strict-Transport-Security "max-age=63072000; includeSubDomains"
-    # CSP：限制资源加载来源（纵深防御 XSS）
-    # unsafe-inline 用于兼容页面内嵌的 <script>（主题切换等），后续可迁移至 nonce 模式
-    Header set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'self'"
+    # CSP is emitted by includes/ContentSecurityPolicy.php with a fresh response nonce.
+    # Do not overwrite or duplicate that PHP header here; script event attributes are denied.
 </IfModule>
 
 # 拒绝直接访问敏感文件类型
@@ -63,18 +62,37 @@ Options -Indexes
     # CLI maintenance entry points are never valid over HTTP.
     RewriteRule ^bin/ - [F,L,NC]
 
+    # Audit/build trees and Composer output are not public app routes.
+    # output/ can contain a nested install.php that ignores the root install.lock.
+    RewriteRule ^output/ - [F,L,NC]
+    RewriteRule ^docs/ - [F,L,NC]
+    RewriteRule ^vendor/ - [F,L,NC]
+    RewriteRule ^evals/ - [F,L,NC]
+    RewriteRule ^logs/ - [F,L,NC]
+
     # Uploaded author works are private source documents; serve them only through authenticated PHP flows.
     RewriteRule ^storage/author_works/ - [F,L]
 
-    # M-6：HTTP → HTTPS 强制重定向
+    # TLS termination: configure SetEnvIfExpr in the server/vhost, checking
+    # CONN_REMOTE_ADDR against your exact proxy IP(s) and X-Forwarded-Proto == https,
+    # to set NOVEL_TRUSTED_HTTPS=1. Never copy a client header into this variable.
+    # No proxy is trusted by default. SetEnv runs too late for these rewrite rules.
+    # Preserve the server's trusted marker across each internal redirect.
+    RewriteCond %{ENV:NOVEL_TRUSTED_HTTPS} =1 [OR]
+    RewriteCond %{ENV:REDIRECT_NOVEL_TRUSTED_HTTPS} =1
+    RewriteRule ^ - [E=NOVEL_TRUSTED_HTTPS:1]
+
+    # M-6：HTTP → HTTPS 强制重定向（可信 TLS 终止代理已经使用外部 HTTPS）
     RewriteCond %{HTTPS} off
+    RewriteCond %{ENV:NOVEL_TRUSTED_HTTPS} !=1
     RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
 
     # H-2：阻止直接访问 api/ 子目录下的 PHP 文件（仅允许 api/index.php）
-    # 例外：hot_novels_ingest.php（外部 Agent 推送）、daemon_write.php（Cron 定时任务）
+    # 例外：hot_novels_ingest.php（外部 Agent 推送）、daemon_write.php（Cron 定时任务）、
+    #       drama_cron.php（漫剧任务队列 Cron 驱动入口，Token 鉴权）
     # RewriteRule 在 .htaccess 中匹配相对当前应用目录的路径，因此同时覆盖
     # 域名根目录和 /some/subdir/ 子目录部署。
-    RewriteRule ^api/(?!index\.php$|hot_novels_ingest\.php$|daemon_write\.php$).+\.php(?:/.*)?$ - [F,L,NC]
+    RewriteRule ^api/(?!index\.php$|hot_novels_ingest\.php$|daemon_write\.php$|drama_cron\.php$).+\.php(?:/.*)?$ - [F,L,NC]
 </IfModule>
 
 # ============================================================

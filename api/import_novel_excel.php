@@ -10,7 +10,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  *   import_chars  将人物卡写入 character_cards 表
  *   run_analysis  启动 AI 分析任务
  */
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 ob_start();
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
@@ -38,6 +38,7 @@ require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/helpers.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
+require_once dirname(__DIR__) . '/includes/NovelProjectionFence.php';
 require_once dirname(__DIR__) . '/includes/ChapterMutationService.php';
 
 requireLoginApi();
@@ -56,7 +57,7 @@ if ($method === 'POST') {
 while (ob_get_level()) ob_end_clean();
 header('Content-Type: application/json; charset=utf-8');
 
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 
 try {
     ensureImportTable();
@@ -187,16 +188,36 @@ function handleBatch(int $userId, array $input): void {
         jsonOut(['ok' => false, 'msg' => '每批最多导入 50 章']);
     }
 
+    // Resolve the novel before opening a transaction: the projection fence must
+    // always be acquired before row locks/transactions. Re-read and lock the
+    // exact same import session below so this optimistic lookup cannot authorize
+    // a batch against a replaced or detached session.
+    $sessionSnapshot = DB::fetch(
+        'SELECT id, novel_id FROM novel_import_sessions WHERE session_key=? AND user_id=?',
+        [$sessionKey, $userId]
+    );
+    if (!$sessionSnapshot || (int)($sessionSnapshot['novel_id'] ?? 0) <= 0) {
+        jsonOut(['ok' => false, 'msg' => '会话不存在']);
+    }
+
+    $novelId = (int)$sessionSnapshot['novel_id'];
     $pdo = DB::getPdo();
-    $pdo->beginTransaction();
+    $projectionFence = NovelProjectionFence::acquire($novelId, 30);
     try {
-        $session = DB::fetch('SELECT * FROM novel_import_sessions WHERE session_key=? AND user_id=? FOR UPDATE', [$sessionKey, $userId]);
-        if (!$session) { $pdo->rollBack(); jsonOut(['ok' => false, 'msg' => '会话不存在']); }
-        $novelId = (int)$session['novel_id'];
+        $pdo->beginTransaction();
+        $session = DB::fetch(
+            'SELECT * FROM novel_import_sessions WHERE id=? AND session_key=? AND user_id=? FOR UPDATE',
+            [(int)$sessionSnapshot['id'], $sessionKey, $userId]
+        );
+        if (!$session || (int)($session['novel_id'] ?? 0) !== $novelId) {
+            throw new RuntimeException('导入会话已变更，请重试');
+        }
 
         $completed = json_decode($session['completed_batches'], true) ?: [];
         if (in_array($batchIndex, $completed, true)) {
             $pdo->rollBack();
+            NovelProjectionFence::release($projectionFence);
+            $projectionFence = null;
             jsonOut(['ok' => true, 'skipped' => true]);
         }
 
@@ -242,7 +263,18 @@ function handleBatch(int $userId, array $input): void {
                 DB::insert('chapters', array_merge([
                     'novel_id' => $novelId,
                     'chapter_number' => $num,
-                ], $updates));
+                ], $updates, [
+                    // Imported completed prose is authoritative legacy Canon:
+                    // it has exact revision identity but no fabricated model
+                    // Candidate, policy snapshot, or Canon-promotion timestamp.
+                    'canonical_state' => $status === 'completed' ? 'legacy' : 'none',
+                    'content_revision_hash' => $status === 'completed'
+                        ? hash('sha256', $content)
+                        : null,
+                    'canonicalized_at' => null,
+                    'canonical_candidate_uid' => null,
+                    'write_policy_snapshot_json' => null,
+                ]));
             }
 
             $imported++;
@@ -269,8 +301,11 @@ function handleBatch(int $userId, array $input): void {
         ], 'session_key = ? AND user_id = ?', [$sessionKey, $userId]);
 
         $pdo->commit();
+        NovelProjectionFence::release($projectionFence);
+        $projectionFence = null;
     } catch (Throwable $e) {
-        $pdo->rollBack();
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($projectionFence !== null) NovelProjectionFence::release($projectionFence);
         throw $e;
     }
 
@@ -339,13 +374,12 @@ function handleImportChars(int $userId, array $input): void {
 }
 
 function handleRunAnalysis(int $userId, array $input): void {
-    $novelId = (int)($input['novel_id'] ?? 0);
-    $tasks = $input['tasks'] ?? [];
-
-    if ($novelId <= 0) jsonOut(['ok' => false, 'msg' => 'novel_id 缺失']);
-
-    $novel = DB::fetch('SELECT id FROM novels WHERE id=? AND user_id=?', [$novelId, $userId]);
-    if (!$novel) jsonOut(['ok' => false, 'msg' => '无权访问']);
-
-    jsonOut(['ok' => true, 'msg' => '分析任务已排队', 'tasks' => $tasks]);
+    // 审计修复（2026-08-30）：原实现校验归属后直接返回“分析任务已排队”的假成功——
+    // 实际既未写库也未启动任何任务，前端据此提示“AI 分析任务已启动”属功能性欺骗。
+    // 三项分析（全书故事大纲/人物卡提取/章节大纲补全）目前均无异步任务基建，
+    // 改为诚实失败，引导用户进入小说页面手动触发对应功能。
+    jsonOut([
+        'ok'  => false,
+        'msg' => 'AI 分析功能尚未接入自动任务，请点击“跳过”进入书库，再在小说页面手动生成全书大纲/人物卡/章节大纲',
+    ]);
 }

@@ -133,6 +133,28 @@ $presets = function_exists('wizardPresetPacks') ? wizardPresetPacks() : [];
       </div>
     </div>
 
+    <?php
+      // 审计修复（2026-08-17 写作逻辑 E）：向导显式「严格拦截」开关（默认关）。
+      // 全局默认不拦截（P0 只记录+写下章紧急指令）；此处仅对本书写小说级覆盖。
+      $strictOn = false;
+      try {
+          $strictOn = class_exists('ConfigCenter', false)
+              && ConfigCenter::getNovel((int)($novel['id'] ?? 0), 'cf_strict_mode', false, 'bool');
+      } catch (\Throwable $strictReadError) {
+          $strictOn = false;
+      }
+    ?>
+    <div class="form-check form-switch mb-3">
+      <input class="form-check-input" type="checkbox" role="switch" name="strict_intercept"
+             id="strict-intercept-switch" value="1" <?= $strictOn ? 'checked' : '' ?>>
+      <label class="form-check-label text-light" for="strict-intercept-switch">
+        严格拦截（约束 P0 违规时本章不标完成）
+      </label>
+      <div class="small text-muted mt-1">
+        默认关闭：约束问题只记录并写入下一章修复指令，不拦截落盘。开启后本书检测到 P0 严重违规（如巧合超限/禁用词爆表）时，该章不标记完成、需人工处理。只对本书生效，不影响其他小说。
+      </div>
+    </div>
+
     <div class="mb-2">
       <label class="form-label text-light fw-semibold">核心想法 / 一句话简介 <span class="text-danger">*</span></label>
       <textarea name="idea" class="form-control bg-dark text-light border-secondary" rows="6"
@@ -276,7 +298,7 @@ $presets = function_exists('wizardPresetPacks') ? wizardPresetPacks() : [];
   </div>
 </form>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 (function(){
   var ideaEl = document.querySelector('textarea[name=idea]');
   var countEl = document.getElementById('idea-count');
@@ -372,6 +394,9 @@ $presets = function_exists('wizardPresetPacks') ? wizardPresetPacks() : [];
       var key = row.dataset.key;
       if (key && !Array.isArray(obj[key])) obj[key] = [];
     });
+    // 审计修复（2026-08-17 写作逻辑 E）：未勾选的 checkbox 不进 FormData，
+    // 显式带 0 让保存时能「关掉」已开启的严格拦截覆盖（与多选空数组同理）。
+    obj.strict_intercept = (fd.get('strict_intercept') === '1') ? '1' : '0';
     obj.novel_id = novelId;
     return obj;
   }

@@ -11,30 +11,41 @@
 // install.php 是安装向导，不依赖 config.php（它是被安装程序创建的）
 // 但后续 include 的 schema.php 等文件需要此常量，在此手动定义
 define('APP_LOADED', true);
+require_once __DIR__ . '/includes/ContentSecurityPolicy.php';
+require_once __DIR__ . '/includes/RequestSecurity.php';
+ContentSecurityPolicy::send();
+// Authorize only the installer's already-CSRF-protected, advisory-file-locked
+// path to reuse the canonical Harness schema migration implementation.
+define('DB_INSTALLATION_MODE', true);
 require_once __DIR__ . '/includes/version.php';
 require_once __DIR__ . '/includes/model_presets.php';
 
 define('LOCK_FILE', __DIR__ . '/install.lock');
-define('INSTALL_SCHEMA_VERSION', 54);
+// v68：在 v67 完整结构基础上，以队列排空屏障统一 UTC 租约。
+// 与 includes/db.php 的 DB::SCHEMA_VERSION 同步。
+define('INSTALL_SCHEMA_VERSION', 72);
 
 // 安全加固：已安装后访问此页面直接返回 404。
 // 原因：install.php 暴露数据库配置格式和管理员账号结构，
 // 攻击者可借此探测系统安装状态。安装完成后应彻底隐藏入口。
 // 如需重新安装，请先手动删除根目录下的 install.lock 文件。
 //
-// 审计说明（2026-06-12）：本系统为单用户系统，安装完成后自动生成
-// install.lock 文件锁，此后 install.php 返回 404 不可访问。
+// 审计说明（2026-06-12，2026-08-13 修订）：本系统为单用户系统，
+// 安装完成后自动生成 install.lock 文件锁，此后 install.php 返回 404 不可访问。
 // install.lock 需要服务器文件系统权限才能删除，攻击者无法远程删除。
-// 因此 install.php 无 CSRF 保护在当前架构下不构成安全风险，无需修复。
+// 此外，安装表单已实施 CSRF 防护（见下方 $_SESSION['install_csrf'] 与
+// hash_equals 校验，第 50-72 行），即使在安装窗口期内也可抵御跨站伪造。
 if (file_exists(LOCK_FILE)) {
     http_response_code(404);
     exit('Not found.');
 }
 
 if (session_status() === PHP_SESSION_NONE) {
-    $secureCookie = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
-        || ((int)($_SERVER['SERVER_PORT'] ?? 0) === 443);
+    $secureCookie = RequestSecurity::isHttps(
+        $_SERVER,
+        defined('FORCE_HTTPS') && FORCE_HTTPS === true,
+        defined('TRUSTED_PROXIES') && is_array(TRUSTED_PROXIES) ? TRUSTED_PROXIES : []
+    );
     session_set_cookie_params([
         'lifetime' => 0,
         'path' => '/',
@@ -56,6 +67,7 @@ $installModelPresets = getInstallSkyhostModelPresets();
 $installModelToken = '';
 
 $host       = 'localhost';
+$port       = 3306;
 $user       = 'ai_novel';
 $pass       = '';
 $dbname     = 'ai_novel';
@@ -72,6 +84,7 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
         $error = '安全验证失败，请刷新页面重试。';
     } else {
     $host       = trim($_POST['db_host']     ?? 'localhost');
+    $port       = (int)($_POST['db_port']    ?? 3306);
     $user       = trim($_POST['db_user']     ?? 'ai_novel');
     $pass       = $_POST['db_pass']          ?? '';
     $dbname     = trim($_POST['db_name']     ?? 'ai_novel');
@@ -79,7 +92,19 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $adminPass  = $_POST['admin_pass']       ?? '';
     $adminPass2 = $_POST['admin_pass2']      ?? '';
 
-    if ($adminUser === '') {
+    $requiredExtensions = ['pdo_mysql', 'curl', 'mbstring', 'json', 'gd', 'openssl', 'zip'];
+    $missingExtensions = array_values(array_filter(
+        $requiredExtensions,
+        static fn(string $extension): bool => !extension_loaded($extension)
+    ));
+
+    if ($missingExtensions !== []) {
+        $error = '缺少必需的 PHP 扩展：' . implode('、', $missingExtensions) . '。请启用后再安装。';
+    } elseif ($port < 1 || $port > 65535) {
+        $error = '数据库端口必须在 1 到 65535 之间。';
+    } elseif ($pass === '') {
+        $error = '数据库密码不能为空；生产环境不允许使用空密码数据库账号。';
+    } elseif ($adminUser === '') {
         $error = '管理员用户名不能为空。';
     } elseif (strlen($adminPass) < 6) {
         $error = '管理员密码至少需要 6 位。';
@@ -104,12 +129,19 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 @unlink($installInProgressLock);
             });
 
-            $pdo = new PDO("mysql:host=$host;charset=utf8mb4", $user, $pass, [
+            $pdo = new PDO("mysql:host=$host;port=$port;charset=utf8mb4", $user, $pass, [
                 PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
                 PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => true,
             ]);
+            // Installer timestamps must use the same UTC session contract as
+            // Web/worker connections. ERRMODE_EXCEPTION makes rejection fatal.
+            $pdo->exec("SET SESSION time_zone = '+00:00'");
             $pdo->exec("CREATE DATABASE IF NOT EXISTS `$dbname` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
             $pdo->exec("USE `$dbname`");
+
+            // Reusing an existing database cannot bypass the v68 clock barrier.
+            require_once __DIR__ . '/includes/db/migrations/LeaseClockMigration.php';
+            LeaseClockMigration::assertDrained($pdo);
 
             // 空库必须先建立基础表，再执行默认数据写入和兼容旧库的 ALTER。
             // 之前的顺序会先 INSERT system_settings / ALTER 业务表，空库首次安装
@@ -119,6 +151,8 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Schema class unavailable during installation');
             }
             Schema::applyAll($pdo);
+            require_once __DIR__ . '/includes/db.php';
+            DB::applyInstallationSchemaMigrations($pdo);
 
             // ================================================================
             // 建表 SQL（v3 完整版，含所有优化字段）
@@ -132,6 +166,9 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                   ('ws_chapter_word_tolerance',     '150'),
                   ('ws_outline_batch',              '5'),
                   ('ws_auto_write_interval',        '2'),
+                  ('ws_daemon_schedule_enabled',    '0'),
+                  ('ws_daemon_window_start',        '00:00'),
+                  ('ws_daemon_window_end',          '06:00'),
                   ('ws_cool_point_density_target',  '0.88'),
                   ('ws_cool_point_hunger_threshold','0.6'),
                   ('ws_double_coolpoint_gap',       '3'),
@@ -140,14 +177,30 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                   ('ws_segment_ratio_climax',       '35'),
                   ('ws_segment_ratio_hook',         '15'),
                   ('ws_foreshadowing_lookback',     '10'),
-                  ('ws_memory_lookback',            '5'),
+                  ('ws_memory_lookback',            '16'),
                   ('ws_embedding_top_k',            '5'),
                   ('ws_temperature_outline',        '0.3'),
                   ('ws_temperature_chapter',        '0.8'),
+                  ('ws_temperature_outline_gen',    '0.75'),
                   ('ws_max_tokens_outline',         '4096'),
                   ('ws_max_tokens_chapter',         '8192'),
+                  ('ws_max_tokens_title',           '512'),
                   ('ws_quality_check_enabled',      '1'),
                   ('ws_quality_min_score',          '6.0'),
+                  ('ws_harness_canon_policy',       'legacy_warn'),
+                  ('ws_harness_mode',               'off'),
+                  ('ws_harness_fencing_enforced',   '0'),
+                  ('ws_harness_event_source',        'legacy'),
+                  ('ws_harness_pipeline_v2_enabled', '0'),
+                  ('ws_harness_context_v2_enabled',  '0'),
+                  ('ws_harness_tool_loop_enabled',   '0'),
+                  ('ws_harness_parallel_review_enabled','0'),
+                  ('ws_harness_branch_candidates_enabled','0'),
+                  ('ws_harness_candidate_ui_enabled','0'),
+                  ('ws_harness_trace_enabled',       '0'),
+                  ('ws_harness_rollout_bps',         '0'),
+                  ('ws_harness_artifact_retention_days','90'),
+                  ('ws_harness_emergency_stop_epoch','0'),
                   ('image_gen_api_url',             ''),
                   ('image_gen_api_key',             ''),
                   ('image_gen_api_mode',            'images'),
@@ -286,17 +339,6 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
 
-            // 新安装不会再进入历史迁移流程，因此在写入当前 schema 版本前，
-            // 显式应用核心外键；任何失败都必须阻止 install.lock 落盘。
-            require_once __DIR__ . '/includes/db/migrations/ForeignKeyMigrations.php';
-            $foreignKeyErrors = [];
-            ForeignKeyMigrations::up($pdo, $foreignKeyErrors);
-            if ($foreignKeyErrors !== []) {
-                throw new RuntimeException(
-                    '安装数据库外键不完整：' . implode(' | ', $foreignKeyErrors)
-                );
-            }
-
             // 默认数据和兼容性 ALTER 完成后验证；失败必须中止安装，不能创建 install.lock。
             $schemaCheck = Schema::verify($pdo);
             if (!($schemaCheck['ok'] ?? false)) {
@@ -321,125 +363,11 @@ if (!$alreadyInstalled && $_SERVER['REQUEST_METHOD'] === 'POST') {
             // 生成合法的 PHP 字符串字面量（返回值自带引号，模板中不再外包引号）。
             $esc = fn(string $s) => var_export($s, true);
 
-            // 写入 config.php
-            $configContent = <<<PHP
-<?php
-// ============================================================
-// 运行环境兼容性检测
-// ============================================================
-if (version_compare(PHP_VERSION, '8.0.0', '<')) {
-    die('系统要求 PHP 8.0+，当前版本：' . PHP_VERSION . '。请在宝塔面板或 php.ini 中切换 PHP 版本。');
-}
-
-// ============================================================
-// 数据库配置
-// ============================================================
-define('DB_HOST',    {$esc($host)});
-define('DB_NAME',    {$esc($dbname)});
-define('DB_USER',    {$esc($user)});
-define('DB_PASS',    {$esc($pass)});
-define('DB_CHARSET', 'utf8mb4');
-
-// ============================================================
-// 后台账号（由安装向导写入，请勿手动修改密码明文）
-// ============================================================
-define('ADMIN_USER', {$esc($adminUser)});
-define('ADMIN_PASS', {$esc($passHash)});
-
-// ============================================================
-// 站点配置
-// ============================================================
-define('SITE_NAME', 'AI小说创作系统');
-define('BASE_PATH', __DIR__);
-
-// ============================================================
-// 默认生成参数
-// ============================================================
-define('DEFAULT_CHAPTER_WORDS',   2000);
-define('DEFAULT_OUTLINE_BATCH',   20);
-define('AUTO_WRITE_INTERVAL',     2);
-
-// ============================================================
-// 文字数据统计 隐私化统计 仅统计文字数量 可以关闭
-// ============================================================
-define('STATS_REPORT_ENABLED',    false);                                       // 是否启用统计上报（true/false）
-define('STATS_SERVER_URL',        'https://www.itzo.cn/api/stats_receiver.php'); // 上报服务器地址
-define('STATS_SITE_ID',           '');                                          // 站点唯一标识（留空则自动生成）
-
-// ---- 禁止直接访问 includes/api 文件（由各入口文件定义） ----
-defined('APP_LOADED') or define('APP_LOADED', true);
-
-// ---- 产品版本单一来源 ----
-require_once __DIR__ . '/includes/version.php';
-
-// ---- 引入集中配置常量 ----
-require_once __DIR__ . '/includes/config_constants.php';
-
-// ---- 引入配置中心类（Agent机制依赖） ----
-require_once __DIR__ . '/includes/config_center.php';
-
-// ============================================================
-// 系统设置读取辅助函数（写作参数等全局配置）
-// 所有参数存储在 system_settings 表中，key 前缀 ws_ = writing settings
-// ============================================================
-/**
- * 从 system_settings 读取单个设置值，找不到时返回默认值。
- * [v42] 优先走请求级整表缓存（includes/config_constants.php::_systemSettingsAll），
- * 载入失败时回退单键直查（审计 2026-06-10 P2-C）。
- */
-function getSystemSetting(string \$key, \$default = null, string \$type = 'string') {
-    try {
-        if (!class_exists('DB', false)) {
-            return \$default;
-        }
-        \$val = null;
-        \$found = false;
-        if (function_exists('_systemSettingsAll')) {
-            \$all = _systemSettingsAll();
-            if (\$all !== null) {
-                if (!array_key_exists(\$key, \$all)) {
-                    return \$default;
-                }
-                \$val = \$all[\$key];
-                \$found = true;
-            }
-        }
-        if (!\$found) {
-            \$row = DB::fetch('SELECT setting_value FROM system_settings WHERE setting_key=?', [\$key]);
-            if (!\$row) {
-                return \$default;
-            }
-            \$val = \$row['setting_value'];
-        }
-        return match (\$type) {
-            'int'    => (int)\$val,
-            'float'  => (float)\$val,
-            'bool'   => in_array(strtolower((string)\$val), ['1', 'true', 'yes', 'on']),
-            default  => (string)\$val,
-        };
-    } catch (\Throwable \$e) {
-        return \$default;
-    }
-}
-
-/**
- * 批量读取写作参数，返回 key=>value 数组。
- */
-function getWritingSettings(array \$keys): array {
-    \$result = [];
-    // 从全局唯一默认值中提取
-    \$defaults = getWritingDefaults();
-    foreach (\$keys as \$key => \$type) {
-        \$def = \$defaults[\$key] ?? ['default'=>null, 'type'=>'string'];
-        \$result[\$key] = getSystemSetting(\$key, \$def['default'], \$type ?: \$def['type']);
-    }
-    return \$result;
-}
-PHP;
-
-            // config.php 必须只有一个真实模板来源。上面的旧内嵌模板为向后兼容暂保留，
-            // 实际安装改为读取当前仓库模板并只替换环境相关凭据，避免安装后丢失
-            // 错误隐藏、未安装保护、DEV_MODE、Agent 配置等后续新增的安全逻辑。
+            // 写入 config.php：只有一个真实模板来源——随包分发的 config.php（发版时由
+            // deploy/config.php.dist 生成），只替换环境相关凭据，避免安装后丢失错误隐藏、
+            // 未安装保护、DEV_MODE、Agent 配置等后续新增的安全逻辑。
+            // 审计 T6（2026-10-31）：原先此处还保留一份内嵌 heredoc 模板，赋值后立即被下方
+            // 模板覆盖、从未生效，且其 getSystemSetting 已与真实模板漂移，故删除。
             $configTemplate = @file_get_contents(__DIR__ . '/config.php');
             if ($configTemplate === false || $configTemplate === '') {
                 throw new RuntimeException('无法读取 config.php 配置模板');
@@ -465,6 +393,7 @@ PHP;
             };
             foreach ([
                 'DB_HOST'    => $esc($host),
+                'DB_PORT'    => (string)$port,
                 'DB_NAME'    => $esc($dbname),
                 'DB_USER'    => $esc($user),
                 'DB_PASS'    => $esc($pass),
@@ -482,14 +411,101 @@ PHP;
                            . "请右键目录 → 属性 → 安全，授予 Web 进程用户写入权限。";
                 } else {
                     $error = "项目目录不可写（" . __DIR__ . "），Web 进程用户（{$who}）没有写入权限。"
-                           . "请在服务器执行：<code>chmod -R 755 " . htmlspecialchars(__DIR__) . "</code> "
-                           . "或 <code>chown -R www:www " . htmlspecialchars(__DIR__) . "</code>"
-                           . "（将 www:www 替换为你的 Web 用户）";
+                           . "请由运维仅向 Web 进程用户授予 config.php 所在目录的必要写权限；"
+                           . "不要递归放宽整个项目的权限。";
                 }
             } else {
-                $configBytes = @file_put_contents(__DIR__ . '/config.php', $configContent, LOCK_EX);
-                if ($configBytes === false || $configBytes !== strlen($configContent)) {
-                    throw new RuntimeException('config.php 写入不完整，安装锁未创建；请检查文件权限和磁盘空间');
+                $configPath = __DIR__ . '/config.php';
+                $configTempPath = __DIR__ . DIRECTORY_SEPARATOR . '.config.php.'
+                    . bin2hex(random_bytes(16)) . '.tmp';
+                $configHandle = @fopen($configTempPath, 'xb');
+                if (!is_resource($configHandle)) {
+                    throw new RuntimeException(
+                        '无法在 config.php 同目录创建安全临时文件；安装锁未创建'
+                    );
+                }
+                try {
+                    // 先收紧临时文件；同目录 rename 会在发布后保留该权限。
+                    if (!@chmod($configTempPath, 0600)) {
+                        throw new RuntimeException(
+                            'config.php 安全临时文件无法设置为 0600；拒绝写入数据库凭据'
+                        );
+                    }
+                    $configLength = strlen($configContent);
+                    $configOffset = 0;
+                    while ($configOffset < $configLength) {
+                        $written = fwrite(
+                            $configHandle,
+                            substr($configContent, $configOffset)
+                        );
+                        if ($written === false || $written === 0) {
+                            throw new RuntimeException(
+                                'config.php 安全临时文件写入不完整；安装锁未创建'
+                            );
+                        }
+                        $configOffset += $written;
+                    }
+                    if (!fflush($configHandle)) {
+                        throw new RuntimeException(
+                            'config.php 安全临时文件无法 flush；安装锁未创建'
+                        );
+                    }
+                    if (function_exists('fsync') && !@fsync($configHandle)) {
+                        throw new RuntimeException(
+                            'config.php 安全临时文件无法 fsync；安装锁未创建'
+                        );
+                    }
+                    if (!fclose($configHandle)) {
+                        throw new RuntimeException(
+                            'config.php 安全临时文件无法关闭；安装锁未创建'
+                        );
+                    }
+                    $configHandle = null;
+
+                    // 临时文件与目标位于同一目录；rename 是唯一发布动作，
+                    // 不调用 shell，兼容 Windows/POSIX，并避免半写 config.php。
+                    if (!@rename($configTempPath, $configPath)) {
+                        throw new RuntimeException(
+                            'config.php 原子替换失败；安装锁未创建，请检查文件占用和目录权限'
+                        );
+                    }
+                    $configTempPath = null;
+                    if (!@chmod($configPath, 0600)) {
+                        throw new RuntimeException(
+                            'config.php 已写入但无法确认 0600 权限；安装被阻断，请立即修复文件权限'
+                        );
+                    }
+                    $persistedConfigHash = hash_file('sha256', $configPath);
+                    if (!is_string($persistedConfigHash)
+                        || !hash_equals(hash('sha256', $configContent), $persistedConfigHash)) {
+                        throw new RuntimeException(
+                            'config.php 原子写入后的内容校验失败；安装锁未创建'
+                        );
+                    }
+                } finally {
+                    if (is_resource($configHandle)) {
+                        fclose($configHandle);
+                    }
+                    if (is_string($configTempPath) && is_file($configTempPath)) {
+                        @unlink($configTempPath);
+                    }
+                }
+
+                // 审计 2026-08-13 #3：同时将管理员凭证写入 storage/admin_credentials.json
+                // （storage/ 受 deny-all .htaccess 保护，web 不可达）。
+                // loadAdminCredentials() 优先读取此文件，config.php 常量作为向后兼容回退。
+                // 写入失败不阻断安装——config.php 常量已就位，系统仍可正常工作。
+                $credJson = json_encode([
+                    'user'      => $adminUser,
+                    'pass_hash' => $passHash,
+                ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+                $credFile = __DIR__ . '/storage/admin_credentials.json';
+                $credWritten = @file_put_contents($credFile, $credJson, LOCK_EX);
+                if ($credWritten !== false) {
+                    // 限制文件权限为仅属主读写（Windows 上 chmod 无效但无副作用）
+                    @chmod($credFile, 0600);
+                } else {
+                    error_log('install: storage/admin_credentials.json 写入失败，回退到 config.php 常量');
                 }
 
                 $lockContent =
@@ -553,7 +569,7 @@ PHP;
 <title>安装向导 - Super Ma  AI小说创作系统</title>
 <link rel="stylesheet" href="assets/vendor/bootstrap.min.css">
 <link rel="stylesheet" href="assets/vendor/bootstrap-icons.min.css">
-<script>(function(){ var t='dark'; try{ t=localStorage.getItem('novel-theme')||'dark'; }catch(e){} document.documentElement.setAttribute('data-theme',t); })();</script>
+<script nonce="<?= cspNonce() ?>">(function(){ var t='dark'; try{ t=localStorage.getItem('novel-theme')||'dark'; }catch(e){} document.documentElement.setAttribute('data-theme',t); })();</script>
 <style>
 :root {
     --bg-body:  #0f0f1a;
@@ -737,50 +753,111 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
       <!-- 环境检测 -->
       <?php
       $disabledFns = array_map('trim', explode(',', ini_get('disable_functions') ?: ''));
-      $cliBinaryOk = false; $cliBinaryPath = '';
-      if (!in_array('exec', $disabledFns) && function_exists('exec')) {
+      // 审计修复 P2-3（2026-10-18）：宝塔默认禁用 exec/popen、只保留 proc_open，而运行时
+      // （write_start.php 及各 worker 启动器）以 proc_open 启动后台进程。原检测只认 exec，
+      // 会把可正常异步写作的环境误报为"PHP CLI 未找到 / 仅 SSE 直连"。下面统一经同一个
+      // 执行器实测：exec 可用用 exec，否则 proc_open，再否则 popen。
+      $installFnOk = static fn(string $fn): bool => !in_array($fn, $disabledFns, true) && function_exists($fn);
+      $installProcOpenOk = $installFnOk('proc_open') && $installFnOk('proc_close');
+      $installPopenOk = $installFnOk('popen') && $installFnOk('pclose');
+      $installCanRun = $installFnOk('exec') || $installProcOpenOk || $installPopenOk;
+      $installNull = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
+      $installRunCmd = static function (string $cmd, ?array &$out = null) use ($installFnOk, $installProcOpenOk, $installPopenOk, $installNull): int {
+          $out = [];
+          $stdout = null;
+          $code = -1;
+          if ($installFnOk('exec')) {
+              @exec($cmd, $out, $code);
+              return (int)$code;
+          }
+          if ($installProcOpenOk) {
+              $proc = @proc_open($cmd, [0 => ['file', $installNull, 'r'], 1 => ['pipe', 'w'], 2 => ['file', $installNull, 'w']], $pipes);
+              if ($proc === false) return -1;
+              $stdout = (string)stream_get_contents($pipes[1]);
+              fclose($pipes[1]);
+              $code = proc_close($proc);
+          } elseif ($installPopenOk) {
+              $handle = @popen($cmd, 'r');
+              if ($handle === false) return -1;
+              $stdout = (string)stream_get_contents($handle);
+              $code = pclose($handle);
+          }
+          if ($stdout !== null && trim($stdout) !== '') {
+              $out = preg_split('/\r?\n/', rtrim($stdout, "\r\n")) ?: [];
+          }
+          return (int)$code;
+      };
+      // 与 write_start.php 相同口径推导 CLI：php-cgi.exe → php.exe；php-fpm → bin/php
+      $installCliForBinary = static function (string $binary): string {
+          if ($binary === '') return '';
           if (PHP_OS_FAMILY === 'Windows') {
-              @exec('where php 2>nul', $out, $code);
-              $cliBinaryOk = ($code === 0 && !empty($out));
-              $cliBinaryPath = $cliBinaryOk ? trim($out[0]) : '';
-          } else {
-              @exec('which php 2>/dev/null', $out, $code);
-              $cliBinaryOk = ($code === 0 && !empty($out));
-              $cliBinaryPath = $cliBinaryOk ? trim($out[0]) : '';
-              // 兜底：常见路径
-              if (!$cliBinaryOk) {
-                  foreach (['/usr/bin/php', '/usr/local/bin/php', '/bin/php'] as $candidate) {
-                      @exec(escapeshellarg($candidate) . ' -r "echo 1;" 2>/dev/null', $testOut, $testCode);
-                      if ($testCode === 0 && !empty($testOut)) {
-                          $cliBinaryOk = true; $cliBinaryPath = $candidate; break;
-                      }
-                  }
+              return preg_replace('#php-cgi\.exe$#i', 'php.exe', $binary) ?? $binary;
+          }
+          return preg_match('#/php-fpm\d*$#', $binary) ? str_replace('/sbin/php-fpm', '/bin/php', $binary) : $binary;
+      };
+      $cliBinaryOk = false; $cliBinaryPath = '';
+      if ($installCanRun) {
+          $cliCandidates = [];
+          $derivedCli = $installCliForBinary(PHP_BINARY ?: '');
+          if ($derivedCli !== '') $cliCandidates[] = $derivedCli;
+          $lookupOut = [];
+          if ($installRunCmd(PHP_OS_FAMILY === 'Windows' ? 'where php 2>nul' : 'which php 2>/dev/null', $lookupOut) === 0
+              && !empty($lookupOut[0])) {
+              $cliCandidates[] = trim($lookupOut[0]);
+          }
+          if (PHP_OS_FAMILY !== 'Windows') {
+              array_push($cliCandidates, '/usr/bin/php', '/usr/local/bin/php', '/bin/php');
+          }
+          foreach (array_values(array_unique($cliCandidates)) as $candidate) {
+              $probeOut = [];
+              $probeCode = $installRunCmd(escapeshellarg($candidate) . ' -r "echo 1;" 2>' . $installNull, $probeOut);
+              if ($probeCode === 0 && trim(implode('', $probeOut)) === '1') {
+                  $cliBinaryOk = true; $cliBinaryPath = $candidate; break;
               }
           }
       }
+      $installProcDesc = static function (bool $available) use ($installProcOpenOk): string {
+          if ($available) return '可用（异步写作后台启动方式之一）';
+          return $installProcOpenOk
+              ? '已禁用（不影响：异步写作使用 proc_open 启动后台进程）'
+              : '已禁用（proc_open 也不可用时写作回退到 SSE 直连模式）';
+      };
       // 进度文件目录可写性
       $tmpWritable = is_writable(sys_get_temp_dir());
       $projectWritable = is_writable(__DIR__);
       $envChecks = [
-          ['PHP 版本',   version_compare(PHP_VERSION, '8.0', '>='),                       '需要 PHP 8.0+（当前 ' . PHP_VERSION . '）'],
-          ['exec()',     !in_array('exec', $disabledFns) && function_exists('exec'),      '异步写作模式需要（禁用后自动回退到SSE直连模式）'],
-          ['popen()',    !in_array('popen', $disabledFns) && function_exists('popen'),    '异步写作模式需要（禁用后自动回退到SSE直连模式）'],
-          ['pclose()',   !in_array('pclose', $disabledFns) && function_exists('pclose'),  '异步写作模式需要（禁用后自动回退到SSE直连模式）'],
-          ['proc_open',  !in_array('proc_open', $disabledFns) && function_exists('proc_open'), '异步写作 Windows 备选（proc_open 比 popen 更可靠）'],
+          ['PHP 版本',   version_compare(PHP_VERSION, '8.2', '>='),                       '需要 PHP 8.2+（当前 ' . PHP_VERSION . '）'],
+          // exec/popen 被禁用但 proc_open 可用时不算警告（宝塔默认配置即如此，异步写作正常）
+          ['exec()',     $installFnOk('exec') || $installProcOpenOk,                       $installProcDesc($installFnOk('exec'))],
+          ['popen()',    $installFnOk('popen') || $installProcOpenOk,                      $installProcDesc($installFnOk('popen'))],
+          ['pclose()',   $installFnOk('pclose') || $installProcOpenOk,                     $installProcDesc($installFnOk('pclose'))],
+          ['proc_open',  $installProcOpenOk,                                               '异步写作首选后台启动方式（宝塔默认保留此函数）'],
           ['flock()',    function_exists('flock'),                                          '进度文件并发锁（多进程写作安全）'],
           ['chmod()',    function_exists('chmod'),                                          'Shell wrapper 可执行权限设置'],
           ['curl',       function_exists('curl_init'),                                      'AI接口调用需要'],
           ['pdo_mysql',  extension_loaded('pdo_mysql'),                                     '数据库连接需要'],
           ['json',       function_exists('json_encode'),                                    '数据交互需要'],
           ['mbstring',   extension_loaded('mbstring'),                                      '中文字数统计需要'],
+          ['fileinfo',   extension_loaded('fileinfo'),                                      '部分上传与媒体功能的类型校验需要启用此扩展', true],
+          ['gd',         extension_loaded('gd'),                                            '图片处理需要'],
+          ['openssl',    extension_loaded('openssl'),                                       '安全加密与签名需要'],
+          ['zip',        extension_loaded('zip'),                                           'Excel/素材包导入导出需要'],
           ['session',    function_exists('session_start'),                                  '登录鉴权需要'],
           ['allow_url_fopen', (bool)ini_get('allow_url_fopen'),                             'HTTP Stream fallback（curl不可用时的备选）'],
           ['PHP CLI',    $cliBinaryOk,                                                      '异步写作核心依赖' . ($cliBinaryOk ? '（' . $cliBinaryPath . '）' : '（未找到，异步写作将不可用）')],
           ['进度目录(/tmp)', $tmpWritable,                                                  '异步写作进度文件写入' . ($tmpWritable ? '（可写）' : '（不可写，将回退到项目目录）')],
           ['项目目录可写', $projectWritable,                                                '配置文件/锁文件写入' . ($projectWritable ? '（可写）' : '（不可写）')],
       ];
-      $hasWarning = false;
-      foreach ($envChecks as $c) { if (!$c[1]) $hasWarning = true; }
+      // 默认只展示异常项；通过项保留在折叠区，避免安装页被正常状态淹没。
+      $failedEnvChecks = array_values(array_filter(
+          $envChecks,
+          static fn(array $check): bool => !$check[1]
+      ));
+      $passedEnvChecks = array_values(array_filter(
+          $envChecks,
+          static fn(array $check): bool => (bool)$check[1]
+      ));
+      $hasWarning = $failedEnvChecks !== [];
 
       // ================================================================
       // 异步写作深入诊断（模拟 test_write_diag.php 核心检测）
@@ -804,19 +881,22 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           'verdict_msg'      => '',
       ];
 
-      $asyncCanTest = (!in_array('exec', $disabledFns) && function_exists('exec'));
+      // 审计修复 P2-3（2026-10-18）：任一后台启动函数可用即做深度检测（原仅认 exec）
+      $asyncCanTest = $installCanRun;
 
       if ($asyncCanTest) {
           $asyncDiag['tested'] = true;
           $asyncDiag['php_binary_raw'] = PHP_BINARY ?: 'php';
           $phpBin = $asyncDiag['php_binary_raw'];
 
-          // 1. 实测 exec()
+          // 1. 实测 exec()（被禁用时调用即致命错误，必须守卫）
           $testOut = []; $testCode = -1;
-          if (PHP_OS_FAMILY === 'Windows') {
-              @exec('echo 1', $testOut, $testCode);
-          } else {
-              @exec('echo 1 2>/dev/null', $testOut, $testCode);
+          if ($installFnOk('exec')) {
+              if (PHP_OS_FAMILY === 'Windows') {
+                  @exec('echo 1', $testOut, $testCode);
+              } else {
+                  @exec('echo 1 2>/dev/null', $testOut, $testCode);
+              }
           }
           $asyncDiag['exec_works'] = ($testCode === 0);
 
@@ -846,10 +926,12 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
               $asyncDiag['php_binary_fixed'] = true;
           }
           if (PHP_OS_FAMILY !== 'Windows' && preg_match('#/php-fpm\d*$#', $phpBin)) {
-              @exec('which php 2>/dev/null', $whichOut, $whichCode);
+              $whichOut = [];
+              $whichCode = $installRunCmd('which php 2>/dev/null', $whichOut);
               if ($whichCode === 0 && !empty($whichOut[0])) {
                   $candidate = trim($whichOut[0]);
-                  @exec(escapeshellarg($candidate) . ' -r "echo 1;" 2>/dev/null', $rTest, $rCode);
+                  $rTest = [];
+                  $rCode = $installRunCmd(escapeshellarg($candidate) . ' -r "echo 1;" 2>/dev/null', $rTest);
                   if ($rCode === 0) {
                       $phpBin = $candidate;
                       $asyncDiag['php_binary_fixed'] = true;
@@ -867,42 +949,64 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           $asyncDiag['worker_exists'] = file_exists($workerScript);
 
           // 6. Worker 语法检查（PHP lint）
-          if ($asyncDiag['exec_works'] && $asyncDiag['worker_exists']) {
+          if ($asyncDiag['worker_exists']) {
               $syncCmd = escapeshellarg($phpBin) . ' -l ' . escapeshellarg($workerScript) . ' 2>&1';
-              @exec($syncCmd, $syncOut, $syncCode);
+              $syncOut = [];
+              $syncCode = $installRunCmd($syncCmd, $syncOut);
               $asyncDiag['worker_syntax_ok'] = ($syncCode === 0);
               $asyncDiag['worker_syntax_out'] = implode(' ', $syncOut);
           }
 
           // 7. CLI pdo_mysql 扩展检测（cli 可能加载不同的 php.ini）
-          if ($asyncDiag['exec_works']) {
-              @exec(escapeshellarg($phpBin) . ' -m 2>&1', $modOut, $modCode);
-              $asyncDiag['cli_ext_list'] = implode(', ', array_slice($modOut, 2));
-              foreach ($modOut as $line) {
-                  if (stripos($line, 'pdo_mysql') !== false || stripos($line, 'PDO') !== false) {
-                      $asyncDiag['cli_pdo_mysql'] = true;
-                      break;
-                  }
+          $modOut = [];
+          $installRunCmd(escapeshellarg($phpBin) . ' -m 2>&1', $modOut);
+          $asyncDiag['cli_ext_list'] = implode(', ', array_slice($modOut, 2));
+          foreach ($modOut as $line) {
+              if (stripos($line, 'pdo_mysql') !== false || stripos($line, 'PDO') !== false) {
+                  $asyncDiag['cli_pdo_mysql'] = true;
+                  break;
               }
           }
 
           // 8. 最小化后台执行测试（验证进程启动机制整体可用）
-          if ($asyncDiag['exec_works']) {
-              $miniScript = sys_get_temp_dir() . '/install_test_' . bin2hex(random_bytes(4)) . '.php';
-              $miniOut    = sys_get_temp_dir() . '/install_test_' . bin2hex(random_bytes(4)) . '.txt';
-              file_put_contents($miniScript, '<?php file_put_contents("' . addslashes($miniOut) . '", "OK_".time()."\n");');
-              if (PHP_OS_FAMILY === 'Windows') {
-                  $miniCmd = 'start /B "" ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($miniScript) . ' 2>nul';
-                  @exec($miniCmd, $miniOutArr, $miniCode);
-              } else {
-                  $miniCmd = 'nohup ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($miniScript) . ' > /dev/null 2>&1 &';
-                  @exec($miniCmd, $miniOutArr, $miniCode);
+          // 与运行时相同：exec 不可用时以 proc_open（再退 popen）分离启动，标准流全部指向空设备，
+          // 外层命令（start /B 或 sh 的 &）立即返回，不等待探针进程。
+          $installDetach = static function (string $cmd) use ($installFnOk, $installProcOpenOk, $installPopenOk, $installNull): void {
+              if ($installFnOk('exec')) {
+                  $ignored = [];
+                  @exec($cmd, $ignored);
+              } elseif ($installProcOpenOk) {
+                  $proc = @proc_open($cmd, [0 => ['file', $installNull, 'r'], 1 => ['file', $installNull, 'w'], 2 => ['file', $installNull, 'w']], $pipes);
+                  if ($proc !== false) proc_close($proc);
+              } elseif ($installPopenOk) {
+                  $handle = @popen($cmd, 'r');
+                  if ($handle !== false) pclose($handle);
               }
-              sleep(2);
-              $asyncDiag['mini_exec_ok'] = (file_exists($miniOut) && strpos(@file_get_contents($miniOut) ?? '', 'OK_') !== false);
-              @unlink($miniScript);
-              @unlink($miniOut);
+          };
+          $miniScript = sys_get_temp_dir() . '/install_test_' . bin2hex(random_bytes(4)) . '.php';
+          $miniOut    = sys_get_temp_dir() . '/install_test_' . bin2hex(random_bytes(4)) . '.txt';
+          // 审计修复 H7（2026-08-16）：探针脚本写入失败（tmp 目录不可写）须显式记录，
+          // 否则后台执行测试会被误判为 unstable，掩盖真实故障原因。
+          if (file_put_contents($miniScript, '<?php file_put_contents("' . addslashes($miniOut) . '", "OK_".time()."\n");') === false) {
+              $asyncDiag['mini_exec_ok'] = false;
+              $asyncDiag['mini_exec_error'] = '无法写入临时探针脚本：' . $miniScript . '（tmp 目录不可写）';
+              error_log('install diag: mini probe write failed: ' . $miniScript);
+          } else {
+              $installDetach(PHP_OS_FAMILY === 'Windows'
+                  ? 'start /B "" ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($miniScript) . ' 2>nul'
+                  : 'nohup ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($miniScript) . ' > /dev/null 2>&1 &');
+              // 成功即返回，最多等 5 秒（Windows 冷启动 php.exe 可能超过原固定的 2 秒）
+              for ($miniWait = 0; $miniWait < 25; $miniWait++) {
+                  $miniBody = is_file($miniOut) ? @file_get_contents($miniOut) : false;
+                  if (is_string($miniBody) && strpos($miniBody, 'OK_') !== false) {
+                      $asyncDiag['mini_exec_ok'] = true;
+                      break;
+                  }
+                  usleep(200000);
+              }
           }
+          @unlink($miniScript);
+          @unlink($miniOut);
 
           // 9. 综合判定
           $anyProcOk = $asyncDiag['exec_works'] || $asyncDiag['popen_works'] || $asyncDiag['proc_open_works'];
@@ -924,7 +1028,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           }
       } else {
           $asyncDiag['verdict'] = 'sse_only';
-          $asyncDiag['verdict_msg'] = 'exec() 被禁用，无法检测异步写作环境';
+          $asyncDiag['verdict_msg'] = 'exec()/proc_open()/popen() 均被禁用，无法启动后台写作进程';
       }
       ?>
       <?php
@@ -937,22 +1041,39 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
       ?>
       <div class="section-title"><span class="step-badge">0</span>环境检测 · 异步写作深度检测</div>
       <div class="mb-3 p-3" style="background:<?= $sectionWarn ? 'rgba(245,158,11,.06)' : 'rgba(16,185,129,.05)' ?>;border:1px solid <?= $sectionWarn ? 'rgba(245,158,11,.2)' : 'rgba(16,185,129,.2)' ?>;border-radius:8px">
-        <?php foreach ($envChecks as $check): list($name, $ok, $desc) = $check; ?>
+        <?php if ($failedEnvChecks === []): ?>
         <div class="d-flex align-items-center gap-2 py-1" style="font-size:.82rem">
-          <?php if ($ok): ?>
-            <i class="bi bi-check-circle-fill text-success"></i>
-            <span style="color:#fff"><?= $name ?></span>
-            <span style="font-size:.72rem;color:#fff">— <?= $desc ?></span>
-          <?php else: ?>
-            <i class="bi bi-exclamation-triangle-fill text-warning"></i>
-            <span class="fw-semibold" style="color:#fff"><?= $name ?></span>
-            <span style="font-size:.72rem;color:#fff">— 已禁用，<?= $desc ?></span>
-          <?php endif; ?>
+          <i class="bi bi-check-circle-fill text-success"></i>
+          <span class="fw-semibold" style="color:#fff">基础环境检测全部通过</span>
+          <span style="font-size:.72rem;color:#fff">— <?= count($passedEnvChecks) ?> 个正常项已隐藏</span>
         </div>
-        <?php endforeach; ?>
+        <?php else: ?>
+          <?php foreach ($failedEnvChecks as $check): list($name, $ok, $desc) = $check; ?>
+          <div class="d-flex align-items-center gap-2 py-1" style="font-size:.82rem">
+            <i class="bi bi-exclamation-triangle-fill text-warning"></i>
+            <span class="fw-semibold" style="color:#fff"><?= htmlspecialchars((string)$name, ENT_QUOTES, 'UTF-8') ?></span>
+            <span style="font-size:.72rem;color:#fff">— <?= !empty($check[3]) ? '未启用（可选，不影响安装）' : '未通过' ?>，<?= htmlspecialchars((string)$desc, ENT_QUOTES, 'UTF-8') ?></span>
+          </div>
+          <?php endforeach; ?>
+        <?php endif; ?>
+
+        <?php if ($passedEnvChecks !== []): ?>
+        <details class="mt-2" style="font-size:.75rem;color:#fff">
+          <summary style="cursor:pointer;color:#fff">查看已通过的 <?= count($passedEnvChecks) ?> 个基础环境项目</summary>
+          <div class="mt-2 ps-2" style="border-left:2px solid rgba(16,185,129,.35)">
+            <?php foreach ($passedEnvChecks as $check): list($name, $ok, $desc) = $check; ?>
+            <div class="d-flex align-items-center gap-2 py-1" style="font-size:.78rem">
+              <i class="bi bi-check-circle-fill text-success" style="font-size:.7rem"></i>
+              <span><?= htmlspecialchars((string)$name, ENT_QUOTES, 'UTF-8') ?></span>
+              <span style="font-size:.7rem">— <?= htmlspecialchars((string)$desc, ENT_QUOTES, 'UTF-8') ?></span>
+            </div>
+            <?php endforeach; ?>
+          </div>
+        </details>
+        <?php endif; ?>
         <?php if ($hasWarning): ?>
         <div class="mt-2 pt-2" style="border-top:1px solid var(--border);font-size:.75rem;color:#fff">
-          <i class="bi bi-info-circle me-1"></i>警告项不影响安装，但可能影响部分功能。exec/popen/pclose 禁用时写作将自动使用 SSE 直连模式（可能受 Nginx 超时限制）。PHP CLI 未找到时异步写作不可用。
+          <i class="bi bi-info-circle me-1"></i>警告项不影响安装，但可能影响部分功能。exec/popen/proc_open 全部禁用时写作将自动使用 SSE 直连模式（可能受 Nginx 超时限制）；只保留 proc_open（宝塔默认）即可异步写作。PHP CLI 未找到时异步写作不可用。
         </div>
         <?php endif; ?>
         <!-- 异步写作深度检测（已合并入「环境检测」区块，原为独立 section） -->
@@ -960,7 +1081,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           <div class="fw-semibold mb-2" style="font-size:.8rem;color:#fff"><i class="bi bi-lightning-charge-fill text-warning me-1"></i>异步写作深度检测</div>
         <?php if (!$asyncDiag['tested']): ?>
         <div style="font-size:.82rem;color:#fff">
-          <i class="bi bi-info-circle me-1"></i>exec() 被禁用，跳过异步写作深度检测。写作将自动使用 SSE 直连模式。
+          <i class="bi bi-info-circle me-1"></i>exec()/proc_open()/popen() 均不可用，跳过异步写作深度检测。写作将自动使用 SSE 直连模式。
         </div>
         <?php else: ?>
 
@@ -981,9 +1102,12 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
         <!-- 详细检测项 -->
         <?php
         $diagItems = [
-            ['exec() 实测',       $asyncDiag['exec_works'],      '后台进程启动核心函数'],
-            ['popen() 实测',      $asyncDiag['popen_works'],     'Linux 备选进程启动方式'],
-            ['proc_open() 实测',  $asyncDiag['proc_open_works'], 'Windows 备选进程启动方式'],
+            // 三者任一可用即可启动后台写作；proc_open 可用时 exec/popen 禁用不算失败项
+            ['proc_open() 实测',  $asyncDiag['proc_open_works'], '后台进程启动首选方式（宝塔默认保留）'],
+            ['exec() 实测',       $asyncDiag['exec_works'] || $asyncDiag['proc_open_works'],
+                $asyncDiag['exec_works'] ? '可用' : ($asyncDiag['proc_open_works'] ? '不可用（不影响，使用 proc_open）' : '不可用')],
+            ['popen() 实测',      $asyncDiag['popen_works'] || $asyncDiag['proc_open_works'],
+                $asyncDiag['popen_works'] ? '可用' : ($asyncDiag['proc_open_works'] ? '不可用（不影响，使用 proc_open）' : '不可用')],
         ];
         if ($asyncDiag['worker_exists']) {
             $diagItems[] = ['Worker 语法检查', $asyncDiag['worker_syntax_ok'], $asyncDiag['worker_syntax_ok'] ? '通过' : $asyncDiag['worker_syntax_out']];
@@ -991,27 +1115,52 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
             $diagItems[] = ['Worker 脚本存在', $asyncDiag['worker_exists'], 'api/write_chapter_worker.php 缺失'];
         }
         $diagItems[] = ['CLI pdo_mysql',   $asyncDiag['cli_pdo_mysql'],   $asyncDiag['cli_pdo_mysql'] ? 'CLI 已加载' : 'CLI 未加载（可能使用不同的php.ini）'];
-        $diagItems[] = ['后台进程测试',    $asyncDiag['mini_exec_ok'],    $asyncDiag['mini_exec_ok'] ? '通过（nohup启动成功）' : '未通过（进程未能正常启动）'];
+        $diagItems[] = ['后台进程测试',    $asyncDiag['mini_exec_ok'],    $asyncDiag['mini_exec_ok'] ? '通过（后台探针进程启动成功）' : '未通过（进程未能正常启动）'];
         if ($asyncDiag['php_binary_fixed']) {
             $diagItems[] = ['PHP_BINARY修正', true, $asyncDiag['php_binary_raw'] . ' → ' . $asyncDiag['php_binary']];
         }
         if ($asyncDiag['cli_ext_list']) {
             $diagItems[] = ['CLI 扩展列表', true, mb_strlen($asyncDiag['cli_ext_list']) > 200 ? mb_substr($asyncDiag['cli_ext_list'], 0, 200) . '…' : $asyncDiag['cli_ext_list']];
         }
+        $failedDiagItems = array_values(array_filter(
+            $diagItems,
+            static fn(array $item): bool => !$item[1]
+        ));
+        $passedDiagItems = array_values(array_filter(
+            $diagItems,
+            static fn(array $item): bool => (bool)$item[1]
+        ));
         ?>
-        <?php foreach ($diagItems as $item): list($name, $ok, $desc) = $item; ?>
+        <?php if ($failedDiagItems === []): ?>
         <div class="d-flex align-items-center gap-2 py-1" style="font-size:.78rem">
-          <?php if ($ok): ?>
-            <i class="bi bi-check-circle-fill text-success" style="font-size:.7rem"></i>
-            <span style="color:#fff"><?= $name ?></span>
-            <span style="font-size:.7rem;color:#fff">— <?= $desc ?></span>
-          <?php else: ?>
-            <i class="bi bi-x-circle-fill text-danger" style="font-size:.7rem"></i>
-            <span class="fw-semibold" style="color:#fff"><?= $name ?></span>
-            <span style="color:#fff;font-size:.7rem">— <?= $desc ?></span>
-          <?php endif; ?>
+          <i class="bi bi-check-circle-fill text-success" style="font-size:.7rem"></i>
+          <span class="fw-semibold" style="color:#fff">深度检测项目全部通过</span>
+          <span style="font-size:.7rem;color:#fff">— <?= count($passedDiagItems) ?> 个正常项已隐藏</span>
         </div>
-        <?php endforeach; ?>
+        <?php else: ?>
+          <?php foreach ($failedDiagItems as $item): list($name, $ok, $desc) = $item; ?>
+          <div class="d-flex align-items-center gap-2 py-1" style="font-size:.78rem">
+            <i class="bi bi-x-circle-fill text-danger" style="font-size:.7rem"></i>
+            <span class="fw-semibold" style="color:#fff"><?= htmlspecialchars((string)$name, ENT_QUOTES, 'UTF-8') ?></span>
+            <span style="color:#fff;font-size:.7rem">— <?= htmlspecialchars((string)$desc, ENT_QUOTES, 'UTF-8') ?></span>
+          </div>
+          <?php endforeach; ?>
+        <?php endif; ?>
+
+        <?php if ($passedDiagItems !== []): ?>
+        <details class="mt-2" style="font-size:.75rem;color:#fff">
+          <summary style="cursor:pointer;color:#fff">查看已通过的 <?= count($passedDiagItems) ?> 个深度检测项目</summary>
+          <div class="mt-2 ps-2" style="border-left:2px solid rgba(16,185,129,.35)">
+            <?php foreach ($passedDiagItems as $item): list($name, $ok, $desc) = $item; ?>
+            <div class="d-flex align-items-center gap-2 py-1" style="font-size:.78rem">
+              <i class="bi bi-check-circle-fill text-success" style="font-size:.7rem"></i>
+              <span><?= htmlspecialchars((string)$name, ENT_QUOTES, 'UTF-8') ?></span>
+              <span style="font-size:.7rem">— <?= htmlspecialchars((string)$desc, ENT_QUOTES, 'UTF-8') ?></span>
+            </div>
+            <?php endforeach; ?>
+          </div>
+        </details>
+        <?php endif; ?>
 
         <?php endif; ?>
         </div>
@@ -1027,7 +1176,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
         <div style="font-size:.75rem;color:#fff">
           <?php if ($isSseOnly): ?>
           写作将使用 SSE 直连模式（Server-Sent Events），该模式受 Nginx/Apache 超时限制（通常 60-120 秒），
-          长篇章节写作可能被截断。建议在服务器上安装并启用 PHP CLI，确保 <code>exec()</code> 未被禁用。
+          长篇章节写作可能被截断。建议在服务器上安装并启用 PHP CLI，确保 <code>proc_open()</code> 或 <code>exec()</code> 至少一个未被禁用。
           <?php else: ?>
           异步写作环境不完全满足要求，写作任务可能启动失败并自动回退到 SSE 直连模式。
           建议检查 PHP CLI 配置，确保 CLI 与 FPM 使用相同的扩展（尤其是 pdo_mysql）。
@@ -1051,9 +1200,9 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           </div>
         </div>
         <div class="col-4">
-          <label class="form-label">端口（可选）</label>
-          <input type="text" class="form-control form-control-sm" placeholder="3306" disabled
-                 style="opacity:.5" title="默认3306，如需修改请直接修改config.php">
+          <label class="form-label">端口</label>
+          <input type="number" name="db_port" class="form-control form-control-sm"
+                 value="<?= (int)$port ?>" min="1" max="65535" required>
         </div>
       </div>
 
@@ -1067,10 +1216,10 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
           </div>
         </div>
         <div class="col-6">
-          <label class="form-label">数据库密码</label>
+          <label class="form-label">数据库密码 <span class="text-danger">*</span></label>
           <div class="input-group input-group-sm">
             <span class="input-group-text"><i class="bi bi-key"></i></span>
-            <input type="password" name="db_pass" class="form-control" autocomplete="off">
+            <input type="password" name="db_pass" class="form-control" required autocomplete="off">
           </div>
         </div>
       </div>
@@ -1162,7 +1311,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
   </div>
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 (function(){
     var p1 = document.getElementById('adminPass');
     var p2 = document.getElementById('adminPass2');
@@ -1177,7 +1326,7 @@ body { background: var(--bg-body); color: var(--text); min-height:100vh; display
 })();
 </script>
 <?php if ($success && $installModelToken !== ''): ?>
-<script>
+<script nonce="<?= cspNonce() ?>">
 (function(){
     const installToken = <?= json_encode($installModelToken, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
     const form = document.getElementById('install-model-form');

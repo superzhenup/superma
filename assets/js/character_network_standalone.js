@@ -320,7 +320,7 @@ const CharacterNetworkStandalone = {
         if (rels.length > 0) {
             relHtml = '<ul class="cn-rel-list">' + rels.map(r =>
                 `<li class="cn-rel-item">
-                    <span class="cn-rel-name" onclick="CharacterNetworkStandalone.selectNode(${parseInt(r.id,10)||0})">${this.escHtml(r.name)}</span>
+                    <span class="cn-rel-name" data-csp-click="character-network.select-node" data-id="${parseInt(r.id,10)||0}">${this.escHtml(r.name)}</span>
                     <span class="cn-rel-type">${this.escHtml(r.type)}</span>
                 </li>`
             ).join('') + '</ul>';
@@ -354,7 +354,7 @@ const CharacterNetworkStandalone = {
             const roleLabel = { protagonist: '主角', major: '主要', minor: '次要', background: '背景' }[n.group] || '';
             // 审计修复 P1-7（2026-07-12）：data-id 强制整数，防属性注入
             const safeId = parseInt(n.id, 10) || 0;
-            return `<div class="cn-char-item" data-id="${safeId}" onclick="CharacterNetworkStandalone.selectNode(${safeId})">
+            return `<div class="cn-char-item" data-id="${safeId}" data-csp-click="character-network.select-node">
                 <span class="cn-char-dot ${dotClass}"></span>
                 <span class="cn-char-name">${this.escHtml(n.label)}</span>
                 <span class="cn-char-badge">${this.escHtml(roleLabel)}</span>
@@ -385,3 +385,7 @@ const CharacterNetworkStandalone = {
         if (e) e.textContent = stats.relationship_count;
     },
 };
+
+window.AppEvents.register('character-network.select-node', function(event, element) {
+    return CharacterNetworkStandalone.selectNode(parseInt(element.dataset.id, 10) || 0);
+});

@@ -69,6 +69,7 @@ class WritingExpertise
             'subtypes' => [
                 'no_climax' => [
                     'diagnosis' => '缺乏高潮爽点',
+                    'symptoms' => ['连续多章缺乏爽点', '章节无高潮时刻'],
                     'solutions' => [
                         '每章至少安排一个"读者看到这里会叫好"的时刻',
                         '高潮必须解决一个具体问题或带来重大突破',
@@ -77,6 +78,7 @@ class WritingExpertise
                 ],
                 'coolpoint_rushed' => [
                     'diagnosis' => '爽点铺垫不足',
+                    'symptoms' => ['爽点缺乏铺垫', '爽点爆发突兀'],
                     'solutions' => [
                         '爽点要有"压抑-爆发"过程，不能太突然',
                         '先让读者感受到压抑/不公/困境',
@@ -85,6 +87,7 @@ class WritingExpertise
                 ],
                 'coolpoint_repetitive' => [
                     'diagnosis' => '爽点类型重复',
+                    'symptoms' => ['爽点类型重复', '近章爽点同质化'],
                     'solutions' => [
                         '检查近5章是否使用了相同的爽点类型',
                         '轮换使用：打脸、逆袭、获宝、扮猪吃虎、智斗',
@@ -99,6 +102,7 @@ class WritingExpertise
             'subtypes' => [
                 'opening_weak' => [
                     'diagnosis' => '开篇吸引力不足',
+                    'symptoms' => ['开篇无钩子', '开头拖沓'],
                     'solutions' => [
                         '开篇第一句必须有钩子：悬念/冲突/意外',
                         '避免从"天气很好"或"人物介绍"开始',
@@ -115,6 +119,7 @@ class WritingExpertise
                 ],
                 'middle_sagging' => [
                     'diagnosis' => '中段疲软',
+                    'symptoms' => ['连续慢节奏章节过多', '中段无转折'],
                     'solutions' => [
                         '每500字必须有一个小转折或新信息',
                         '用子目标分解主线，让读者有阶段性成就感',
@@ -123,6 +128,7 @@ class WritingExpertise
                 ],
                 'ending_rushed' => [
                     'diagnosis' => '结尾仓促',
+                    'symptoms' => ['结尾仓促', '高潮后无收尾'],
                     'solutions' => [
                         '高潮后留出200-300字收尾空间',
                         '结尾必须有钩子：悬念/预告/情绪余韵',
@@ -137,6 +143,7 @@ class WritingExpertise
             'subtypes' => [
                 'emotion_monotone' => [
                     'diagnosis' => '情绪单调',
+                    'symptoms' => ['情绪曲线平直', '情绪缺乏起伏'],
                     'solutions' => [
                         '情绪曲线要有起伏：不能一直是兴奋或一直是平静',
                         '用"对比"制造情绪张力：期待vs失望、希望vs绝望',
@@ -145,6 +152,7 @@ class WritingExpertise
                 ],
                 'emotion_inauthentic' => [
                     'diagnosis' => '情绪不真实',
+                    'symptoms' => ['情绪描写直白告知', '情绪反应不符人设'],
                     'solutions' => [
                         '情绪反应要符合人物性格',
                         '用具体细节代替笼统的情绪词',
@@ -159,6 +167,7 @@ class WritingExpertise
             'subtypes' => [
                 'foreshadowing_forgotten' => [
                     'diagnosis' => '伏笔遗忘',
+                    'symptoms' => ['伏笔长期未提及', '伏笔超期未回收'],
                     'solutions' => [
                         '在伏笔表中标注提醒章节',
                         '每隔5章检查一次待回收伏笔',
@@ -167,6 +176,7 @@ class WritingExpertise
                 ],
                 'foreshadowing_rushed' => [
                     'diagnosis' => '伏笔回收仓促',
+                    'symptoms' => ['伏笔回收仓促', '回收缺乏铺垫'],
                     'solutions' => [
                         '回收伏笔时要有铺垫，不能太突然',
                         '回收方式要有惊喜感，最好超出读者预期',
@@ -271,6 +281,12 @@ class WritingExpertise
 
     /**
      * 根据症状匹配子类型
+     *
+     * 审计修复（2026-08-16 P1，C2）：
+     * 1. 无 symptoms 定义的子类型跳过——此前 5 个域中 4 个域的子类型无症状定义，
+     *    即使调用方传了症状也恒匹配 null（本次已为全部子类型补齐症状）；
+     * 2. 症状短语由预测器从数据信号翻译而来，与 KB 措辞可能部分重叠而非完全
+     *    一致——在精确交集外补充双向子串包含匹配（限计 1 分，防长短语占优）。
      */
     private static function matchSubtype(array $symptoms, array $subtypes): ?string
     {
@@ -279,7 +295,20 @@ class WritingExpertise
 
         foreach ($subtypes as $name => $subtype) {
             $subtypeSymptoms = $subtype['symptoms'] ?? [];
+            if (empty($subtypeSymptoms)) continue;
+
             $score = count(array_intersect($symptoms, $subtypeSymptoms));
+            if ($score === 0) {
+                foreach ($symptoms as $s) {
+                    if (!is_string($s) || $s === '') continue;
+                    foreach ($subtypeSymptoms as $t) {
+                        if (mb_strpos($t, $s) !== false || mb_strpos($s, $t) !== false) {
+                            $score = 1;
+                            break 2;
+                        }
+                    }
+                }
+            }
 
             if ($score > $bestScore) {
                 $bestScore = $score;

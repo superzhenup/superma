@@ -42,6 +42,15 @@ class EnumMigrations
 
         // [v14] novel_style.category 从 VARCHAR(30) 迁移为 ENUM（与代码一致）
         self::convertStyleCategoryToEnum($pdo);
+
+        // [v15] novel_worldbuilding.category ENUM 扩展：添加 golden_finger
+        // （审计功能 2026-08-16 P3-金手指设计模板：向导蓝图五要素存储，
+        //   与 PowerSystem 读 category='rule' 境界链先例同构）
+        self::extendEnumIfMissing($pdo, 'novel_worldbuilding', 'category',
+            ["'golden_finger'"],
+            "ALTER TABLE `novel_worldbuilding` MODIFY COLUMN `category` ENUM(
+                'location','faction','rule','item','golden_finger','other'
+             ) NOT NULL DEFAULT 'other' COMMENT '类别'", 'v15-golden-finger');
     }
 
     /**

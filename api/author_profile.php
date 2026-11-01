@@ -4,7 +4,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  * 作者画像API - 提供 RESTful 接口
  */
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 ob_start();
 
 $baseDir = dirname(__DIR__);
@@ -755,7 +755,7 @@ function handleGet(string $action, array $pathParts, ?int $userId): void
         foreach ($chapters as $ch) {
             $text = $ch['content'] ?? '';
             $charCount = mb_strlen($text);
-            $dialogueCount = preg_match_all('/["""\'"].*?["""\']/u', $text);
+            $dialogueCount = preg_match_all('/[“‘"\'].*?[”’"\']/u', $text);
             $chapterStats[] = [
                 'number' => $ch['number'] ?? 0,
                 'title' => $ch['title'] ?? '',

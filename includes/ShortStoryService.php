@@ -21,7 +21,7 @@ class ShortStoryService
 
     public function listStories(int $userId = 0): array
     {
-        $sql = 'SELECT id, title, genre, status, target_words, quality_score, model_id, created_at, updated_at
+        $sql = 'SELECT id, title, genre, status, target_words, quality_score, model_id, created_at, updated_at, content
                 FROM short_stories';
         $params = [];
         if ($userId > 0) {
@@ -32,6 +32,7 @@ class ShortStoryService
         $rows = DB::fetchAll($sql, $params);
         foreach ($rows as &$r) {
             $r['word_count'] = $this->contentWordCount($r);
+            unset($r['content']);
         }
         unset($r);
         return $rows;
@@ -126,6 +127,9 @@ class ShortStoryService
     {
         $story = DB::fetch('SELECT * FROM short_stories WHERE id = ?', [$storyId]);
         if (!$story) return ['ok' => false, 'error' => '短篇小说不存在'];
+        if ((int)($story['chapter_count'] ?? 1) >= 2) {
+            return ['ok' => false, 'error' => '分章模式请保存当前章节，不能直接覆盖全文'];
+        }
 
         $versionSaved = false;
         $oldContent = $story['content'] ?? '';
@@ -169,6 +173,9 @@ class ShortStoryService
     {
         $story = DB::fetch('SELECT * FROM short_stories WHERE id = ?', [$storyId]);
         if (!$story) return ['ok' => false, 'error' => '短篇小说不存在'];
+        if ((int)($story['chapter_count'] ?? 1) >= 2) {
+            return ['ok' => false, 'error' => '分章模式请使用写本章或连续写作'];
+        }
 
         $versionSaved = false;
         $oldContent = $story['content'] ?? '';
@@ -240,19 +247,40 @@ class ShortStoryService
 
     public function rollbackVersion(int $storyId, int $versionId): array
     {
-        $story = DB::fetch('SELECT * FROM short_stories WHERE id = ?', [$storyId]);
-        if (!$story) return ['ok' => false, 'error' => '短篇小说不存在'];
+        $pdo = DB::connect();
+        $ownTransaction = !$pdo->inTransaction();
+        if ($ownTransaction) $pdo->beginTransaction();
+        try {
+            $lock = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql' ? ' FOR UPDATE' : '';
+            $story = DB::fetch('SELECT * FROM short_stories WHERE id = ?' . $lock, [$storyId]);
+            $ver = DB::fetch('SELECT * FROM short_story_versions WHERE id = ? AND story_id = ?', [$versionId, $storyId]);
+            if (!$story || !$ver) {
+                if ($ownTransaction) $pdo->rollBack();
+                return ['ok' => false, 'error' => !$story ? '短篇小说不存在' : '版本不存在'];
+            }
 
-        $ver = DB::fetch('SELECT * FROM short_story_versions WHERE id = ? AND story_id = ?', [$versionId, $storyId]);
-        if (!$ver) return ['ok' => false, 'error' => '版本不存在'];
-
-        $this->createVersion($storyId, $story, '回滚前自动保存');
-
-        $update = ['content' => $ver['content'] ?? ''];
-        if ($ver['brief_json']) $update['brief_json'] = $ver['brief_json'];
-        if ($ver['beats_json']) $update['beats_json'] = $ver['beats_json'];
-        if (!empty($ver['chapters_json'])) $update['chapters_json'] = $ver['chapters_json'];
-        DB::update('short_stories', $update, 'id = ?', [$storyId]);
+            $update = ['content' => $ver['content'] ?? ''];
+            if ($ver['brief_json']) $update['brief_json'] = $ver['brief_json'];
+            if ($ver['beats_json']) $update['beats_json'] = $ver['beats_json'];
+            $versionChapters = json_decode((string)($ver['chapters_json'] ?? ''), true);
+            if ((int)($story['chapter_count'] ?? 1) >= 2) {
+                if (!is_array($versionChapters) || count($versionChapters) < 2) {
+                    if ($ownTransaction) $pdo->rollBack();
+                    return ['ok' => false, 'error' => '此历史版本没有完整分章数据，不能覆盖当前分章正文'];
+                }
+                $normalized = $this->normalizeChapters($versionChapters);
+                $update['chapters_json'] = json_encode($normalized, JSON_UNESCAPED_UNICODE);
+                $update['content'] = $this->mergeChapters($normalized);
+            } elseif (!empty($ver['chapters_json'])) {
+                $update['chapters_json'] = $ver['chapters_json'];
+            }
+            $this->createVersion($storyId, $story, '回滚前自动保存');
+            DB::update('short_stories', $update, 'id = ?', [$storyId]);
+            if ($ownTransaction) $pdo->commit();
+        } catch (Throwable $e) {
+            if ($ownTransaction && $pdo->inTransaction()) $pdo->rollBack();
+            throw $e;
+        }
 
         return ['ok' => true, 'story' => $this->getStory($storyId)];
     }
@@ -280,48 +308,116 @@ class ShortStoryService
 
     private function contentWordCount(array $story): int
     {
-        $content = $story['content'] ?? '';
+        $content = (string)($story['content'] ?? '');
         if ($content === '') return 0;
-        return mb_strlen(preg_replace('/\s+/', '', $content));
+        return mb_strlen(preg_replace('/\s+/u', '', $content));
+    }
+
+    /** Select the only prose the polish operation is allowed to replace. */
+    public function getPolishTarget(array $story, ?int $chapterIndex): array
+    {
+        if ((int)($story['chapter_count'] ?? 1) < 2) {
+            if ($chapterIndex !== null) throw new InvalidArgumentException('单篇模式不接受章节参数');
+            return $story;
+        }
+        $chapters = $story['chapters_json'] ?? [];
+        if ($chapterIndex === null || $chapterIndex < 0 || !isset($chapters[$chapterIndex])) {
+            throw new InvalidArgumentException('分章模式请先选择要润色的当前章节');
+        }
+        $chapter = $chapters[$chapterIndex];
+        $story['content'] = (string)($chapter['content'] ?? '');
+        $budget = (int)($chapter['word_budget'] ?? 0);
+        $story['target_words'] = $budget > 0 ? $budget : max(500, $this->contentWordCount($chapter));
+        return $story;
     }
 
     public function saveChapters(int $storyId, array $chapters): array
     {
-        $story = DB::fetch('SELECT * FROM short_stories WHERE id = ?', [$storyId]);
-        if (!$story) return ['ok' => false, 'error' => '短篇小说不存在'];
-
-        $normalized = $this->normalizeChapters($chapters);
-        DB::update('short_stories', [
-            'chapters_json' => json_encode($normalized, JSON_UNESCAPED_UNICODE),
-        ], 'id = ?', [$storyId]);
+        $pdo = DB::connect();
+        $ownTransaction = !$pdo->inTransaction();
+        if ($ownTransaction) $pdo->beginTransaction();
+        try {
+            $lock = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql' ? ' FOR UPDATE' : '';
+            $story = DB::fetch('SELECT * FROM short_stories WHERE id = ?' . $lock, [$storyId]);
+            if (!$story) {
+                if ($ownTransaction) $pdo->rollBack();
+                return ['ok' => false, 'error' => '短篇小说不存在'];
+            }
+            if ((int)($story['chapter_count'] ?? 1) < 2) {
+                if ($ownTransaction) $pdo->rollBack();
+                return ['ok' => false, 'error' => '单篇模式不接受章节大纲'];
+            }
+            $normalized = $this->normalizeChapters($chapters);
+            // Read the current chapter prose under the same lock used by
+            // chapter saves so outline edits cannot overwrite a newer chapter.
+            $existing = json_decode((string)($story['chapters_json'] ?? ''), true) ?: [];
+            foreach ($existing as $index => $oldChapter) {
+                if (trim((string)($oldChapter['content'] ?? '')) === '') continue;
+                if (!isset($normalized[$index])) {
+                    if ($ownTransaction) $pdo->rollBack();
+                    return ['ok' => false, 'error' => '不能通过修改大纲删除已有正文的章节'];
+                }
+                $normalized[$index]['content'] = (string)$oldChapter['content'];
+                $normalized[$index]['status'] = (string)($oldChapter['status'] ?? 'written');
+            }
+            if (trim((string)($story['content'] ?? '')) !== '') {
+                $this->createVersion($storyId, $story, '保存章节大纲');
+            }
+            DB::update('short_stories', [
+                'chapters_json' => json_encode($normalized, JSON_UNESCAPED_UNICODE),
+                'content' => $this->mergeChapters($normalized),
+            ], 'id = ?', [$storyId]);
+            if ($ownTransaction) $pdo->commit();
+        } catch (Throwable $e) {
+            if ($ownTransaction && $pdo->inTransaction()) $pdo->rollBack();
+            throw $e;
+        }
 
         return ['ok' => true, 'story' => $this->getStory($storyId)];
     }
 
-    public function updateChapterContent(int $storyId, int $chapterIndex, string $content): array
+    public function updateChapterContent(int $storyId, int $chapterIndex, string $content, string $note = '保存章节正文'): array
     {
-        $story = $this->getStory($storyId);
-        if (!$story) return ['ok' => false, 'error' => '短篇小说不存在'];
+        $pdo = DB::connect();
+        $ownTransaction = !$pdo->inTransaction();
+        if ($ownTransaction) $pdo->beginTransaction();
+        try {
+            $lock = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql' ? ' FOR UPDATE' : '';
+            $story = DB::fetch('SELECT * FROM short_stories WHERE id = ?' . $lock, [$storyId]);
+            if (!$story) {
+                if ($ownTransaction) $pdo->rollBack();
+                return ['ok' => false, 'error' => '短篇小说不存在'];
+            }
 
-        $chapters = $story['chapters_json'] ?? [];
-        if (empty($chapters) || !isset($chapters[$chapterIndex])) {
-            return ['ok' => false, 'error' => '章节不存在,请先生成章节大纲'];
+            $chapters = json_decode((string)($story['chapters_json'] ?? ''), true) ?: [];
+            if ((int)($story['chapter_count'] ?? 1) < 2 || $chapterIndex < 0 || !isset($chapters[$chapterIndex])) {
+                if ($ownTransaction) $pdo->rollBack();
+                return ['ok' => false, 'error' => '章节不存在,请先生成章节大纲'];
+            }
+
+            if ((string)($chapters[$chapterIndex]['content'] ?? '') !== $content
+                && trim((string)($story['content'] ?? '')) !== '') {
+                $this->createVersion($storyId, $story, $note);
+            }
+            $chapters[$chapterIndex]['content'] = $content;
+            $chapters[$chapterIndex]['status'] = mb_strlen(trim($content)) > 0 ? 'written' : 'pending';
+
+            $merged = $this->mergeChapters($chapters);
+            $allWritten = $this->allChaptersWritten($chapters);
+
+            $update = [
+                'chapters_json' => json_encode($chapters, JSON_UNESCAPED_UNICODE),
+                'content'       => $merged,
+            ];
+            if ($allWritten && in_array($story['status'], ['draft', 'brief_ready', 'beats_ready'], true)) {
+                $update['status'] = 'written';
+            }
+            DB::update('short_stories', $update, 'id = ?', [$storyId]);
+            if ($ownTransaction) $pdo->commit();
+        } catch (Throwable $e) {
+            if ($ownTransaction && $pdo->inTransaction()) $pdo->rollBack();
+            throw $e;
         }
-
-        $chapters[$chapterIndex]['content'] = $content;
-        $chapters[$chapterIndex]['status'] = mb_strlen(trim($content)) > 0 ? 'written' : 'pending';
-
-        $merged = $this->mergeChapters($chapters);
-        $allWritten = $this->allChaptersWritten($chapters);
-
-        $update = [
-            'chapters_json' => json_encode($chapters, JSON_UNESCAPED_UNICODE),
-            'content'       => $merged,
-        ];
-        if ($allWritten && in_array($story['status'], ['draft', 'brief_ready', 'beats_ready'], true)) {
-            $update['status'] = 'written';
-        }
-        DB::update('short_stories', $update, 'id = ?', [$storyId]);
 
         return ['ok' => true, 'story' => $this->getStory($storyId)];
     }

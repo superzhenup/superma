@@ -5,7 +5,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  * GET: { novel_id }
  * 返回: { optimized_chapter, total_chapters, progress_percent }
  */
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();

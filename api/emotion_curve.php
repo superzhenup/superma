@@ -3,7 +3,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
@@ -17,7 +17,7 @@ header('Content-Type: application/json; charset=utf-8');
 $novelId = (int)($_GET['novel_id'] ?? $_POST['novel_id'] ?? 0);
 
 // 审计 P0（2026-06-12）：归属校验
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 if ($novelId > 0) checkNovelOwnership($novelId, $userId);
 
 if ($novelId <= 0) {

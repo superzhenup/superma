@@ -20,6 +20,10 @@
 
 defined('APP_LOADED') or die('Direct access denied.');
 
+// 旧部署的 config.php 也加载本文件，升级即可统一 Web 与 CLI 的应用时区。
+// 调度与显示显式使用该时区，避免改变历史代码对数据库 UTC 时间的解析。
+require_once __DIR__ . '/app_time.php';
+
 // ============================================================
 // 零、system_settings 请求级缓存（审计 2026-06-10 P2-C，台账条目 25）
 //
@@ -43,15 +47,36 @@ if (!function_exists('_systemSettingsAll')) {
     function _systemSettingsAll(bool $reset = false): ?array {
         static $all = null;
         if ($reset) { $all = null; return null; }
-        if ($all !== null) return $all;
-        if (!class_exists('DB', false)) return null;
+        if ($all !== null) {
+            return class_exists('ChapterRunFrozenConfigScope', false)
+                ? ChapterRunFrozenConfigScope::overlaySystemSettings($all)
+                : $all;
+        }
+        if (!class_exists('DB', false)) {
+            return class_exists('ChapterRunFrozenConfigScope', false)
+                ? ChapterRunFrozenConfigScope::overlaySystemSettings([])
+                : null;
+        }
         try {
             $rows = DB::fetchAll('SELECT setting_key, setting_value FROM system_settings');
         } catch (\Throwable $e) {
-            return null;
+            // 审计修复（2026-08-30 M-5）：DB 故障导致整表载入失败时必须留下告警——
+            // 否则所有系统设置（含 harness 开关、字数、温度）会静默回退代码默认值，
+            // 行为突变却零日志。static 标志保证每请求只记一次，防止高频轮询刷屏。
+            static $loadFailureLogged = false;
+            if (!$loadFailureLogged) {
+                $loadFailureLogged = true;
+                error_log('[config] system_settings full-table load failed, falling back to per-key lookup: '
+                    . $e->getMessage());
+            }
+            return class_exists('ChapterRunFrozenConfigScope', false)
+                ? ChapterRunFrozenConfigScope::overlaySystemSettings([])
+                : null;
         }
         $all = array_column($rows, 'setting_value', 'setting_key');
-        return $all;
+        return class_exists('ChapterRunFrozenConfigScope', false)
+            ? ChapterRunFrozenConfigScope::overlaySystemSettings($all)
+            : $all;
     }
 }
 
@@ -141,6 +166,9 @@ if (!defined('CFG_ENDING_START_RATIO'))  define('CFG_ENDING_START_RATIO', 0.90);
 // ============================================================
 if (!defined('CFG_MEMORY_TOKEN_BUDGET'))  define('CFG_MEMORY_TOKEN_BUDGET', 12000); // 记忆上下文 token 预算
 if (!defined('CFG_KB_PREVIEW_CHARS'))     define('CFG_KB_PREVIEW_CHARS', 3000);    // 知识库预览字数
+// 审计优化（2026-10-23）：章节记忆提取（generateChapterSummary）不再丢段落。
+if (!defined('CFG_SUMMARY_FULL_TEXT_MAX_CHARS')) define('CFG_SUMMARY_FULL_TEXT_MAX_CHARS', 24000); // 整章原文交给 AI 概括提取的上限（字符），超出先 AI 分段概括
+if (!defined('CFG_SUMMARY_SEGMENT_CHARS'))       define('CFG_SUMMARY_SEGMENT_CHARS', 8000);        // 超长章 AI 分段概括的每段字符数
 if (!defined('CFG_VERSIONS_KEEP'))        define('CFG_VERSIONS_KEEP', 10);         // 版本保留数
 if (!defined('CFG_CANCEL_CHECK_FREQ'))    define('CFG_CANCEL_CHECK_FREQ', 50);     // 取消检测频率（token）
 // 审计优化 P1-3（2026-06-16）：章节列表全量分支硬上限，防止千章书单次拉取数十 MB
@@ -158,6 +186,11 @@ if (!defined('CFG_CHAPTER_VERSION_MIN_WORDS')) define('CFG_CHAPTER_VERSION_MIN_W
 if (!defined('CFG_VECTOR_SIM_THRESHOLD'))  define('CFG_VECTOR_SIM_THRESHOLD', 0.3);   // 向量余弦相似度最低阈值
 if (!defined('CFG_KB_SCAN_LIMIT'))         define('CFG_KB_SCAN_LIMIT', 1500);         // KB 向量候选池扫描上限（千章书护栏）
 if (!defined('CFG_FORESHADOW_SCAN_LIMIT')) define('CFG_FORESHADOW_SCAN_LIMIT', 300);   // 未回收伏笔向量候选池上限
+
+// 审计修复（2026-08-17 P3）：逾期伏笔缓冲章数统一口径。原先 buildBatch 用裸 3、
+// prompt.php / MemoryEngine::getFullPromptContext 的 listOverdue 传 0，两口径不一致
+// （0 缓冲会把刚到期伏笔提前算作逾期）。统一为与 buildBatch 一致的 3 章缓冲。
+if (!defined('CFG_FORESHADOW_OVERDUE_BUFFER')) define('CFG_FORESHADOW_OVERDUE_BUFFER', 3); // 判定伏笔逾期的缓冲章数（deadline < 当前章-缓冲 才算逾期）
 
 // ============================================================
 // 十、大纲优化（原 config_optimize.php，现统一至此）
@@ -188,6 +221,9 @@ function getWritingDefaults(): array
         'ws_outline_batch_1m'            => ['default' => 30,      'type' => 'int'],
         'ws_context_mode'                => ['default' => 'auto',  'type' => 'string'],
         'ws_auto_write_interval'         => ['default' => 2,       'type' => 'int'],
+        'ws_daemon_schedule_enabled'     => ['default' => '0',     'type' => 'string'],
+        'ws_daemon_window_start'         => ['default' => '00:00', 'type' => 'string'],
+        'ws_daemon_window_end'           => ['default' => '06:00', 'type' => 'string'],
         // ── 爽点调度参数 ──
         'ws_cool_point_density_target'   => ['default' => 0.88,    'type' => 'float'],
         'ws_cool_point_hunger_threshold' => ['default' => 0.6,     'type' => 'float'],
@@ -204,15 +240,39 @@ function getWritingDefaults(): array
         'ws_returning_character_enabled' => ['default' => true,    'type' => 'bool'],
         'ws_returning_character_gap'     => ['default' => 15,      'type' => 'int'],
         'ws_returning_character_limit'   => ['default' => 3,       'type' => 'int'],
-        'ws_memory_lookback'             => ['default' => 5,       'type' => 'int'],
+        'ws_memory_lookback'             => ['default' => 16,       'type' => 'int'],
         'ws_embedding_top_k'             => ['default' => 5,       'type' => 'int'],
+        'ws_memory_token_budget'         => ['default' => 20000,   'type' => 'int'],
+        'ws_prompt_cache_ttl'            => ['default' => 0,       'type' => 'int'],
+        'ws_pp_wait_sec'                 => ['default' => 300,     'type' => 'int'],
+        'ws_postprocess_parallel_enabled' => ['default' => false,  'type' => 'bool'],
+        'ws_breather_interval'           => ['default' => 9,       'type' => 'int'],
+        'ws_outline_memory_budget'       => ['default' => 8000,    'type' => 'int'],
         // ── AI 生成参数 ──
         'ws_temperature_outline'         => ['default' => 0.3,     'type' => 'float'],
         'ws_temperature_chapter'         => ['default' => 0.8,     'type' => 'float'],
+        'ws_temperature_outline_gen'     => ['default' => 0.75,    'type' => 'float'],
         'ws_max_tokens_outline'          => ['default' => 4096,    'type' => 'int'],
         'ws_max_tokens_chapter'          => ['default' => 8192,    'type' => 'int'],
+        'ws_max_tokens_title'            => ['default' => 512,     'type' => 'int'],
         // ── 质量检查参数 ──
         'ws_quality_check_enabled'       => ['default' => true,    'type' => 'bool'],
+        // Harness defaults remain warning-only until rollout is explicit.
+        // The epoch is the one live kill switch for in-flight writes.
+        'ws_harness_canon_policy'        => ['default' => 'legacy_warn', 'type' => 'string'],
+        'ws_harness_mode'                => ['default' => 'off',    'type' => 'string'],
+        'ws_harness_event_source'        => ['default' => 'legacy', 'type' => 'string'],
+        'ws_harness_pipeline_v2_enabled' => ['default' => false,    'type' => 'bool'],
+        'ws_harness_context_v2_enabled'  => ['default' => false,    'type' => 'bool'],
+        'ws_harness_tool_loop_enabled'   => ['default' => false,    'type' => 'bool'],
+        'ws_harness_parallel_review_enabled' => ['default' => false, 'type' => 'bool'],
+        'ws_harness_branch_candidates_enabled' => ['default' => false, 'type' => 'bool'],
+        'ws_harness_candidate_ui_enabled' => ['default' => false, 'type' => 'bool'],
+        'ws_harness_rollout_bps'         => ['default' => 0,        'type' => 'int'],
+        'ws_harness_artifact_retention_days' => ['default' => 90,   'type' => 'int'],
+        'ws_harness_trace_enabled'       => ['default' => false,    'type' => 'bool'],
+        'ws_harness_fencing_enforced'    => ['default' => false,    'type' => 'bool'],
+        'ws_harness_emergency_stop_epoch'=> ['default' => 0,       'type' => 'int'],
         'ws_quality_min_score'           => ['default' => 6.0,     'type' => 'float'],  // 1-10分制，代码×10转百分制
 
         // ── 写作质量增强（v1.9 盲点修复）──
@@ -226,7 +286,8 @@ function getWritingDefaults(): array
         // ── Agent 决策系统 ──
         'agent.enabled'                  => ['default' => true,    'type' => 'bool'],
         'agent.strategy_agent.enabled'   => ['default' => true,    'type' => 'bool'],
-        'agent.strategy_agent.check_interval' => ['default' => 10, 'type' => 'int'],
+        // 审计修复（2026-08-09 R7-3）：与 install.php / AgentCoordinator / config.php 统一为 decision_interval
+        'agent.strategy_agent.decision_interval' => ['default' => 10, 'type' => 'int'],
         'agent.quality_agent.enabled'    => ['default' => true,    'type' => 'bool'],
         'agent.quality_agent.check_interval' => ['default' => 5,   'type' => 'int'],
         'agent.quality_agent.auto_fix'   => ['default' => true,    'type' => 'bool'],
@@ -263,16 +324,16 @@ function getConstraintDefaults(): array
         'cf_speed_factor'                => ['default' => '10',    'type' => 'int'],
         'cf_rival_factor'                => ['default' => '0.8',   'type' => 'float'],
         // ── 情节约束 ──
-        'cf_max_same_conflict'           => ['default' => '1',     'type' => 'int'], // 预留，当前无消费逻辑
+        'cf_max_same_conflict'           => ['default' => '1',     'type' => 'int'],
         'cf_max_coincidences'            => ['default' => '5',     'type' => 'int'],
-        // ── 信息/伏笔约束（预留，当前无消费逻辑，不生效）──
+        // ── 信息/伏笔约束 ──
         'cf_foreshadowing_recovery_min'  => ['default' => '70',    'type' => 'int'],
         'cf_max_new_info_per_ch'         => ['default' => '2',     'type' => 'int'],
-        // ── 节奏约束（预留，当前无消费逻辑，不生效）──
+        // ── 节奏约束 ──
         'cf_min_buffer_release'          => ['default' => '2',     'type' => 'int'],
         'cf_cooldown_after_climax'       => ['default' => '1',     'type' => 'int'],
         // ── 语言/风格约束 ──
-        'cf_max_banned_word_usage'       => ['default' => '15',    'type' => 'int'], // 预留，当前无消费逻辑
+        'cf_max_banned_word_usage'       => ['default' => '15',    'type' => 'int'],
         'cf_banned_words'                => ['default' => '绝境,反杀,真相,背水,逆袭', 'type' => 'string'],
     ];
 }
@@ -283,4 +344,13 @@ function getConstraintDefaults(): array
 // 生产环境默认关闭；在 config.php 中定义 CFG_DIAGNOSTIC_ENABLED = true 可开启
 if (!defined('CFG_DIAGNOSTIC_ENABLED')) {
     define('CFG_DIAGNOSTIC_ENABLED', false);
+}
+
+// 统计上报详细日志开关（审计 2026-08-13 #1）
+// 默认关闭：reportRealtime 每次访问 novel.php 都触发，详细日志会刷屏 error_log，
+// 且会把 STATS_SERVER_URL / payload / 远端响应体打印进日志，无谓的噪音。
+// 故障排查时在 config.php 中定义 CFG_STATS_VERBOSE_LOG = true 即可临时开启。
+// 失败路径（curl error / DB 异常）不受此开关影响，始终记录。
+if (!defined('CFG_STATS_VERBOSE_LOG')) {
+    define('CFG_STATS_VERBOSE_LOG', false);
 }

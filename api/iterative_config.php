@@ -280,8 +280,15 @@ function getNovelSettings(int $novelId): array
  */
 function updateIterativeConfig(int $novelId, array $input)
 {
+    // 审计修复（2026-10-31 B5）：嵌套时 DB::beginTransaction() 静默返回 false，旧实现
+    // 照常执行且 commit/rollback 会误提交/回滚外层事务。$ownTx 标记本层所有权，
+    // catch 仅在自有事务时回滚，避免把外层事务一并回滚。
+    $ownTx = false;
     try {
-        DB::beginTransaction();
+        $ownTx = DB::beginTransaction();
+        if (!$ownTx) {
+            throw new RuntimeException('迭代配置事务开启失败（已存在活动事务）');
+        }
 
         // 更新 rewrite 设置
         if (isset($input['rewrite'])) {
@@ -308,7 +315,7 @@ function updateIterativeConfig(int $novelId, array $input)
 
         return true;
     } catch (\Throwable $e) {
-        try { DB::rollBack(); } catch (\Throwable $e2) { error_log('iterative_config rollback failed: ' . $e2->getMessage()); }
+        try { if ($ownTx) DB::rollBack(); } catch (\Throwable $e2) { error_log('iterative_config rollback failed: ' . $e2->getMessage()); }
         error_log('更新迭代配置失败：' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
         return '更新失败，请稍后重试';
     }

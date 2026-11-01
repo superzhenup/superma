@@ -9,5 +9,5 @@
 defined('APP_LOADED') or die('Direct access denied.');
 
 if (!defined('APP_VERSION')) {
-    define('APP_VERSION', '1.8.0');
+    define('APP_VERSION', '1.8.5');
 }

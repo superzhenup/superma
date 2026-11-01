@@ -311,7 +311,7 @@ class StyleGuard
             $totalSentences += preg_match_all('/[。！？?!]/u', $text);
 
             // 对话字数 = 引号内的内容
-            preg_match_all('/[「『""\'\'""].*?[」』""\'\'""]/u', $text, $dialogueMatches);
+            preg_match_all('/[「『“‘"\'].*?[」』”’"\']/u', $text, $dialogueMatches);
             foreach ($dialogueMatches[0] as $d) {
                 $totalDialogueChars += mb_strlen($d);
             }

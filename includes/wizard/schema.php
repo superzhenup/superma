@@ -3,7 +3,7 @@
  * 高阶向导 — Schema 自适应 & 数据访问层
  *
  * 职责：
- *   - 探测 novels 表实际列名，缺失时 lazy 补齐
+ *   - 探测 novels 表实际列名（只读；向导字段由统一迁移 ColumnMigrations [v37] 补齐）
  *   - 把向导宽数据安全写入（filterCols 兜底）
  *   - 提供阶段间共用的常量数据（标签库、阶段元数据）
  */
@@ -15,24 +15,8 @@ function wizardEnsureSchema(): array {
     static $cache = null;
     if ($cache !== null) return $cache;
 
-    $needed = [
-        'narrative_structure'   => "VARCHAR(50) DEFAULT NULL COMMENT '叙事结构'",
-        'narrative_method'      => "VARCHAR(50) DEFAULT NULL COMMENT '叙事方法'",
-        'narrative_pov'         => "VARCHAR(50) DEFAULT NULL COMMENT '叙事视角'",
-        'literary_genre'        => "VARCHAR(100) DEFAULT NULL COMMENT '文学流派'",
-        'world_setting_era'     => "VARCHAR(100) DEFAULT NULL COMMENT '世界设定（时代）'",
-        'novel_types'           => "JSON DEFAULT NULL COMMENT '小说类型多选'",
-        'writing_tone'          => "JSON DEFAULT NULL COMMENT '文风多选'",
-        'protagonist_traits'    => "JSON DEFAULT NULL COMMENT '主角设定多选'",
-        'core_conflicts'        => "JSON DEFAULT NULL COMMENT '核心冲突多选'",
-        'appeal_points'         => "JSON DEFAULT NULL COMMENT '爽点多选'",
-        'taboos'                => "JSON DEFAULT NULL COMMENT '禁忌多选'",
-        'opening_type'          => "VARCHAR(50) DEFAULT NULL COMMENT '开篇类型'",
-        'protagonist_entrance'  => "VARCHAR(50) DEFAULT NULL COMMENT '主角出场'",
-        'custom_settings'       => "TEXT DEFAULT NULL COMMENT '自定义设定'",
-        'chapter_word_target'   => "INT DEFAULT NULL COMMENT '单章字数目标'",
-    ];
-
+    // 只读探测。向导字段（narrative_structure … chapter_word_target）由统一迁移补齐，
+    // 缺列说明未执行 php bin/migrate.php --apply，此时 DB::connect 的 schema 屏障已拒绝服务。
     try {
         $cols = DB::fetchAll("SHOW COLUMNS FROM `novels`");
         $existing = array_column($cols, 'Field');
@@ -41,20 +25,20 @@ function wizardEnsureSchema(): array {
         return $cache = ['cols' => [], 'added' => []];
     }
 
-    $added = [];
-    foreach ($needed as $col => $def) {
-        if (!in_array($col, $existing, true)) {
-            try {
-                DB::execute("ALTER TABLE `novels` ADD COLUMN `{$col}` {$def}");
-                $existing[] = $col;
-                $added[] = $col;
-            } catch (\Throwable $e) {
-                error_log("wizardEnsureSchema: add {$col} failed - " . $e->getMessage());
-            }
-        }
-    }
+    return $cache = ['cols' => $existing, 'added' => []];
+}
 
-    return $cache = ['cols' => $existing, 'added' => $added];
+/**
+ * 向导字数目标同时写入 chapter_word_target（向导 UI）与 chapter_words（写作引擎）。
+ * 两者不同步时，高阶模式设的 2500 会 silently 按 schema 默认 2000 写章。
+ */
+function wizardChapterWordFields(int $wordTarget): array
+{
+    $wordTarget = max(800, min(10000, $wordTarget));
+    return [
+        'chapter_word_target' => $wordTarget,
+        'chapter_words'       => $wordTarget,
+    ];
 }
 
 function wizardFilterNovelRow(array $row): array {
@@ -67,58 +51,11 @@ function wizardFilterNovelRow(array $row): array {
 }
 
 /**
- * 兼容 install.php 创建的旧 volume_outlines 表（单一来源，幂等，进程内只跑一次）
- *   旧: volume_number / start_chapter / end_chapter (+ NOT NULL 的 conflict/resolution/summary)
- *   新: volume_index / chapter_from / chapter_to
- * 策略：补缺列 → 放宽老 NOT NULL 列 → 老列回填新列
+ * 返回 volume_outlines 表当前列集合（缓存，只读）。
+ * 新旧两套列（volume_index/chapter_from/chapter_to 与 volume_number/start_chapter/
+ * end_chapter）、theme 扩容、旧 NOT NULL 列放宽与回填均由统一迁移 v71
+ * （ColumnMigrations::convergeVolumeOutlines）完成；Web 请求不执行 DDL。
  */
-function wizardMigrateVolumeOutlines(): void {
-    static $done = false;
-    if ($done) return;
-    $done = true;
-    try {
-        $cols = DB::fetchAll("SHOW COLUMNS FROM `volume_outlines`");
-        if (!$cols) return;
-        $byField = [];
-        foreach ($cols as $c) $byField[$c['Field']] = $c;
-        $existing = array_keys($byField);
-
-        $adds = [];
-        if (!in_array('volume_index', $existing, true)) $adds[] = "ADD COLUMN `volume_index` INT UNSIGNED NOT NULL DEFAULT 1";
-        if (!in_array('chapter_from', $existing, true)) $adds[] = "ADD COLUMN `chapter_from` INT UNSIGNED DEFAULT 1";
-        if (!in_array('chapter_to',   $existing, true)) $adds[] = "ADD COLUMN `chapter_to` INT UNSIGNED DEFAULT 50";
-        if (!in_array('theme',        $existing, true)) $adds[] = "ADD COLUMN `theme` TEXT DEFAULT NULL";
-        if (!in_array('title',        $existing, true)) $adds[] = "ADD COLUMN `title` VARCHAR(200) DEFAULT ''";
-        if ($adds) {
-            DB::execute("ALTER TABLE `volume_outlines` " . implode(', ', $adds));
-        }
-
-        // 老 schema NOT NULL 列放宽，避免新插入失败
-        foreach (['volume_number','start_chapter','end_chapter','conflict','resolution','summary'] as $col) {
-            if (!isset($byField[$col])) continue;
-            if (strtoupper($byField[$col]['Null'] ?? '') !== 'NO') continue;
-            try {
-                DB::execute("ALTER TABLE `volume_outlines` MODIFY COLUMN `{$col}` {$byField[$col]['Type']} DEFAULT NULL");
-            } catch (\Throwable $e) {
-                error_log("wizardMigrateVolumeOutlines relax {$col} failed: " . $e->getMessage());
-            }
-        }
-
-        // 老列 → 新列回填
-        foreach (['volume_number'=>'volume_index','start_chapter'=>'chapter_from','end_chapter'=>'chapter_to'] as $old => $new) {
-            if (!in_array($old, $existing, true)) continue;
-            try {
-                DB::execute("UPDATE `volume_outlines` SET `{$new}` = `{$old}` WHERE `{$old}` IS NOT NULL AND (`{$new}` IS NULL OR `{$new}` = 0 OR `{$new}` = 1)");
-            } catch (\Throwable $e) {
-                error_log("wizardMigrateVolumeOutlines backfill {$old}->{$new} failed: " . $e->getMessage());
-            }
-        }
-    } catch (\Throwable $e) {
-        error_log('wizardMigrateVolumeOutlines: ' . $e->getMessage());
-    }
-}
-
-/** 返回 volume_outlines 表当前列集合（缓存） */
 function wizardVolumeOutlinesColumns(): array {
     static $cols = null;
     if ($cols !== null) return $cols;
@@ -129,6 +66,31 @@ function wizardVolumeOutlinesColumns(): array {
         $cols = [];
     }
     return $cols;
+}
+
+/**
+ * 只清理没有 AI 内容的卷。向导早期创建的简表没有 summary/key_events/status，
+ * 不能在 DELETE 中直接引用；按实际列构造条件，同时保留其他富字段中的内容。
+ */
+function wizardEmptyVolumeGuard(array $cols): string {
+    if (!$cols) return '1 = 0'; // 列探测失败时不删除任何卷
+
+    $checks = [];
+    foreach (['summary', 'conflict', 'resolution'] as $col) {
+        if (in_array($col, $cols, true)) {
+            $checks[] = "({$col} IS NULL OR {$col} = '')";
+        }
+    }
+    foreach (['key_events', 'character_focus', 'foreshadowing', 'volume_goals', 'must_resolve_foreshadowing'] as $col) {
+        if (in_array($col, $cols, true)) {
+            // MySQL 原生 JSON null 与 SQL 字符串 'null' 不直接相等；
+            // 转文本后比较，同时兼容旧表把 JSON 存在 TEXT 中的情况。
+            $checks[] = "({$col} IS NULL OR CAST({$col} AS CHAR) = 'null')";
+        }
+    }
+    if (in_array('status', $cols, true)) $checks[] = "status = 'pending'";
+
+    return $checks ? implode(' AND ', $checks) : '1 = 1';
 }
 
 function wizardStages(): array {

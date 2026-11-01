@@ -14,7 +14,7 @@ defined('APP_LOADED') or die('Direct access denied.');
  *
  * 整定对象（核心控制变量）：
  *   1. emotion_score — 情绪密度 (0-100, 目标 75)
- *   2. cool_point_density — 爽点密度 (章/爽点, 目标 3.5)
+ *   2. cool_point_density — 爽点密度（近窗有爽点章占比, 目标 0.88，与调度默认对齐）
  *   3. word_count_accuracy — 字数准确率 (0-1, 目标 0.85)
  *   4. quality_score — 质量分数 (0-100, 目标 80)
  *
@@ -137,6 +137,16 @@ class PIDController
         // 衰减积分：每次只用最近的积分窗口，防止积分饱和
         $decayFactor = 0.85;
         $this->state['error_integral'] = ($this->state['error_integral'] * $decayFactor) + $error;
+        // 审计修复 P1（2026-09-27）：限幅必须在 iCorrection 计算之前执行。
+        // 原实现在 iCorrection 用未限幅积分计算后才裁剪——质量分 80→0 时积分
+        // 瞬间累积至约 -77，iCorrection 以 -9.3 进入 total 与推荐文本，
+        // 单次大偏差输出未被钳制；且衰减窗口内积分可无界增长。
+        // 移到此处后：积分先硬限幅再参与 I 项计算，输出永不超过 ki*3.0。
+        $maxIntegral = 3.0;
+        $this->state['error_integral'] = max(-$maxIntegral, min(
+            $maxIntegral,
+            (float)$this->state['error_integral']
+        ));
         $iCorrection = $coeff['ki'] * $this->state['error_integral'];
 
         // --- D 项：微分控制（变化率） ---
@@ -160,13 +170,8 @@ class PIDController
         // --- 严重度 ---
         $severity = 'normal';
         $absError = abs($error) / max(1e-6, abs($target));
-        // 审计修复（2026-07-19 H-中1 配套）：积分增幅 0.85 衰减 + 100 样本减半会导致
-        // 持续偏差时积分无界（-166 + iCorrection -25），必须硬限幅。
-        $maxIntegral = 3.0;
-        $this->state['error_integral'] = max(-$maxIntegral, min(
-            $maxIntegral,
-            (float)$this->state['error_integral']
-        ));
+        // 审计修复（2026-07-19 H-中1 配套）：积分已在 I 项计算前硬限幅（上方）。
+        // 达到限幅值（3.0）即意味着持续偏差饱和，仍按 >2.5 判 critical。
         $absIntegral = abs($this->state['error_integral']);
         if ($absError > 0.3 || $absIntegral > 2.5) {
             $severity = 'critical';
@@ -266,9 +271,20 @@ class PIDController
      */
     public function evaluateAll(array $currents): array
     {
+        // 审计修复（2026-08-09 R7-4 / R9-6）：cool_point_density 读小说级目标，
+        // 与 ws_cool_point_density_target / Strategy / 调度同量纲（有爽点章占比）。
+        $densityTarget = 0.88;
+        if (class_exists('ConfigCenter', false)) {
+            $densityTarget = (float)ConfigCenter::getNovel(
+                $this->novelId,
+                'ws_cool_point_density_target',
+                0.88,
+                'float'
+            );
+        }
         $targets = [
             'emotion_score'       => 75.0,
-            'cool_point_density'  => 0.29,
+            'cool_point_density'  => $densityTarget,
             'word_count_accuracy' => 0.85,
             'quality_score'       => 80.0,
         ];

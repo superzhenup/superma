@@ -303,6 +303,11 @@ final class AtomRepo
      * @param int    $chapterNumber 章节号
      * @param string $type          atom 类型（仅允许 plot_detail / cool_point）
      * @return int 删除行数
+     *
+     * 审计修复 P0（2026-09-27）：移除吞错 catch。此方法只被
+     * ChapterMemoryFinalizer::revertChapterMemory 在 finalize 事务内调用，
+     * 失败必须上抛让主事务回滚并由 postprocess 重试；静默返回 0 会让随后
+     * 的 ingestChapter 无条件 INSERT 产生重复记忆原子。
      */
     public function deleteByChapterAndType(int $chapterNumber, string $type): int
     {
@@ -310,15 +315,11 @@ final class AtomRepo
         if (!in_array($type, ['plot_detail', 'cool_point'], true)) {
             return 0;
         }
-        try {
-            return DB::delete(
-                'memory_atoms',
-                'novel_id=? AND source_chapter=? AND atom_type=?',
-                [$this->novelId, $chapterNumber, $type]
-            );
-        } catch (\Throwable $e) {
-            return 0;
-        }
+        return DB::delete(
+            'memory_atoms',
+            'novel_id=? AND source_chapter=? AND atom_type=?',
+            [$this->novelId, $chapterNumber, $type]
+        );
     }
 
     /**

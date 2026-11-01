@@ -10,7 +10,7 @@ ob_start();
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';

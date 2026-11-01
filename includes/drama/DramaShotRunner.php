@@ -21,6 +21,7 @@ final class DramaShotRunner
 
     public static function runAssetImageTask(array $task): array
     {
+        DramaTaskRepository::assertOwned($task);
         $asset = DramaService::getAsset((int)$task['ref_id']);
         if (!$asset || (int)$asset['project_id'] !== (int)$task['project_id']) {
             throw new RuntimeException('资产不存在或已变更');
@@ -37,21 +38,24 @@ final class DramaShotRunner
             $prompt,
             '1024x1024',
             $dir,
-            'asset_' . (int)$asset['id'] . '_' . time() . '_' . bin2hex(random_bytes(3))
+            'asset_' . (int)$asset['id'] . '_' . bin2hex(random_bytes(16))
         );
 
-        // 切换引用后清理旧文件
-        $old = (string)($asset['ref_image_path'] ?? '');
-        DB::update('drama_assets', ['ref_image_path' => $rel], 'id=?', [(int)$asset['id']]);
-        self::deleteManagedDramaFile($old);
-
-        return ['asset_id' => (int)$asset['id'], 'ref_image_path' => $rel];
+        return DramaTaskRepository::commitResult($task, static function () use ($asset, $rel): array {
+            $fresh = DB::fetch('SELECT * FROM drama_assets WHERE id=? FOR UPDATE', [(int)$asset['id']]);
+            self::assertSnapshot($fresh, $asset, ['project_id', 'name', 'description', 'ref_image_path']);
+            DB::update('drama_assets', ['ref_image_path' => $rel], 'id=?', [(int)$asset['id']]);
+            // Keep prior immutable files: late/ambiguous commits must never unlink
+            // media that another request may still reference.
+            return ['asset_id' => (int)$asset['id'], 'ref_image_path' => $rel];
+        });
     }
 
     // ------------------------------------------------------- 分镜图抽卡
 
     public static function runShotImageTask(array $task): array
     {
+        DramaTaskRepository::assertOwned($task);
         $shot = DramaService::getShot((int)$task['ref_id']);
         if (!$shot) throw new RuntimeException('分镜不存在');
         $episode = DramaService::getEpisode((int)$shot['episode_id']);
@@ -83,30 +87,33 @@ final class DramaShotRunner
             throw new RuntimeException('无法创建分镜图目录');
         }
 
-        $candidates = json_decode((string)($shot['image_candidates'] ?? ''), true) ?: [];
         $newPaths = [];
         for ($i = 1; $i <= $batch; $i++) {
+            DramaTaskRepository::assertOwned($task);
             $rel = DramaImageService::generate(
                 $fullPrompt,
                 (string)$project['image_size'],
                 $dir,
-                'shot_' . (int)$shot['id'] . '_b' . $i . '_' . time() . '_' . bin2hex(random_bytes(3))
+                'shot_' . (int)$shot['id'] . '_b' . $i . '_' . bin2hex(random_bytes(16))
             );
             $newPaths[] = $rel;
-            $candidates[] = $rel;
-            DramaTaskRepository::updateProgress((int)$task['id'], (int)round($i * 100 / $batch));
+            DramaTaskRepository::updateProgress($task, (int)round($i * 100 / $batch));
         }
 
-        $update = ['image_candidates' => json_encode(array_values($candidates), JSON_UNESCAPED_SLASHES)];
-        // 尚未选定图时自动选定第一张新图
-        if (empty($shot['image_path']) && $newPaths) {
-            $update['image_path'] = $newPaths[0];
-        }
-        $update['status'] = 'image_ready';
-        $update['error_msg'] = null;
-        DB::update('drama_shots', $update, 'id=?', [(int)$shot['id']]);
+        return DramaTaskRepository::commitResult($task, static function () use ($shot, $newPaths): array {
+            $fresh = self::lockShotSnapshot($shot, false);
+            $candidates = array_merge(json_decode((string)($fresh['image_candidates'] ?? ''), true) ?: [], $newPaths);
+            $update = ['image_candidates' => json_encode(array_values($candidates), JSON_UNESCAPED_SLASHES)];
+            // 尚未选定图时自动选定第一张新图
+            if (empty($fresh['image_path']) && $newPaths) {
+                $update['image_path'] = $newPaths[0];
+                $update['status'] = 'image_ready';
+                $update['error_msg'] = null;
+            }
+            DB::update('drama_shots', $update, 'id=?', [(int)$shot['id']]);
 
-        return ['shot_id' => (int)$shot['id'], 'new_images' => $newPaths];
+            return ['shot_id' => (int)$shot['id'], 'new_images' => $newPaths];
+        });
     }
 
     // ------------------------------------------------------- 视频片段
@@ -134,6 +141,7 @@ final class DramaShotRunner
      */
     public static function runShotVideoTask(array $task): array
     {
+        DramaTaskRepository::assertOwned($task);
         if (!self::videoConfigured()) {
             throw new RuntimeException('请先在漫剧页面配置视频生成引擎');
         }
@@ -155,12 +163,21 @@ final class DramaShotRunner
         $model = (string)getSystemSetting('video_gen_model', '');
         $result = json_decode((string)($task['result'] ?? ''), true) ?: [];
         $providerTaskId = (string)($result['provider_task_id'] ?? '');
+        // A polled provider job belongs to the exact first frame/prompt submitted.
+        $sourceFingerprint = self::videoSourceFingerprint($shot);
+        if ($providerTaskId !== '' && !hash_equals((string)($result['source_fingerprint'] ?? ''), $sourceFingerprint)) {
+            throw new RuntimeException('分镜首帧或视频描述已变更，请重新提交视频任务');
+        }
 
         if ($providerTaskId === '') {
             $providerTaskId = self::submitVideoTask($provider, $baseUrl, $apiKey, $model, $project, $shot, $imagePath);
-            DB::update('drama_shots', ['status' => 'video_running'], 'id=?', [(int)$shot['id']]);
-            DramaTaskRepository::requeue((int)$task['id'], 30, ['provider_task_id' => $providerTaskId]);
-            return ['shot_id' => (int)$shot['id'], 'submitted' => true, 'provider_task_id' => $providerTaskId];
+            // Business status and requeue/provider identity must commit together.
+            return DramaTaskRepository::commitResult($task, static function () use ($shot, $providerTaskId, $sourceFingerprint): array {
+                self::lockShotSnapshot($shot);
+                DB::update('drama_shots', ['status' => 'video_running'], 'id=?', [(int)$shot['id']]);
+                return ['shot_id' => (int)$shot['id'], 'submitted' => true,
+                    'provider_task_id' => $providerTaskId, 'source_fingerprint' => $sourceFingerprint];
+            }, 'pending', 30);
         }
 
         $endpoint = VideoGenerationProtocol::queryEndpoint($provider, $baseUrl, $providerTaskId);
@@ -176,18 +193,18 @@ final class DramaShotRunner
         $qr = VideoGenerationProtocol::extractQueryResult($provider, $resp['body']);
 
         if ($qr['status'] === 'running' || $qr['status'] === 'pending') {
-            DramaTaskRepository::requeue((int)$task['id'], 30, ['provider_task_id' => $providerTaskId]);
+            // 审计修复（2026-08-09）：轮询走 requeue 成功路径从不触发 markRetryOrFailed，
+            // 而 claimNext 每次认领会 attempts+1，故 attempts 耗尽 max_attempts 后任务会被
+            // 静默遗留为 pending、永不进入 failed（不报错、不重试、无法收敛）。这里在预算
+            // 耗尽时抛异常，由 DramaTaskRunner::runNext 统一转 markRetryOrFailed → 标记失败。
+            if ((int)$task['attempts'] >= (int)$task['max_attempts']) {
+                return self::commitVideoFailure($task, $shot, '视频生成轮询超时（已达最大轮询次数），provider 未返回就绪');
+            }
+            DramaTaskRepository::requeue($task, 30, ['provider_task_id' => $providerTaskId, 'source_fingerprint' => $sourceFingerprint]);
             return ['shot_id' => (int)$shot['id'], 'polling' => true];
         }
         if ($qr['status'] === 'failed') {
-            DB::update('drama_shots', ['status' => 'failed', 'error_msg' => mb_substr((string)($qr['error'] ?? '视频生成失败'), 0, 480)], 'id=?', [(int)$shot['id']]);
-            // provider 确定性失败：标记任务完成（记录失败原因），不再重试
-            DramaTaskRepository::markDone((int)$task['id'], [
-                'shot_id' => (int)$shot['id'],
-                'failed'  => true,
-                'error'   => mb_substr((string)($qr['error'] ?? 'provider 返回失败'), 0, 480),
-            ]);
-            return ['shot_id' => (int)$shot['id'], 'failed' => true, 'error' => $qr['error'] ?? 'provider 返回失败'];
+            return self::commitVideoFailure($task, $shot, (string)($qr['error'] ?? 'provider 返回失败'));
         }
 
         // done：下载片段落盘
@@ -198,21 +215,57 @@ final class DramaShotRunner
         }
         $absPath = DramaMediaClient::downloadMedia(
             (string)$qr['video_url'],
-            $dir . '/shot_' . (int)$shot['id'] . '_' . time(),
+            $dir . '/shot_' . (int)$shot['id'] . '_' . bin2hex(random_bytes(16)),
             self::VIDEO_MIMES,
             DramaMediaClient::MAX_VIDEO_BYTES
         );
         $rel = DramaImageService::toRelativePath($absPath);
 
-        $old = (string)($shot['video_path'] ?? '');
-        DB::update('drama_shots', [
-            'video_path' => $rel,
-            'status'     => 'video_done',
-            'error_msg'  => null,
-        ], 'id=?', [(int)$shot['id']]);
-        self::deleteManagedDramaFile($old);
+        return DramaTaskRepository::commitResult($task, static function () use ($shot, $rel): array {
+            self::lockShotSnapshot($shot);
+            DB::update('drama_shots', [
+                'video_path' => $rel,
+                'status'     => 'video_done',
+                'error_msg'  => null,
+            ], 'id=?', [(int)$shot['id']]);
+            return ['shot_id' => (int)$shot['id'], 'video_path' => $rel];
+        });
+    }
 
-        return ['shot_id' => (int)$shot['id'], 'video_path' => $rel];
+    private static function commitVideoFailure(array $task, array $shot, string $error): array
+    {
+        return DramaTaskRepository::commitResult($task, static function () use ($shot, $error): array {
+            self::lockShotSnapshot($shot);
+            DB::update('drama_shots', ['status' => 'failed', 'error_msg' => mb_substr($error, 0, 480)], 'id=?', [(int)$shot['id']]);
+            return ['shot_id' => (int)$shot['id'], 'failed' => true, 'error' => mb_substr($error, 0, 480)];
+        }, 'failed');
+    }
+
+    private static function videoSourceFingerprint(array $shot): string
+    {
+        return hash('sha256', json_encode(array_map(
+            static fn(string $key): string => (string)($shot[$key] ?? ''),
+            ['image_path', 'video_prompt', 'scene_desc', 'camera_movement', 'duration']
+        ), JSON_THROW_ON_ERROR));
+    }
+
+    private static function lockShotSnapshot(array $shot, bool $video = true): array
+    {
+        $fresh = DB::fetch('SELECT * FROM drama_shots WHERE id=? FOR UPDATE', [(int)$shot['id']]);
+        $keys = ['episode_id', 'scene_desc', 'shot_type', 'camera_movement', 'characters', 'image_prompt'];
+        if ($video) $keys = array_merge($keys, ['image_path', 'video_prompt', 'duration', 'video_path']);
+        self::assertSnapshot($fresh, $shot, $keys);
+        return $fresh;
+    }
+
+    private static function assertSnapshot(?array $fresh, array $snapshot, array $keys): void
+    {
+        if (!$fresh) throw new RuntimeException('资产或分镜已删除，生成结果未发布');
+        foreach ($keys as $key) {
+            if ((string)($fresh[$key] ?? '') !== (string)($snapshot[$key] ?? '')) {
+                throw new RuntimeException('资产或分镜已变更，生成结果未发布');
+            }
+        }
     }
 
     private static function submitVideoTask(
@@ -243,7 +296,7 @@ final class DramaShotRunner
         $duration = VideoGenerationProtocol::normalizeDuration((int)($shot['duration'] ?? 5));
         $payload = VideoGenerationProtocol::buildSubmitPayload(
             $provider,
-            $model !== '' ? $model : 'doubao-seedance-1-0-pro-250528',
+            $model !== '' ? $model : VideoGenerationProtocol::defaultModel($provider),
             $prompt,
             base64_encode($raw),
             $mime,

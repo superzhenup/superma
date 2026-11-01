@@ -4,6 +4,16 @@
  */
 'use strict';
 
+window.AppEvents.register('drama.open-video-config', function() {
+    return openVideoConfig();
+});
+window.AppEvents.register('drama.parse-script', function(event, element) {
+    return parseScript(element, parseInt(element.dataset.episodeId, 10) || 0);
+});
+window.AppEvents.register('drama.delete-episode', function(event, element) {
+    return deleteEpisode(element, parseInt(element.dataset.episodeId, 10) || 0);
+});
+
 // ---------------------------------------------------------------- 状态
 
 let dramaProject = null;      // 项目对象
@@ -59,7 +69,10 @@ async function loadProject() {
 }
 
 async function pollProject() {
-    if (!dramaProject) return;
+    // 审计修复（2026-08-02 H10）：原实现 `if (!dramaProject) return;` 直接退出且不再
+    // schedulePoll；而 loadProject 失败路径只调度了 1 次 15s 轮询 → 首次 get_project
+    // 失败后页面永不自动恢复。改为保持轮询链，直到项目成功加载。
+    if (!dramaProject) { schedulePoll(15000); return; }
     const res = await apiGet('drama_poll', { action: 'poll', project_id: dramaProject.id });
     if (res.ok && res.data) {
         if (res.data.project) dramaProject = res.data.project;
@@ -121,8 +134,8 @@ function renderEngineBadges(d) {
     if (d.video_configured) {
         vidBadge.innerHTML = '<span class="badge bg-success"><i class="bi bi-camera-video me-1"></i>视频引擎 已配置</span>';
     } else {
-        vidBadge.innerHTML = '<a href="javascript:void(0)" class="badge bg-danger text-decoration-none" onclick="openVideoConfig()">' +
-            '<i class="bi bi-camera-video me-1"></i>视频引擎 未配置</a>';
+        vidBadge.innerHTML = '<button type="button" class="badge bg-danger text-decoration-none border-0" data-csp-click="drama.open-video-config">' +
+            '<i class="bi bi-camera-video me-1"></i>视频引擎 未配置</button>';
     }
 }
 
@@ -177,9 +190,9 @@ function renderEpisodes() {
             '<td class="text-nowrap">' +
                 '<a class="btn btn-primary btn-xs" href="drama_studio.php?episode_id=' + escHtml(ep.id) + '">' +
                     '<i class="bi bi-easel"></i> 工作台</a> ' +
-                '<button type="button" class="btn btn-outline-info btn-xs" onclick="parseScript(this, ' + escHtml(ep.id) + ')">' +
+                '<button type="button" class="btn btn-outline-info btn-xs" data-csp-click="drama.parse-script" data-episode-id="' + escHtml(ep.id) + '">' +
                     '<i class="bi bi-file-text"></i> 解析剧本</button> ' +
-                '<button type="button" class="btn btn-outline-danger btn-xs" onclick="deleteEpisode(this, ' + escHtml(ep.id) + ')">' +
+                '<button type="button" class="btn btn-outline-danger btn-xs" data-csp-click="drama.delete-episode" data-episode-id="' + escHtml(ep.id) + '">' +
                     '<i class="bi bi-trash"></i></button>' +
             '</td>' +
         '</tr>';
@@ -298,6 +311,12 @@ async function openVideoConfig() {
     keyInput.value = '';
     keyInput.placeholder = d.api_key_hint ? ('已保存（' + d.api_key_hint + '），留空不修改') : '未设置';
     document.getElementById('vc-model').value = d.model || '';
+    const keyHelp = document.getElementById('vc-key-help');
+    if (keyHelp) {
+        keyHelp.textContent = d.provider === 'kling'
+            ? '可灵填写 access_key:secret_key（系统会生成短时 JWT）；留空表示不修改已保存凭据'
+            : '留空表示不修改已保存的 Key';
+    }
     document.getElementById('vc-test-result').style.display = 'none';
 }
 
@@ -305,6 +324,13 @@ function onProviderChange() {
     const key = document.getElementById('vc-provider').value;
     const p = videoProviders.find(x => x.key === key);
     if (p && p.default_base) document.getElementById('vc-url').value = p.default_base;
+    if (p && p.default_model) document.getElementById('vc-model').value = p.default_model;
+    const help = document.getElementById('vc-key-help');
+    if (help) {
+        help.textContent = key === 'kling'
+            ? '可灵填写 access_key:secret_key（系统会生成短时 JWT）；留空表示不修改已保存凭据'
+            : '留空表示不修改已保存的 Key';
+    }
 }
 
 function videoConfigPayload() {
@@ -356,30 +382,50 @@ function setBtnLoading(btn, loading) {
 
 // ---------------------------------------------------------------- 任务监控 & 自动驱动
 
-const DRAMA_CRON_TOKEN = 'drama-cron-2026-07-26';
-const DRAMA_CRON_SCRIPT = '/tmp_drama_cron.php';
+// 令牌从后端获取（api/drama_cron.php?action=get_token，需登录态），
+// 不再使用硬编码值——硬编码令牌会随 JS 源码泄露给所有访客。
+let dramaCronToken = '';
+const DRAMA_CRON_SCRIPT = '/api/drama_cron.php';
 
 /** 构建监控脚本完整 URL */
 function dramaCronUrl(action) {
     const base = location.origin + DRAMA_CRON_SCRIPT;
-    const params = new URLSearchParams({ token: DRAMA_CRON_TOKEN });
+    const params = new URLSearchParams();
     if (action) params.set('action', action);
     return base + '?' + params.toString();
 }
 
-/** 初始化监控面板（填充 URL、绑定链接） */
-function dramaInitMonitor() {
-    const monitorUrl = dramaCronUrl(''); // 默认 run
+/** 生成宝塔计划任务命令（令牌在请求头里，shell 单引号转义规则全站唯一） */
+function dramaMonitorCommand() {
+    const shellQuote = value => "'" + value.replace(/'/g, "'\\''") + "'";
+    return 'curl --fail --silent --show-error -H '
+        + shellQuote('X-Drama-Cron-Token: ' + dramaCronToken) + ' ' + shellQuote(dramaCronUrl('run'));
+}
+
+/** 初始化监控面板：获取令牌后填充 URL、绑定链接 */
+async function dramaInitMonitor() {
+    try {
+        const resp = await fetch(location.origin + DRAMA_CRON_SCRIPT + '?action=get_token', {
+            method: 'POST',
+            headers: jsonHeaders(),
+            credentials: 'same-origin'
+        });
+        const data = await resp.json().catch(() => null);
+        if (data && data.ok && data.token) {
+            dramaCronToken = data.token;
+        }
+    } catch (e) { /* 令牌获取失败，下方按未就绪处理 */ }
+
+    if (!dramaCronToken) {
+        const el = document.getElementById('monitor-url');
+        if (el) el.value = '监控令牌获取失败，请刷新页面重试';
+        const statusBox = document.getElementById('monitor-status');
+        if (statusBox) statusBox.textContent = '监控令牌获取失败，请刷新页面重试';
+        return;
+    }
+
     const el = document.getElementById('monitor-url');
-    if (el) el.value = monitorUrl;
-    const link = document.getElementById('monitor-url-link');
-    if (link) link.href = monitorUrl;
-    const linkStatus = document.getElementById('link-status');
-    if (linkStatus) linkStatus.href = dramaCronUrl('status');
-    const linkRun = document.getElementById('link-run');
-    if (linkRun) linkRun.href = dramaCronUrl('');
-    const linkCancel = document.getElementById('link-cancel');
-    if (linkCancel) linkCancel.href = dramaCronUrl('cancel');
+    if (el) el.value = dramaMonitorCommand();
 }
 
 /** 展开/折叠监控面板 */
@@ -402,25 +448,62 @@ async function dramaCopyMonitorUrl() {
     if (!el) return;
     try {
         await navigator.clipboard.writeText(el.value);
-        showToast('已复制监控地址', 'success');
+        showToast('已复制定时任务命令', 'success');
     } catch (e) {
         el.select();
         document.execCommand('copy');
-        showToast('已复制监控地址', 'success');
+        showToast('已复制定时任务命令', 'success');
     }
 }
 
-/** 通用任务操作（status/run/cancel）—— 通过 fetch 调用 tmp_drama_cron.php */
+/** 轮换监控令牌（审计 Low-3 / R2）
+ *  旧令牌立即失效，必须同步更新宝塔计划任务里的命令，否则自动驱动会中断。
+ */
+async function dramaRotateCronToken() {
+    if (!confirm('确定要轮换监控令牌吗？\n\n旧令牌会立即失效，必须同步更新宝塔计划任务里的命令，否则定时任务将无法继续驱动。')) return;
+    let data = null;
+    try {
+        const resp = await fetch(location.origin + DRAMA_CRON_SCRIPT + '?action=rotate_token', {
+            method: 'POST',
+            headers: jsonHeaders(),
+            credentials: 'same-origin'
+        });
+        data = await resp.json().catch(() => null);
+    } catch (e) {
+        showToast('轮换失败：' + e.message, 'error');
+        return;
+    }
+    if (!data || !data.ok || !data.token) {
+        // 失败时保持现有令牌与命令显示不变
+        showToast('轮换失败：' + ((data && data.msg) || '未知错误'), 'error');
+        return;
+    }
+    dramaCronToken = data.token;
+    const el = document.getElementById('monitor-url');
+    if (el) el.value = dramaMonitorCommand();
+    showToast('令牌已轮换，请到宝塔计划任务中更新命令中的新令牌', 'success');
+}
+
+/** 通用任务操作（status/run/cancel）—— 通过 fetch 调用 api/drama_cron.php */
 async function dramaTaskAction(action) {
     const statusBox = document.getElementById('monitor-status');
     if (statusBox) {
         const actionLabel = action === 'status' ? '查询状态' : (action === 'cancel' ? '取消任务' : '处理任务');
         statusBox.textContent = '正在' + actionLabel + '...';
     }
+    if (!dramaCronToken) {
+        if (statusBox) statusBox.textContent = '监控令牌未就绪，请刷新页面重试';
+        showToast('监控令牌未就绪，请刷新页面重试', 'error');
+        return null;
+    }
     const url = dramaCronUrl(action === 'run' ? '' : action);
     try {
         const t0 = Date.now();
-        const resp = await fetch(url, { method: 'GET' });
+        const resp = await fetch(url, {
+            method: 'GET',
+            headers: { 'X-Drama-Cron-Token': dramaCronToken },
+            credentials: 'same-origin'
+        });
         const elapsed = Date.now() - t0;
         const data = await resp.json().catch(() => null);
         if (statusBox) {
@@ -429,10 +512,7 @@ async function dramaTaskAction(action) {
         // 处理成功后刷新任务列表（pollProject 会重新拉取 drama_tasks）
         if (data && data.ok && (action === 'run' || action === 'cancel')) {
             if (typeof pollProject === 'function') pollProject();
-            const msg = action === 'cancel'
-                ? (data.msg || '已取消')
-                : ('已处理 ' + (data.processed_count || 0) + ' 个任务');
-            showToast(msg, 'success');
+            showToast(data.msg || (action === 'cancel' ? '已取消' : '已处理'), 'success');
         }
         return data;
     } catch (e) {

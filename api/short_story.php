@@ -1,6 +1,6 @@
 <?php
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 
 while (ob_get_level()) ob_end_clean();
 ini_set('display_errors', '0');
@@ -17,13 +17,19 @@ require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/ShortStoryService.php';
 require_once dirname(__DIR__) . '/includes/ShortStoryPromptBuilder.php';
 require_once dirname(__DIR__) . '/includes/ShortStoryQualityGuard.php';
+require_once dirname(__DIR__) . '/includes/quality/ChapterGenerationIntegrity.php';
 
 requireLoginApi(true);
 
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 if ($userId <= 0) jsonResponse(false, null, '未登录');
 
 $action = $_GET['action'] ?? $_POST['action'] ?? '';
+// Only reads may use GET/HEAD, which the shared auth helper exempts from CSRF.
+// Requiring POST here also protects future write actions added to this switch.
+if (!in_array($action, ['list', 'get', 'versions'], true)) {
+    requireHttpMethod('POST');
+}
 $input  = json_decode(file_get_contents('php://input'), true) ?: [];
 
 $service = new ShortStoryService();
@@ -41,6 +47,10 @@ switch ($action) {
         break;
 
     case 'create':
+        if (!is_string($input['title'] ?? null) || trim($input['title']) === '') {
+            http_response_code(422);
+            jsonOut(['ok' => false, 'msg' => '请填写标题']);
+        }
         $id = $service->createStory($input, $userId);
         $story = $service->getStory($id);
         jsonOut(['ok' => true, 'data' => $story]);
@@ -122,6 +132,9 @@ switch ($action) {
     case 'write_draft':
         $id = (int)($input['id'] ?? 0);
         $story = getStoryOwned($service, $id, $userId);
+        if ((int)($story['chapter_count'] ?? 1) >= 2) {
+            jsonOut(['ok' => false, 'msg' => '分章模式请使用写本章或连续写作']);
+        }
 
         set_time_limit(600);
         header('Content-Type: text/event-stream; charset=utf-8');
@@ -161,6 +174,7 @@ switch ($action) {
                 if (ob_get_level() > 0) ob_flush();
                 flush();
             }, 'creative');
+            shortStreamRejectIncomplete($ai);
 
             if (mb_strlen(trim($fullContent)) < 100) {
                 echo "data: " . json_encode(['error' => '生成内容过短，请重试'], JSON_UNESCAPED_UNICODE) . "\n\n";
@@ -270,6 +284,7 @@ switch ($action) {
                 if (ob_get_level() > 0) ob_flush();
                 flush();
             }, 'creative');
+            shortStreamRejectIncomplete($ai);
 
             if (mb_strlen(trim($fullContent)) < 50) {
                 echo "data: " . json_encode(['error' => '生成内容过短,请重试'], JSON_UNESCAPED_UNICODE) . "\n\n";
@@ -310,15 +325,26 @@ switch ($action) {
         $mode = $input['mode'] ?? 'full';
         $selection = $input['selection'] ?? '';
         $story = getStoryOwned($service, $id, $userId);
-        if (empty($story['content'])) jsonOut(['ok' => false, 'msg' => '没有可润色的内容']);
+        $chapterIndex = array_key_exists('chapter_index', $input) ? (int)$input['chapter_index'] : null;
+        try {
+            $target = $service->getPolishTarget($story, $chapterIndex);
+        } catch (InvalidArgumentException $e) {
+            jsonOut(['ok' => false, 'msg' => (int)($story['chapter_count'] ?? 1) >= 2
+                ? '分章模式请先选择要润色的当前章节'
+                : '单篇模式不接受章节参数']);
+        }
+        if (trim((string)($target['content'] ?? '')) === '') jsonOut(['ok' => false, 'msg' => '没有可润色的内容']);
 
         try {
             $modelId = !empty($input['model_id']) ? (int)$input['model_id'] : ($story['model_id'] ?? null);
             $ai = getAIClient($modelId);
-            $messages = ShortStoryPromptBuilder::buildPolishMessages($story, $mode, $selection);
+            $messages = ShortStoryPromptBuilder::buildPolishMessages($target, $mode, $selection);
             $content = $ai->chat($messages, 'creative');
+            if (trim($content) === '') throw new RuntimeException('润色结果为空');
 
-            $result = $service->saveContent($id, $content, 'AI润色（' . $mode . '）');
+            $result = $chapterIndex === null
+                ? $service->saveContent($id, $content, 'AI润色（' . $mode . '）')
+                : $service->updateChapterContent($id, $chapterIndex, $content, 'AI润色当前章（' . $mode . '）');
             jsonOut(normalizeResult($result));
         } catch (Throwable $e) {
             error_log('short_story 润色失败: ' . $e->getMessage());
@@ -432,22 +458,19 @@ function getStoryOwned(ShortStoryService $svc, int $storyId, int $userId): array
     if ($userId <= 0) {
         jsonResponse(false, null, '会话异常，请重新登录', 'forbidden');
     }
-    $ownerId = $story['user_id'] ?? null;
-    if ($ownerId === null || (int)$ownerId === 0) {
-        // 历史数据：user_id 为 NULL/0 时自动认领给当前用户
-        try {
-            DB::update(
-                'short_stories',
-                ['user_id' => $userId],
-                'id=? AND (user_id IS NULL OR user_id=0)',
-                [$storyId]
-            );
-        } catch (Throwable $e) {
-            error_log('ShortStory ownership auto-claim failed: ' . $e->getMessage());
-        }
-    } elseif ((int)$ownerId !== $userId) {
+    // 审计修复 F03（2026-11-01）：与页面入口共用 claimOrVerifyOwner()。历史 NULL/0 归属的
+    // 条件认领影响 0 行时复核最新归属；认领异常或无法确认一律拒绝——绝不以读到的旧
+    // 无主快照授权后续仅按 ID 的写入（否则竞争失败方会覆盖抢先认领者的正文）。
+    try {
+        $owned = claimOrVerifyOwner('short_stories', $storyId, $userId, $story['user_id'] ?? null);
+    } catch (Throwable $e) {
+        error_log('ShortStory ownership claim failed: ' . $e->getMessage());
+        $owned = false;
+    }
+    if (!$owned) {
         jsonResponse(false, null, '无权操作此短篇小说', 'forbidden');
     }
+    $story['user_id'] = $userId;
     return $story;
 }
 
@@ -459,6 +482,27 @@ function getStoryOwned(ShortStoryService $svc, int $storyId, int $userId): array
 function ensureStoryOwned(ShortStoryService $svc, int $storyId, int $userId): void
 {
     getStoryOwned($svc, $storyId, $userId);
+}
+
+/**
+ * 审计修复 F01（2026-11-01）：短篇正文与长篇 streamWrite 使用同一完整性证据。
+ * 流有终止事件不代表正文写完——finish_reason=length/content_filter 等结果
+ * 只能丢弃：不保存、不标 written、不发 saved 回执，原正文与版本保持不变。
+ * incomplete=true 告诉前端这段预览是确定的残稿，不要留作待保存草稿。
+ */
+function shortStreamRejectIncomplete(AIClient $ai): void
+{
+    $findings = ChapterGenerationIntegrity::findings($ai->lastFinishReason);
+    if ($findings === []) return;
+    $reason = (string)($findings[0]['evidence']['finish_reason'] ?? 'incomplete');
+    error_log('short_story incomplete generation discarded: finish_reason=' . $reason);
+    echo "data: " . json_encode([
+        'error' => '模型输出未完整结束（' . $reason . '），本次内容未保存，请重试',
+        'incomplete' => true,
+        'finish_reason' => $reason,
+    ], JSON_UNESCAPED_UNICODE) . "\n\n";
+    flush();
+    exit;
 }
 
 function jsonOut(array $payload): void

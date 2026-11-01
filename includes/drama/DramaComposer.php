@@ -4,6 +4,7 @@ defined('APP_LOADED') or die('Direct access denied.');
 
 require_once __DIR__ . '/DramaService.php';
 require_once __DIR__ . '/DramaImageService.php';
+require_once __DIR__ . '/DramaTaskRepository.php';
 
 /**
  * 剧集合成器：FFmpeg 拼接分镜视频片段为成片（v1 无音轨）。
@@ -15,47 +16,28 @@ final class DramaComposer
     {
         static $available = null;
         if ($available !== null) return $available;
-        $available = false;
-        if (function_exists('exec')) {
-            $out = [];
-            $code = 1;
-            @exec('ffmpeg -version 2>&1', $out, $code);
-            $available = ($code === 0);
-        }
+        $available = self::ffmpegBinary() !== null;
         return $available;
     }
 
     /**
-     * 拼接剧集全部 video_done 分镜。
+     * 拼接剧集全部分镜；执行前与发布时均核验完整集合和媒体版本。
      * @return string 成片相对路径
      */
-    public static function compose(array $project, array $episode): string
+    public static function compose(array $project, array $episode, array $task): string
     {
+        DramaTaskRepository::assertOwned($task);
+        $snapshot = self::compositionSnapshot($project, $episode);
         if (!self::ffmpegAvailable()) {
             throw new RuntimeException('服务器未检测到 FFmpeg，无法在线合成；请安装 FFmpeg 或改用导出素材包');
         }
-        $shots = DB::fetchAll(
-            "SELECT * FROM drama_shots WHERE episode_id=? AND status='video_done' AND video_path IS NOT NULL AND video_path != '' ORDER BY shot_no ASC",
-            [(int)$episode['id']]
-        );
-        if (count($shots) < 1) {
-            throw new RuntimeException('没有已生成的分镜视频片段');
-        }
-
-        $base = defined('BASE_PATH') ? BASE_PATH : dirname(__DIR__, 2);
-        $segments = [];
-        foreach ($shots as $shot) {
-            $abs = $base . '/' . ltrim(str_replace('\\', '/', (string)$shot['video_path']), '/');
-            if (!is_file($abs)) {
-                throw new RuntimeException('分镜 ' . (int)$shot['shot_no'] . ' 的视频文件缺失');
-            }
-            $segments[] = $abs;
-        }
+        $segments = array_column($snapshot, 'absolute_path');
 
         DramaService::ensureProjectDirs((int)$project['id']);
         $finalDir = DramaService::projectStorageDir((int)$project['id']) . '/final';
-        $listFile = $finalDir . '/concat_' . (int)$episode['id'] . '_' . time() . '.txt';
-        $outFile = $finalDir . '/episode_' . (int)$episode['episode_no'] . '_' . date('Ymd_His') . '.mp4';
+        $artifactId = bin2hex(random_bytes(16));
+        $listFile = $finalDir . '/concat_' . (int)$episode['id'] . '_' . $artifactId . '.txt';
+        $outFile = $finalDir . '/episode_' . (int)$episode['episode_no'] . '_' . $artifactId . '.mp4';
 
         $listContent = '';
         foreach ($segments as $abs) {
@@ -69,9 +51,10 @@ final class DramaComposer
         }
 
         [$w, $h] = self::parseSize((string)$project['image_size']);
+        $ffmpeg = escapeshellarg((string)self::ffmpegBinary());
 
         // 先试流复制（同 provider 同参数片段通常可直接拼），失败再重编码统一规格
-        $copyCmd = 'ffmpeg -y -f concat -safe 0 -i ' . escapeshellarg($listFile)
+        $copyCmd = $ffmpeg . ' -y -f concat -safe 0 -i ' . escapeshellarg($listFile)
             . ' -c copy -an ' . escapeshellarg($outFile) . ' 2>&1';
         $ok = self::runFfmpeg($copyCmd, $outFile);
 
@@ -81,7 +64,7 @@ final class DramaComposer
                 'scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1',
                 $w, $h, $w, $h
             );
-            $reCmd = 'ffmpeg -y -f concat -safe 0 -i ' . escapeshellarg($listFile)
+            $reCmd = $ffmpeg . ' -y -f concat -safe 0 -i ' . escapeshellarg($listFile)
                 . ' -vf ' . escapeshellarg($filter)
                 . ' -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -an '
                 . escapeshellarg($outFile) . ' 2>&1';
@@ -94,15 +77,56 @@ final class DramaComposer
         }
 
         $rel = DramaImageService::toRelativePath($outFile);
-        $old = (string)($episode['final_video_path'] ?? '');
-        DB::update('drama_episodes', [
-            'final_video_path' => $rel,
-            'status'           => 'completed',
-        ], 'id=?', [(int)$episode['id']]);
-        if ($old !== '' && $old !== $rel) {
-            DramaShotRunner::deleteManagedDramaFile($old);
-        }
+        DramaTaskRepository::commitResult($task, static function () use ($project, $episode, $snapshot, $rel): array {
+            $freshEpisode = DB::fetch('SELECT * FROM drama_episodes WHERE id=? FOR UPDATE', [(int)$episode['id']]);
+            if (!$freshEpisode || (int)$freshEpisode['project_id'] !== (int)$project['id']) {
+                throw new RuntimeException('剧集不存在或已变更');
+            }
+            if (self::compositionSnapshot($project, $episode, true) !== $snapshot) {
+                throw new RuntimeException('分镜集合或视频已变更，请重新合成');
+            }
+            DB::update('drama_episodes', [
+                'final_video_path' => $rel,
+                'status'           => 'completed',
+            ], 'id=?', [(int)$episode['id']]);
+            // Outputs are immutable; stale/ambiguous publishers never delete shared media.
+            return ['episode_id' => (int)$episode['id'], 'final_video_path' => $rel];
+        });
         return $rel;
+    }
+
+    /** Complete, ordered input manifest. Used by the API and again by the worker. */
+    public static function compositionSnapshot(array $project, array $episode, bool $lock = false): array
+    {
+        $shots = DB::fetchAll(
+            'SELECT * FROM drama_shots WHERE episode_id=? ORDER BY shot_no ASC' . ($lock ? ' FOR UPDATE' : ''),
+            [(int)$episode['id']]
+        );
+        if (!$shots) throw new RuntimeException('没有可合成的分镜');
+        $root = realpath(DramaService::projectStorageDir((int)$project['id']));
+        $base = defined('BASE_PATH') ? BASE_PATH : dirname(__DIR__, 2);
+        $snapshot = [];
+        foreach ($shots as $index => $shot) {
+            if ((int)$shot['shot_no'] !== $index + 1 || (string)$shot['status'] !== 'video_done'
+                || (string)($shot['video_path'] ?? '') === '') {
+                throw new RuntimeException('分镜视频尚未全部就绪，不能合成不完整剧集');
+            }
+            $path = str_replace('\\', '/', (string)$shot['video_path']);
+            $absolute = realpath($base . '/' . ltrim($path, '/'));
+            if ($root === false || $absolute === false || !is_file($absolute) || filesize($absolute) <= 0
+                || !str_starts_with(str_replace('\\', '/', $absolute), rtrim(str_replace('\\', '/', $root), '/') . '/')) {
+                throw new RuntimeException('分镜 ' . (int)$shot['shot_no'] . ' 的视频文件缺失或不在项目目录');
+            }
+            $hash = hash_file('sha256', $absolute);
+            if ($hash === false) throw new RuntimeException('分镜视频读取失败');
+            $snapshot[] = [
+                'id' => (int)$shot['id'], 'shot_no' => (int)$shot['shot_no'],
+                'video_path' => $path, 'image_path' => (string)($shot['image_path'] ?? ''),
+                'video_prompt' => (string)($shot['video_prompt'] ?? ''),
+                'duration' => (int)$shot['duration'], 'sha256' => $hash, 'absolute_path' => $absolute,
+            ];
+        }
+        return $snapshot;
     }
 
     /**
@@ -147,12 +171,92 @@ final class DramaComposer
     private static function runFfmpeg(string $cmd, string $outFile): bool
     {
         $out = [];
-        $code = 1;
-        @exec($cmd, $out, $code);
+        $code = self::runCommand($cmd, $out);
         if ($code !== 0) {
             error_log('DramaComposer ffmpeg failed (code ' . $code . '): ' . mb_substr(implode("\n", $out), 0, 800));
         }
         return $code === 0 && is_file($outFile) && filesize($outFile) > 0;
+    }
+
+    /**
+     * 返回可执行的 FFmpeg 路径。除 PATH 外兼容 Windows 常见安装位置，
+     * 并允许通过 FFMPEG_BINARY 环境变量或 CFG_FFMPEG_BINARY 常量显式指定。
+     */
+    private static function ffmpegBinary(): ?string
+    {
+        static $resolved = false;
+        static $binary = null;
+        if ($resolved) return $binary;
+        $resolved = true;
+
+        $candidates = [];
+        if (defined('CFG_FFMPEG_BINARY') && trim((string)CFG_FFMPEG_BINARY) !== '') {
+            $candidates[] = trim((string)CFG_FFMPEG_BINARY);
+        }
+        $fromEnv = trim((string)getenv('FFMPEG_BINARY'));
+        if ($fromEnv !== '') $candidates[] = $fromEnv;
+        $candidates[] = 'ffmpeg';
+        if (PHP_OS_FAMILY === 'Windows') {
+            $candidates[] = 'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe';
+            $candidates[] = 'C:\\ffmpeg\\bin\\ffmpeg.exe';
+        } else {
+            $candidates[] = '/usr/bin/ffmpeg';
+            $candidates[] = '/usr/local/bin/ffmpeg';
+        }
+
+        foreach (array_unique($candidates) as $candidate) {
+            if ($candidate !== 'ffmpeg' && !is_file($candidate)) continue;
+            $out = [];
+            if (self::runCommand(escapeshellarg($candidate) . ' -version 2>&1', $out) === 0) {
+                return $binary = $candidate;
+            }
+        }
+        return null;
+    }
+
+    /** @param string[] $output */
+    private static function runCommand(string $command, array &$output): int
+    {
+        $output = [];
+        if (function_exists('exec')) {
+            $code = 1;
+            @exec($command, $output, $code);
+            return (int)$code;
+        }
+        if (!function_exists('proc_open')) return 127;
+
+        $descriptors = [
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ];
+        $process = @proc_open($command, $descriptors, $pipes, null, null, ['bypass_shell' => false]);
+        if (!is_resource($process)) return 127;
+
+        foreach ($pipes as $pipe) stream_set_blocking($pipe, false);
+        $captured = '';
+        $exitCode = -1;
+        do {
+            foreach ($pipes as $pipe) {
+                $chunk = stream_get_contents($pipe);
+                if ($chunk !== false && $chunk !== '') $captured .= $chunk;
+            }
+            $status = proc_get_status($process);
+            if (!$status['running']) {
+                $exitCode = (int)$status['exitcode'];
+                break;
+            }
+            usleep(10000);
+        } while (true);
+
+        foreach ($pipes as $pipe) {
+            $chunk = stream_get_contents($pipe);
+            if ($chunk !== false && $chunk !== '') $captured .= $chunk;
+            fclose($pipe);
+        }
+        $closeCode = proc_close($process);
+        if ($closeCode >= 0) $exitCode = $closeCode;
+        $output = preg_split('/\r?\n/', trim($captured)) ?: [];
+        return $exitCode >= 0 ? $exitCode : 1;
     }
 
     /** @return array{0:int,1:int} */

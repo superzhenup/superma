@@ -17,7 +17,7 @@ ob_start();
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/auth.php';
 require_once __DIR__ . '/../includes/db.php';
@@ -371,7 +371,7 @@ function uploadTxt() {
 
 /** 取当前会话 user_id（无登录态时由 requireLoginApi 拦在更上层） */
 function currentBookUserId(): int {
-    return (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    return currentUserId();
 }
 
 /** 检查/认领后再次核对，防 TOCTOU（与 checkNovelOwnership::H-NEW-1 同思路） */
@@ -393,7 +393,6 @@ function saveAnalysis() {
     $title = trim($input['title'] ?? '');
     $content = trim($input['content'] ?? '');
     if (empty($title) || empty($content)) throw new Exception('缺少必要参数');
-    ensureBookAnalysesTable();
     $id = DB::insert('book_analyses', [
         'user_id' => currentBookUserId(),  // 审计修复 H-2
         'title' => $title,
@@ -408,7 +407,6 @@ function saveAnalysis() {
 
 function listAnalyses() {
     header('Content-Type: application/json; charset=utf-8');
-    ensureBookAnalysesTable();
     $userId = currentBookUserId();
     // 审计修复 H-2：只返回当前用户的分析 + 历史 user_id=0 自动认领
     DB::execute('UPDATE book_analyses SET user_id=? WHERE user_id=0', [$userId]);
@@ -422,7 +420,6 @@ function listAnalyses() {
 
 function getAnalysis() {
     header('Content-Type: application/json; charset=utf-8');
-    ensureBookAnalysesTable();
     $id = (int)($_GET['id'] ?? 0);
     if (!$id) throw new Exception('缺少 id');
     $userId = currentBookUserId();
@@ -437,7 +434,6 @@ function getAnalysis() {
 
 function deleteAnalysis() {
     header('Content-Type: application/json; charset=utf-8');
-    ensureBookAnalysesTable();
     $input = json_decode(file_get_contents('php://input'), true);
     $id = (int)($input['id'] ?? 0);
     if (!$id) throw new Exception('缺少 id');
@@ -449,37 +445,4 @@ function deleteAnalysis() {
     $affected = DB::execute('DELETE FROM book_analyses WHERE id=? AND user_id=?', [$id, $userId]);
     if (!$affected) throw new Exception('记录不存在或无权访问');
     echo json_encode(['success' => true], JSON_UNESCAPED_UNICODE);
-}
-
-function ensureBookAnalysesTable() {
-    static $checked = false;
-    if ($checked) return;
-    $checked = true;
-    // 审计修复 H-2（2026-06-17）：表加 user_id 列 + 索引；旧库无此列时
-    // 由下方 ensureBookAnalysesUserIdColumn() 兼容升级。
-    DB::query("CREATE TABLE IF NOT EXISTS `book_analyses` (
-        `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-        `user_id` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '所属用户ID，0=历史无主',
-        `title` VARCHAR(200) NOT NULL DEFAULT '',
-        `author` VARCHAR(100) NOT NULL DEFAULT '',
-        `genre` VARCHAR(100) NOT NULL DEFAULT '',
-        `content` MEDIUMTEXT NOT NULL,
-        `source_text` MEDIUMTEXT,
-        `created_at` DATETIME NOT NULL,
-        INDEX `idx_created` (`created_at`),
-        INDEX `idx_user` (`user_id`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-
-    // 旧库可能没有 user_id 列 —— 显式 ALTER 一次（IF NOT EXISTS 在 MySQL 5.7+ 可用）
-    try {
-        $colExists = (int)(DB::fetch(
-            "SELECT COUNT(*) AS c FROM information_schema.COLUMNS
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'book_analyses' AND COLUMN_NAME = 'user_id'"
-        )['c'] ?? 0);
-        if (!$colExists) {
-            DB::query("ALTER TABLE `book_analyses` ADD COLUMN `user_id` INT UNSIGNED NOT NULL DEFAULT 0 AFTER `id`, ADD INDEX `idx_user` (`user_id`)");
-        }
-    } catch (Throwable $e) {
-        error_log('analyze_book: ensure user_id column failed — ' . $e->getMessage());
-    }
 }

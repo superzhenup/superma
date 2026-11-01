@@ -1,0 +1,15 @@
+{
+  "id": "finale",
+  "version": "1.0.0",
+  "description": "收束核心承诺、角色弧与伏笔，以结果和余韵结束全书而非开启新主线。",
+  "triggers": {
+    "chapter_types": ["finale", "ending"],
+    "keywords": ["终章", "大结局", "最终章"],
+    "outline_tags": ["finale", "ending"],
+    "final_chapter": true
+  },
+  "priority": 50,
+  "token_budget": 700,
+  "requires": [],
+  "conflicts": []
+}

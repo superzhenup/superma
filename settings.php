@@ -15,40 +15,12 @@ $error = '';
  * SSRF 防护：公网 API 强制 HTTPS，并阻止 private、link-local、保留地址。
  * 本系统的模型配置仅管理员可写；为兑现内置 Ollama 预设，精确放行
  * localhost / 127.0.0.1 / ::1，不放行其他内网地址或解析到内网的域名。
+ *
+ * 审计修复 M1（2026-08-16）：校验内核迁移到 includes/helpers.php 的
+ * assertPublicApiEndpointResolve() / apiUrlHostIsLocal() / normalizeApiUrlHost()
+ * （A+AAAA 全量校验、解析失败 fail-closed），与 ai.php 请求侧共用同一真理源。
+ * 页面原有的本地函数定义已删除，避免与 helpers.php 守卫定义重复声明。
  */
-function normalizeApiUrlHost(string $host): string {
-    $host = strtolower(trim($host));
-    if (str_starts_with($host, '[') && str_ends_with($host, ']')) {
-        $host = substr($host, 1, -1);
-    }
-    return rtrim($host, '.');
-}
-
-function isDisallowedIpv6(string $ip): bool {
-    if (strlen($ip) !== 16) return false;
-
-    if ($ip === str_repeat("\0", 16)) return true;
-    if ($ip === str_repeat("\0", 15) . "\1") return true;
-
-    $first = ord($ip[0]);
-    $second = ord($ip[1]);
-    if (($first & 0xFE) === 0xFC) return true;
-    if ($first === 0xFE && ($second & 0xC0) === 0x80) return true;
-    if ($first === 0xFF) return true;
-
-    $mappedPrefix = str_repeat("\0", 10) . "\xff\xff";
-    if (substr($ip, 0, 12) === $mappedPrefix) {
-        $mappedLong = unpack('N', substr($ip, 12))[1];
-        if (($mappedLong & 0xFF000000) === 0x7F000000) return true;
-        if (($mappedLong & 0xFF000000) === 0x0A000000) return true;
-        if (($mappedLong & 0xFFFF0000) === 0xC0A80000) return true;
-        if (($mappedLong & 0xFFF00000) === 0xAC100000) return true;
-        if (($mappedLong & 0xFFFF0000) === 0xA9FE0000) return true;
-    }
-
-    return false;
-}
-
 function isSafeApiUrl(string $url): bool {
     $scheme = strtolower((string)parse_url($url, PHP_URL_SCHEME));
     $host = parse_url($url, PHP_URL_HOST);
@@ -56,55 +28,18 @@ function isSafeApiUrl(string $url): bool {
     $host = normalizeApiUrlHost($host);
 
     // 单用户部署允许管理员连接本机 Ollama；远程端点仍强制 HTTPS。
-    if ($host === 'localhost' || $host === '127.0.0.1' || $host === '::1') {
+    if (apiUrlHostIsLocal($host)) {
         return $scheme === 'http' || $scheme === 'https';
     }
     if ($scheme !== 'https') return false;
 
-    $ip = @inet_pton($host);
-    if ($ip === false) {
-        // 非 IP 地址（域名），DNS 解析后再校验
-        $resolved = @gethostbyname($host);
-        if ($resolved === $host) return true; // 解析失败，放行（由 cURL 自行处理）
-        $ip = @inet_pton($resolved);
-        if ($ip === false) return true; // 非 IPv4，放行
+    // 域名/IP 解析与内网段校验（含 AAAA 记录与解析失败 fail-closed）
+    try {
+        assertPublicApiEndpointResolve($url);
+        return true;
+    } catch (\RuntimeException $e) {
+        return false;
     }
-
-    if (strlen($ip) === 16) return !isDisallowedIpv6($ip);
-    if (strlen($ip) !== 4) return true;
-
-    $ipLong = unpack('N', $ip)[1];
-
-    // 0.0.0.0/8
-    if (($ipLong & 0xFF000000) === 0x00000000) return false;
-    // 10.0.0.0/8
-    if (($ipLong & 0xFF000000) === 0x0A000000) return false;
-    // 100.64.0.0/10 (CGN)
-    if (($ipLong & 0xFFC00000) === 0x64400000) return false;
-    // 127.0.0.0/8 (loopback — 127.0.0.1 已在上方放行，其余拒绝)
-    if (($ipLong & 0xFF000000) === 0x7F000000) return false;
-    // 169.254.0.0/16 (link-local)
-    if (($ipLong & 0xFFFF0000) === 0xA9FE0000) return false;
-    // 172.16.0.0/12
-    if (($ipLong & 0xFFF00000) === 0xAC100000) return false;
-    // 192.0.0.0/24 (IETF Protocol Assignments)
-    if (($ipLong & 0xFFFFFF00) === 0xC0000000) return false;
-    // 192.0.2.0/24 (TEST-NET-1)
-    if (($ipLong & 0xFFFFFF00) === 0xC0000200) return false;
-    // 192.168.0.0/16
-    if (($ipLong & 0xFFFF0000) === 0xC0A80000) return false;
-    // 198.18.0.0/15 (benchmark)
-    if (($ipLong & 0xFFFE0000) === 0xC6120000) return false;
-    // 198.51.100.0/24 (TEST-NET-2)
-    if (($ipLong & 0xFFFFFF00) === 0xC6336400) return false;
-    // 203.0.113.0/24 (TEST-NET-3)
-    if (($ipLong & 0xFFFFFF00) === 0xCB007100) return false;
-    // 224.0.0.0/4 (multicast)
-    if (($ipLong & 0xF0000000) === 0xE0000000) return false;
-    // 240.0.0.0/4 (reserved)
-    if (($ipLong & 0xF0000000) === 0xF0000000) return false;
-
-    return true;
 }
 
 // Handle form actions
@@ -128,8 +63,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             : null;
 
         // 编辑时保留系统暂不认识的第三方/未来能力标签，只重建当前表单
-        // 管理的四个已知标签，避免一次普通编辑静默丢失扩展能力。
-        $knownCapabilities = ['creative', 'structured', 'synopsis', 'context_1m'];
+        // 管理的五个已知标签，避免一次普通编辑静默丢失扩展能力。
+        $knownCapabilities = [
+            'creative', 'structured', 'synopsis', 'context_1m', 'native_tools',
+        ];
         $capabilities = [];
         if ($existingEditModel) {
             $existingCapabilities = json_decode((string)($existingEditModel['capabilities'] ?? '[]'), true);
@@ -149,6 +86,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (isset($_POST['cap_structured'])) $capabilities[] = 'structured';
         if (isset($_POST['cap_synopsis']))   $capabilities[] = 'synopsis';
         if (isset($_POST['cap_context_1m'])) $capabilities[] = 'context_1m';
+        if (isset($_POST['cap_native_tools'])) $capabilities[] = 'native_tools';
         $capabilities = array_values(array_unique($capabilities));
         $capabilities_json = !empty($capabilities) ? json_encode($capabilities) : null;
 
@@ -273,16 +211,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-$models  = DB::fetchAll('SELECT * FROM ai_models ORDER BY is_default DESC, id ASC');
+$models  = DB::fetchAll('SELECT id,name,api_url,model_name,max_tokens,temperature,is_default,embedding_enabled,thinking_enabled,capabilities FROM ai_models ORDER BY is_default DESC, id ASC');
 $editModel = null;
 if (isset($_GET['edit'])) {
-    $editModel = DB::fetch('SELECT * FROM ai_models WHERE id=?', [(int)$_GET['edit']]);
+    $editModel = DB::fetch('SELECT id,name,api_url,model_name,max_tokens,temperature,is_default,embedding_enabled,thinking_enabled,capabilities FROM ai_models WHERE id=?', [(int)$_GET['edit']]);
 }
 
+$announcementUrl = ConfigCenter::get('announcement_url', 'https://www.itzo.cn/api/super.html', 'string');
+if (!ContentSecurityPolicy::allowFrameUrl($announcementUrl)) $announcementUrl = '';
 pageHeader('模型设置', 'settings');
 
 $presets = getSettingsModelPresets();
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-settings-confirm-delete', function (event, element) { return confirm('确定删除模型「' + element.dataset.modelName + '」？'); });
+AppEvents.register('page-settings-resize-announcement', function (event, element) { this.style.height=Math.min(this.contentDocument?.body?.scrollHeight+20||380,400)+'px'; });
+AppEvents.register('page-settings-announcement-error', function (event, element) { document.getElementById('announce-placeholder').style.display='';this.parentElement.style.display='none'; });
+AppEvents.register('page-settings-test-connection-3', function (event, element) { testConnection(); });
+AppEvents.register('page-settings-validate-embedding-4', function (event, element) { validateEmbedding(); });
+AppEvents.register('page-settings-test-embedding-5', function (event, element) { testEmbedding(); });
+AppEvents.register('page-settings-reset-form-6', function (event, element) { resetForm(); });
+AppEvents.register('page-settings-save-image-api-config-7', function (event, element) { saveImageApiConfig(); });
+AppEvents.register('page-settings-test-image-api-8', function (event, element) { testImageApi(); });
+</script>
+
 
 <div class="row g-4">
 
@@ -334,6 +286,8 @@ $presets = getSettingsModelPresets();
                 <span class="badge bg-warning me-1">synopsis</span>
                 <?php elseif ($cap === 'context_1m'): ?>
                 <span class="badge bg-success me-1">1M 上下文</span>
+                <?php elseif ($cap === 'native_tools'): ?>
+                <span class="badge bg-danger me-1">Native Tools</span>
                 <?php endif; ?>
                 <?php endforeach; ?>
               </div>
@@ -359,7 +313,7 @@ $presets = getSettingsModelPresets();
                 <i class="bi bi-pencil"></i>
               </button>
               <form method="post" class="d-inline"
-                    onsubmit="return confirm('确定删除模型「<?= h(addslashes($m['name'])) ?>」？')">
+                    data-csp-submit="page-settings-confirm-delete" data-model-name="<?= h($m['name']) ?>">
                 <input type="hidden" name="_token" value="<?= csrf_token() ?>">
                 <input type="hidden" name="action" value="delete">
                 <input type="hidden" name="del_id" value="<?= $m['id'] ?>">
@@ -376,7 +330,6 @@ $presets = getSettingsModelPresets();
     </div>
 
     <!-- 官方公告（iframe 嵌入远程页面） -->
-<?php $announcementUrl = ConfigCenter::get('announcement_url', 'https://www.itzo.cn/api/super.html', 'string'); ?>
     <div class="page-card mt-3" style="border-color:rgba(99,102,241,.4);background:linear-gradient(135deg,rgba(99,102,241,.08),rgba(139,92,246,.08))">
       <div class="page-card-header d-flex align-items-center justify-content-between" style="border-color:rgba(99,102,241,.3)">
         <div><i class="bi bi-stars me-2" style="color:#a78bfa"></i>官方公告</div>
@@ -392,8 +345,8 @@ $presets = getSettingsModelPresets();
                   style="width:100%;height:600px;border:none;background:transparent"
                   sandbox="allow-scripts allow-same-origin allow-popups allow-top-navigation"
                   loading="lazy"
-                  onload="this.style.height=Math.min(this.contentDocument?.body?.scrollHeight+20||380,400)+'px'"
-                  onerror="document.getElementById('announce-placeholder').style.display='';this.parentElement.style.display='none'">
+                  data-csp-load="page-settings-resize-announcement"
+                  data-csp-error="page-settings-announcement-error">
           </iframe>
         </div>
         <!-- 无 URL 时的提示 -->
@@ -417,7 +370,7 @@ $presets = getSettingsModelPresets();
             </select>
           </div>
           <div class="col-auto">
-            <button class="btn btn-sm btn-outline-info" onclick="testConnection()">
+            <button class="btn btn-sm btn-outline-info" data-csp-click="page-settings-test-connection-3">
               <i class="bi bi-send me-1"></i>测试
             </button>
           </div>
@@ -563,19 +516,26 @@ $presets = getSettingsModelPresets();
                 <span class="badge bg-success me-1">1M</span>支持 1M 上下文
               </label>
             </div>
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="cap_native_tools" id="f-cap-native-tools">
+              <label class="form-check-label text-muted" for="f-cap-native-tools">
+                <span class="badge bg-danger me-1">Tools</span>原生 Tool calling
+              </label>
+            </div>
           </div>
           <div class="small text-muted mt-2" style="line-height:1.6">
             <strong>creative</strong>：正文写作，需要高创意和文采<br>
             <strong>structured</strong>：大纲生成、摘要提取、JSON解析等结构化任务<br>
             <strong>synopsis</strong>：章节简介生成，介于创意和结构之间<br>
-            <strong>1M 上下文</strong>：仅当模型服务明确支持约 100 万 Token 上下文时勾选；系统会为它构建完整历史上下文
+            <strong>1M 上下文</strong>：仅当模型服务明确支持约 100 万 Token 上下文时勾选；系统会为它构建完整历史上下文<br>
+            <strong>Native Tools</strong>：仅当模型端点明确兼容原生 Tool calling 时勾选；Harness 不会猜测该能力
           </div>
         </div>
         
         <!-- 记忆增强-Embedding模型开关 -->
         <div class="mb-3 p-3 rounded" style="background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.2)">
           <div class="form-check mb-2">
-            <input class="form-check-input" type="checkbox" name="embedding_enabled" id="f-embedding" onchange="validateEmbedding()">
+            <input class="form-check-input" type="checkbox" name="embedding_enabled" id="f-embedding" data-csp-change="page-settings-validate-embedding-4">
             <label class="form-check-label fw-semibold" style="color:var(--text)" for="f-embedding">
               <i class="bi bi-lightning-charge me-1" style="color:#a78bfa"></i>记忆增强-Embedding模型
             </label>
@@ -591,7 +551,7 @@ $presets = getSettingsModelPresets();
             <i class="bi bi-check-circle me-1"></i>已自动开启记忆增强（doubao-embedding-vision）
           </div>
           <div id="embedding-test-result" class="small mt-2" style="display:none"></div>
-          <button type="button" class="btn btn-outline-info btn-sm mt-2" onclick="testEmbedding()" id="btn-test-embedding">
+          <button type="button" class="btn btn-outline-info btn-sm mt-2" data-csp-click="page-settings-test-embedding-5" id="btn-test-embedding">
             <i class="bi bi-lightning-charge me-1"></i>检测记忆增强是否生效
           </button>
         </div>
@@ -601,7 +561,7 @@ $presets = getSettingsModelPresets();
             <i class="bi bi-plus-lg me-1"></i>添加模型
           </button>
           <button type="button" class="btn btn-secondary btn-sm" id="form-cancel-btn"
-                  style="display:none" onclick="resetForm()">取消</button>
+                  style="display:none" data-csp-click="page-settings-reset-form-6">取消</button>
         </div>
       </form>
       </div><!-- /text-engine-panel -->
@@ -685,10 +645,10 @@ $presets = getSettingsModelPresets();
         </div>
 
         <div class="d-flex gap-2">
-          <button type="button" class="btn btn-sm flex-grow-1" style="background:linear-gradient(135deg,#ec4899,#a855f7);border:none;color:#fff;font-weight:600" onclick="saveImageApiConfig()">
+          <button type="button" class="btn btn-sm flex-grow-1" style="background:linear-gradient(135deg,#ec4899,#a855f7);border:none;color:#fff;font-weight:600" data-csp-click="page-settings-save-image-api-config-7">
             <i class="bi bi-check-lg me-1"></i>保存配置
           </button>
-          <button type="button" class="btn btn-sm btn-outline-info" onclick="testImageApi()">
+          <button type="button" class="btn btn-sm btn-outline-info" data-csp-click="page-settings-test-image-api-8">
             <i class="bi bi-send me-1"></i>测试连接
           </button>
         </div>
@@ -752,7 +712,7 @@ $presets = getSettingsModelPresets();
 .remote-announce img { max-width: 100%; border-radius: 8px; }
 .remote-announce p { margin-bottom: .5em; }
 </style>
-<script>
+<script nonce="<?= cspNonce() ?>">
 // Engine Tab Switching
 document.querySelectorAll('.engine-tab').forEach(tab => {
     tab.addEventListener('click', function() {
@@ -896,6 +856,7 @@ document.querySelectorAll('.btn-edit-model').forEach(btn => {
         document.getElementById('f-cap-structured').checked = caps.includes('structured');
         document.getElementById('f-cap-synopsis').checked   = caps.includes('synopsis');
         document.getElementById('f-cap-context-1m').checked = caps.includes('context_1m');
+        document.getElementById('f-cap-native-tools').checked = caps.includes('native_tools');
         // 联动显示 embedding 支持提示
         const isArkApi = (m.api_url || '').includes('ark.cn-beijing.volces.com') || (m.api_url || '').includes('volces.com');
         const embCheckbox = document.getElementById('f-embedding');
@@ -949,6 +910,7 @@ function resetForm() {
     document.getElementById('f-cap-structured').checked = false;
     document.getElementById('f-cap-synopsis').checked = false;
     document.getElementById('f-cap-context-1m').checked = false;
+    document.getElementById('f-cap-native-tools').checked = false;
 }
 
 // 检测记忆增强（Embedding）是否生效

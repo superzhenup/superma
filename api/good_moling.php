@@ -1,6 +1,6 @@
 <?php
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 
 while (ob_get_level()) ob_end_clean();
 ini_set('display_errors', '0');
@@ -31,7 +31,7 @@ if ($method === 'POST' && in_array($action, ['chat', 'clear'])) {
     requireLoginApi(true);
 }
 
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 if ($userId <= 0) jsonResponse(false, null, '未登录');
 
 $input = json_decode(file_get_contents('php://input'), true) ?: [];
@@ -65,7 +65,8 @@ try {
 function handleListModels(): void
 {
     $rows = DB::fetchAll(
-        "SELECT id, name, model_name, channel, token_multiplier, is_default
+        // ai_models 无 channel / token_multiplier 列，查询这两列会让接口恒报错。
+        "SELECT id, name, model_name, is_default
          FROM ai_models
          ORDER BY is_default DESC, id ASC"
     );
@@ -75,8 +76,6 @@ function handleListModels(): void
             'id'         => (int)$r['id'],
             'name'       => $r['name'],
             'model_name' => $r['model_name'] ?? '',
-            'channel'    => $r['channel'] ?? 'admin',
-            'multiplier' => (float)($r['token_multiplier'] ?? 1.0),
             'is_default' => (int)($r['is_default'] ?? 0),
         ];
     }

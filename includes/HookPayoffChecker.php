@@ -26,14 +26,38 @@ class HookPayoffChecker
         if (!getSystemSetting('ws_hook_payoff_enabled', true, 'bool')) return $miss;
 
         $prev = DB::fetch(
-            "SELECT hook FROM chapters WHERE novel_id=? AND chapter_number=? AND status='completed' LIMIT 1",
+            "SELECT hook, content FROM chapters WHERE novel_id=? AND chapter_number=? AND status='completed' LIMIT 1",
             [$novelId, $chNum - 1]
         );
         $prevHook = trim((string)($prev['hook'] ?? ''));
         if ($prevHook === '') return $miss;
 
-        // 本章开头（钩子应在前段被回应）
+        // 本章开头（AI 判定路径用；关键词路径已扩为全文）
         $opening = mb_substr($content, 0, max(800, (int)(mb_strlen($content) * 0.4)));
+
+        // 审计修复 N3（2026-09-27）：hook 是大纲"计划钩子"。上一章实际正文若未
+        // 按计划收钩，本章对它判定"未回收"必然误报——悬挂指令会让后续章去
+        // "回应"一个从未真正抛出的悬念。先用钩子关键词验证上一章结尾段确实
+        // 埋了这个钩子；未埋设则按无法判定跳过（不写悬挂指令）。
+        $keys = self::extractKeyTokens($novelId, $prevHook);
+        if (empty($keys)) {
+            // 抽不出可判定的实体 → 不下结论，避免误报
+            return $miss;
+        }
+        $prevContent = (string)($prev['content'] ?? '');
+        if ($prevContent !== '') {
+            $prevTail = mb_substr($prevContent, -max(600, (int)(mb_strlen($prevContent) * 0.15)));
+            $prevPlanted = 0;
+            foreach ($keys as $k) {
+                if (mb_strpos($prevTail, $k) !== false) {
+                    $prevPlanted++;
+                }
+            }
+            if ($prevPlanted === 0) {
+                // 计划钩子未出现在上一章结尾段 → 实际正文没埋这个钩子
+                return ['checked' => false, 'resolved' => null, 'prev_chapter' => $chNum - 1, 'prev_hook' => $prevHook, 'method' => 'prev_hook_not_planted'];
+            }
+        }
 
         // 可选：AI 判定
         if (getSystemSetting('ws_hook_payoff_ai', false, 'bool')) {
@@ -43,19 +67,19 @@ class HookPayoffChecker
             }
         }
 
-        // 启发式：从上章钩子里抽"关键实体/词"，看本章开头是否提及
-        $keys = self::extractKeyTokens($novelId, $prevHook);
-        if (empty($keys)) {
-            // 抽不出可判定的实体 → 不下结论，避免误报
-            return $miss;
-        }
+        // 启发式：从上章钩子里抽"关键实体/词"，看本章是否提及
+        // 审计修复 N3（2026-09-27）：原仅匹配本章前 40%（"钩子应在前段被
+        // 回应"），本章在中后段才回收钩子会被误判悬挂并触发错误的"补钩子"
+        // 写作干预。扩为全文匹配；无关提及由 H-9 的 requiredHits 门槛
+        // （多关键词需命中 ≥2）兜底。
+        $scope = $content;
         // H-9 修复（2026-07-25）：原代码任意单个关键词命中即判"已回收"，
         // 常见词（如"剑""战斗"）在无关上下文出现会导致假阳性，让真正的烂尾钩子被忽略。
         // 改为：统计命中数，当有多个关键词时要求至少 2 个命中；
         // 仅当只有 1 个关键词时（如只有角色名）才接受单命中。
         $hitCount = 0;
         foreach ($keys as $k) {
-            if (mb_strpos($opening, $k) !== false) {
+            if (mb_strpos($scope, $k) !== false) {
                 $hitCount++;
             }
         }

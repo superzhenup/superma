@@ -17,7 +17,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  * }
  */
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/auth.php';
 requireLoginApi();

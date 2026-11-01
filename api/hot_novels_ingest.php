@@ -58,6 +58,9 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 header('Content-Type: application/json; charset=utf-8');
 
+require_once dirname(__DIR__) . '/includes/maintenance.php';
+maintenanceGuardHttp();
+require_once dirname(__DIR__) . '/includes/RequestBody.php';
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/HotNovelService.php';
@@ -73,6 +76,11 @@ function respond(array $payload, int $http = 200): void
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     respond(['success' => false, 'error' => 'METHOD_NOT_ALLOWED'], 405);
+}
+
+$rawBody = readRequestBodyBounded(5 * 1024 * 1024);
+if ($rawBody === null) {
+    respond(['success' => false, 'error' => 'VALIDATION_ERROR', 'detail' => 'body_too_large'], 413);
 }
 
 if (!HotNovelService::isIngestEnabled()) {
@@ -121,10 +129,6 @@ try {
 }
 
 // ---- Body 解析 ----
-$rawBody = file_get_contents('php://input');
-if (strlen($rawBody) > 5 * 1024 * 1024) {
-    respond(['success' => false, 'error' => 'VALIDATION_ERROR', 'detail' => 'body_too_large'], 413);
-}
 $body = json_decode($rawBody, true);
 if (!is_array($body)) {
     respond(['success' => false, 'error' => 'VALIDATION_ERROR', 'detail' => 'invalid_json'], 400);

@@ -3,6 +3,19 @@
 
   var API = 'api/index.php?route=hot_novels';
 
+  window.AppEvents.register('hot-topics.goto-page', function(event, element) {
+    return window.gotoPage(parseInt(element.dataset.page, 10) || 1);
+  });
+  window.AppEvents.register('hot-topics.regenerate-key', function() {
+    return window.regenerateKey();
+  });
+  window.AppEvents.register('hot-topics.save-settings', function() {
+    return window.saveSettings();
+  });
+  window.AppEvents.register('hot-topics.close-settings', function() {
+    return window.closeModal('settingsModal');
+  });
+
   var state = {
     source: 'all',
     channel: 'all',
@@ -357,23 +370,23 @@
   }
 
   function renderPagination(totalPage, current){
-    // 审计修复 P1-7（2026-07-12）：强制类型转换，防止字符串型 totalPage/current 注入 onclick/innerHTML
+    // Keep pagination attributes numeric even when the API returns strings.
     totalPage = parseInt(totalPage, 10) || 1;
     current   = parseInt(current, 10) || 1;
     var el = document.getElementById('pagination');
     if (totalPage <= 1) { el.innerHTML = ''; return; }
     var html = '';
-    html += '<button ' + (current<=1?'disabled':'') + ' onclick="gotoPage(' + (current-1) + ')">‹</button>';
+    html += '<button ' + (current<=1?'disabled':'') + ' data-csp-click="hot-topics.goto-page" data-page="' + (current-1) + '">‹</button>';
 
     var start = Math.max(1, current - 3);
     var end = Math.min(totalPage, current + 3);
-    if (start > 1) html += '<button onclick="gotoPage(1)">1</button>' + (start > 2 ? '<span>…</span>' : '');
+    if (start > 1) html += '<button data-csp-click="hot-topics.goto-page" data-page="1">1</button>' + (start > 2 ? '<span>…</span>' : '');
     for (var i = start; i <= end; i++) {
-      html += '<button class="' + (i===current?'active':'') + '" onclick="gotoPage(' + i + ')">' + i + '</button>';
+      html += '<button class="' + (i===current?'active':'') + '" data-csp-click="hot-topics.goto-page" data-page="' + i + '">' + i + '</button>';
     }
-    if (end < totalPage) html += (end < totalPage-1 ? '<span>…</span>' : '') + '<button onclick="gotoPage(' + totalPage + ')">' + totalPage + '</button>';
+    if (end < totalPage) html += (end < totalPage-1 ? '<span>…</span>' : '') + '<button data-csp-click="hot-topics.goto-page" data-page="' + totalPage + '">' + totalPage + '</button>';
 
-    html += '<button ' + (current>=totalPage?'disabled':'') + ' onclick="gotoPage(' + (current+1) + ')">›</button>';
+    html += '<button ' + (current>=totalPage?'disabled':'') + ' data-csp-click="hot-topics.goto-page" data-page="' + (current+1) + '">›</button>';
     el.innerHTML = html;
   }
 
@@ -502,7 +515,7 @@
     html += '<div class="mb-3">'
          + '<div class="form-label mb-1 d-flex justify-content-between align-items-center">'
          + '<span>接入密钥 X-Ingest-Key</span>'
-         + '<button class="btn btn-sm btn-primary" onclick="regenerateKey()"><i class="bi bi-arrow-clockwise me-1"></i>生成新密钥</button>'
+         + '<button class="btn btn-sm btn-primary" data-csp-click="hot-topics.regenerate-key"><i class="bi bi-arrow-clockwise me-1"></i>生成新密钥</button>'
          + '</div>'
          + '<div id="ingestKeyBox" style="padding:.4rem;background:#0f0f25;border-radius:6px;min-height:1.8rem">' + keyDisplay + '</div>'
          + '<div style="color:#707090;margin-top:.3rem;font-size:.72rem">'
@@ -528,8 +541,8 @@
          + '</div>';
 
     html += '<div class="d-flex gap-2 mt-3">'
-         + '<button class="btn btn-primary" onclick="saveSettings()">保存设置</button>'
-         + '<button class="btn btn-outline-secondary" onclick="closeModal(\'settingsModal\')">关闭</button>'
+         + '<button class="btn btn-primary" data-csp-click="hot-topics.save-settings">保存设置</button>'
+         + '<button class="btn btn-outline-secondary" data-csp-click="hot-topics.close-settings">关闭</button>'
          + '</div>';
 
     document.getElementById('settingsContent').innerHTML = html;

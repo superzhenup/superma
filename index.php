@@ -23,6 +23,15 @@ $totalModels   = DB::count('ai_models');
 
 pageHeader('我的书库', 'home');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-index-open', function (event, element) { location.href = 'novel.php?id=' + Number(element.dataset.novelId); });
+AppEvents.register('page-index-show-export-modal-1', function (event, element) { showExportModal(); });
+AppEvents.register('page-index-show-import-modal-2', function (event, element) { showImportModal(); });
+AppEvents.register('page-index-stop-card-navigation', function (event, element) { event.stopPropagation(); });
+AppEvents.register('page-index-do-export-4', function (event, element) { doExport(); });
+AppEvents.register('page-index-do-import-5', function (event, element) { doImport(); });
+</script>
+
 
 <!-- Stats row -->
 <div class="row g-3 mb-4">
@@ -68,10 +77,10 @@ pageHeader('我的书库', 'home');
 <div class="d-flex align-items-center justify-content-between mb-3">
   <h6 class="mb-0 fw-semibold text-light">书库列表</h6>
   <div class="btn-group">
-    <button class="btn btn-outline-success btn-sm" onclick="showExportModal()">
+    <button class="btn btn-outline-success btn-sm" data-csp-click="page-index-show-export-modal-1">
       <i class="bi bi-download me-1"></i>导出
     </button>
-    <button class="btn btn-outline-info btn-sm" onclick="showImportModal()">
+    <button class="btn btn-outline-info btn-sm" data-csp-click="page-index-show-import-modal-2">
       <i class="bi bi-upload me-1"></i>导入
     </button>
     <a href="workshop.php" class="btn btn-outline-primary btn-sm">
@@ -117,10 +126,10 @@ pageHeader('我的书库', 'home');
     $coverUrl = $hasCoverImage ? $coverPath : null;
   ?>
   <div class="col-4 col-md-2 col-xl-2">
-    <div class="novel-card" onclick="location.href='novel.php?id=<?= $novel['id'] ?>'">
+    <div class="novel-card" data-csp-click="page-index-open" data-novel-id="<?= (int)$novel['id'] ?>">
       <!-- 封面区：3:2 比例，统一尺寸 -->
       <div class="novel-cover" style="<?= $coverUrl ? '' : 'background: linear-gradient(135deg, ' . h($color) . ', ' . h($color) . '99)' ?>">
-        <a href="drama.php?novel_id=<?= $novel['id'] ?>" class="drama-entry" title="漫剧制作" onclick="event.stopPropagation()">
+        <a href="drama.php?novel_id=<?= $novel['id'] ?>" class="drama-entry" title="漫剧制作" data-csp-click="page-index-stop-card-navigation">
           <i class="bi bi-film"></i>
         </a>
         <?php if ($coverUrl): ?>
@@ -190,7 +199,7 @@ pageHeader('我的书库', 'home');
       </div>
       <div class="modal-footer border-secondary">
         <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">取消</button>
-        <button type="button" class="btn btn-success btn-sm" onclick="doExport()">
+        <button type="button" class="btn btn-success btn-sm" data-csp-click="page-index-do-export-4">
           <i class="bi bi-download me-1"></i>开始导出
         </button>
       </div>
@@ -222,7 +231,7 @@ pageHeader('我的书库', 'home');
       </div>
       <div class="modal-footer border-secondary">
         <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">取消</button>
-        <button type="button" class="btn btn-info btn-sm" onclick="doImport()">
+        <button type="button" class="btn btn-info btn-sm" data-csp-click="page-index-do-import-5">
           <i class="bi bi-upload me-1"></i>开始导入
         </button>
       </div>
@@ -230,7 +239,7 @@ pageHeader('我的书库', 'home');
   </div>
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 function showExportModal() {
   new bootstrap.Modal(document.getElementById('exportModal')).show();
 }

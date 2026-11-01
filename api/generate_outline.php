@@ -1,12 +1,12 @@
 <?php
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 /**
- * 生成章节大纲 API（流式 SSE）
+ * 生成章节大纲：HTTP 短请求启动后台 CLI，CLI 复用本文件的批量生成逻辑。
  * POST JSON: { novel_id, start_chapter, end_chapter }
  *
  * v5 重构：
  * - 每次请求只生成 1 批（默认 5 章），前端循环调用
- * - SSE 连接时间短（30-60秒），不会触发 Nginx/PHP 超时
+ * - HTTP 只完成鉴权、范围校验与排队；模型调用和保存由持锁的 CLI 执行
  * - 保留心跳机制、模型降级、记忆上下文
  */
 
@@ -21,7 +21,7 @@ ob_start();
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 
-define('APP_LOADED', true);
+if (!defined('APP_LOADED')) define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
@@ -30,10 +30,27 @@ require_once dirname(__DIR__) . '/includes/cache.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 require_once dirname(__DIR__) . '/includes/OutlineQualityGuard.php';
 require_once dirname(__DIR__) . '/includes/helpers.php';
-requireLoginApi();
+require_once dirname(__DIR__) . '/includes/ChapterOutlineTrace.php';
+require_once dirname(__DIR__) . '/includes/ChapterOutlineRequestStore.php';
+require_once dirname(__DIR__) . '/includes/ChapterOutlineWorkerContext.php';
+require_once dirname(__DIR__) . '/includes/ChapterOutlineWorkerLauncher.php';
+require_once dirname(__DIR__) . '/includes/ChapterOutlinePersistence.php';
+require_once dirname(__DIR__) . '/includes/harness/HarnessControlPlane.php';
+require_once dirname(__DIR__) . '/includes/harness/outline/bootstrap.php';
+$isOutlineWorker = PHP_SAPI === 'cli'
+    && isset($chapterOutlineWorkerContext)
+    && $chapterOutlineWorkerContext instanceof ChapterOutlineWorkerContext;
+if (!$isOutlineWorker) requireLoginApi();
 session_write_close();
 
 ob_end_clean();
+
+// Register before the SSE fatal handler so a PHP shutdown records the last phase
+// even if another shutdown handler exits. A killed FPM process may log no shutdown.
+$outlineTrace = $isOutlineWorker ? $chapterOutlineWorkerContext->trace() : new ChapterOutlineTrace(error_trace_id());
+$outlineRequest = $isOutlineWorker ? $chapterOutlineWorkerContext->store() : null;
+$outlineTrace->registerShutdown();
+$outlineTrace->phase('init');
 
 // v1.6: 动态超时机制
 // 初始设置较长的基础超时，后续每次有输出时重置静默超时
@@ -96,24 +113,76 @@ header('Connection: keep-alive');
 
 // 初始确认
 echo "event: init\n";
-echo 'data: ' . json_encode(['msg' => 'SSE 连接已建立']) . "\n\n";
+echo 'data: ' . json_encode(['msg' => 'SSE 连接已建立', 'request_id' => $outlineTrace->requestId()]) . "\n\n";
 if (ob_get_level()) ob_flush();
 flush();
 
+// 记忆上下文也可能等待 embedding 网络请求，必须从准备阶段开始保活，
+// 不能等到 chatStream 前才注册。闭包读取更新后的普通/1M 静默超时。
+$lastHeartbeat = time();
+$lastRequestTouch = 0;
+$requestTouchWarningLogged = false;
+$GLOBALS['sendHeartbeat'] = function() use (&$lastHeartbeat, &$silenceTimeout, &$outlineRequest, &$lastRequestTouch, &$requestTouchWarningLogged) {
+    $now = time();
+    if ($outlineRequest !== null && $now - $lastRequestTouch >= 5) {
+        $lastRequestTouch = $now;
+        try {
+            $outlineRequest->record([]);
+        } catch (Throwable $error) {
+            if (!$requestTouchWarningLogged) {
+                $requestTouchWarningLogged = true;
+                error_log('[' . error_trace_id() . '] chapter_outline request status write failed');
+            }
+        }
+    }
+    if ($now - $lastHeartbeat >= 3) {
+        resetDynamicTimeout($silenceTimeout, $GLOBALS['maxExecutionTime'] ?? 7200);
+        sse('heartbeat', ['time' => $now, 'msg' => 'keep-alive']);
+        $lastHeartbeat = $now;
+    }
+};
+
 // ---- 解析入参 ----
-$input   = json_decode(file_get_contents('php://input'), true) ?? [];
+$input   = $isOutlineWorker ? $chapterOutlineWorkerContext->input()
+    : (json_decode(file_get_contents('php://input'), true) ?? []);
 $novelId = (int)($input['novel_id']      ?? 0);
 $startCh = (int)($input['start_chapter'] ?? 1);
 $endCh   = (int)($input['end_chapter']   ?? $startCh + 4);
 
 // 审计 P0（2026-06-12）：归属校验
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
-if ($novelId > 0) checkNovelOwnership($novelId, $userId);
+$userId = $isOutlineWorker ? $chapterOutlineWorkerContext->userId() : currentUserId();
+if (!$isOutlineWorker && $novelId > 0) checkNovelOwnership($novelId, $userId);
 
 $novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$novelId]);
-if (!$novel) { sse('error', ['msg' => '小说不存在']); sseDone(); exit; }
+if (!$novel) { $outlineTrace->phase('rejected'); sse('error', ['msg' => '小说不存在']); sseDone(); exit; }
+// The CLI identity comes only from a successfully claimed server-side queue
+// record. Recheck current ownership; never claim an unowned novel in a worker.
+if ($isOutlineWorker && ($userId < 1 || (int)($novel['user_id'] ?? 0) !== $userId)) {
+    $outlineTrace->phase('rejected');
+    sse('error', ['msg' => '小说归属已变化，已停止后台细纲生成']);
+    sseDone();
+    exit;
+}
+if ($startCh < 1 || $endCh < $startCh) {
+    $outlineTrace->phase('rejected');
+    sse('error', ['msg' => '章节范围无效，请刷新页面后重试']);
+    sseDone();
+    exit;
+}
+$outlineTrace->authorize($novelId, $startCh, $endCh);
+$outlineTrace->phase('authorized');
+
+// 审计功能（2026-08-16 P3-金手指设计模板）：结构化设定并入 $novel，
+// 供黄金三章实体核验/点名与细纲层金手指档位表消费；无设定回退文本挖掘。失败静默。
+try {
+    require_once dirname(__DIR__) . '/includes/GoldenFinger.php';
+    $novel['golden_finger'] = (new GoldenFinger($novelId))->get();
+} catch (\Throwable $e) {
+    // 读取失败不阻断大纲生成
+}
 
 // 检测模型是否支持 1M 上下文，决定批量大小和超时
+$outlineTrace->phase('model_check');
 $is1MModel = false;
 $silenceTimeout = defined('CFG_TIME_SILENCE_TIMEOUT') ? CFG_TIME_SILENCE_TIMEOUT : 180; // 默认静默超时
 try {
@@ -144,8 +213,58 @@ if ($is1MModel) {
 }
 
 if ($endCh - $startCh + 1 > $batchSize) {
+    if ($isOutlineWorker) {
+        $outlineTrace->phase('rejected');
+        sse('error', ['msg' => '模型或批量设置已变化，请重新启动本批细纲']);
+        sseDone();
+        exit;
+    }
     $endCh = $startCh + $batchSize - 1;
 }
+$outlineTrace->authorize($novelId, $startCh, $endCh);
+
+// CHAPTER_OUTLINE_REQUEST_ADMISSION_BEGIN
+// Queue publication and CLI claiming share the stable novel lock. The short
+// HTTP request never calls the provider; a claimed worker holds the lock through
+// its final legacy enhancement write, including after its base save receipt.
+try {
+    if (!($isOutlineWorker ?? false)) {
+        $outlineRequest = new ChapterOutlineRequestStore();
+        if (!$outlineRequest->queue($userId, $novelId, $outlineTrace->requestId(), $startCh, $endCh)) {
+            sse('request_active', [
+                'msg' => '该小说已有章节细纲任务，正在核对原任务',
+                'request' => $outlineRequest->snapshot($userId, $novelId),
+            ]);
+            $outlineTrace->phase('rejected');
+            sseDone();
+            exit;
+        }
+        if (!ChapterOutlineWorkerLauncher::launch($novelId, $outlineTrace->requestId())) {
+            $outlineRequest->failQueued($userId, $novelId, $outlineTrace->requestId());
+            throw new RuntimeException('Chapter outline CLI launch failed.');
+        }
+        sse('request_queued', [
+            'msg' => '后台细纲任务已提交，正在等待处理结果',
+            'request_id' => $outlineTrace->requestId(),
+            'request' => $outlineRequest->snapshot($userId, $novelId, $outlineTrace->requestId()),
+        ]);
+        $outlineTrace->phase('response_finished');
+        sseDone();
+        exit;
+    }
+    // This object already owns the exact queued request; acquiring a new lock
+    // here would overwrite its identity or conflict with the worker itself.
+    $outlineRequest = $chapterOutlineWorkerContext->store();
+    // Keep the Context observer: it also authenticates the save receipt and
+    // records an abnormal early exit before the stable lock is released.
+    $outlineTrace->phase('authorized');
+} catch (Throwable $e) {
+    $outlineTrace->phase('failed');
+    sse('error', safe_sse_error_payload($e, '后台细纲任务未能启动，请检查 PHP CLI 路径、进程启动权限和存储目录权限'));
+    sseDone();
+    exit;
+}
+// CHAPTER_OUTLINE_REQUEST_ADMISSION_END
 
 $actualBatchChapters = $endCh - $startCh + 1;
 $outlineFallbackRequirements = ($is1MModel && $actualBatchChapters > $standardBatchSize)
@@ -159,37 +278,40 @@ $outlineFallbackRequirements = ($is1MModel && $actualBatchChapters > $standardBa
 try {
     getModelFallbackList($novel['model_id'] ?: null, 'structured', $outlineFallbackRequirements);
 } catch (ModelFallbackRequirementException $e) {
+    $outlineTrace->phase('rejected');
     error_log('generate_outline model capability guard: ' . $e->getMessage());
     sse('error', ['msg' => $e->clientMessage(), 'code' => 'model_capability_unavailable']);
     sseDone();
     exit;
 } catch (RuntimeException $e) {
+    $outlineTrace->phase('rejected');
     sse('error', safe_sse_error_payload($e, '模型检查失败，请稍后重试'));
     sseDone();
     exit;
 }
 
 try {
+    // CHAPTER_OUTLINE_SOURCE_CAPTURE_BEGIN
+    // Freeze the full target range before context/model work, including absent
+    // rows and existing detailed blueprints. Later saves may change only this base.
+    $outlinePersistence = new ChapterOutlinePersistence(DB::getPdo(), $userId, $novelId);
+    $outlinePersistence->capture($startCh, $endCh);
+    // CHAPTER_OUTLINE_SOURCE_CAPTURE_END
+    $outlineTrace->phase('context_prepare');
     require_once dirname(__DIR__) . '/includes/memory/MemoryEngine.php';
     require_once dirname(__DIR__) . '/includes/prompt.php';
     $engine = new MemoryEngine($novelId);
 
     // 获取卷大纲上下文（跨卷时同时注入两卷上下文）
-    $currentVolume = null;
-    $volumeOutlines = DB::fetchAll(
-        'SELECT * FROM volume_outlines WHERE novel_id=? AND start_chapter <= ? AND end_chapter >= ?',
-        [$novelId, $endCh, $startCh]
-    );
-    if (!empty($volumeOutlines)) {
-        $currentVolume = $volumeOutlines[0];
-        if (count($volumeOutlines) > 1) {
-            $nextVol = $volumeOutlines[1];
-            $extraEvents = json_decode($nextVol['key_events'] ?? '[]', true) ?: [];
-            $currentVolume['_next_volume_title'] = $nextVol['title'] ?? '';
-            $currentVolume['_next_volume_theme'] = $nextVol['theme'] ?? '';
-            $currentVolume['_next_volume_conflict'] = $nextVol['conflict'] ?? '';
-            $currentVolume['_next_volume_key_events'] = implode('、', array_slice($extraEvents, 0, 3));
-        }
+    $volumeOutlines = fetchVolumeOutlinesOverlapping($novelId, $startCh, $endCh);
+    $currentVolume = $volumeOutlines[0] ?? null;
+    if ($currentVolume && count($volumeOutlines) > 1) {
+        $nextVol = $volumeOutlines[1];
+        $extraEvents = json_decode($nextVol['key_events'] ?? '[]', true) ?: [];
+        $currentVolume['_next_volume_title'] = $nextVol['title'] ?? '';
+        $currentVolume['_next_volume_theme'] = $nextVol['theme'] ?? '';
+        $currentVolume['_next_volume_conflict'] = $nextVol['conflict'] ?? '';
+        $currentVolume['_next_volume_key_events'] = implode('、', array_slice($extraEvents, 0, 3));
     }
 
     // 获取近章大纲上下文（v41 去套路化：细纲专用窗口，默认更大，便于跨更多章去重）
@@ -215,19 +337,21 @@ try {
     }
 
     sse('progress', [
-        'msg'   => "正在生成第 {$startCh}～{$endCh} 章大纲...",
+        'msg'   => "正在整理第 {$startCh}～{$endCh} 章的设定和记忆上下文...",
         'start' => $startCh,
         'end'   => $endCh,
     ]);
 
     // 获取记忆上下文
     $queryText = trim(($novel['genre'] ?? '') . '：' . ($novel['plot_settings'] ?? ''));
-    $semanticTopK = max(1, min(20, (int)getSystemSetting('ws_embedding_top_k', 6, 'int')));
+    // 审计修复（2026-08-09 R10-9）：默认与写引擎/UI 对齐为 5
+    $semanticTopK = max(1, min(40, (int)getSystemSetting('ws_embedding_top_k', 5, 'int')));
+    $outlineTrace->phase('memory_lookup');
     try {
         $memoryCtx = $engine->getPromptContext(
             $startCh,
             $queryText !== '：' ? $queryText : null,
-            max(2000, (int)getSystemSetting('ws_outline_memory_budget', 12000, 'int')),
+            max(2000, (int)getSystemSetting('ws_outline_memory_budget', 8000, 'int')),
             20,
             $semanticTopK
         );
@@ -276,7 +400,8 @@ try {
 
             // 伏笔降级
             $foreshadows = DB::fetchAll(
-                'SELECT planted_chapter AS chapter, description AS desc, deadline_chapter AS deadline
+                // desc 是保留字，别名必须加反引号，否则整条降级查询语法错误。
+                'SELECT planted_chapter AS chapter, description AS `desc`, deadline_chapter AS deadline
                  FROM foreshadowing_items WHERE novel_id=? AND resolved_chapter IS NULL
                  ORDER BY planted_chapter ASC LIMIT 10',
                 [$novelId]
@@ -290,6 +415,8 @@ try {
             // 降级也失败，保持 $memoryCtx 为空数组（非 null），prompt 层会正确处理
         }
     }
+
+    $outlineTrace->phase('memory_ready');
 
     // 预取全书故事大纲全字段注入 $novel，避免 buildOutlinePrompt 内重复查询
     $storyOutline = null;
@@ -323,22 +450,12 @@ try {
     $messages    = buildOutlinePrompt($novel, $startCh, $endCh, $recentOutlines, $prevHook, $memoryCtx, $currentVolume, $existingTitles);
     $rawResponse = '';
     $usage       = ['prompt_tokens' => 0, 'completion_tokens' => 0];
-    $lastHeartbeat = time();
-
-    // 注册全局心跳
-    $GLOBALS['sendHeartbeat'] = function() use (&$lastHeartbeat, $silenceTimeout) {
-        $now = time();
-        if ($now - $lastHeartbeat >= 3) {
-            // v1.6: 心跳时也重置动态超时
-            resetDynamicTimeout($silenceTimeout, $GLOBALS['maxExecutionTime'] ?? 7200);
-
-            echo "event: heartbeat\n";
-            echo "data: " . json_encode(['time' => $now, 'msg' => 'keep-alive']) . "\n\n";
-            if (ob_get_level()) ob_flush();
-            flush();
-            $lastHeartbeat = $now;
-        }
-    };
+    sse('progress', [
+        'msg' => "上下文已就绪，正在请求模型生成第 {$startCh}～{$endCh} 章大纲...",
+        'start' => $startCh,
+        'end' => $endCh,
+    ]);
+    $lastWaitingNotice = 0;
 
     $outlines = [];
     $maxParseRetries = 2;
@@ -364,24 +481,25 @@ try {
         try {
             withModelFallback(
                 $novel['model_id'] ?: null,
-                function (AIClient $ai) use ($retryMessages, &$rawResponse, &$usage, &$lastHeartbeat, $silenceTimeout, $thinkingTimeout) {
+                function (AIClient $ai) use ($retryMessages, &$rawResponse, &$usage, &$lastHeartbeat, $silenceTimeout, $thinkingTimeout, $outlineTrace, $parseAttempt) {
                     $rawResponse = '';
+                    $outlineTrace->phase('model_request', ['attempt' => $parseAttempt]);
                     // v1.11.5: 思考过程回调——CFG_SHOW_OUTLINE_THINKING=1时发送thinking事件
                     // 使用长思考超时确保深度推理不超时
                     $effectiveTimeout = $thinkingTimeout;
-                    $onThinking = (defined('CFG_SHOW_OUTLINE_THINKING') && CFG_SHOW_OUTLINE_THINKING)
-                        ? function (string $reasoning) use (&$lastHeartbeat, $effectiveTimeout) {
+                    $onThinking = function (string $reasoning) use (&$lastHeartbeat, $effectiveTimeout, $outlineTrace) {
+                            if ($reasoning !== '') $outlineTrace->firstModelOutput('thinking');
+                            if (!(defined('CFG_SHOW_OUTLINE_THINKING') && CFG_SHOW_OUTLINE_THINKING)) return;
                             resetDynamicTimeout($effectiveTimeout, $GLOBALS['maxExecutionTime'] ?? 7200);
                             echo "event: thinking\n";
                             echo 'data: ' . json_encode(['thinking' => $reasoning], JSON_UNESCAPED_UNICODE) . "\n\n";
                             if (ob_get_level()) ob_flush();
                             flush();
                             $lastHeartbeat = time();
-                          }
-                        : null;
+                          };
                     // v1.11.5: 内容输出也使用长超时——模型在输出正文时也可能间歇停顿，
                     // 若用短静默超时（120s）会在长输出间歇被PHP kill，导致整批重来
-                    $usage = $ai->chatStream($retryMessages, function (string $token) use (&$rawResponse, &$lastHeartbeat, $effectiveTimeout) {
+                    $usage = $ai->chatStream($retryMessages, function (string $token) use (&$rawResponse, &$lastHeartbeat, $effectiveTimeout, $outlineTrace) {
                         resetDynamicTimeout($effectiveTimeout, $GLOBALS['maxExecutionTime'] ?? 7200);
                         $now = time();
                         if ($now - $lastHeartbeat >= 3) {
@@ -392,12 +510,14 @@ try {
                             $lastHeartbeat = $now;
                         }
                         if ($token === '[DONE]') return;
+                        if ($token !== '') $outlineTrace->firstModelOutput('content');
                         $rawResponse .= $token;
                         echo "event: chunk\n";
                         echo 'data: ' . json_encode(['t' => $token], JSON_UNESCAPED_UNICODE) . "\n\n";
                         if (ob_get_level()) ob_flush();
                         flush();
                     }, 'outline', $onThinking);   // v41: 细纲走高温档，去套路化
+                    $outlineTrace->phase('model_response', ['attempt' => $parseAttempt]);
                 },
                 function (AIClient $nextAi, string $errMsg) use ($startCh, $endCh) {
                     sse('model_switch', [
@@ -407,29 +527,39 @@ try {
                     ]);
                 },
                 null,
-                null,
+                function (int $elapsed) use (&$lastWaitingNotice) {
+                    // 兼顾 AI 静默等待和 429 逐秒退避，避免重试时刷屏。
+                    if (time() - $lastWaitingNotice < 5) return;
+                    sse('waiting', [
+                        'msg' => '模型仍在处理请求，正在等待输出...',
+                        'elapsed' => $elapsed,
+                    ]);
+                    $lastWaitingNotice = time();
+                },
                 $outlineFallbackRequirements
             );
         } catch (ModelFallbackRequirementException $e) {
+            $outlineTrace->phase('failed');
             error_log('generate_outline compatible fallback exhausted: ' . $e->getMessage());
             sse('error', ['msg' => $e->clientMessage(), 'code' => 'model_capability_unavailable']);
             sseDone();
             exit;
         } catch (RuntimeException $e) {
+            $outlineTrace->phase('failed');
             sse('error', safe_sse_error_payload($e, "第{$startCh}～{$endCh}章：所有模型均失败"));
             sseDone();
             exit;
         }
 
         $outlines = extractOutlineObjects($rawResponse);
+        $outlineTrace->phase('parse_result', ['attempt' => $parseAttempt, 'parsed' => count($outlines)]);
         if (!empty($outlines)) break;
 
-        // 诊断日志（2026-06-18）：记录解析失败的原始响应片段，便于排查根因
-        $rawSnippet = safe_substr($rawResponse, 0, 500);
+        // 仅记录大小和请求号；解析诊断不把模型原文写入服务器日志。
         $rawLen     = strlen($rawResponse);
         error_log(sprintf(
-            'generate_outline: 第%d-%d章解析失败（尝试%d/%d），原始长度%d，片段：%s',
-            $startCh, $endCh, $parseAttempt, $maxParseRetries, $rawLen, $rawSnippet
+            '[%s] generate_outline: 第%d-%d章解析失败（尝试%d/%d），原始长度%d',
+            $outlineTrace->requestId(), $startCh, $endCh, $parseAttempt, $maxParseRetries, $rawLen
         ));
 
         if ($parseAttempt < $maxParseRetries) {
@@ -447,6 +577,7 @@ try {
     $parseNote = '';
 
     if (empty($outlines)) {
+        $outlineTrace->phase('failed');
         // 强化兜底（2026-06-18）：2次重试 + 正则兜底都失败，提供更明确的错误信息和建议
         $rawLen = strlen($rawResponse);
         $isEmpty = $rawLen < 10;
@@ -470,31 +601,26 @@ try {
     // 抽成闭包是为了「先存原始解析结果、再增强后回写」：即便后续质量返修/转折点/弧段摘要
     // 被任何超时（nginx fastcgi_read_timeout / php-fpm request_terminate_timeout）或异常杀掉，
     // 本批章节也已落库、前端也已据 batch_done 推进 —— 杜绝「生成完却没保存、随后重复整批生成」。
-    $persistOutlines = function (array $outlines) use (&$existingTitles, $novelId): array {
+    // 审计修复（2026-08-02 H5）：闭包捕获 startCh/endCh，落库前校验章号必须落在本次批次范围内，
+    // 防止 AI 幻觉输出批次外章号（如 999）破坏断点续传推进（actual_end 被推飞、后续章被永久跳过）。
+    $persistOutlines = function (array $outlines) use (&$existingTitles, $novelId, $startCh, $endCh, $outlinePersistence): array {
         $saved = 0;
         $savedChNums = [];
-        $allChNums = [];
-        foreach ($outlines as $item) {
-            $cn = (int)($item['chapter_number'] ?? 0);
-            if ($cn > 0) $allChNums[] = $cn;
-        }
-        $existMap = [];
-        if (!empty($allChNums)) {
-            $ph = implode(',', array_fill(0, count($allChNums), '?'));
-            $existingRows = DB::fetchAll(
-                "SELECT id, chapter_number, status FROM chapters WHERE novel_id=? AND chapter_number IN ({$ph})",
-                array_merge([$novelId], $allChNums)
-            );
-            // 保留 id + status：已完成章节不能被重写大纲覆盖（否则状态被重置为 outlined，正文会被下次写作覆盖）
-            foreach ($existingRows as $er) {
-                $existMap[(int)$er['chapter_number']] = ['id' => (int)$er['id'], 'status' => $er['status']];
-            }
-        }
+        $savedChapterSet = [];
 
         foreach ($outlines as $item) {
             $chNum   = (int)($item['chapter_number'] ?? 0);
             $title   = trim($item['title']           ?? '');
-            $summary = trim($item['summary']         ?? $item['outline'] ?? '');
+            // 空 summary 不能挡住有效 outline 回退；无实质文本的对象
+            // 不能写成 outlined，否则完成回执会越过尚未生成的细纲。
+            $summary = '';
+            foreach (['summary', 'outline'] as $outlineField) {
+                $candidate = $item[$outlineField] ?? null;
+                if (is_string($candidate) && preg_match('/[^\s\p{Z}]/u', $candidate) === 1) {
+                    $summary = trim($candidate);
+                    break;
+                }
+            }
             $kpts    = $item['key_points']            ?? [];
             $hook    = trim($item['hook']             ?? '');
             $pacing  = trim($item['pacing']           ?? '中');
@@ -505,10 +631,24 @@ try {
             if (!in_array($suspense, ['有', '无'])) $suspense = '无';
             $validHookTypes = array_keys(\HOOK_TYPES);
             if ($hookType && !in_array($hookType, $validHookTypes)) $hookType = '';
-            $validCoolTypes = array_keys(\COOL_POINT_TYPES);
-            if ($coolPtType && !in_array($coolPtType, $validCoolTypes)) $coolPtType = '';
+            // 审计修复（2026-08-09 R11-2）：允许 breather/development 落盘，供 Gate4 豁免
+            if ($coolPtType !== '' && !isPersistedCoolPointType($coolPtType)) $coolPtType = '';
 
             if (!$chNum) continue;
+            // 审计修复（2026-08-02 H5）：越界章号（AI 幻觉）直接丢弃并记日志，
+            // 防止杂散章节入库 + actual_end 被批次外章号推飞导致断点续传跳章。
+            if ($chNum < $startCh || $chNum > $endCh) {
+                sse('progress', ['msg' => "AI 返回了批次外的章号（第{$chNum}章），已跳过（本批次范围 {$startCh}~{$endCh}）"]);
+                addLog($novelId, 'warn', "大纲生成：AI 返回批次外章号 {$chNum}（范围 {$startCh}-{$endCh}），已丢弃");
+                continue;
+            }
+            // AI 可能重复返回同一章号。首次保存后跳过重复对象，避免新章
+            // 再次 INSERT 命中唯一键，让已保存的批次失去 batch_done 回执。
+            if (isset($savedChapterSet[$chNum])) continue;
+            if ($summary === '') {
+                sse('progress', ['msg' => "第{$chNum}章未返回有效细纲内容，保留为待补充章节"]);
+                continue;
+            }
 
             // 标题去重：与已有章节（非本批）的标题精确匹配时，自动追加序号后缀
             if ($title !== '' && isset($existingTitles) && is_array($existingTitles)) {
@@ -529,12 +669,6 @@ try {
                 $existingTitles[$chNum] = $title;
             }
 
-            $existing = $existMap[$chNum] ?? null;
-            // 数据保护：已完成（已写正文）的章节，不被重写大纲覆盖，避免正文被下次写作清掉
-            if ($existing && $existing['status'] === 'completed') {
-                sse('progress', ['msg' => "第{$chNum}章已写完，跳过大纲覆盖（保护正文）"]);
-                continue;
-            }
             $row = [
                 'title'      => $title,
                 'outline'    => $summary,
@@ -546,17 +680,13 @@ try {
             ];
             if ($hookType !== '') $row['hook_type'] = $hookType;
             if ($coolPtType !== '') $row['cool_point_type'] = $coolPtType;
-            if ($existing) {
-                // 双保险：WHERE 排除 completed，防并发期间状态变更
-                DB::update('chapters', $row, 'id=? AND status<>"completed"', [$existing['id']]);
-            } else {
-                DB::insert('chapters', array_merge($row, [
-                    'novel_id'       => $novelId,
-                    'chapter_number' => $chNum,
-                ]));
+            if (!$outlinePersistence->save($chNum, $row)) {
+                sse('progress', ['msg' => "第{$chNum}章大纲、简介或写作状态已变化，已保留当前版本，请核对后重新生成"]);
+                continue;
             }
             $saved++;
             $savedChNums[] = $chNum;
+            $savedChapterSet[$chNum] = true;
         }
 
         if ($saved > 0) {
@@ -569,19 +699,93 @@ try {
 
     // ① 先把原始解析结果落库 + 立即 batch_done（章节安全 + 前端可据 actual_end 推进）。
     //    质量增强放到 batch_done 之后，绝不阻塞「章节先落库」这件最重要的事。
+    $outlineTrace->phase('persist');
     $persistResult = $persistOutlines($outlines);
-    $saved       = $persistResult['saved'];
-    $savedChNums = $persistResult['savedChNums'];
+    $savedChNums = array_values(array_unique($persistResult['savedChNums']));
+    $saved       = count($savedChNums);
+    $outlineTrace->phase('base_saved', ['saved' => $saved, 'expected' => $expected]);
+    if ($outlinePersistence->conflicts() !== []) {
+        // A partial receipt would make the browser automatically submit a fresh
+        // generation for the conflicting chapter, defeating the revision guard.
+        throw new \ChapterOutlineSourceChangedException('生成期间第' . implode('、', $outlinePersistence->conflicts())
+            . '章已被修改，已保留当前版本并停止本批次，请刷新核对后再生成。');
+    }
 
-    addLog($novelId, 'outline', "生成第{$startCh}-{$endCh}章大纲，共{$saved}章{$parseNote}");
+    // 日志失败不应把已保存的大纲报告为失败，引发整批重复生成。
+    try {
+        addLog($novelId, 'outline', "生成第{$startCh}-{$endCh}章大纲，共{$saved}章{$parseNote}");
+    } catch (Throwable $logError) {
+        error_log('generate_outline saved batch log failed: ' . $logError->getMessage());
+    }
 
-    $actualEnd = !empty($savedChNums) ? max($savedChNums) : $startCh - 1;
-    $isComplete = $saved >= $expected;
+    // 只能按已保存的连续前缀推进。模型若返回 1、2、4、5 章，MAX=5
+    // 会永久跳过第3章；此时权威进度必须停在第2章。
+    $savedSet = array_fill_keys($savedChNums, true);
+    $actualEnd = $startCh - 1;
+    while ($actualEnd < $endCh && isset($savedSet[$actualEnd + 1])) {
+        $actualEnd++;
+    }
+    $isComplete = count($savedSet) >= $expected;
+
+    // Harness 非 off 模式把慢速质量增强交给 durable outline queue。
+    // Run 的幂等身份直接绑定刚刚落库的精确章节集合及其内容/修订哈希；
+    // 创建失败时保留基础大纲并 fail closed，不回落到无租约的后台写入。
+    $enhancementRunId = null;
+    $enhancementJobId = null;
+    // 未能读取控制配置时跳过增强，不能回落到无租约的 legacy 写入。
+    $harnessMode = null;
+    $outlineTrace->phase('enhancement_queue');
+    try {
+        $harnessControls = HarnessControlPlane::captureForNovel($novelId);
+        $harnessMode = $harnessControls['harness_mode'];
+        if (HarnessControlPlane::allowsNewHarnessRun($harnessMode) && $savedChNums !== []) {
+            $pdo = DB::getPdo();
+            $outlineStore = new DbOutlineEnhancementStore($pdo);
+            $outlineGateway = new GenerationRunOutlineGateway(
+                new GenerationRunRepository($pdo)
+            );
+            $queuedEnhancement = (new OutlineEnhancementRunFactory(
+                $outlineGateway,
+                $outlineStore
+            ))->enqueue(
+                $userId,
+                $novelId,
+                $startCh,
+                $endCh,
+                $savedChNums,
+                $harnessMode,
+                $harnessControls['fencing_enforced'],
+                $memoryLookback
+            );
+            $enhancementRunId = $queuedEnhancement->run->runUid;
+            $enhancementJob = (new OutlineEnhancementJobMapper(
+                new HarnessJobRepository($pdo),
+                $pdo
+            ))->map($queuedEnhancement->run);
+            $enhancementJobId = $enhancementJob->jobUid;
+        }
+    } catch (Throwable $enhancementQueueError) {
+        $traceId = error_trace_id();
+        error_log(sprintf(
+            '[%s] outline enhancement enqueue failed (%s): %s',
+            $traceId,
+            get_class($enhancementQueueError),
+            $enhancementQueueError->getMessage()
+        ));
+        try {
+            addLog(
+                $novelId,
+                'warn',
+                "第{$startCh}-{$endCh}章基础大纲已保存，但 durable 增强排队失败（追踪号 {$traceId}）"
+            );
+        } catch (Throwable $logError) {
+            error_log('generate_outline enhancement failure log failed: ' . $logError->getMessage());
+        }
+    }
 
     // 检测截断缺口，供前端/SFE 信息参考
     $gaps = [];
-    if (!$isComplete && !empty($savedChNums)) {
-        $savedSet = array_flip($savedChNums);
+    if (!$isComplete) {
         for ($g = $startCh; $g <= $endCh; $g++) {
             if (!isset($savedSet[$g])) $gaps[] = $g;
         }
@@ -596,11 +800,17 @@ try {
         'expected'          => $expected,
         'actual_end'        => $actualEnd,
         'is_complete'       => $isComplete,
-        'truncated'         => $saved < $expected,
+        'truncated'         => !$isComplete,
         'gaps'              => $gaps,
+        'enhancement_run_id' => $enhancementRunId,
+        'enhancement_job_id' => $enhancementJobId,
         'prompt_tokens'     => $usage['prompt_tokens'],
         'completion_tokens' => $usage['completion_tokens'],
         'total_tokens'      => $usage['prompt_tokens'] + $usage['completion_tokens'],
+    ]);
+    $outlineTrace->phase('save_receipt', [
+        'saved' => $saved, 'expected' => $expected, 'actual_end' => $actualEnd,
+        'receipt_complete' => $isComplete && $gaps === [],
     ]);
 
     // batch_done 后注销全局心跳回调，避免终态后仍尝试发送心跳，
@@ -625,6 +835,7 @@ try {
     // 继续执行（此时已脱离 nginx 超时窗口）。参考 daemon_write.php:450 的做法。
     // 章节已在 ① 落库，后处理只是"增强"，失败不丢章、不重复生成。
     sseDone();
+    $outlineTrace->phase('response_finished');
 
     // 关键：立即结束 FPM 请求，把 SSE 响应发送给 nginx → 客户端
     // 之后执行的代码不会影响客户端响应，nginx 不再计时
@@ -636,9 +847,17 @@ try {
         flush();
     }
 
+    // 非 off 模式的增强已由可重领 worker 承担；只有 off 模式继续执行
+    // 下方原封不动的 legacy 请求内后台路径。
+    if ($harnessMode !== HarnessControlPlane::MODE_OFF) {
+        $outlineTrace->phase('finished');
+        return;
+    }
+
     // 后台执行：解除超时限制（后处理可能耗时数分钟）
     @set_time_limit(0);
     @ignore_user_abort(true);
+    $outlineTrace->phase('postprocess');
 
     try {
         // 质量返修
@@ -663,6 +882,20 @@ try {
             // 转折点失败不阻断
         }
 
+        // 审计功能（2026-08-16 P3-黄金三章）：开篇里程碑核验与定向返修（失败不阻断）。
+        // 仅批次含第1-3章时实际生效；残留问题记日志供人工检查。
+        try {
+            $g3Result = enforceGoldenThree($novel, $startCh, $endCh, $outlines, null);
+            if (!empty($g3Result['issues'])) {
+                $g3Miss = implode('；', array_map(fn($i) => $i['hint'], $g3Result['issues']));
+                addLog($novelId, $g3Result['repaired'] ? 'info' : 'warn',
+                    ($g3Result['repaired'] ? '黄金三章里程碑已返修（残留，建议人工检查）：' : '黄金三章里程碑未达成（建议人工检查）：') . $g3Miss);
+            }
+            $outlines = $g3Result['outlines'];
+        } catch (\Throwable $e) {
+            // 黄金三章核验失败不阻断
+        }
+
         // 增强后回写（覆盖已存行；若增强未改动则为幂等更新）
         try {
             $persistOutlines($outlines);
@@ -682,6 +915,54 @@ try {
             }
         }
 
+        // 审计功能（2026-08-16 P3-卷级摘要）：批末区间卷末逐卷触发。
+        // 查 volume_outlines 中 chapter_to 落在本批区间 [startCh, endCh] 的卷
+        // 逐卷生成（BETWEEN 语义含 endCh 恰为卷末，批次跨卷时不漏触发）；
+        // 无卷行时按 50 章回退分组计算本批跨过的分组边界（50 的倍数 ∈ 区间）。
+        // 弧段未齐的卷 generateAndSaveVolumeSummary 返回 false 自动跳过；
+        // 逐卷失败静默（下次卷末触发 / 重优化链自动补）。
+        try {
+            if (getSystemSetting('ws_volume_summary_enabled', true, 'bool')) {
+                require_once dirname(__DIR__) . '/includes/memory.php';
+                if (function_exists('generateAndSaveVolumeSummary') && function_exists('parseVolumeRows')) {
+                    $volRows   = DB::fetchAll('SELECT * FROM volume_outlines WHERE novel_id=? ORDER BY id ASC', [$novelId]);
+                    $volBounds = [];
+                    foreach (parseVolumeRows($volRows) as $v) {
+                        if ($v['chapter_to'] >= $startCh && $v['chapter_to'] <= $endCh) {
+                            $volBounds[] = $v;
+                        }
+                    }
+                    if (empty($volRows)) {
+                        // 无卷书：50 章分组边界（vol*50）落在本批区间
+                        for ($to = (int)ceil($startCh / 50) * 50; $to <= $endCh; $to += 50) {
+                            $volBounds[] = [
+                                'volume_number' => intdiv($to, 50),
+                                'chapter_from'  => $to - 49,
+                                'chapter_to'    => $to,
+                            ];
+                        }
+                    }
+                    $volDone = 0;
+                    foreach ($volBounds as $vb) {
+                        if (generateAndSaveVolumeSummary(
+                            $novelId,
+                            (int)$vb['volume_number'],
+                            (int)$vb['chapter_from'],
+                            (int)$vb['chapter_to'],
+                            $novel['model_id'] ?? null
+                        )) {
+                            $volDone++;
+                        }
+                    }
+                    if ($volDone > 0) {
+                        addLog($novelId, 'outline', "本批卷级摘要已生成 {$volDone} 卷（第{$startCh}-{$endCh}章区间）");
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // 静默失败：卷级摘要不阻断大纲批末链路
+        }
+
         // 更新小说状态
         $totalOutlined = DB::count('chapters', 'novel_id=? AND status != "pending"', [$novelId]);
         if ($totalOutlined >= (int)$novel['target_chapters']) {
@@ -694,12 +975,15 @@ try {
     }
         }
 
-        addLog($novelId, 'outline', "第{$startCh}-{$endCh}章后处理（质量返修/转折点/弧段摘要）完成");
+        addLog($novelId, 'outline', "第{$startCh}-{$endCh}章后处理（质量返修/转折点/弧段/卷级摘要）完成");
+        $outlineTrace->phase('finished');
     } catch (\Throwable $e) {
+        $outlineTrace->phase('failed');
         addLog($novelId, 'warn', "第{$startCh}-{$endCh}章后处理失败：{$e->getMessage()}");
     }
 
 } catch (Throwable $e) {
+    $outlineTrace->phase('failed');
     // 审计 P0：异常细节（类型/消息/文件/行号）只写服务端日志，
     // 客户端仅收到稳定文案 + 可追踪请求 ID。
     $rid = error_trace_id();
@@ -708,10 +992,13 @@ try {
     if (!headers_sent()) {
         http_response_code(200);
     }
-    $clientMsg = '服务器内部错误，请稍后重试（追踪号 ' . $rid . '）';
+    $sourceConflict = $e instanceof ChapterOutlineSourceChangedException;
+    $clientMsg = $sourceConflict
+        ? '生成期间章节大纲、简介或状态已变化，已保留当前版本并停止本批次，请刷新核对后再生成。'
+        : '服务器内部错误，请稍后重试（追踪号 ' . $rid . '）';
     echo "event: fatal_error\n";
     echo 'data: ' . json_encode([
-        'code'       => 'internal_error',
+        'code'       => $sourceConflict ? 'outline_source_changed' : 'internal_error',
         'error'      => $clientMsg,
         'message'    => $clientMsg,
         'msg'        => $clientMsg,

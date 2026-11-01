@@ -11,7 +11,7 @@ ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 ob_start();
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/error_handler.php';
 registerApiErrorHandlers();
@@ -19,6 +19,7 @@ require_once __DIR__ . '/../includes/auth.php';
 requireLoginApi();
 require_once __DIR__ . '/../includes/functions.php';
 require_once __DIR__ . '/../includes/db.php';
+require_once __DIR__ . '/../includes/NovelBackupContract.php';
 
 ob_end_clean();
 
@@ -36,7 +37,7 @@ $skipContent = isset($_GET['skip_content']) && $_GET['skip_content'] === '1';
 // 审计 P0（2026-06-12）：归属隔离。
 // - 单本导出：必须校验小说归属
 // - 全量导出：只导出当前用户名下的书，禁止跨用户拖库
-$sessionUserId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$sessionUserId = currentUserId();
 if ($sessionUserId <= 0) {
     http_response_code(403);
     echo json_encode(['ok' => false, 'msg' => '会话异常，请重新登录'], JSON_UNESCAPED_UNICODE);
@@ -55,7 +56,9 @@ try {
             echo json_encode(['error' => '小说不存在']);
             exit;
         }
-        $fileName = 'novel_' . preg_replace('/[^\w]/', '_', $data['novel']['title'] ?? 'unknown') . '_' . date('Ymd_His');
+        // 审计 T3（2026-10-31）：书名保持原文交给 contentDispositionAttachment 清洗，
+        // 不再以不带 /u 的 \w 类逐字节清洗书名（旧实现会把中文书名整段替换成下划线）。
+        $fileName = 'novel_' . ($data['novel']['title'] ?? 'unknown') . '_' . date('Ymd_His');
     } else {
         // 全部导出（严格限定当前用户名下；归属为 NULL 的历史书需先在 UI 内打开认领后再导出，
         // 避免跨用户拖库）
@@ -76,7 +79,7 @@ try {
             if ($d) $allData[] = $d;
         }
         $data = [
-            'export_version' => '1.0',
+            'export_version' => NovelBackupContract::VERSION,
             'export_time'    => date('Y-m-d H:i:s'),
             'novel_count'    => count($allData),
             'novels'         => $allData,
@@ -88,7 +91,7 @@ try {
 
     // 输出JSON文件下载
     header('Content-Type: application/json; charset=utf-8');
-    header('Content-Disposition: attachment; filename="' . $fileName . '.json"');
+    header('Content-Disposition: ' . contentDispositionAttachment($fileName . '.json'));
     echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
 
 } catch (Exception $e) {
@@ -158,9 +161,9 @@ function exportSingleNovel(int $novelId, bool $skipContent = false): ?array {
     }
 
     // 2. 章节列表
-    $chapterCols = $skipContent
-        ? 'id, chapter_number, title, outline, chapter_summary, hook, status, words, created_at, updated_at'
-        : 'id, chapter_number, title, outline, content, chapter_summary, hook, status, words, created_at, updated_at';
+    $chapterFields = array_merge(['id', 'synopsis_id'], NovelBackupContract::CHAPTER_FIELDS, ['created_at', 'updated_at']);
+    if ($skipContent) $chapterFields = array_values(array_diff($chapterFields, ['content']));
+    $chapterCols = implode(', ', $chapterFields);
     $chapters = DB::fetchAll(
         "SELECT {$chapterCols} FROM chapters WHERE novel_id = ? ORDER BY chapter_number", [$novelId]
     );
@@ -212,9 +215,9 @@ function exportSingleNovel(int $novelId, bool $skipContent = false): ?array {
     );
 
     return [
-        'export_version'   => '1.0',
+        'export_version'   => NovelBackupContract::VERSION,
         'export_time'      => date('Y-m-d H:i:s'),
-        'novel'            => $novel,
+        'novel'            => NovelBackupContract::exportNovel($novel),
         'chapters'         => $chapters,
         'chapter_synopses' => $synopses,
         'story_outline'    => $storyOutline,

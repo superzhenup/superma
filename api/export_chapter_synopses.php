@@ -6,7 +6,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  */
 
 // 定义常量，允许直接访问
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/error_handler.php';
@@ -15,6 +15,7 @@ require_once __DIR__ . '/../includes/auth.php';
 requireLoginApi();
 require_once __DIR__ . '/../includes/functions.php';
 require_once __DIR__ . '/../includes/db.php';
+require_once __DIR__ . '/../includes/ChapterSynopsisTextFormat.php';
 
 // 获取参数
 $novelId = intval($_GET['novel_id'] ?? 0);
@@ -97,7 +98,7 @@ function exportAsJson(array $novel, array $chapters): void {
     
     // 设置响应头
     header('Content-Type: application/json; charset=utf-8');
-    header('Content-Disposition: attachment; filename="' . ecsSafeFilename($novel['title']) . '_章节概要_' . date('Ymd_His') . '.json"');
+    header('Content-Disposition: ' . contentDispositionAttachment($novel['title'] . '_章节概要_' . date('Ymd_His') . '.json'));
     header('Cache-Control: no-cache, must-revalidate');
 
     echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
@@ -106,13 +107,13 @@ function exportAsJson(array $novel, array $chapters): void {
 /**
  * 导出为Excel格式（CSV，兼容Excel）
  * 防御：
- *  1) Content-Disposition 文件名注入 → 使用 ecsSafeFilename() 清洗
+ *  1) Content-Disposition 文件名注入 → 统一经 contentDispositionAttachment() 清洗（RFC 6266/5987）
  *  2) CSV 公式注入（= + - @ 开头）→ 通过 ecsCsvSafe() 转义
  */
 function exportAsExcel(array $novel, array $chapters): void {
     // 设置响应头
     header('Content-Type: text/csv; charset=utf-8');
-    header('Content-Disposition: attachment; filename="' . ecsSafeFilename($novel['title']) . '_章节概要_' . date('Ymd_His') . '.csv"');
+    header('Content-Disposition: ' . contentDispositionAttachment($novel['title'] . '_章节概要_' . date('Ymd_His') . '.csv'));
     header('Cache-Control: no-cache, must-revalidate');
 
     // 输出UTF-8 BOM，确保Excel正确识别中文
@@ -145,53 +146,10 @@ function exportAsExcel(array $novel, array $chapters): void {
 function exportAsTxt(array $novel, array $chapters): void {
     // 设置响应头
     header('Content-Type: text/plain; charset=utf-8');
-    header('Content-Disposition: attachment; filename="' . ecsSafeFilename($novel['title']) . '_章节概要_' . date('Ymd_His') . '.txt"');
+    header('Content-Disposition: ' . contentDispositionAttachment($novel['title'] . '_章节概要_' . date('Ymd_His') . '.txt'));
     header('Cache-Control: no-cache, must-revalidate');
 
-    // 输出标题
-    echo "========================================\n";
-    // 审计修复 M-NEW-4（2026-06-15）：TXT 输出也做基本转义（防御纵深）。
-    // 虽然 Content-Type: text/plain + nosniff 头已阻止浏览器渲染 HTML，
-    // 但对用户数据调用 h() 确保即使 Content-Type 被篡改也不会触发 XSS。
-    echo "小说标题：" . h($novel['title']) . "\n";
-    echo "导出时间：" . date('Y-m-d H:i:s') . "\n";
-    echo "总章节数：" . count($chapters) . "\n";
-    echo "========================================\n\n";
-
-    // 输出每个章节
-    foreach ($chapters as $ch) {
-        echo "【第{$ch['chapter_number']}章】" . h($ch['title'] ?? '未命名') . "\n";
-        echo "【大纲】" . h($ch['outline'] ?? '暂无') . "\n";
-        echo "【概要】" . h($ch['synopsis'] ?? '暂无') . "\n";
-        echo "【节奏】" . h($ch['pacing'] ?? '中') . "\n";
-        echo "【悬念】" . h($ch['cliffhanger'] ?? '无') . "\n";
-        echo "\n" . str_repeat('-', 40) . "\n\n";
-    }
-}
-
-/**
- * 把字符串清洗为安全的 HTTP filename 片段：
- *  - 去掉 ASCII 控制字符（包括 \r\n 防 Header 注入）
- *  - 去掉 Windows 非法字符 <>:"/\|?*
- *  - 去掉双引号（防突破 Content-Disposition 引号）
- *  - 限制长度为 80 字符
- *  - 若结果为空，回退 'untitled'
- */
-function ecsSafeFilename(?string $raw): string
-{
-    $s = (string)($raw ?? '');
-    // 去掉控制字符（含 \r / \n）
-    $s = preg_replace('/[\x00-\x1F\x7F]/u', '', $s) ?? '';
-    // 去掉 Windows / HTTP 非法字符
-    $s = preg_replace('/[\/\\\:\*\?\"\<\>\|]/u', '', $s) ?? '';
-    $s = trim($s);
-    if ($s === '') {
-        return 'untitled';
-    }
-    if (mb_strlen($s, 'UTF-8') > 80) {
-        $s = mb_substr($s, 0, 80, 'UTF-8');
-    }
-    return $s;
+    echo ChapterSynopsisTextFormat::encode($novel, $chapters);
 }
 
 /**

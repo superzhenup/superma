@@ -2,9 +2,16 @@
 /**
  * 登录页面
  */
+require_once __DIR__ . '/includes/maintenance.php';
+maintenanceGuardHttp();
+
 define('APP_LOADED', true);
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/includes/auth.php';  // 会话启动 + 登录限速辅助函数
+// 审计整改 C2（2026-10-31）：登录限速以数据库为主存储，原先本页从未加载 DB 类，
+// loginThrottleDbReady() 恒为 false，实际只走文件路径。运行时连接不执行 DDL，Schema 未就绪时
+// 限速自动改用文件存储。
+require_once __DIR__ . '/includes/db.php';
 
 // 已登录直接跳首页
 if (!empty($_SESSION['logged_in'])) {
@@ -27,7 +34,7 @@ $throttle = loginThrottleState($clientIp);
 // 配置损坏时不要再显示误导性的“用户名或密码错误”，也不要累计锁定次数。
 // 旧版安装器可能因正则 replacement 解析 bcrypt 中的 "$2y$" 而写坏 ADMIN_PASS。
 if (!adminCredentialsConfigured()) {
-    $error = '管理员登录凭据未正确生成，请修复 config.php 中的 ADMIN_PASS 或重新安装。';
+    $error = '管理员登录凭据未正确生成，请检查 storage/admin_credentials.json 或 config.php 中的 ADMIN_PASS，或重新安装。';
 } elseif ($throttle['lockout_until'] > time()) {
     // 检查是否被锁定
     $remaining = $throttle['lockout_until'] - time();
@@ -38,12 +45,23 @@ if (!adminCredentialsConfigured()) {
         $user = trim($_POST['username'] ?? '');
         $pass = $_POST['password'] ?? '';
 
-        // 计算延迟（每次失败增加2秒，最多30秒）
-        $delay = min(30, $throttle['attempts'] * 2);
-        if ($delay > 0 && time() - $throttle['last_attempt'] < $delay) {
-            $error = '请等待 ' . $delay . ' 秒后再试。';
+        // 审计整改 C2：校验密码之前原子地占用一次尝试额度（锁定、渐进延迟 2 秒/次、最多 30 秒
+        // 都在同一把锁内判定）。原先先读状态、失败后才记录，并发请求可以一起绕过限速。
+        $admission = loginThrottleAdmit($clientIp);
+        if (!$admission['allowed']) {
+            if ($admission['reason'] === 'locked') {
+                $error = '登录尝试次数过多，请 ' . ceil($admission['wait'] / 60) . ' 分钟后再试。';
+            } elseif ($admission['reason'] === 'wait') {
+                $error = '请等待 ' . $admission['wait'] . ' 秒后再试。';
+            } else {
+                $error = '登录服务暂时繁忙，请稍后再试。';
+            }
         } else {
-            if (hash_equals(ADMIN_USER, $user) && doLogin($user, $pass)) {
+            // 审计 2026-08-13 #3：通过 loadAdminCredentials() 读取用户名，
+            // 兼容 storage/admin_credentials.json（优先）与 config.php 常量（回退）。
+            // doLogin 内部也会读 pass_hash，此处仅做用户名常量时间比较。
+            $cred = loadAdminCredentials();
+            if (hash_equals($cred['user'], $user) && doLogin($user, $pass)) {
                 // 登录成功，清除该 IP 限速记录
                 loginThrottleReset($clientIp);
                 $_SESSION['logged_in']  = true;
@@ -59,9 +77,8 @@ if (!adminCredentialsConfigured()) {
                 header('Location: index.php');
                 exit;
             } else {
-                // 登录失败，持久化记录一次
-                $throttle = loginThrottleRecordFail($clientIp);
-                if ($throttle['lockout_until'] > time()) {
+                // 本次尝试已在准入时计数；达到阈值时准入已同时设置锁定
+                if ($admission['state']['lockout_until'] > time()) {
                     $error = '登录尝试次数过多，账户已被锁定15分钟。';
                 } else {
                     $error = '用户名或密码错误，请重试。';
@@ -80,7 +97,7 @@ if (!adminCredentialsConfigured()) {
 <link rel="stylesheet" href="assets/vendor/bootstrap.min.css">
 <link rel="stylesheet" href="assets/vendor/bootstrap-icons.min.css">
 <link rel="stylesheet" href="assets/css/style.css">
-<script>(function(){ var t='dark'; try{ t=localStorage.getItem('novel-theme')||'dark'; }catch(e){} document.documentElement.setAttribute('data-theme',t); })();</script>
+<script nonce="<?= cspNonce() ?>">(function(){ var t='dark'; try{ t=localStorage.getItem('novel-theme')||'dark'; }catch(e){} document.documentElement.setAttribute('data-theme',t); })();</script>
 <style>
 body {
     min-height: 100vh;

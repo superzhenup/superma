@@ -3,6 +3,18 @@
  */
 const NOVEL_ID = parseInt(document.querySelector('input[name="novel_id"]')?.value || '0');
 
+// The action registry also handles rows inserted after an API response.
+[
+    ['edit-character', editCharacter], ['delete-character', deleteCharacter],
+    ['edit-worldbuilding', editWorldbuilding], ['delete-worldbuilding', deleteWorldbuilding],
+    ['edit-plot', editPlot], ['delete-plot', deletePlot],
+    ['edit-style', editStyle], ['delete-style', deleteStyle],
+].forEach(function([action, handler]) {
+    window.AppEvents.register('knowledge.' + action, function(event, element) {
+        return handler(parseInt(element.dataset.recordId, 10) || 0);
+    });
+});
+
 // API 调用封装
 // 审计修复 C1（2026-06-12）：所有修改类请求自动携带 X-CSRF-Token。
 // 与 app.js 的 jsonHeaders() 行为一致，后端在 csrf_verify_api() 中 hash_equals 校验。
@@ -74,13 +86,13 @@ function loadCharacters() {
         return `
             <tr>
                 <td><strong>${escapeHtml(c.name)}</strong></td>
-                <td><span class="badge bg-${roleColors[c.role_type] || 'secondary'}">${roleTypes[c.role_type] || c.role_type}</span></td>
+                <td><span class="badge bg-${roleColors[c.role_type] || 'secondary'}">${escapeHtml(roleTypes[c.role_type] || c.role_type)}</span></td>
                 <td><span class="badge bg-${tm.cls}">${tm.name}</span></td>
                 <td>${c.gender === 'male' ? '男' : c.gender === 'female' ? '女' : '-'}</td>
                 <td>${escapeHtml(c.personality || '-').substring(0, 25)}</td>
                 <td>
-                    <button class="btn btn-sm btn-outline-primary me-1" onclick="editCharacter(${parseInt(c.id,10)||0})"><i class="bi bi-pencil"></i></button>
-                    <button class="btn btn-sm btn-outline-danger" onclick="deleteCharacter(${parseInt(c.id,10)||0})"><i class="bi bi-trash"></i></button>
+                    <button class="btn btn-sm btn-outline-primary me-1" data-csp-click="knowledge.edit-character" data-record-id="${parseInt(c.id,10)||0}"><i class="bi bi-pencil"></i></button>
+                    <button class="btn btn-sm btn-outline-danger" data-csp-click="knowledge.delete-character" data-record-id="${parseInt(c.id,10)||0}"><i class="bi bi-trash"></i></button>
                 </td>
             </tr>`;
     }).join('');
@@ -143,8 +155,8 @@ function loadWorldbuilding() {
                 <td><span class="badge bg-info">${escapeHtml(categoryNames[w.category] || w.category)}</span></td>
                 <td>${escapeHtml(w.description || '-').substring(0, 50)}</td>
                 <td>
-                    <button class="btn btn-sm btn-outline-primary me-1" onclick="editWorldbuilding(${parseInt(w.id,10)||0})"><i class="bi bi-pencil"></i></button>
-                    <button class="btn btn-sm btn-outline-danger" onclick="deleteWorldbuilding(${parseInt(w.id,10)||0})"><i class="bi bi-trash"></i></button>
+                    <button class="btn btn-sm btn-outline-primary me-1" data-csp-click="knowledge.edit-worldbuilding" data-record-id="${parseInt(w.id,10)||0}"><i class="bi bi-pencil"></i></button>
+                    <button class="btn btn-sm btn-outline-danger" data-csp-click="knowledge.delete-worldbuilding" data-record-id="${parseInt(w.id,10)||0}"><i class="bi bi-trash"></i></button>
                 </td>
             </tr>
         `).join('');
@@ -220,14 +232,14 @@ function loadPlots() {
         var fsType = fsTypeMap[p.foreshadow_type] || '-';
         return `
             <tr>
-                <td>第${p.chapter_from}章${p.chapter_to ? '-' + p.chapter_to : ''}</td>
+                <td>第${escapeHtml(p.chapter_from)}章${p.chapter_to ? '-' + escapeHtml(p.chapter_to) : ''}</td>
                 <td><strong>${escapeHtml(p.title)}</strong></td>
                 <td><span class="badge bg-light text-dark">${fsType}</span></td>
                 <td><span class="badge bg-${sm.cls}">${sm.icon} ${sm.name}</span></td>
                 <td class="small text-muted" style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(p.description || '-')}</td>
                 <td>
-                    <button class="btn btn-sm btn-outline-primary me-1" onclick="editPlot(${parseInt(p.id,10)||0})"><i class="bi bi-pencil"></i></button>
-                    <button class="btn btn-sm btn-outline-danger" onclick="deletePlot(${parseInt(p.id,10)||0})"><i class="bi bi-trash"></i></button>
+                    <button class="btn btn-sm btn-outline-primary me-1" data-csp-click="knowledge.edit-plot" data-record-id="${parseInt(p.id,10)||0}"><i class="bi bi-pencil"></i></button>
+                    <button class="btn btn-sm btn-outline-danger" data-csp-click="knowledge.delete-plot" data-record-id="${parseInt(p.id,10)||0}"><i class="bi bi-trash"></i></button>
                 </td>
             </tr>`;
     }).join('');
@@ -309,8 +321,8 @@ function loadStyles() {
                 <td><span class="badge bg-light text-dark">${refStr}</span></td>
                 <td><small class="text-muted">${kwStr}</small></td>
                 <td>
-                    <button class="btn btn-sm btn-outline-primary me-1" onclick="editStyle(${parseInt(s.id,10)||0})"><i class="bi bi-pencil"></i></button>
-                    <button class="btn btn-sm btn-outline-danger" onclick="deleteStyle(${parseInt(s.id,10)||0})"><i class="bi bi-trash"></i></button>
+                    <button class="btn btn-sm btn-outline-primary me-1" data-csp-click="knowledge.edit-style" data-record-id="${parseInt(s.id,10)||0}"><i class="bi bi-pencil"></i></button>
+                    <button class="btn btn-sm btn-outline-danger" data-csp-click="knowledge.delete-style" data-record-id="${parseInt(s.id,10)||0}"><i class="bi bi-trash"></i></button>
                 </td>
             </tr>`;
     }).join('');

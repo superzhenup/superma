@@ -4,6 +4,7 @@ defined('APP_LOADED') or die('Direct access denied.');
 
 require_once dirname(__DIR__) . '/ai.php';
 require_once __DIR__ . '/DramaService.php';
+require_once __DIR__ . '/DramaTaskRepository.php';
 
 /**
  * 漫剧剧本解析：LLM 从章节正文提取角色/场景/道具资产 + 生成分镜脚本。
@@ -17,8 +18,9 @@ final class DramaScriptParser
      *
      * @return array{characters:int,scenes:int,props:int}
      */
-    public static function parseEpisode(array $project, array $episode): array
+    public static function parseEpisode(array $project, array $episode, array $task): array
     {
+        DramaTaskRepository::assertOwned($task);
         $sourceText = trim((string)($episode['source_text'] ?? ''));
         if ($sourceText === '') throw new RuntimeException('剧集没有可用的章节正文');
 
@@ -44,30 +46,33 @@ final class DramaScriptParser
         $text = self::chat((int)($novel['model_id'] ?? 0), $prompt);
         $data = self::decodeJsonObject($text);
 
-        $counts = ['characters' => 0, 'scenes' => 0, 'props' => 0];
-        foreach ((array)($data['characters'] ?? []) as $item) {
-            if (empty($item['name'])) continue;
-            DramaService::upsertAsset((int)$project['id'], 'character', (string)$item['name'], (string)($item['description'] ?? ''), 'llm');
-            $counts['characters']++;
-        }
-        foreach ((array)($data['scenes'] ?? []) as $item) {
-            if (empty($item['name'])) continue;
-            DramaService::upsertAsset((int)$project['id'], 'scene', (string)$item['name'], (string)($item['description'] ?? ''), 'llm');
-            $counts['scenes']++;
-        }
-        foreach ((array)($data['props'] ?? []) as $item) {
-            if (empty($item['name'])) continue;
-            DramaService::upsertAsset((int)$project['id'], 'prop', (string)$item['name'], (string)($item['description'] ?? ''), 'llm');
-            $counts['props']++;
-        }
+        return DramaTaskRepository::commitResult($task, static function () use ($data, $project, $episode): array {
+            self::assertEpisodeSnapshot($episode);
+            $counts = ['characters' => 0, 'scenes' => 0, 'props' => 0];
+            foreach ((array)($data['characters'] ?? []) as $item) {
+                if (empty($item['name'])) continue;
+                DramaService::upsertAsset((int)$project['id'], 'character', (string)$item['name'], (string)($item['description'] ?? ''), 'llm');
+                $counts['characters']++;
+            }
+            foreach ((array)($data['scenes'] ?? []) as $item) {
+                if (empty($item['name'])) continue;
+                DramaService::upsertAsset((int)$project['id'], 'scene', (string)$item['name'], (string)($item['description'] ?? ''), 'llm');
+                $counts['scenes']++;
+            }
+            foreach ((array)($data['props'] ?? []) as $item) {
+                if (empty($item['name'])) continue;
+                DramaService::upsertAsset((int)$project['id'], 'prop', (string)$item['name'], (string)($item['description'] ?? ''), 'llm');
+                $counts['props']++;
+            }
 
-        $style = trim((string)($data['style_suggestion'] ?? ''));
-        if ($style !== '' && trim((string)($project['style_prompt'] ?? '')) === '') {
-            DramaService::updateProject((int)$project['id'], ['style_prompt' => $style]);
-        }
+            $style = trim((string)($data['style_suggestion'] ?? ''));
+            if ($style !== '' && trim((string)($project['style_prompt'] ?? '')) === '') {
+                DramaService::updateProject((int)$project['id'], ['style_prompt' => $style]);
+            }
 
-        DB::update('drama_episodes', ['script_status' => 'parsed'], 'id=?', [(int)$episode['id']]);
-        return $counts;
+            DB::update('drama_episodes', ['script_status' => 'parsed'], 'id=?', [(int)$episode['id']]);
+            return $counts;
+        });
     }
 
     /**
@@ -75,8 +80,9 @@ final class DramaScriptParser
      *
      * @return int 分镜数量
      */
-    public static function generateStoryboard(array $project, array $episode, int $targetShots = 12): int
+    public static function generateStoryboard(array $project, array $episode, int $targetShots, array $task): int
     {
+        DramaTaskRepository::assertOwned($task);
         $sourceText = trim((string)($episode['source_text'] ?? ''));
         if ($sourceText === '') throw new RuntimeException('剧集没有可用的章节正文');
 
@@ -128,8 +134,21 @@ final class DramaScriptParser
             ];
         }
 
-        DramaService::replaceShots((int)$episode['id'], $shots);
-        return count($shots);
+        $result = DramaTaskRepository::commitResult($task, static function () use ($episode, $shots): array {
+            self::assertEpisodeSnapshot($episode);
+            DramaService::replaceShots((int)$episode['id'], $shots);
+            return ['episode_id' => (int)$episode['id'], 'shots' => count($shots)];
+        });
+        return $result['shots'];
+    }
+
+    private static function assertEpisodeSnapshot(array $episode): void
+    {
+        $fresh = DB::fetch('SELECT * FROM drama_episodes WHERE id=? FOR UPDATE', [(int)$episode['id']]);
+        if (!$fresh || (int)$fresh['project_id'] !== (int)$episode['project_id']
+            || (string)$fresh['source_text'] !== (string)$episode['source_text']) {
+            throw new RuntimeException('剧集正文已变更，请重新提交任务');
+        }
     }
 
     // ----------------------------------------------------------------- 内部

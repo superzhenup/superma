@@ -15,14 +15,16 @@ class TrendPredictor
     private int $novelId;
 
     /** @var array 指标目标值 */
+    // 审计修复（2026-08-09 R7-4）：cool_point_density 与 write_engine 实测口径一致
+    // （近窗「有爽点章占比」），目标对齐调度默认 0.88/章（约 88% 章有爽点）。
     private const TARGETS = [
         'quality_score' => 80.0,
         'emotion_score' => 75.0,
-        'cool_point_density' => 0.29,
+        'cool_point_density' => 0.88,
         'word_count_accuracy' => 0.85,
     ];
 
-    public function __construct(int $novelId)
+    public function __construct(int $novelId, private int $beforeChapter = PHP_INT_MAX)
     {
         $this->novelId = $novelId;
     }
@@ -98,24 +100,38 @@ class TrendPredictor
         try {
             // 修复：原分母为全部历史章节，长篇早期低密度永久拖后腿，
             // below_target 随章节数增长几乎不可逆。改为近 30 章滚动窗口。
+            // 审计修复（2026-08-09 R8）：优先 actual_cool_point_types，空则回退计划列
             $stats = DB::fetch(
                 "SELECT
                     COUNT(*) as total_chapters,
-                    SUM(CASE WHEN cool_point_type IS NOT NULL AND cool_point_type != '' THEN 1 ELSE 0 END) as chapters_with_coolpoint
+                    SUM(CASE
+                        WHEN (actual_cool_point_types IS NOT NULL AND actual_cool_point_types != '' AND actual_cool_point_types != 'null' AND actual_cool_point_types != '[]')
+                          OR (cool_point_type IS NOT NULL AND cool_point_type != '')
+                        THEN 1 ELSE 0 END) as chapters_with_coolpoint
                  FROM (
-                     SELECT cool_point_type FROM chapters
-                     WHERE novel_id = ? AND status = 'completed'
+                     SELECT cool_point_type, actual_cool_point_types FROM chapters
+                     WHERE novel_id = ? AND status = 'completed' AND chapter_number < ?
                      ORDER BY chapter_number DESC
                      LIMIT 30
                  ) recent",
-                [$this->novelId]
+                [$this->novelId, $this->beforeChapter]
             );
 
             $total = (int)($stats['total_chapters'] ?? 0);
             $withCoolpoint = (int)($stats['chapters_with_coolpoint'] ?? 0);
 
             $density = $total > 0 ? $withCoolpoint / $total : 0;
+            // 审计修复（2026-08-09 R11-5）：读小说级密度目标，禁止硬编码 0.88
             $targetDensity = self::TARGETS['cool_point_density'];
+            if (class_exists('ConfigCenter', false)) {
+                $targetDensity = (float)ConfigCenter::getNovel(
+                    $this->novelId,
+                    'ws_cool_point_density_target',
+                    $targetDensity,
+                    'float'
+                );
+            }
+            $targetDensity = max(0.3, min(1.0, $targetDensity));
 
             // 分析最近10章的爽点类型分布
             $typeDistribution = $this->getCoolPointTypeDistribution();
@@ -150,8 +166,8 @@ class TrendPredictor
     {
         try {
             $currentChapter = DB::fetch(
-                "SELECT COALESCE(MAX(chapter_number), 0) as max_ch FROM chapters WHERE novel_id = ? AND status = 'completed'",
-                [$this->novelId]
+                "SELECT COALESCE(MAX(chapter_number), 0) as max_ch FROM chapters WHERE novel_id = ? AND status = 'completed' AND chapter_number < ?",
+                [$this->novelId, $this->beforeChapter]
             );
             $maxCh = (int)($currentChapter['max_ch'] ?? 0);
 
@@ -159,12 +175,12 @@ class TrendPredictor
             $stats = DB::fetch(
                 "SELECT
                     COUNT(*) as total,
-                    SUM(CASE WHEN resolved_chapter IS NULL THEN 1 ELSE 0 END) as pending,
-                    SUM(CASE WHEN resolved_chapter IS NULL AND deadline_chapter IS NOT NULL AND deadline_chapter < ? THEN 1 ELSE 0 END) as overdue,
-                    SUM(CASE WHEN priority = 'critical' AND resolved_chapter IS NULL THEN 1 ELSE 0 END) as critical_pending
+                    SUM(CASE WHEN resolved_chapter IS NULL OR resolved_chapter >= ? THEN 1 ELSE 0 END) as pending,
+                    SUM(CASE WHEN (resolved_chapter IS NULL OR resolved_chapter >= ?) AND deadline_chapter IS NOT NULL AND deadline_chapter < ? THEN 1 ELSE 0 END) as overdue,
+                    SUM(CASE WHEN priority = 'critical' AND (resolved_chapter IS NULL OR resolved_chapter >= ?) THEN 1 ELSE 0 END) as critical_pending
                  FROM foreshadowing_items
-                 WHERE novel_id = ?",
-                [$maxCh, $this->novelId]
+                 WHERE novel_id = ? AND planted_chapter < ?",
+                [$this->beforeChapter, $this->beforeChapter, $maxCh, $this->beforeChapter, $this->novelId, $this->beforeChapter]
             );
 
             $total = (int)($stats['total'] ?? 0);
@@ -206,9 +222,9 @@ class TrendPredictor
                 "SELECT c.words, n.chapter_words as target
                  FROM chapters c
                  JOIN novels n ON c.novel_id = n.id
-                 WHERE c.novel_id = ? AND c.status = 'completed'
+                 WHERE c.novel_id = ? AND c.status = 'completed' AND c.chapter_number < ?
                  ORDER BY c.chapter_number DESC LIMIT 20",
-                [$this->novelId]
+                [$this->novelId, $this->beforeChapter]
             );
 
             if (empty($chapters)) {
@@ -272,9 +288,11 @@ class TrendPredictor
         // 情绪分 (0-100)
         $scores['emotion'] = min(100, ($emotion['current'] ?? 70));
 
-        // 爽点密度分 (0-100)
+        // 爽点密度分 (0-100) —— 用实测目标（含小说级覆盖）
         $density = $coolpoint['current_density'] ?? 0;
-        $scores['coolpoint'] = min(100, $density / self::TARGETS['cool_point_density'] * 100);
+        $targetDensity = (float)($coolpoint['target_density'] ?? self::TARGETS['cool_point_density']);
+        $targetDensity = max(0.3, min(1.0, $targetDensity));
+        $scores['coolpoint'] = min(100, $density / $targetDensity * 100);
 
         // 伏笔分 (0-100)
         $pending = $foreshadowing['pending'] ?? 0;
@@ -314,9 +332,9 @@ class TrendPredictor
             $rows = DB::fetchAll(
                 "SELECT chapter_number, {$metric} as value
                  FROM chapters
-                 WHERE novel_id = ? AND status = 'completed' AND {$metric} IS NOT NULL
+                 WHERE novel_id = ? AND status = 'completed' AND {$metric} IS NOT NULL AND chapter_number < ?
                  ORDER BY chapter_number DESC LIMIT ?",
-                [$this->novelId, $limit]
+                [$this->novelId, $this->beforeChapter, $limit]
             ) ?: [];
             // 审计修复（2026-07-19 H-10）：DESC 取最近 N 章后必须反转为时间升序——
             // calculateSlope 以数组下标为 x 轴，降序会让"质量上升"被算成负斜率，
@@ -406,11 +424,11 @@ class TrendPredictor
             $types = DB::fetchAll(
                 "SELECT cool_point_type, COUNT(*) as count
                  FROM chapters
-                 WHERE novel_id = ? AND status = 'completed'
+                 WHERE novel_id = ? AND status = 'completed' AND chapter_number < ?
                    AND cool_point_type IS NOT NULL AND cool_point_type != ''
                  GROUP BY cool_point_type
                  ORDER BY count DESC",
-                [$this->novelId]
+                [$this->novelId, $this->beforeChapter]
             );
             return $types ?: [];
         } catch (\Throwable $e) {
@@ -424,10 +442,10 @@ class TrendPredictor
             $recent = DB::fetchAll(
                 "SELECT chapter_number, cool_point_type
                  FROM chapters
-                 WHERE novel_id = ? AND status = 'completed'
+                 WHERE novel_id = ? AND status = 'completed' AND chapter_number < ?
                    AND cool_point_type IS NOT NULL AND cool_point_type != ''
                  ORDER BY chapter_number DESC LIMIT 5",
-                [$this->novelId]
+                [$this->novelId, $this->beforeChapter]
             );
 
             if (count($recent) < 3) return null;

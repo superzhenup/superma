@@ -8,7 +8,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 // 最先设置 header，防止任何错误输出导致 JSON 解析失败
 header('Content-Type: application/json; charset=utf-8');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/error_handler.php';
 registerApiErrorHandlers();
@@ -18,6 +18,7 @@ csrf_verify_api();
 require_once __DIR__ . '/../includes/db.php';
 require_once __DIR__ . '/../includes/memory/MemoryEngine.php';
 require_once __DIR__ . '/../includes/ChapterMemoryFinalizer.php';
+require_once __DIR__ . '/../includes/NovelProjectionFence.php';
 
 /**
  * 角色卡片为空时，从小说【已定义的角色】惰性补种卡片。
@@ -92,12 +93,23 @@ if (!$novelId && $action !== 'embedding_status') {
 
 // 归属权校验（embedding_status 全局检测跳过）
 if ($novelId) {
-    $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    $userId = currentUserId();
     checkNovelOwnership($novelId, $userId);
 }
 
 // 初始化 MemoryEngine（embedding_status 不需要）
 $engine = $novelId ? new MemoryEngine($novelId) : null;
+
+// Lock order for every direct projection write:
+// novel projection fence -> repository transaction/row locks.
+$withProjectionFence = static function (callable $operation) use ($novelId) {
+    $projectionFence = NovelProjectionFence::acquire($novelId, 30);
+    try {
+        return $operation();
+    } finally {
+        NovelProjectionFence::release($projectionFence);
+    }
+};
 
 try {
     switch ($action) {
@@ -108,7 +120,11 @@ try {
         case 'get_cards':
             // 修复：面板为空时，从小说已定义的角色（主角 + novel_characters）惰性补种卡片，
             // 避免"尚未写出含角色变化的章节 → 角色卡片永远空白"。仅在无任何卡片时执行一次。
-            try { seedCharacterCardsFromDefinitions($engine, $novelId); }
+            try {
+                $withProjectionFence(
+                    static fn() => seedCharacterCardsFromDefinitions($engine, $novelId)
+                );
+            }
             catch (\Throwable $e) { error_log('get_cards seed skip: ' . $e->getMessage()); }
 
             // only_alive=true 只返回存活角色（默认全返回）
@@ -156,7 +172,21 @@ try {
                 echo json_encode(['ok' => false, 'msg' => '缺少要更新的字段 data'], JSON_UNESCAPED_UNICODE);
                 exit;
             }
-            $id = $engine->cards()->upsert($name, $data, $chapter);
+            $id = $withProjectionFence(
+                static fn() => $engine->cards()->upsert($name, $data, $chapter)
+            );
+            echo json_encode(['ok' => true, 'data' => ['id' => $id]], JSON_UNESCAPED_UNICODE);
+            break;
+
+        case 'confirm_card_replay_baseline':
+            $cardId = (int)($input['card_id'] ?? 0);
+            $data = is_array($input['data'] ?? null) ? $input['data'] : [];
+            if ($cardId <= 0 || ($input['confirmed'] ?? false) !== true) {
+                throw new InvalidArgumentException('请先确认已移除撤稿事实并保留人工设定');
+            }
+            $id = $withProjectionFence(
+                static fn() => $engine->cards()->confirmReplayBaseline($cardId, $data)
+            );
             echo json_encode(['ok' => true, 'data' => ['id' => $id]], JSON_UNESCAPED_UNICODE);
             break;
 
@@ -166,7 +196,9 @@ try {
                 echo json_encode(['ok' => false, 'msg' => '缺少卡片ID'], JSON_UNESCAPED_UNICODE);
                 exit;
             }
-            $result = $engine->cards()->delete($cardId);
+            $result = $withProjectionFence(
+                static fn() => $engine->cards()->delete($cardId)
+            );
             echo json_encode(['ok' => $result, 'msg' => $result ? '删除成功' : '删除失败'], JSON_UNESCAPED_UNICODE);
             break;
 
@@ -211,7 +243,9 @@ try {
                 echo json_encode(['ok' => false, 'msg' => '缺少必要参数'], JSON_UNESCAPED_UNICODE);
                 exit;
             }
-            $id = $engine->foreshadowing()->plant($desc, $chapter, $deadline);
+            $id = $withProjectionFence(
+                static fn() => $engine->foreshadowing()->plant($desc, $chapter, $deadline)
+            );
             echo json_encode(['ok' => true, 'data' => ['id' => $id]], JSON_UNESCAPED_UNICODE);
             break;
 
@@ -235,7 +269,9 @@ try {
                     exit;
                 }
             }
-            $result = $engine->foreshadowing()->resolveById($id, $chapter);
+            $result = $withProjectionFence(
+                static fn() => $engine->foreshadowing()->resolveById($id, $chapter)
+            );
             echo json_encode(['ok' => $result, 'msg' => $result ? '已回收' : '回收失败（可能已被回收）'], JSON_UNESCAPED_UNICODE);
             break;
 
@@ -245,7 +281,9 @@ try {
                 echo json_encode(['ok' => false, 'msg' => '缺少伏笔ID'], JSON_UNESCAPED_UNICODE);
                 exit;
             }
-            $result = $engine->foreshadowing()->delete($id);
+            $result = $withProjectionFence(
+                static fn() => $engine->foreshadowing()->delete($id)
+            );
             echo json_encode(['ok' => $result, 'msg' => $result ? '删除成功' : '删除失败'], JSON_UNESCAPED_UNICODE);
             break;
 
@@ -301,7 +339,9 @@ try {
                 exit;
             }
 
-            $id = $engine->atoms()->add($type, $content, $chapter, $confidence, $metadata);
+            $id = $withProjectionFence(
+                static fn() => $engine->atoms()->add($type, $content, $chapter, $confidence, $metadata)
+            );
             echo json_encode(['ok' => true, 'data' => ['id' => $id]], JSON_UNESCAPED_UNICODE);
             break;
 
@@ -311,7 +351,9 @@ try {
                 echo json_encode(['ok' => false, 'msg' => '缺少原子记忆ID'], JSON_UNESCAPED_UNICODE);
                 exit;
             }
-            $result = $engine->atoms()->delete($atomId);
+            $result = $withProjectionFence(
+                static fn() => $engine->atoms()->delete($atomId)
+            );
             echo json_encode(['ok' => $result, 'msg' => $result ? '删除成功' : '删除失败'], JSON_UNESCAPED_UNICODE);
             break;
 
@@ -323,7 +365,9 @@ try {
                 echo json_encode(['ok' => false, 'msg' => '缺少必要参数'], JSON_UNESCAPED_UNICODE);
                 exit;
             }
-            $result = $engine->atoms()->updateContent($atomId, $content, $atomType);
+            $result = $withProjectionFence(
+                static fn() => $engine->atoms()->updateContent($atomId, $content, $atomType)
+            );
             echo json_encode(['ok' => $result, 'msg' => $result ? '更新成功' : '更新失败'], JSON_UNESCAPED_UNICODE);
             break;
 
@@ -362,7 +406,9 @@ try {
         case 'ensure_embeddings':
             // 手动触发 embedding 补齐
             $maxBatch = (int)($input['max_batch'] ?? 50);
-            $report = $engine->ensureEmbeddings($maxBatch);
+            $report = $withProjectionFence(
+                static fn() => $engine->ensureEmbeddings($maxBatch)
+            );
             echo json_encode(['ok' => true, 'data' => $report], JSON_UNESCAPED_UNICODE);
             break;
 

@@ -1,0 +1,6 @@
+{
+  "chapter_type": "education",
+  "outline": "师父通过一次失败演示讲清阵眼位置，学徒随后独立修复阵法。",
+  "expected": ["education-explanation"],
+  "must_preserve": ["失败演示", "独立修复"]
+}

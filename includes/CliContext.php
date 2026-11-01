@@ -26,6 +26,11 @@ class CliContext
     private const ALLOWED_ENTRYPOINTS = [
         'write_chapter_worker.php',
         'daemon_write.php',
+        // 审计修复 P0（2026-08-04）：bin/ 下两个 worker 调用 activate() 但不在白名单，
+        // 启动即抛 RuntimeException 退出，漫剧后台链与后处理兜底队列断裂。
+        'drama_worker.php',
+        'postprocess_worker.php',
+        'postprocess_subtask_worker.php',
     ];
 
     /**

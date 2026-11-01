@@ -91,11 +91,12 @@ if (!function_exists('runAllTests')) {
             }, $diagnostic);
 
             runTest('foreshadowing', 'foreshadowing_stats', function () use ($novelId) {
+                // foreshadowing_items 没有 status 列，回收与否以 resolved_chapter 为准。
                 $row = DB::fetch(
                     'SELECT
                         COUNT(*) AS total,
-                        SUM(CASE WHEN status="planted" THEN 1 ELSE 0 END) AS planted,
-                        SUM(CASE WHEN status="resolved" THEN 1 ELSE 0 END) AS resolved
+                        SUM(CASE WHEN resolved_chapter IS NULL THEN 1 ELSE 0 END) AS planted,
+                        SUM(CASE WHEN resolved_chapter IS NOT NULL THEN 1 ELSE 0 END) AS resolved
                      FROM foreshadowing_items WHERE novel_id=?',
                     [$novelId]
                 );
@@ -232,10 +233,15 @@ if (!function_exists('runAllTests')) {
             }, $diagnostic);
 
             runTest('progress', 'chapter_synopses', function () use ($novelId) {
+                // chapters 没有 synopsis 列，章节简介存放在 chapter_synopses。
                 $row = DB::fetch(
                     'SELECT COUNT(*) AS total,
-                     SUM(CASE WHEN synopsis IS NOT NULL AND synopsis<>"" THEN 1 ELSE 0 END) AS filled
-                     FROM chapters WHERE novel_id=?',
+                     SUM(CASE WHEN EXISTS (
+                         SELECT 1 FROM chapter_synopses cs
+                         WHERE cs.novel_id=c.novel_id AND cs.chapter_number=c.chapter_number
+                           AND cs.synopsis IS NOT NULL AND cs.synopsis<>""
+                     ) THEN 1 ELSE 0 END) AS filled
+                     FROM chapters c WHERE c.novel_id=?',
                     [$novelId]
                 );
                 $total = (int)($row['total'] ?? 0);

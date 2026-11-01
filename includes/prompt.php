@@ -8,6 +8,7 @@ defined('APP_LOADED') or die('Direct access denied.');
 // 且不回指 prompt.php，独立加载安全、无循环依赖。
 require_once __DIR__ . '/helpers.php';
 require_once __DIR__ . '/data.php';
+require_once __DIR__ . '/memory/NarrativePosition.php';
 
 // ================================================================
 // prompt.php — Prompt 构建层（依赖 data.php / helpers.php，不含 AI 调用）
@@ -28,7 +29,8 @@ require_once __DIR__ . '/data.php';
  *  - protagonist_info / protagonist_name（人设）
  *  - plot_settings / world_settings / extra_settings（情节/世界观/自定义）
  *  - ref_author（参考作者）
- *  - tone / audience / style_vector 元素（文风类）
+ *  - style_vector（四维风格向量，novels 表实际字段）
+ * （tone/audience 并非 novels 表字段，不纳入白名单——2026-08-17 P3 注释与实现对齐）
  *
  * 策略：复用 includes/helpers.php::sanitizeForPrompt() 移除已知的越狱/注入
  * 关键词并做长度截断。在每个 prompt builder 入口处对整本小说一次性调用，
@@ -43,6 +45,8 @@ function sanitizeNovelForPrompt(array $novel): array {
         'protagonist_info', 'protagonist_name',
         'plot_settings', 'world_settings', 'extra_settings',
         'ref_author',
+        // 审计修复（2026-08-17 P3）：注释声称覆盖 style_vector 但白名单缺失，补上
+        'style_vector',
     ];
     foreach ($keys as $k) {
         if (isset($novel[$k]) && is_string($novel[$k])) {
@@ -53,15 +57,63 @@ function sanitizeNovelForPrompt(array $novel): array {
 }
 
 /**
+ * 审计修复 M2（2026-09-27）：章节级用户可控字段消毒（与 sanitizeNovelForPrompt
+ * 同策略、同 C-2 注释契约——"所有进入 AI 提示词的字段必须消毒"）。
+ *
+ * 章节大纲/标题/钩子/关键点由用户在章节编辑页或写作向导直接编辑，是
+ * ChapterPromptBuilder 的直接注入面——原实现仅消毒 novel 字段，chapter
+ * 规划字段原样拼入提示词（outline/hook/key_points 进入强注意区）。
+ * 仅消毒"用户可编辑的规划字段"；正文/上一章结尾/章节摘要等 AI 生成
+ * 内容按 C-2 注释约定不过滤（它们是 AI 的合法输出）。
+ */
+function sanitizeChapterForPrompt(array $chapter): array {
+    $keys = ['title', 'outline', 'hook', 'key_points'];
+    foreach ($keys as $k) {
+        if (isset($chapter[$k]) && is_string($chapter[$k])) {
+            // 大纲等规划字段远超 sanitizeForPrompt 默认的 2000 字截断——
+            // 2000 会切掉长大纲尾部的关键情节点，改用 20000 防御性兜底。
+            $chapter[$k] = sanitizeForPrompt($chapter[$k], 20000);
+        }
+    }
+    return $chapter;
+}
+
+/**
  * 计算动态容差
- * 
+ *
  * @param int $targetWords 目标字数
+ * @param int|null $novelId 小说ID；传入时优先读小说级 ws_dynamic_tolerance_ratio
  * @return array 包含 min, max, tolerance, early_finish 的数组
  */
-function calculateDynamicTolerance(int $targetWords): array
+/**
+ * 小说单章目标字数：有效 chapter_words 优先，否则回退全局 ws_chapter_words。
+ * SSE / worker / 挂机共用，避免挂机在空值时 silently 按 500 字写。
+ */
+function resolveNovelChapterWords(array $novel): int
 {
-    // 读取配置
-    $ratio = (int)getSystemSetting('ws_dynamic_tolerance_ratio', 10, 'int') / 100;
+    $novelWords = (int)($novel['chapter_words'] ?? 0);
+    if ($novelWords < 500) {
+        $novelWords = (int)getSystemSetting('ws_chapter_words', 2000, 'int');
+    }
+    return max(500, $novelWords);
+}
+
+function calculateDynamicTolerance(int $targetWords, ?int $novelId = null): array
+{
+    $ratioPct = (int)getSystemSetting('ws_dynamic_tolerance_ratio', 10, 'int');
+    if ($novelId !== null && $novelId > 0) {
+        if (!class_exists('ConfigCenter', false)) {
+            $ccPath = __DIR__ . '/config_center.php';
+            if (is_file($ccPath)) {
+                require_once $ccPath;
+            }
+        }
+        if (class_exists('ConfigCenter', false)) {
+            $ratioPct = (int)ConfigCenter::getNovel($novelId, 'ws_dynamic_tolerance_ratio', $ratioPct, 'int');
+        }
+    }
+    $ratioPct = max(5, min(25, $ratioPct));
+    $ratio = $ratioPct / 100;
     $minTolerance = (int)getSystemSetting('ws_min_tolerance', 100, 'int');
     $maxTolerance = (int)getSystemSetting('ws_max_tolerance', 500, 'int');
     
@@ -213,7 +265,10 @@ function buildOutlinePrompt(
         require_once dirname(__DIR__) . '/includes/memory/ForeshadowingRepo.php';
         $fRepo = new \ForeshadowingRepo((int)$novel['id']);
         $foreshadowAllPending = $fRepo->listPending();
-        $foreshadowAllOverdue = $fRepo->listOverdue($startChapter, 0);
+        // 审计修复（2026-08-17 P3）：缓冲 0 改 CFG_FORESHADOW_OVERDUE_BUFFER（=3），
+        // 与 MemoryEngine::buildBatch 逾期分类口径统一（常量由 config.php 统一加载
+        // 的 config_constants.php 定义）。
+        $foreshadowAllOverdue = $fRepo->listOverdue($startChapter, CFG_FORESHADOW_OVERDUE_BUFFER);
     } catch (\Throwable $e) {
         // ForeshadowingRepo 不可用时静默跳过
     }
@@ -505,6 +560,32 @@ function buildOutlinePrompt(
     $coolPointHistory = ($memoryCtx['cool_point_history'] ?? []);
     $coolPointSchedule = calculateCoolPointSchedule($startChapter, $count, $coolPointHistory, (int)$novel['id']);
 
+    // 审计功能（2026-08-16 P3-黄金三章）：前三章里程碑要求（仅批次含第1-3章时注入）。
+    // 同时打通 novels.opening_type / protagonist_entrance 断头路——两列由向导写入主表
+    // （api/wizard.php wizardApplyTopicTags）但此前无任何 prompt 消费方。失败不阻断（空串）。
+    $goldenThreeSection = '';
+    try {
+        require_once __DIR__ . '/GoldenThreeChapters.php';
+        if (GoldenThreeChapters::appliesToBatch($startChapter, $endChapter)) {
+            $goldenThreeSection = "\n" . trim(GoldenThreeChapters::buildOutlinePromptSection($novel)) . "\n";
+        }
+    } catch (\Throwable $e) {
+        $goldenThreeSection = '';
+    }
+
+    // 审计功能（2026-08-16 P3-金手指设计模板）：本批各章档位表 + 代价/限制约束。
+    // 有设定才输出（批次全在铺垫期→铺垫提示；档位变化→逐档列出）；失败静默。
+    $goldenFingerSection = '';
+    try {
+        require_once __DIR__ . '/GoldenFinger.php';
+        $gfTable = (new GoldenFinger((int)$novel['id']))->batchConstraintTable($startChapter, $endChapter);
+        if ($gfTable !== '') {
+            $goldenFingerSection = "\n" . trim($gfTable) . "\n";
+        }
+    } catch (\Throwable $e) {
+        $goldenFingerSection = '';
+    }
+
     // ── 全书进度感知 + 故事大纲引用（F1/F3/F6 优化）───────────────────
     $progressSection  = '';
     $endingContext    = '';  // 细纲层收尾指令
@@ -771,7 +852,8 @@ EOT;
         &$arcSummarySection, &$hookHistorySection, &$coolPointSection, &$arcSection,
     ];
     $hardPartsLen = safe_strlen($prevHookSection . $overdueSection . $volumeForceResolve . $volumeSection
-        . $progressSection . $endingContext . $characterSection . $foreshadowSection
+        . $progressSection . $endingContext . $goldenThreeSection . $goldenFingerSection
+        . $characterSection . $foreshadowSection
         . $keyEventsSection . $usedTitlesSection . $contextSection . $storyOutlineSection);
     $softLen = 0;
     foreach ($softParts as $sp) { $softLen += safe_strlen((string)$sp); }
@@ -791,7 +873,7 @@ EOT;
 情节：{$plotSettings}
 世界观：{$worldSettings}
 其他：{$extraSettings}
-{$progressSection}{$endingContext}{$storyOutlineSection}{$volumeSection}{$overdueSection}{$volumeForceResolve}{$arcSection}{$contextSection}{$prevHookSection}{$momentumSection}{$arcSummarySection}{$hookHistorySection}{$coolPointSection}{$beatStatsSection}{$expressionGuide}{$sceneTemplateSection}{$usedTitlesSection}{$keyEventsSection}{$characterSection}{$foreshadowSection}
+{$goldenThreeSection}{$goldenFingerSection}{$progressSection}{$endingContext}{$storyOutlineSection}{$volumeSection}{$overdueSection}{$volumeForceResolve}{$arcSection}{$contextSection}{$prevHookSection}{$momentumSection}{$arcSummarySection}{$hookHistorySection}{$coolPointSection}{$beatStatsSection}{$expressionGuide}{$sceneTemplateSection}{$usedTitlesSection}{$keyEventsSection}{$characterSection}{$foreshadowSection}
 输出JSON数组（{$count}个元素）：
 [{"chapter_number":整数,"title":"标题","summary":"概要","key_points":["点1","点2"],"hook":"钩子","hook_type":"九选一","pacing":"快/中/慢","suspense":"有/无","story_delta":"本章相对上一章新增的变化","conflict":"本章核心冲突","result":"本章结束时局面变化","next_trigger":"下一章触发点","unique_role":"本章在本卷里的唯一作用"},...]
 
@@ -808,16 +890,15 @@ EOT;
  * 从已有章节反向推导全书故事大纲 Prompt
  * 适用于已有章节内容的情况下，基于已写内容反推出故事框架
  */
-function buildStoryOutlineFromChaptersPrompt(array $novel, array $chaptersData): array {
+function buildStoryOutlineFromChaptersPrompt(array $novel, array $chaptersData, ?array $progress = null, array $volumeSummaries = []): array {
     // 审计修复 C-2（2026-06-17）：集中消毒所有用户可控字段
     $novel = sanitizeNovelForPrompt($novel);
     $truncate = fn(string $text, int $limit = 200): string =>
         safe_strlen($text) > $limit ? safe_substr($text, 0, $limit) . '…' : $text;
 
     $protagonistInfo = $truncate($novel['protagonist_info'] ?? '', 200);
-    $targetChapters  = (int)($novel['target_chapters'] ?? 100);
-    $act1End = (int)($targetChapters * 0.2);
-    $act2End = (int)($targetChapters * 0.8);
+    $targetChapters  = max(1,(int)($novel['target_chapters'] ?? 100));
+    [$act1Range,$act2Range,$act3Range] = storyOutlineActRanges($targetChapters);
 
     // 组装已有章节信息（章节号、标题、大纲、摘要、首200字正文）
     $chapterLines = [];
@@ -846,9 +927,14 @@ function buildStoryOutlineFromChaptersPrompt(array $novel, array $chaptersData):
     $chaptersText = implode("\n", $chapterLines);
 
     // 统计边界
-    $completedCount = count($chaptersData);
-    $lastChapterNum = $completedCount > 0 ? $chaptersData[count($chaptersData) - 1]['chapter_number'] : 0;
+    $completedCount = (int)($progress['completed_count'] ?? count($chaptersData));
+    $lastChapterNum = (int)($progress['last_chapter_number'] ?? ($chaptersData ? max(array_column($chaptersData,'chapter_number')) : 0));
     $remainingChapters = max(0, $targetChapters - $lastChapterNum);
+    $summaryLines=[];
+    foreach ($volumeSummaries as $volumeSummary) {
+        $summaryLines[]='第'.(int)$volumeSummary['volume_number'].'卷（'.(int)$volumeSummary['chapter_from'].'-'.(int)$volumeSummary['chapter_to'].'章）：'.$truncate((string)($volumeSummary['summary']??''),600);
+    }
+    $volumeSummaryText=$summaryLines ? implode("\n",$summaryLines) : '暂无卷级摘要；章节样本之外的事实不可视为已知。';
 
     $system = <<<EOT
 你是一位资深的小说编辑，擅长从已完成的内容中反向归纳故事框架。
@@ -870,18 +956,21 @@ EOT;
 主角：{$novel['protagonist_name']}
 主角人设：{$protagonistInfo}
 目标总章数：{$targetChapters}章
-已写：{$completedCount}章（第1-{$lastChapterNum}章），剩余{$remainingChapters}章
+已完成：{$completedCount}章；最新已完成章节号：{$lastChapterNum}；距目标末章剩余{$remainingChapters}章（章节号空洞不视为已完成）。
 
-【已有章节信息（大纲+摘要）】
+【卷级事实摘要（覆盖章节样本间的剧情）】
+{$volumeSummaryText}
+
+【已有章节信息（已完成章节的前50与真实最后20章；省略部分依照卷级摘要）】
 {$chaptersText}
 
 请输出以下格式的JSON（从已有章节反推，不要编造未写的内容）：
 {
   "story_arc": "基于已写{$completedCount}章归纳的全书故事主线（200字，剩余章节走向可做合理推断但标注为\"推测\"）",
   "act_division": {
-    "act1": {"chapters": "1-{$act1End}", "theme": "开篇主题（从第1-某些章归纳）", "key_events": ["已发生的核心事件1","事件2"], "character_growth": "主角已完成的成长"},
-    "act2": {"chapters": "{$act1End}-{$act2End}", "theme": "发展阶段", "key_events": ["已发生事件1","已发生事件2"], "character_growth": "主角本段成长"},
-    "act3": {"chapters": "{$act2End}-{$targetChapters}", "theme": "后续主题（根据已有伏笔推测）", "key_events": ["推测事件（标注为推测）"], "character_growth": "预期成长"}
+    "act1": {"chapters": "{$act1Range}", "theme": "开篇主题（从第1-某些章归纳）", "key_events": ["已发生的核心事件1","事件2"], "character_growth": "主角已完成的成长"},
+    "act2": {"chapters": "{$act2Range}", "theme": "发展阶段", "key_events": ["已发生事件1","已发生事件2"], "character_growth": "主角本段成长"},
+    "act3": {"chapters": "{$act3Range}", "theme": "后续主题（根据已有伏笔推测）", "key_events": ["推测事件（标注为推测）"], "character_growth": "预期成长"}
   },
   "major_turning_points": [
     {"chapter": 具体已写章节号, "event": "转折事件（已发生的标注为已写）", "impact": "影响", "volume": 卷号}
@@ -946,6 +1035,14 @@ function buildChapterPrompt(
 /**
  * 构建全书故事大纲 Prompt（三幕式结构）
  */
+function storyOutlineActRanges(int $target): array {
+    if ($target===1) return ['1','无','无'];
+    if ($target===2) return ['1','2','无'];
+    $first=max(1,min($target-2,(int)floor($target*0.2)));
+    $second=max($first+1,min($target-1,(int)floor($target*0.8)));
+    return ['1-'.$first,($first+1).'-'.$second,($second+1).'-'.$target];
+}
+
 function buildStoryOutlinePrompt(array $novel): array {
     // 审计修复 C-2（2026-06-17）：集中消毒用户可控字段
     $novel = sanitizeNovelForPrompt($novel);
@@ -957,27 +1054,33 @@ function buildStoryOutlinePrompt(array $novel): array {
     $worldSettings   = $truncate($novel['world_settings']   ?? '', 300);
     $extraSettings   = $truncate($novel['extra_settings']   ?? '', 200);
 
-    $targetChapters = (int)($novel['target_chapters'] ?? 100);
-    $act1End = (int)($targetChapters * 0.2);
-    $act2End = (int)($targetChapters * 0.8);
+    $targetChapters = max(1,(int)($novel['target_chapters'] ?? 100));
+    [$act1Range,$act2Range,$act3Range] = storyOutlineActRanges($targetChapters);
 
     // 读取用户预设的卷结构（新建时已写入 volume_outlines）
     $volumePlanSection = '';
     try {
-        $presetVolumes = \DB::fetchAll(
-            'SELECT volume_number, title, start_chapter, end_chapter
-             FROM volume_outlines WHERE novel_id=? ORDER BY volume_number ASC',
-            [(int)$novel['id']]
-        );
+        if (!function_exists('fetchVolumeOutlinesOverlapping')) {
+            require_once __DIR__ . '/memory.php';
+        }
+        $presetVolumes = fetchVolumeOutlinesOverlapping((int)$novel['id'], 1, PHP_INT_MAX);
         if (!empty($presetVolumes)) {
             $volLines = [];
             foreach ($presetVolumes as $pv) {
-                $vtitle = $pv['title'] ?: "第{$pv['volume_number']}卷";
-                $chCount = $pv['end_chapter'] - $pv['start_chapter'] + 1;
-                $volLines[] = "第{$pv['volume_number']}卷《{$vtitle}》：第{$pv['start_chapter']}-{$pv['end_chapter']}章（共{$chCount}章）";
+                $volNo = (int)($pv['volume_number'] ?? $pv['volume_index'] ?? 0);
+                $from = (int)($pv['chapter_from'] ?? $pv['start_chapter'] ?? 0);
+                $to = (int)($pv['chapter_to'] ?? $pv['end_chapter'] ?? 0);
+                if ($volNo < 1 || $from < 1 || $to < $from) {
+                    continue;
+                }
+                $vtitle = $pv['title'] ?: "第{$volNo}卷";
+                $chCount = $to - $from + 1;
+                $volLines[] = "第{$volNo}卷《{$vtitle}》：第{$from}-{$to}章（共{$chCount}章）";
             }
-            $volumePlanSection = "\n【用户预设卷结构——故事大纲必须严格按照此卷划分设计，转折点和关键事件需落在对应卷内】\n"
-                . implode("\n", $volLines) . "\n";
+            if ($volLines !== []) {
+                $volumePlanSection = "\n【用户预设卷结构——故事大纲必须严格按照此卷划分设计，转折点和关键事件需落在对应卷内】\n"
+                    . implode("\n", $volLines) . "\n";
+            }
         }
     } catch (\Throwable $e) {
         // 无卷结构时静默跳过
@@ -1012,9 +1115,9 @@ EOT;
 {
   "story_arc": "全书故事主线发展脉络（200字）",
   "act_division": {
-    "act1": {"chapters": "1-{$act1End}", "theme": "开篇主题", "key_events": ["事件1","事件2","事件3"], "character_growth": "主角本幕成长"},
-    "act2": {"chapters": "{$act1End}-{$act2End}", "theme": "发展主题", "key_events": ["事件1","事件2","事件3"], "character_growth": "主角本幕成长"},
-    "act3": {"chapters": "{$act2End}-{$targetChapters}", "theme": "高潮主题", "key_events": ["事件1","事件2","事件3"], "character_growth": "主角本幕成长"}
+    "act1": {"chapters": "{$act1Range}", "theme": "开篇主题", "key_events": ["事件1","事件2","事件3"], "character_growth": "主角本幕成长"},
+    "act2": {"chapters": "{$act2Range}", "theme": "发展主题", "key_events": ["事件1","事件2","事件3"], "character_growth": "主角本幕成长"},
+    "act3": {"chapters": "{$act3Range}", "theme": "高潮主题", "key_events": ["事件1","事件2","事件3"], "character_growth": "主角本幕成长"}
   },
   "major_turning_points": [
     {"chapter": 章节号, "event": "转折事件描述（必须落在对应卷的章节范围内）", "impact": "对故事的影响", "volume": 卷号}
@@ -1097,6 +1200,19 @@ function buildChapterSynopsisPrompt(array $novel, array $chapter, array $storyOu
         // PowerSystem 不可用，跳过
     }
 
+    // 审计功能（2026-08-16 P3-金手指设计模板）：章节感知档位/代价/限制约束
+    // （与反派对标同位注入 system 规则区；无设定/关闭输出空串）
+    $goldenFingerConstraint = '';
+    try {
+        require_once __DIR__ . '/GoldenFinger.php';
+        $gfConstraint = (new GoldenFinger((int)($novel['id'] ?? 0)))->buildConstraint($chNum);
+        if ($gfConstraint !== '') {
+            $goldenFingerConstraint = "\n" . trim($gfConstraint);
+        }
+    } catch (\Throwable $e) {
+        // GoldenFinger 不可用，跳过
+    }
+
     $system = <<<EOT
 你是一位小说场景设计师,擅长将章节大纲细化为可执行的写作蓝图。
 输出规则（必须严格遵守）：
@@ -1105,7 +1221,7 @@ function buildChapterSynopsisPrompt(array $novel, array $chapter, array $storyOu
 3. 对话要点要符合人物性格
 4. 感官细节要丰富,有代入感
 5. 章节逻辑要合理经得起推敲，并且章节不要重复
-6. 所有字段值中不得出现未转义的双引号{$protagonistRuleCS}{$antagonistConstraint}
+6. 所有字段值中不得出现未转义的双引号{$protagonistRuleCS}{$antagonistConstraint}{$goldenFingerConstraint}
 EOT;
 
     $storyArcExcerpt = $truncate($storyOutline['story_arc'] ?? '', 150);
@@ -1298,9 +1414,10 @@ function buildEndingContext(array $prog, int $currentChapter): string
 {
     if (($prog['target_chapters'] ?? 0) <= 0) return '';
 
-    $pct       = (int)($prog['progress_pct'] ?? 0);
-    $remaining = (int)($prog['remaining_chapters'] ?? 0);
     $target    = (int)($prog['target_chapters'] ?? 0);
+    $position = NarrativePosition::forChapter($currentChapter, $target);
+    $pct = $position['progress_pct'];
+    $remaining = $position['remaining_chapters'];
     $endingThreshold = (int)(CFG_ENDING_START_RATIO * 100);
 
     if ($pct < $endingThreshold) return '';
@@ -1310,7 +1427,7 @@ function buildEndingContext(array $prog, int $currentChapter): string
     // === 收尾阶段（进度 >= 90%）===
     $lines[] = '';
     $lines[] = '【🏁 全书收尾阶段——以下指令优先级高于常规写作规则】';
-    $lines[] = "本书已完成{$pct}%，仅剩{$remaining}章。你现在处于收尾阶段，必须逐步收束所有故事线。";
+    $lines[] = "故事推进至{$pct}%，从本章起剩余{$remaining}章。你现在处于收尾阶段，必须逐步收束所有故事线。";
     $lines[] = '';
     $lines[] = '收尾约束：';
     $lines[] = '1. 禁止引入新主线冲突、新核心人物、新势力阵营——精力集中在现有故事线的推进和收束';
@@ -1439,6 +1556,19 @@ const COOL_POINT_TYPES = [
     'last_stand'    => ['name' => '背水一战',     'weight' => 13, 'cooldown' => 6],
     'sacrifice'     => ['name' => '牺牲感动',     'weight' => 8,  'cooldown' => 12],
 ];
+
+/** 计划型非爽点标记（可落盘 chapters.cool_point_type，不参与饥饿排期） */
+const COOL_POINT_PLAN_MARKERS = ['breather', 'development'];
+
+/**
+ * 大纲/终态落盘是否接受该 cool_point_type（含呼吸/过渡）
+ */
+function isPersistedCoolPointType(string $type): bool
+{
+    if ($type === '') return false;
+    if (isset(COOL_POINT_TYPES[$type])) return true;
+    return in_array($type, COOL_POINT_PLAN_MARKERS, true);
+}
 
 /**
  * 爽点类型表达词库：同一种爽点可以用不同词语表达，避免重复
@@ -1678,9 +1808,11 @@ function getDensityGuidelines(string $genre): string
     }
 
     $d = $matrix[$key];
-    return "场景描写{$d['scene']} | 动作描写{$d['action']} | 对话{$d['dialogue']} "
-         . "| 心理描写{$d['psychology']} | 设定交代{$d['setting']}\n"
-         . "→ {$d['tip']}";
+    // 审计修复（2026-08-09 R13）：百分比降级为软性参考，避免与质检硬口径（句/千字）双重量纲打架
+    return "比例参考（软性，无需精确对齐）：场景{$d['scene']} | 动作{$d['action']} | 对话{$d['dialogue']} "
+         . "| 心理{$d['psychology']} | 设定{$d['setting']}\n"
+         . "→ {$d['tip']}\n"
+         . "硬性口径以此为准：对话≥25句/千字，连续非对话叙述≤300字。";
 }
 
 /**
@@ -1695,10 +1827,15 @@ function suggestHookType(array $chapter): array
 
     // ── 关键词匹配（优先级从高到低）──
     // 注意：truth_reveal 必须在 info_bomb 之前，否则"真相/揭秘"等词会被 info_bomb 先吞
+    // P2-10 修复（2026-08-09）：原 plot_twist 含"幕后|真凶"，与 truth_reveal 的"幕后|真凶现身"
+    // 重叠。plot_twist 在前导致"幕后"恒命中 plot_twist，truth_reveal 永远拿不到这类大纲，
+    // 钩子类型推荐被系统性遮蔽。现从 plot_twist 移除"幕后|真凶"（属真相揭露语义），
+    // 保留"黑手"（"幕后黑手"更偏反转）。"阴谋"保留在 plot_twist（"阴谋败露"的"阴谋"子串
+    // 仍会命中 plot_twist，但"阴谋"本身确实是反转元素，语义可接受）。
     $matched = null;
     if (preg_match('/战斗|对决|击败|反击|越级|打脸|厮杀|搏斗|迎战|交手|出手|动手|暴揍|碾压|秒杀|强敌|围攻/u', $outline)) {
         $matched = ['type' => 'crisis_interrupt', 'reason' => '检测到战斗/冲突情节'];
-    } elseif (preg_match('/背叛|反转|陷阱|阴谋|算计|被坑|被骗|出卖|叛变|真凶|幕后|黑手|暗算/u', $outline)) {
+    } elseif (preg_match('/背叛|反转|陷阱|阴谋|算计|被坑|被骗|出卖|叛变|黑手|暗算/u', $outline)) {
         $matched = ['type' => 'plot_twist', 'reason' => '检测到反转/阴谋元素'];
     } elseif (preg_match('/真相|揭秘|身份暴露|幕后|原来是|真正的|隐藏的秘密|内幕|真凶现身|阴谋败露|大白于天下|真面目|揭穿|水落石出/u', $outline)) {
         $matched = ['type' => 'truth_reveal', 'reason' => '检测到真相揭露情节'];
@@ -1764,6 +1901,71 @@ function suggestHookType(array $chapter): array
 }
 
 /**
+ * 审计修复（2026-08-09 R9 / R7-1 / R8-1）：按正文末尾分类"实写钩子"。
+ *
+ * 强短语计 3 分（须足够特异，避免「没想到/就在这时/原来是」单点满分）；
+ * 弱词计 1 分。门槛 ≥3：至少 1 个强短语，或 ≥3 个弱信号。
+ * 返回 null 表示无明显钩子信号（调用方不得用默认轮换污染历史）。
+ */
+function classifyHookTypeFromText(string $content): ?string
+{
+    $tail = mb_substr(trim($content), -500);
+    if ($tail === '') return null;
+
+    $rules = [
+        'plot_twist'       => [
+            'strong' => '幕后黑手|阴谋败露|出卖了|竟是背叛|一直在暗算',
+            'weak'   => '背叛|反转|陷阱|算计|被坑|被骗|叛变|暗算|没想到',
+        ],
+        'truth_reveal'     => [
+            'strong' => '身份暴露|隐藏的秘密|真凶现身|真面目|水落石出|才是失踪',
+            'weak'   => '真相|揭秘|原来是|幕后|内幕|揭穿',
+        ],
+        'info_bomb'        => [
+            'strong' => '惊天秘密|预言应验|谜底揭开|隐情曝光',
+            'weak'   => '隐情|谜底|来历|应验',
+        ],
+        'upgrade_omen'     => [
+            'strong' => '境界松动|力量躁动|突破征兆|新能力觉醒',
+            'weak'   => '晋级|晋升|觉醒|进阶|凝核|开窍|顿悟|蜕变',
+        ],
+        'last_stand'       => [
+            'strong' => '生死关头|孤注一掷|背水一战|决一死战|绝地反击|没有退路',
+            'weak'   => '绝境|以命相搏|最后一战',
+        ],
+        'sacrifice'        => [
+            'strong' => '挡在.{0,4}前面|以命相救|壮烈成仁',
+            'weak'   => '牺牲|殒落|陨落|永别|葬礼|遗言',
+        ],
+        'emotional_impact' => [
+            'strong' => '惊喜重逢|生死离别|当众表白',
+            'weak'   => '重逢|离别|表白|告白|诀别',
+        ],
+        'new_goal'         => [
+            'strong' => '新地图|新任务发布|一封密信|宝藏线索',
+            'weak'   => '邀请|线报|情报|委托|契机|招募',
+        ],
+        'crisis_interrupt' => [
+            'strong' => '强敌围攻|生死一线|破窗而入|杀机四起|杀手蜂拥|刀光一闪|血溅三尺',
+            'weak'   => '就在这时|对决|厮杀|搏斗|迎战|交手|围攻|险境|爆炸|崩塌|追杀',
+        ],
+    ];
+
+    $best = null;
+    $bestScore = 0;
+    foreach ($rules as $type => $kw) {
+        $strong = (int)preg_match_all('/(?:' . $kw['strong'] . ')/u', $tail);
+        $weak   = (int)preg_match_all('/(?:' . $kw['weak'] . ')/u', $tail);
+        $score  = $strong * 3 + $weak;
+        if ($score > $bestScore) {
+            $bestScore = $score;
+            $best = $type;
+        }
+    }
+    return $bestScore >= 3 ? $best : null;
+}
+
+/**
  * 开篇五式定义
  * 用于自动识别章节开篇风格，辅助 AI 保持风格多样性
  */
@@ -1785,13 +1987,15 @@ const OPENING_TYPES = [
     ],
     'scene'    => [
         'name'     => '场景开篇',
-        'desc'     => '以环境描写/场景铺陈开场',
+        // 审计修复（2026-08-09 R10-5）：与黄金三行对齐——强画面+即将变故，禁纯静态环境
+        'desc'     => '以强画面开场并暗示即将变故（禁止纯静态环境铺陈）',
         'keywords' => '阳光|月色|星空|山峰|山谷|宫殿|密林|深渊|废墟|古城|天地|苍穹|云海|晨曦|暮色',
     ],
     'emotion'  => [
         'name'     => '情感开篇',
-        'desc'     => '以内心独白/情感渲染引入',
-        'keywords' => '心中|内心|暗想|回忆|感慨|悲痛|愤怒|不甘|释然|觉悟|感悟|叹息|暗叹',
+        'desc'     => '以可见情绪反应/微表情切入（禁止大段内心独白）',
+        // 审计修复（2026-08-09 R11-9）：关键词对齐可见反应，不再匹配「心中/内心」独白
+        'keywords' => '眼眶|拳头|指甲|咬牙|喉结|指节|发抖|颤抖|泪光|冷笑|苦笑|握紧|攥紧|胸口一紧',
     ],
 ];
 
@@ -1816,20 +2020,21 @@ function suggestOpeningType(array $chapter): array
 
     $types = array_keys(OPENING_TYPES);
 
-    // ── 防连续同类型：读取前2章已用开篇类型 ──
+    // ── 防连续同类型：优先实测 actual_opening_type，回退计划 opening_type ──
+    // 审计修复（2026-08-09 R8-3）
     $recentTypes = [];
     if ($novelId > 0 && $chNum > 1) {
         $lookback = min(2, $chNum - 1);
         $recentChapters = \DB::fetchAll(
-            'SELECT opening_type FROM chapters
-             WHERE novel_id=? AND chapter_number BETWEEN ? AND ? AND opening_type IS NOT NULL AND opening_type != ""
+            'SELECT opening_type, actual_opening_type FROM chapters
+             WHERE novel_id=? AND chapter_number BETWEEN ? AND ?
              ORDER BY chapter_number DESC LIMIT ?',
             [$novelId, $chNum - $lookback, $chNum - 1, $lookback]
         );
         foreach ($recentChapters as $rc) {
-            if (!empty($rc['opening_type'])) {
-                $recentTypes[] = $rc['opening_type'];
-            }
+            $t = trim((string)($rc['actual_opening_type'] ?? ''));
+            if ($t === '') $t = trim((string)($rc['opening_type'] ?? ''));
+            if ($t !== '') $recentTypes[] = $t;
         }
     }
 
@@ -1844,12 +2049,18 @@ function suggestOpeningType(array $chapter): array
         return $matched;
     }
 
-    // ── 默认轮换：按章号取模，跳过最近已用类型 ──
-    $defaultIdx = ($chNum - 1) % count($types);
-    $candidate  = $types[$defaultIdx];
+    // ── 默认轮换：避开 scene/emotion（与黄金三行冲突），按章号取模 ──
+    // 注：调用方（落盘/prompt）不得把「默认轮换」当硬真相注入；仅作内部多样性候选。
+    $rotateTypes = array_values(array_filter(
+        $types,
+        static fn($t) => !in_array($t, ['scene', 'emotion'], true)
+    ));
+    if (empty($rotateTypes)) $rotateTypes = $types;
+    $defaultIdx = ($chNum - 1) % count($rotateTypes);
+    $candidate  = $rotateTypes[$defaultIdx];
 
     if (!empty($recentTypes) && $recentTypes[0] === $candidate) {
-        $candidate = $types[($defaultIdx + 1) % count($types)];
+        $candidate = $rotateTypes[($defaultIdx + 1) % count($rotateTypes)];
     }
 
     return ['type' => $candidate, 'reason' => '默认轮换（已避开近期重复类型）'];
@@ -1873,15 +2084,23 @@ function detectOpeningType(string $content): array
 
     $first200 = mb_substr($firstParagraph, 0, 200);
 
-    $matched = null;
+    // 审计修复（2026-08-09 R10-7）：计分阈值，避免单点弱词（说道/心中/阳光）假阳
+    $best = null;
+    $bestScore = 0;
     foreach (OPENING_TYPES as $type => $def) {
-        if (preg_match('/' . $def['keywords'] . '/u', $first200)) {
-            $matched = ['type' => $type, 'reason' => "检测到{$def['name']}元素"];
-            break;
+        $hits = (int)preg_match_all('/(?:' . $def['keywords'] . ')/u', $first200);
+        if ($hits > $bestScore) {
+            $bestScore = $hits;
+            $best = $type;
         }
     }
 
-    if ($matched) return $matched;
+    if ($best !== null && $bestScore >= 2) {
+        return [
+            'type' => $best,
+            'reason' => '检测到' . (OPENING_TYPES[$best]['name'] ?? $best) . "元素（命中{$bestScore}）",
+        ];
+    }
 
     return [];
 }
@@ -1953,8 +2172,13 @@ function calculateCoolPointSchedule(int $startChapter, int $count, array $histor
 
     // v41 去套路化：呼吸章（蓄力/日常/情感/伏笔章）——约 1/N 章免爽点，打破每章同构。
     // 收尾期（进度≥80%）不安排，保证高潮冲刺；批次首章不安排，保证承接上章钩子。
+    // 审计修复（2026-08-09 R10-4）：呼吸频率不得把有爽点章占比压到目标以下。
+    // 最大呼吸率 ≈ 1-target；interval ≥ ceil(1/rate)，再与配置取较大值（更少呼吸）。
     $breatherEnabled  = getSystemSetting('ws_breather_enabled', true, 'bool');
-    $breatherInterval = max(3, (int)getSystemSetting('ws_breather_interval', 4, 'int'));
+    $configuredInterval = max(3, (int)getSystemSetting('ws_breather_interval', 9, 'int'));
+    $maxBreatherRate = max(0.05, min(0.4, 1.0 - $densityTarget));
+    $minIntervalForTarget = max(3, (int)ceil(1.0 / $maxBreatherRate));
+    $breatherInterval = max($configuredInterval, $minIntervalForTarget);
     $breatherPhase    = $novelId ? ($novelId % $breatherInterval) : 0; // 每本相位错开，避免机械规律
     $isEndgame        = false;
     if ($novelId) {
@@ -1964,11 +2188,19 @@ function calculateCoolPointSchedule(int $startChapter, int $count, array $histor
         } catch (\Throwable $e) { /* 忽略 */ }
     }
 
+    require_once __DIR__ . '/GoldenThreeChapters.php';
+
     for ($i = 0; $i < $count; $i++) {
         $chNum = $startChapter + $i;
 
+        // 审计功能（2026-08-16 P3-黄金三章）：第1-3章排期倾斜。
+        // 非1-3章或功能关闭时为 null，以下所有路径零侵入。
+        $goldenBias = GoldenThreeChapters::scheduleBias($chNum);
+
         // 呼吸章判定：免爽点，直接记录后跳过排期
-        if ($breatherEnabled && !$isEndgame && $i > 0
+        // P3-黄金三章：开篇1-3章绝对豁免呼吸章（此前仅批次首章 $i>0 规则保护第1章，
+        // 第2/3章可能被相位命中吞掉爽点，与开篇里程碑矛盾）
+        if ($goldenBias === null && $breatherEnabled && !$isEndgame && $i > 0
             && ((($chNum + $breatherPhase) % $breatherInterval) === 0)) {
             $lines[] = [
                 'chapter'   => $chNum,
@@ -1997,6 +2229,50 @@ function calculateCoolPointSchedule(int $startChapter, int $count, array $histor
                     'score'  => $score,
                     'hunger' => round($hunger, 2),
                 ];
+            }
+        }
+
+        // 审计修复（2026-08-09 R11-4）：高密度目标下阈值未达也不落 development，
+        // 改为强制取饥饿度最高的类型，避免呼吸章+过渡章双抽空占比。
+        if (empty($candidates) && $densityTarget >= 0.75) {
+            foreach (COOL_POINT_TYPES as $typeId => $cp) {
+                $last   = $lastUsed[$typeId] ?? 0;
+                $gap    = $chNum - $last;
+                $adjustedCooldown = max(1, $cp['cooldown'] * $cooldownMultiplier);
+                $hunger = $gap / $adjustedCooldown;
+                $candidates[] = [
+                    'type'   => $typeId,
+                    'name'   => $cp['name'],
+                    'score'  => $cp['weight'] * max(0.01, $hunger),
+                    'hunger' => round($hunger, 2),
+                ];
+            }
+        }
+
+        // 审计功能（2026-08-16 P3-黄金三章）：第1-3章候选限定在 milestone 推荐白名单内。
+        // 交集非空 → 交集内沿用既有分数机制选择（白名单加权而非硬指定单类型）；
+        // 交集为空 → 白名单按章号轮换保底，保证 selected 非空——开篇章永不落
+        // development（与 forbid 语义配套；breather 已在循环首豁免）。
+        if ($goldenBias !== null) {
+            $recTypes = $goldenBias['recommended'];
+            $recCandidates = array_values(array_filter(
+                $candidates,
+                fn($c) => in_array($c['type'], $recTypes, true)
+            ));
+            if (empty($recCandidates)) {
+                $pickType = $recTypes[$chNum % count($recTypes)];
+                $pickCp = COOL_POINT_TYPES[$pickType] ?? null;
+                if ($pickCp !== null) {
+                    $recCandidates = [[
+                        'type'   => $pickType,
+                        'name'   => $pickCp['name'],
+                        'score'  => (float)$pickCp['weight'],
+                        'hunger' => 0.0,
+                    ]];
+                }
+            }
+            if (!empty($recCandidates)) {
+                $candidates = $recCandidates;
             }
         }
 
@@ -2087,18 +2363,20 @@ function calculateCoolPointSchedule(int $startChapter, int $count, array $histor
         // v41 呼吸章：免爽点行
         if (!empty($l['breather'])) {
             $hasBreather = true;
-            $result[] = "  第{$l['chapter']}章 → 🌿蓄力/呼吸章（不安排爽点，专注铺垫/日常/情感/伏笔/世界观，钩子可弱，用悬念或情感留白收尾）";
+            // 明确要求落盘 cool_point_type=breather，供 Gate4 豁免
+            $result[] = "  第{$l['chapter']}章 → 🌿蓄力/呼吸章（cool_point_type=breather；不安排爽点，专注铺垫/日常/情感/伏笔/世界观，钩子可弱）";
             continue;
         }
         $pri  = $l['primary'];
         $sec  = $l['secondary'];
         $flag = in_array($pri['type'], $bigTypes) ? '【大爽点】' : '';
+        $priType = (string)($pri['type'] ?? '');
 
         if ($sec) {
             $secFlag = in_array($sec['type'], $bigTypes) ? '【大爽点】' : '';
-            $result[] = "  第{$l['chapter']}章 → {$pri['name']}{$flag} + {$sec['name']}{$secFlag} 【双爽点】";
+            $result[] = "  第{$l['chapter']}章 → {$pri['name']}{$flag} + {$sec['name']}{$secFlag} 【双爽点】（cool_point_type={$priType}）";
         } else {
-            $result[] = "  第{$l['chapter']}章 → {$pri['name']} {$flag}";
+            $result[] = "  第{$l['chapter']}章 → {$pri['name']} {$flag}（cool_point_type={$priType}）";
         }
     }
 

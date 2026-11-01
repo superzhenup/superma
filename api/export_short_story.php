@@ -1,6 +1,6 @@
 <?php
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 
 while (ob_get_level()) ob_end_clean();
 ini_set('display_errors', '0');
@@ -33,7 +33,7 @@ if (!$story) {
 }
 
 // 审计 P0（2026-06-12）：归属校验
-$sessionUserId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$sessionUserId = currentUserId();
 if ($sessionUserId > 0 && ($story['user_id'] ?? 0) > 0 && (int)$story['user_id'] !== $sessionUserId) {
     http_response_code(403);
     die('无权访问此短篇');
@@ -56,11 +56,10 @@ $lines[] = $content;
 
 $txt = implode("\n", $lines);
 
-$filename = preg_replace('/[^\w\x{4e00}-\x{9fff}]+/u', '_', $title);
-$filename = trim($filename, '_') ?: 'short_story';
-
+// 审计 T3（2026-10-31）：下载文件名统一经 contentDispositionAttachment()
+// （RFC 6266/5987 双文件名），文件名内容保持原意（短篇标题 + .txt）。
 header('Content-Type: text/plain; charset=utf-8');
-header('Content-Disposition: attachment; filename="' . $filename . '.txt"');
+header('Content-Disposition: ' . contentDispositionAttachment($title . '.txt'));
 header('Content-Length: ' . mb_strlen($txt, '8bit'));
 echo $txt;
 exit;

@@ -1,0 +1,60 @@
+# ============================================================
+# 封面图片目录安全配置 — storage/covers/.htaccess
+#
+# 作用：允许浏览器直接访问封面图片，同时禁止任何脚本执行。
+# 场景：用户上传封面图片时，系统已通过 MIME 检查（finfo）和
+#       GD 重编码做了第一道防线；本文件是纵深防御的第二道——
+#       即使 MIME 检查被绕过，Apache 也不会执行 PHP 等脚本。
+#
+# 规则总结：
+#   1. 关闭 PHP 引擎（mod_php）
+#   2. 拒绝所有脚本类型文件（.php / .asp / .py 等）的直接访问
+#   3. 仅允许图片扩展名（.jpg/.png/.webp/.gif）被访问
+#   4. 默认拒绝其他一切文件
+# ============================================================
+
+# ---- 第一道：关闭 PHP 引擎（兼容 mod_php 模式）----
+# 如果 Apache 以 mod_php 方式加载，直接关闭此目录的 PHP 解析
+<IfModule mod_php_module>
+    php_flag engine off
+</IfModule>
+
+# ---- 第二道：拒绝 PHP 系列文件（覆盖 .php/.php3/.php4/.php5/.php7/.phps/.pht/.phtml）----
+<FilesMatch "\.ph(p[3457s]?|t|tml)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# ---- 第三道：拒绝其他常见脚本类型（ASP/CGI/Perl/Python/Shell/JSP）----
+<FilesMatch "\.(asp|cgi|pl|py|sh|bash|jsp)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# ---- 第四道：仅允许图片文件被浏览器直接访问 ----
+# 注意：双扩展名攻击（如 shell.php.jpg）在 GD 重编码后不会残留可执行代码，
+# 此规则额外确保只有真正的图片扩展名能被访问。
+<FilesMatch "^[^.]+\.(jpg|jpeg|png|webp|gif)$">
+    <IfModule mod_authz_core.c>
+        Require all granted
+    </IfModule>
+</FilesMatch>
+
+# ---- 兜底：默认拒绝所有其他文件（包括无扩展名文件）----
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>
+<IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+</IfModule>

@@ -162,39 +162,40 @@ final class CatchphraseRepo
      * 1. 从 catchphrase_callback_log 查找该章节的回调记录
      * 2. 对每个受影响的金句：callback_count-1，last_callback_chapter 回退到上一条日志
      * 3. 删除该章节的 callback_log 记录
+     *
+     * 审计修复 P0（2026-09-27）：移除吞错 catch。此方法只被
+     * ChapterMemoryFinalizer::revertChapterMemory 在 finalize 事务内调用，
+     * 失败必须上抛让主事务回滚并由 postprocess 重试；静默返回 0 会让随后
+     * 的 trackCallbacksInContent 叠加重复回调计数。
      */
     public function revertCallbacksForChapter(int $chapterNumber): int
     {
-        try {
-            $logs = DB::fetchAll(
-                'SELECT catchphrase_id FROM catchphrase_callback_log WHERE novel_id=? AND chapter_number=?',
-                [$this->novelId, $chapterNumber]
+        $logs = DB::fetchAll(
+            'SELECT catchphrase_id FROM catchphrase_callback_log WHERE novel_id=? AND chapter_number=?',
+            [$this->novelId, $chapterNumber]
+        );
+        if (empty($logs)) return 0;
+
+        $affected = 0;
+        foreach ($logs as $log) {
+            $cid = (int)$log['catchphrase_id'];
+
+            $prevLog = DB::fetch(
+                'SELECT chapter_number FROM catchphrase_callback_log WHERE catchphrase_id=? AND novel_id=? AND chapter_number<? ORDER BY chapter_number DESC LIMIT 1',
+                [$cid, $this->novelId, $chapterNumber]
             );
-            if (empty($logs)) return 0;
 
-            $affected = 0;
-            foreach ($logs as $log) {
-                $cid = (int)$log['catchphrase_id'];
+            $newLastCallback = $prevLog ? (int)$prevLog['chapter_number'] : null;
 
-                $prevLog = DB::fetch(
-                    'SELECT chapter_number FROM catchphrase_callback_log WHERE catchphrase_id=? AND novel_id=? AND chapter_number<? ORDER BY chapter_number DESC LIMIT 1',
-                    [$cid, $this->novelId, $chapterNumber]
-                );
-
-                $newLastCallback = $prevLog ? (int)$prevLog['chapter_number'] : null;
-
-                DB::execute(
-                    'UPDATE novel_catchphrases SET callback_count=GREATEST(callback_count-1, 0), last_callback_chapter=? WHERE id=? AND novel_id=?',
-                    [$newLastCallback, $cid, $this->novelId]
-                );
-                $affected++;
-            }
-
-            DB::delete('catchphrase_callback_log', 'novel_id=? AND chapter_number=?', [$this->novelId, $chapterNumber]);
-
-            return $affected;
-        } catch (\Throwable $e) {
-            return 0;
+            DB::execute(
+                'UPDATE novel_catchphrases SET callback_count=GREATEST(callback_count-1, 0), last_callback_chapter=? WHERE id=? AND novel_id=?',
+                [$newLastCallback, $cid, $this->novelId]
+            );
+            $affected++;
         }
+
+        DB::delete('catchphrase_callback_log', 'novel_id=? AND chapter_number=?', [$this->novelId, $chapterNumber]);
+
+        return $affected;
     }
 }

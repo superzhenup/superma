@@ -2,8 +2,16 @@
 define('APP_LOADED', true);
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/includes/auth.php';
-if (isInstalled() && PHP_SAPI !== 'cli') {
-    requireLogin();
+if (PHP_SAPI !== 'cli') {
+    if (isInstalled()) {
+        requireLogin();
+    }
+    $debugOn = defined('APP_DEBUG') && APP_DEBUG;
+    $diagOn = defined('CFG_DIAGNOSTIC_ENABLED') && CFG_DIAGNOSTIC_ENABLED;
+    if (!$debugOn && !$diagOn) {
+        http_response_code(404);
+        exit('Not found.');
+    }
 }
 require_once __DIR__ . '/includes/helpers.php';
 require_once __DIR__ . '/includes/quality/Gates.php';

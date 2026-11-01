@@ -134,6 +134,9 @@ function getAIClient(?int $modelId = null): AIClient {
     }
 
     if (!$model) throw new RuntimeException('请先在【模型设置】中添加至少一个AI模型。');
+    if (class_exists('ChapterRunFrozenConfigScope', false)) {
+        ChapterRunFrozenConfigScope::assertModelSelection($modelId, $model);
+    }
     return new AIClient($model);
 }
 
@@ -152,6 +155,9 @@ function getModelFallbackList(?int $preferredModelId = null, ?string $taskType =
     $all = DB::fetchAll('SELECT * FROM ai_models ORDER BY is_default DESC, id ASC');
     if (empty($all)) {
         throw new RuntimeException('请先在【模型设置】中添加至少一个AI模型。');
+    }
+    if (class_exists('ChapterRunFrozenConfigScope', false)) {
+        ChapterRunFrozenConfigScope::assertModelRows($all);
     }
 
     // 如果没有指定任务类型，使用原有逻辑
@@ -255,7 +261,7 @@ function withModelFallback(
                 // 审计修复 M-NEW-2（2026-06-15）：心跳回调用 try-catch 包裹，
                 // 防止回调抛异常穿透 fallback 链导致后续模型不被尝试。
                 for ($s = 0; $s < $delay; $s++) {
-                    sleep(1);
+                    HarnessRuntime::sleepSeconds(1);
                     try {
                         // 审计优化 P2-1（2026-06-16）：优先使用显式注入的 $waitingCb
                         if ($onSwitch !== null && $waitingCb !== null) {
@@ -271,6 +277,11 @@ function withModelFallback(
 
             try {
                 return $callback($ai);
+            } catch (AIRequestCanceledException $e) {
+                // 审计修复（2026-08-30）：用户主动取消必须直通，绝不能切换到
+                // 下一个模型继续生成——否则取消语义失效，浪费 token 且用户
+                // 无法停止写作。取消同样不适用 429 重试。
+                throw $e;
             } catch (RuntimeException $e) {
                 $msg = $e->getMessage();
 
@@ -287,7 +298,14 @@ function withModelFallback(
         if ($lastError && strpos($lastError->getMessage(), '(429)') === false) {
             if ($idx + 1 < count($models) && $onSwitch !== null) {
                 $nextAi = new AIClient($models[$idx + 1]);
-                $onSwitch($nextAi, $lastError->getMessage());
+                // 审计修复（2026-08-02 F2）：原实现把 AI 异常原始消息直接传给 onSwitch 回调，
+                // 被 9+ 个端点的 SSE model_switch 事件原样回传浏览器，绕过 sanitizeAiErrorMessage
+                // 脱敏（provider 原始消息可含 sk-... API key 前缀、内部 endpoint、错误 JSON）。
+                // 统一在出口处脱敏，一处修复覆盖全部端点。
+                $safeErrMsg = function_exists('sanitizeAiErrorMessage')
+                    ? sanitizeAiErrorMessage($lastError->getMessage())
+                    : '模型切换';
+                $onSwitch($nextAi, $safeErrMsg);
             }
         }
     }

@@ -243,6 +243,7 @@ foreach ($characters as $c) {
           <?php foreach ($characters as $c):
             $attrs = !empty($c['attributes']) ? (json_decode($c['attributes'], true) ?: []) : [];
             $role = (string)($c['title'] ?? ($attrs['角色类型'] ?? '普通配角'));
+            $realm = (string)($attrs['realm'] ?? '');
             $personality = (string)($attrs['性格'] ?? $attrs['描述'] ?? '');
             $background = (string)($attrs['背景'] ?? '');
             $appearance = (string)($attrs['外貌'] ?? '');
@@ -253,6 +254,7 @@ foreach ($characters as $c) {
           <div class="char-card" data-id="<?= (int)$c['id'] ?>"
                data-name="<?= h($c['name']) ?>"
                data-role="<?= h($role) ?>"
+               data-realm="<?= h($realm) ?>"
                data-personality="<?= h($personality) ?>"
                data-background="<?= h($background) ?>"
                data-appearance="<?= h($appearance) ?>">
@@ -266,8 +268,9 @@ foreach ($characters as $c) {
                 <button class="btn btn-outline-danger btn-del-char" title="删除"><i class="bi bi-trash"></i></button>
               </div>
             </div>
-            <?php if ($personality || $background || $appearance): ?>
+            <?php if ($realm || $personality || $background || $appearance): ?>
             <div class="char-attrs">
+              <?php if ($realm): ?><div><b>境界：</b><?= h(mb_substr($realm,0,20)) ?></div><?php endif; ?>
               <?php if ($personality): ?><div><b>性格：</b><?= h(mb_substr($personality,0,40)) ?></div><?php endif; ?>
               <?php if ($background): ?><div><b>背景：</b><?= h(mb_substr($background,0,40)) ?></div><?php endif; ?>
               <?php if ($appearance): ?><div><b>外貌：</b><?= h(mb_substr($appearance,0,40)) ?></div><?php endif; ?>
@@ -377,6 +380,16 @@ foreach ($characters as $c) {
         </select>
       </div>
       <div class="cm-field">
+        <!-- 审计修复（2026-08-16 P1，B5）：补境界输入，打通 PowerSystem 等级对标链路 -->
+        <label>境界 / 等级</label>
+        <input type="text" id="f-realm" maxlength="40" autocomplete="off" list="f-realm-list" placeholder="（可选）如：炼气、武者、S级、一阶">
+        <datalist id="f-realm-list">
+          <option value="炼气"></option><option value="筑基"></option><option value="金丹"></option>
+          <option value="武者"></option><option value="武师"></option>
+          <option value="S级"></option><option value="一阶"></option><option value="斗者"></option>
+        </datalist>
+      </div>
+      <div class="cm-field">
         <label>性格</label>
         <textarea id="f-personality" rows="2"></textarea>
       </div>
@@ -396,7 +409,7 @@ foreach ($characters as $c) {
   </div>
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 (function(){
   var novelId = <?= (int)$novelId ?>;
   var streaming = false;
@@ -419,6 +432,7 @@ foreach ($characters as $c) {
     document.getElementById('f-id').value          = data && data.id ? data.id : '';
     document.getElementById('f-name').value        = data && data.name ? data.name : '';
     document.getElementById('f-role').value        = data && data.role ? data.role : '普通配角';
+    document.getElementById('f-realm').value       = data && data.realm ? data.realm : '';
     document.getElementById('f-personality').value = data && data.personality ? data.personality : '';
     document.getElementById('f-background').value  = data && data.background ? data.background : '';
     document.getElementById('f-appearance').value  = data && data.appearance ? data.appearance : '';
@@ -439,6 +453,7 @@ foreach ($characters as $c) {
         id: card.dataset.id,
         name: card.dataset.name,
         role: card.dataset.role,
+        realm: card.dataset.realm,
         personality: card.dataset.personality,
         background: card.dataset.background,
         appearance: card.dataset.appearance,
@@ -468,6 +483,7 @@ foreach ($characters as $c) {
       char_id: parseInt(document.getElementById('f-id').value) || 0,
       name: name,
       title: document.getElementById('f-role').value,
+      realm: document.getElementById('f-realm').value.trim(),
       personality: document.getElementById('f-personality').value.trim(),
       background: document.getElementById('f-background').value.trim(),
       appearance: document.getElementById('f-appearance').value.trim(),

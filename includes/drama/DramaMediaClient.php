@@ -146,6 +146,7 @@ final class DramaMediaClient
         $security = self::assertSafeEndpoint($url);
         $content = false;
         $bytes = 0;
+        $tooLarge = false;
 
         $options = [
             CURLOPT_RETURNTRANSFER => true,
@@ -158,9 +159,12 @@ final class DramaMediaClient
             CURLOPT_PROTOCOLS      => CURLPROTO_HTTPS,
             CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
             CURLOPT_RESOLVE        => $security['resolve'],
-            CURLOPT_WRITEFUNCTION  => function ($ch, string $chunk) use (&$content, &$bytes, $maxBytes) {
+            CURLOPT_WRITEFUNCTION  => function ($ch, string $chunk) use (&$content, &$bytes, &$tooLarge, $maxBytes) {
                 $bytes += strlen($chunk);
-                if ($bytes > $maxBytes) return 0;
+                if ($bytes > $maxBytes) {
+                    $tooLarge = true;
+                    return 0;
+                }
                 $content = ($content === false ? '' : $content) . $chunk;
                 return strlen($chunk);
             },
@@ -170,11 +174,13 @@ final class DramaMediaClient
         }
         $ch = curl_init($url);
         curl_setopt_array($ch, $options);
-        curl_exec($ch);
+        $ok = curl_exec($ch);
         $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
         curl_close($ch);
 
-        if ($content === false || $content === '' || $httpCode < 200 || $httpCode >= 300) {
+        if ($tooLarge) throw new RuntimeException('媒体文件超过大小限制');
+        if ($ok === false || $error !== '' || $content === false || $content === '' || $httpCode < 200 || $httpCode >= 300) {
             throw new RuntimeException('下载媒体文件失败');
         }
         return self::saveCheckedMedia($content, $destBasePath, $allowedMimes, $maxBytes);

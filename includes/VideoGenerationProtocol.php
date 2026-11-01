@@ -20,18 +20,22 @@ final class VideoGenerationProtocol
         'volcengine_seedance' => [
             'label'        => '即梦 Seedance（火山方舟）',
             'default_base' => 'https://ark.cn-beijing.volces.com/api/v3',
+            'default_model' => 'doubao-seedance-1-0-pro-250528',
         ],
         'kling' => [
             'label'        => '可灵 Kling',
             'default_base' => 'https://api.klingai.com',
+            'default_model' => 'kling-v2-1',
         ],
         'vidu' => [
             'label'        => 'Vidu',
-            'default_base' => 'https://api.vidu.cn',
+            'default_base' => 'https://api.vidu.com',
+            'default_model' => 'viduq3-turbo',
         ],
         'wanx' => [
             'label'        => '通义万相（DashScope）',
             'default_base' => 'https://dashscope.aliyuncs.com',
+            'default_model' => 'wan2.6-i2v-flash',
         ],
     ];
 
@@ -51,6 +55,12 @@ final class VideoGenerationProtocol
     {
         $provider = self::normalizeProvider($provider);
         return self::PROVIDERS[$provider]['default_base'];
+    }
+
+    public static function defaultModel(string $provider): string
+    {
+        $provider = self::normalizeProvider($provider);
+        return self::PROVIDERS[$provider]['default_model'];
     }
 
     public static function normalizeBaseUrl(string $apiUrl): string
@@ -143,11 +153,17 @@ final class VideoGenerationProtocol
     /** @return string[] */
     public static function submitHeaders(string $provider, string $apiKey): array
     {
+        $provider = self::normalizeProvider($provider);
+        $authorization = match ($provider) {
+            'vidu' => 'Authorization: Token ' . $apiKey,
+            'kling' => 'Authorization: Bearer ' . self::klingBearerToken($apiKey),
+            default => 'Authorization: Bearer ' . $apiKey,
+        };
         $headers = [
             'Content-Type: application/json',
-            'Authorization: Bearer ' . $apiKey,
+            $authorization,
         ];
-        if (self::normalizeProvider($provider) === 'wanx') {
+        if ($provider === 'wanx') {
             $headers[] = 'X-DashScope-Async: enable';
         }
         return $headers;
@@ -189,7 +205,39 @@ final class VideoGenerationProtocol
     /** 轮询一律 GET，无请求体。 */
     public static function queryHeaders(string $provider, string $apiKey): array
     {
-        return ['Authorization: Bearer ' . $apiKey];
+        $provider = self::normalizeProvider($provider);
+        return [match ($provider) {
+            'vidu' => 'Authorization: Token ' . $apiKey,
+            'kling' => 'Authorization: Bearer ' . self::klingBearerToken($apiKey),
+            default => 'Authorization: Bearer ' . $apiKey,
+        }];
+    }
+
+    /**
+     * Kling 官方鉴权使用 AK/SK 生成短时 HS256 JWT。
+     * 配置支持 `access_key:secret_key`；若直接传入 JWT，则保持兼容。
+     */
+    private static function klingBearerToken(string $credential): string
+    {
+        $credential = trim($credential);
+        if (!str_contains($credential, ':')) return $credential;
+
+        [$accessKey, $secretKey] = explode(':', $credential, 2);
+        if ($accessKey === '' || $secretKey === '') return $credential;
+        $now = time();
+        $header = self::base64UrlEncode(json_encode(['alg' => 'HS256', 'typ' => 'JWT'], JSON_UNESCAPED_SLASHES));
+        $payload = self::base64UrlEncode(json_encode([
+            'iss' => $accessKey,
+            'exp' => $now + 1800,
+            'nbf' => $now - 5,
+        ], JSON_UNESCAPED_SLASHES));
+        $signature = self::base64UrlEncode(hash_hmac('sha256', $header . '.' . $payload, $secretKey, true));
+        return $header . '.' . $payload . '.' . $signature;
+    }
+
+    private static function base64UrlEncode(string $value): string
+    {
+        return rtrim(strtr(base64_encode($value), '+/', '-_'), '=');
     }
 
     /**

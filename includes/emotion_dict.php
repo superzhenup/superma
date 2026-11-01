@@ -356,8 +356,8 @@ class EmotionDictionary
         $angerDensity = $density['anger_density'] ?? 0;
         $angerTarget = $targets['anger'];
         if ($angerDensity < $angerTarget * 0.6) {
-            $evaluation['issues'][] = "愤怒类词汇密度不足（实际{$angerDensity}，目标{$angerTarget}）";
-            $evaluation['suggestions'][] = "建议增加愤怒、怒火、恼怒等词汇的使用";
+            $evaluation['issues'][] = "愤怒类可见情绪反应不足（实际{$angerDensity}，目标{$angerTarget}）";
+            $evaluation['suggestions'][] = "建议增加愤怒相关的可见反应（握拳/咬牙/眼眶发热等），禁止堆砌直述情绪词";
             $evaluation['overall_score'] -= 15;
         } elseif ($angerDensity > $angerTarget * 1.5) {
             $evaluation['issues'][] = "愤怒类词汇密度过高（实际{$angerDensity}，目标{$angerTarget}）";
@@ -369,8 +369,8 @@ class EmotionDictionary
         $joyDensity = $density['joy_density'] ?? 0;
         $joyTarget = $targets['joy'];
         if ($joyDensity < $joyTarget * 0.6) {
-            $evaluation['issues'][] = "喜悦类词汇密度不足（实际{$joyDensity}，目标{$joyTarget}）";
-            $evaluation['suggestions'][] = "建议增加喜悦、高兴、兴奋等词汇的使用";
+            $evaluation['issues'][] = "喜悦类可见情绪反应不足（实际{$joyDensity}，目标{$joyTarget}）";
+            $evaluation['suggestions'][] = "建议增加喜悦相关的可见反应（嘴角/步伐/呼吸等），禁止堆砌直述情绪词";
             $evaluation['overall_score'] -= 15;
         } elseif ($joyDensity > $joyTarget * 1.5) {
             $evaluation['issues'][] = "喜悦类词汇密度过高（实际{$joyDensity}，目标{$joyTarget}）";
@@ -381,8 +381,8 @@ class EmotionDictionary
         $surpriseDensity = $density['surprise_density'] ?? 0;
         $surpriseTarget = $targets['surprise'];
         if ($surpriseDensity < $surpriseTarget * 0.6) {
-            $evaluation['issues'][] = "惊讶类词汇密度不足（实际{$surpriseDensity}，目标{$surpriseTarget}）";
-            $evaluation['suggestions'][] = "建议增加惊讶、震惊、意外等词汇的使用";
+            $evaluation['issues'][] = "惊讶类可见情绪反应不足（实际{$surpriseDensity}，目标{$surpriseTarget}）";
+            $evaluation['suggestions'][] = "建议增加惊讶相关的可见反应（愣住/瞳孔/后退等），禁止堆砌直述情绪词";
             $evaluation['overall_score'] -= 10;
         }
         

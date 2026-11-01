@@ -13,49 +13,9 @@ require_once __DIR__ . '/includes/functions.php';
 require_once __DIR__ . '/includes/layout.php';
 require_once __DIR__ . '/includes/wizard/schema.php';
 
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 
-try {
-    DB::execute("CREATE TABLE IF NOT EXISTS `novel_wizard_progress` (
-        `novel_id` INT UNSIGNED PRIMARY KEY,
-        `current_stage` VARCHAR(20) NOT NULL DEFAULT 'topic',
-        `completed_stages` JSON DEFAULT NULL,
-        `metadata` JSON DEFAULT NULL,
-        `started_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        `last_active` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-
-    DB::execute("CREATE TABLE IF NOT EXISTS `novel_wizard_chats` (
-        `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-        `novel_id` INT UNSIGNED NOT NULL,
-        `stage` VARCHAR(20) NOT NULL,
-        `role` ENUM('user','assistant','system') NOT NULL,
-        `content` MEDIUMTEXT NOT NULL,
-        `model_id` INT UNSIGNED DEFAULT NULL,
-        `tokens` INT UNSIGNED DEFAULT 0,
-        `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        INDEX `idx_novel_stage` (`novel_id`, `stage`, `created_at`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-
-    DB::execute("CREATE TABLE IF NOT EXISTS `volume_outlines` (
-        `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-        `novel_id` INT UNSIGNED NOT NULL,
-        `volume_index` INT UNSIGNED NOT NULL,
-        `title` VARCHAR(200) DEFAULT '',
-        `theme` TEXT DEFAULT NULL,
-        `chapter_from` INT UNSIGNED DEFAULT 1,
-        `chapter_to` INT UNSIGNED DEFAULT 50,
-        `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX `idx_novel` (`novel_id`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-
-    // 兼容旧 install.php 创建的表结构（迁移逻辑见 includes/wizard/schema.php 单一来源）
-    wizardMigrateVolumeOutlines();
-} catch (Throwable $e) {
-    error_log('novel_wizard.php table creation failed: ' . $e->getMessage());
-}
-
+// 向导表与列由统一迁移建立（Schema + ColumnMigrations v71），页面请求不执行 DDL。
 wizardEnsureSchema();
 
 $STAGES = wizardStages();

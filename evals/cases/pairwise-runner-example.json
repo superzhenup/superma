@@ -1,0 +1,66 @@
+{
+  "schema": "harness.eval.pairwise.input.v1",
+  "suite_version": "novel_pairwise_suite_v1",
+  "fixture_version": "synthetic_examples_v1",
+  "fixture_provenance": "synthetic",
+  "seed": 41,
+  "rubric": {
+    "version": "novel_rubric_v1",
+    "text": "Compare A and B only. Judge canon causality, outline and foreshadowing, voice and POV, immersion, pacing, freshness, naturalness, and read-on intent. Return concise evidence grounded in the supplied text.",
+    "dimensions": [
+      "canon_causality",
+      "outline_foreshadow",
+      "voice_pov",
+      "immersion",
+      "pacing",
+      "freshness",
+      "naturalness",
+      "read_on_intent"
+    ]
+  },
+  "baseline": {
+    "id": "legacy_v1",
+    "workflow_version": "legacy_workflow_v1",
+    "model": "writer-model-v1",
+    "prompt_manifest_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+    "artifact_manifest_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+    "p95_latency_ms": 1000
+  },
+  "candidate": {
+    "id": "harness_v2",
+    "workflow_version": "chapter_generate_v1",
+    "model": "writer-model-v2",
+    "prompt_manifest_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+    "artifact_manifest_hash": "4444444444444444444444444444444444444444444444444444444444444444",
+    "p95_latency_ms": 1120
+  },
+  "judge": {
+    "model": "judge-model-v1",
+    "system_prompt": "You are a blind fiction-quality judge. You do not know Writer identities. Return only a JSON object with label (a, b, or tie), evidence, and confidence from 0 to 1. Never include hidden reasoning or credentials."
+  },
+  "limits": {
+    "trials_per_case": 3,
+    "max_cases": 2,
+    "max_case_characters": 5000,
+    "max_total_characters": 10000,
+    "max_requests": 6,
+    "max_input_tokens_per_request": 10000,
+    "max_total_input_tokens": 60000,
+    "max_output_tokens_per_request": 128,
+    "max_total_output_tokens": 768
+  },
+  "cases": [
+    {
+      "id": "synthetic_case_01",
+      "category": "canon_causality",
+      "baseline_content": "The courier opened the sealed gate without using the key introduced in the previous scene.",
+      "candidate_content": "The courier pressed the brass key into the seal; the gate opened only after the old oath was spoken."
+    },
+    {
+      "id": "synthetic_case_02",
+      "category": "pacing",
+      "baseline_content": "They discussed the plan for a long time, repeated it, and eventually walked toward the tower.",
+      "candidate_content": "The tower bell cut their argument short. They chose the eastern stair and ran before the guards turned the corner."
+    }
+  ]
+}

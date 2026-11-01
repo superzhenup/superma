@@ -1,5 +1,6 @@
 <?php
 defined('APP_LOADED') or die('Direct access denied.');
+require_once __DIR__ . '/CharacterCardReplay.php';
 
 /**
  * ================================================================
@@ -12,6 +13,9 @@ defined('APP_LOADED') or die('Direct access denied.');
 final class CharacterCardRepo
 {
     private int $novelId;
+    private array $writtenHistoryIds = [];
+    private bool $replaying = false;
+    private static int $scopeSequence = 0;
 
     public function __construct(int $novelId)
     {
@@ -74,7 +78,50 @@ final class CharacterCardRepo
      * @param int    $chapterNum  本次更新是哪一章触发的
      * @return int                card_id
      */
-    public function upsert(string $name, array $updates, int $chapterNum): int
+    public function upsert(string $name, array $updates, int $chapterNum, string $source = 'manual'): int
+    {
+        if (!in_array($source, ['manual', 'chapter', 'baseline'], true)) {
+            throw new InvalidArgumentException('Invalid character card source');
+        }
+        return $this->atomic(function () use ($name, $updates, $chapterNum, $source): int {
+            $name = trim($name);
+            $before = DB::fetch('SELECT * FROM character_cards WHERE novel_id=? AND name=? FOR UPDATE', [$this->novelId, $name]);
+            if ($source === 'chapter' && $before && $this->replaying) {
+                // An explicit human override remains authoritative during replay.
+                foreach ($this->revisionEvents((int)$before['id']) as $event) {
+                    if ($event['source'] !== 'manual') continue;
+                    foreach ($event['updates'] as $field => $value) {
+                        if (in_array($field, ['attributes', 'voice_profile'], true) && is_array($value)) {
+                            if (isset($updates[$field]) && is_array($updates[$field])) {
+                                $updates[$field] = array_diff_key($updates[$field], $value);
+                            }
+                        } else {
+                            unset($updates[$field]);
+                        }
+                    }
+                }
+            }
+            $this->writtenHistoryIds = [];
+            $id = $this->applyUpsert($name, $updates, $chapterNum);
+            $after = DB::fetch('SELECT * FROM character_cards WHERE id=? AND novel_id=?', [$id, $this->novelId]);
+            $historyIds = $this->writtenHistoryIds;
+            if ($source === 'manual' && $before) {
+                // The editor submits the entire visible card. Unchanged AI
+                // facts in that form must not become new human-owned facts.
+                $updates = self::changedUpdates(CharacterCardReplay::snapshot($before), CharacterCardReplay::snapshot($after));
+                if ($updates === []) return $id;
+            }
+            $this->writeRevision($id, $chapterNum, CharacterCardReplay::snapshot($before ?: null), [
+                'source' => $source,
+                'updates' => $updates,
+                'after' => CharacterCardReplay::snapshot($after),
+                'history_ids' => $historyIds,
+            ]);
+            return $id;
+        });
+    }
+
+    private function applyUpsert(string $name, array $updates, int $chapterNum): int
     {
         $name = trim($name);
         if ($name === '') {
@@ -312,7 +359,7 @@ final class CharacterCardRepo
         return DB::fetchAll(
             'SELECT chapter_number, field_name, old_value, new_value, created_at
              FROM character_card_history
-             WHERE card_id=? ORDER BY chapter_number DESC, id DESC LIMIT ' . (int)$limit,
+             WHERE card_id=? AND field_name<>"_card_revision_v1" ORDER BY chapter_number DESC, id DESC LIMIT ' . (int)$limit,
             [$cardId]
         );
     }
@@ -334,9 +381,175 @@ final class CharacterCardRepo
 
     // ---------- 内部辅助 ----------
 
+    /** Must run before any replacement summaries are ingested, in the finalizer transaction. */
+    public function rewindFromChapter(int $fromChapter): void
+    {
+        $replacing = false;
+        $this->atomic(function () use ($fromChapter, &$replacing): void {
+            $cards = DB::fetchAll('SELECT * FROM character_cards WHERE novel_id=? ORDER BY id FOR UPDATE', [$this->novelId]);
+            foreach ($cards as $card) {
+                $id = (int)$card['id'];
+                $history = DB::fetchAll('SELECT * FROM character_card_history WHERE card_id=? ORDER BY id', [$id]);
+                // Old UI seeds used a positive appearance chapter. They remain
+                // recoverable only when every stored fact exactly matches the
+                // independently retained character definition.
+                if ($this->isLegacyDefinitionSeed($card, $history)) {
+                    $state = CharacterCardReplay::snapshot($card);
+                    $this->writeRevision($id, 0, null, ['source' => 'baseline', 'updates' => $state, 'after' => $state, 'history_ids' => [(int)$history[0]['id']]]);
+                    $history = DB::fetchAll('SELECT * FROM character_card_history WHERE card_id=? ORDER BY id', [$id]);
+                }
+                $plan = CharacterCardReplay::rewind($card, $history, $fromChapter);
+                $replacing = $replacing || $plan['removed'] !== [];
+                if ($plan['state'] === null) {
+                    $this->delete($id);
+                    continue;
+                }
+                foreach (array_chunk($plan['removed'], 200) as $ids) {
+                    DB::execute('DELETE FROM character_card_history WHERE card_id=? AND id IN (' . implode(',', array_fill(0, count($ids), '?')) . ')', array_merge([$id], $ids));
+                }
+                foreach ($plan['retained'] as $event) {
+                    $this->writtenHistoryIds = [];
+                    $this->writeDisplayHistory($id, $event['chapter'], $event['before'], $event['after'], (string)$card['name']);
+                    $event['history_ids'] = $this->writtenHistoryIds;
+                    $this->writeRevision($id, $event['chapter'], $event['before'], $event, $event['id']);
+                }
+                DB::update('character_cards', self::storageState($plan['state']), 'id=? AND novel_id=?', [$id, $this->novelId]);
+            }
+        });
+        $this->replaying = $replacing;
+    }
+
+    /** Explicit recovery only: replace an individually reviewed pre-replay card baseline. */
+    public function confirmReplayBaseline(int $cardId, array $data): int
+    {
+        return $this->atomic(function () use ($cardId, $data): int {
+            $card = DB::fetch('SELECT * FROM character_cards WHERE id=? AND novel_id=? FOR UPDATE', [$cardId, $this->novelId]);
+            if (!$card) throw new RuntimeException('人物卡不存在');
+            foreach (['title', 'status', 'alive', 'attributes'] as $field) {
+                if (!array_key_exists($field, $data)) throw new InvalidArgumentException('请完整确认人物基线字段');
+            }
+            if (!is_array($data['attributes'])) throw new InvalidArgumentException('人物属性格式无效');
+            // The card editor does not edit voice settings; preserve those explicitly.
+            $data['voice_profile'] = CharacterCardReplay::snapshot($card)['voice_profile'];
+            $state = CharacterCardReplay::apply(null, $data, 0);
+            DB::update('character_cards', self::storageState($state), 'id=? AND novel_id=?', [$cardId, $this->novelId]);
+            DB::execute('DELETE FROM character_card_history WHERE card_id=?', [$cardId]);
+            $this->writtenHistoryIds = [];
+            $this->writeDisplayHistory($cardId, 0, null, $state, (string)$card['name']);
+            $this->writeRevision($cardId, 0, null, ['source' => 'baseline', 'updates' => $data, 'after' => $state, 'history_ids' => $this->writtenHistoryIds]);
+            return $cardId;
+        });
+    }
+
+    private function revisionEvents(int $cardId): array
+    {
+        return array_map([CharacterCardReplay::class, 'decode'], DB::fetchAll(
+            'SELECT * FROM character_card_history WHERE card_id=? AND field_name=? ORDER BY id',
+            [$cardId, CharacterCardReplay::EVENT]
+        ));
+    }
+
+    private function isLegacyDefinitionSeed(array $card, array $history): bool
+    {
+        if (count($history) !== 1 || $history[0]['field_name'] !== 'created') return false;
+        $state = CharacterCardReplay::snapshot($card);
+        if ($state['status'] !== null || $state['alive'] !== 1 || $state['voice_profile'] !== []) return false;
+        $clip = static fn($value, $limit = 40) => mb_substr(trim((string)$value), 0, $limit);
+        $novel = DB::fetch('SELECT protagonist_name, protagonist_info FROM novels WHERE id=?', [$this->novelId]);
+        if (trim((string)($novel['protagonist_name'] ?? '')) === $card['name']) {
+            $info = $clip($novel['protagonist_info'] ?? '', 60);
+            if ($state['title'] === '主角' && $state['attributes'] === ($info !== '' ? ['设定' => $info] : [])) return true;
+        }
+        $definition = DB::fetch('SELECT role_type, gender, personality, abilities, appearance FROM novel_characters WHERE novel_id=? AND name=? ORDER BY id LIMIT 1', [$this->novelId, $card['name']]);
+        if (!$definition) return false;
+        $attributes = [];
+        foreach (['gender' => '性别', 'personality' => '性格', 'abilities' => '能力', 'appearance' => '外貌'] as $field => $label) {
+            $value = $clip($definition[$field] ?? '', $field === 'gender' ? 10 : 40);
+            if ($value !== '') $attributes[$label] = $value;
+        }
+        ksort($attributes);
+        $titles = ['protagonist' => '主角', 'major' => '主要角色', 'minor' => '配角', 'background' => '背景角色'];
+        return $state['title'] === ($titles[$definition['role_type']] ?? '配角') && $state['attributes'] === $attributes;
+    }
+
+    private function writeRevision(int $cardId, int $chapter, ?array $before, array $event, ?int $id = null): void
+    {
+        unset($event['before'], $event['id'], $event['chapter']);
+        $data = [
+            'old_value' => json_encode($before, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+            'new_value' => json_encode($event, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+        ];
+        if ($id !== null) {
+            DB::update('character_card_history', $data, 'id=? AND card_id=?', [$id, $cardId]);
+        } else {
+            DB::insert('character_card_history', $data + ['card_id' => $cardId, 'chapter_number' => $chapter, 'field_name' => CharacterCardReplay::EVENT]);
+        }
+    }
+
+    private function writeDisplayHistory(int $id, int $chapter, ?array $before, array $after, string $name): void
+    {
+        if ($before === null) {
+            $this->logHistory($id, $chapter, 'created', null, "$name 首次登场");
+            return;
+        }
+        foreach (['title', 'status', 'alive', 'attributes', 'voice_profile'] as $field) {
+            if ($before[$field] === $after[$field]) continue;
+            $encode = static fn($value) => is_scalar($value) ? (string)$value : json_encode($value, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+            $this->logHistory($id, $chapter, $field, $encode($before[$field]), $encode($after[$field]));
+        }
+    }
+
+    private static function storageState(array $state): array
+    {
+        foreach (['attributes', 'voice_profile'] as $field) {
+            $state[$field] = json_encode($state[$field], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        }
+        return $state;
+    }
+
+    private static function changedUpdates(array $before, array $after): array
+    {
+        $updates = [];
+        foreach (['title', 'status', 'alive'] as $field) {
+            if ($before[$field] !== $after[$field]) $updates[$field] = $after[$field];
+        }
+        foreach (['attributes', 'voice_profile'] as $field) {
+            foreach ($after[$field] as $key => $value) {
+                if (!array_key_exists($key, $before[$field]) || $before[$field][$key] !== $value) {
+                    $updates[$field][$key] = $value;
+                }
+            }
+        }
+        return $updates;
+    }
+
+    private function atomic(callable $operation): mixed
+    {
+        $pdo = DB::getPdo();
+        $own = !$pdo->inTransaction();
+        $savepoint = 'sp_card_' . (++self::$scopeSequence);
+        if ($own) $pdo->beginTransaction();
+        else $pdo->exec("SAVEPOINT {$savepoint}");
+        try {
+            $result = $operation();
+            if ($own) $pdo->commit();
+            else $pdo->exec("RELEASE SAVEPOINT {$savepoint}");
+            return $result;
+        } catch (Throwable $error) {
+            if ($pdo->inTransaction()) {
+                if ($own) $pdo->rollBack();
+                else {
+                    $pdo->exec("ROLLBACK TO SAVEPOINT {$savepoint}");
+                    $pdo->exec("RELEASE SAVEPOINT {$savepoint}");
+                }
+            }
+            throw $error;
+        }
+    }
+
     private function logHistory(int $cardId, int $chapter, string $field, ?string $old, ?string $new): void
     {
-        DB::insert('character_card_history', [
+        $this->writtenHistoryIds[] = (int)DB::insert('character_card_history', [
             'card_id'        => $cardId,
             'chapter_number' => $chapter,
             'field_name'     => $field,

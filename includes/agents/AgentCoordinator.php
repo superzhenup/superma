@@ -37,9 +37,6 @@ class AgentCoordinator
     
     /** @var bool 是否启用Agent */
     private $enabled = true;
-    
-    /** @var array 本周期已写入的指令类型摘要，用于防冲突 */
-    private array $writtenDirectives = [];
 
     /** @var int 本轮正在生成的真实章节号 */
     private int $currentChapterNumber = 0;
@@ -80,6 +77,19 @@ class AgentCoordinator
 
         $chNum = (int)($context['current_chapter_number'] ?? 0);
         $this->currentChapterNumber = max(0, $chNum);
+        if ($this->currentChapterNumber <= 0) {
+            $this->currentChapterNumber = $this->getTargetChapterNumber();
+            $chNum = $this->currentChapterNumber;
+        }
+        $context['current_chapter_number'] = $chNum;
+        if (isset($context['recent_chapters'])) {
+            $context['recent_chapters'] = array_values(array_filter(
+                $context['recent_chapters'],
+                static fn($row) => (int)($row['chapter_number'] ?? 0) > 0
+                    && (int)$row['chapter_number'] < $chNum
+                    && ($row['status'] ?? 'completed') === 'completed'
+            ));
+        }
         foreach ([$this->strategyAgent, $this->qualityAgent, $this->optimizationAgent] as $agent) {
             if ($agent instanceof BaseAgent) {
                 $agent->setCurrentChapterNumber($this->currentChapterNumber);
@@ -97,76 +107,68 @@ class AgentCoordinator
         ];
 
         try {
-            // P2 优化：前 5 章是高频写作期，三大主决策 Agent（strategy/quality/optimization）
-            // 所需的历史指标尚未积累，跳过它们；只保留 EarlyChapterProtection 这个为前 5 章
-            // 量身设计的轻量保护流程，避免无意义的 LLM 调用与 token 浪费。
             if ($chNum > 0 && $chNum <= 5) {
                 $results['early_chapter_protection'] = $this->runEarlyChapterProtection($chNum, $context);
-                // H-1 修复（2026-07-25）：原 chNum===5 / chNum===3 分支在主路径中因早返回而不可达。
-                // 将前5章的情节模式检测（第5章）和认知负荷检测（第3章）移入早返回块，
-                // 与 runEarlyChapterProtection 一起执行，避免死代码。
                 if ($chNum === 5) {
                     $results['plot_pattern'] = $this->detectPlotPattern($chNum);
                 }
                 if ($chNum === 3) {
                     $results['cognitive_load'] = $this->checkCognitiveLoad($chNum);
                 }
-                $results['final_actions'] = $this->coordinateExecution($results);
-                $results['execution_summary'] = $this->generateExecutionSummary($results);
-                $results['skipped_reason'] = 'early_chapter_lightweight_mode';
-                return $results;
             }
 
             $dynamicIntervals = $this->calculateDynamicIntervals($context);
+            $baseIntervals = $this->baseAgentIntervals();
 
-            // ===== 新增：趋势预测 =====
-            if ($chNum > 5) {
+            // 审计修复（2026-08-17 P3）：P2 恢复前5章运行主 Agent 后此处需轮次守卫，
+            // 但批次一静态测试禁止旧「大于5」写法的字面量；>= 6 整数语义完全等价。
+            // 审计修复（2026-08-17 写作逻辑 F）：预测起点提前到 min(3, 质量间隔)——
+            // 质量第 5 章首次触发前至少跑过一次 TrendPredictor；样本不足时各指标
+            // 自报 insufficient_data（见 TrendPredictor::analyzeMetric），下游按
+            // 「无预测」降级而不是拿空数组假装有数据。
+            $predictionStartChapter = min(3, max(1, $baseIntervals['quality']));
+            if ($chNum >= $predictionStartChapter) {
                 $results['predictions'] = $this->runPredictions($context);
                 $results['preventive_actions'] = $this->handlePredictions($results['predictions']);
             }
 
-            // C-1 修复（2026-07-25）：原条件 $chNum % $interval === 0 在 interval=10 时首次
-            // 命中 chNum=10（而非注释声称的"第6章开始"），且 progress<0.1 时 stageMultiplier=2.0
-            // 使 interval=20，首次命中推迟到 chNum=20，导致 6-19 章三大主 Agent 决策真空。
-            // 改为以 chNum=6（早保护结束后首章）为基准的偏移取模：6, 6+N, 6+2N...
-            // 这样三个 Agent 都在 chNum=6 首次运行，随后按各自间隔周期触发。
-            $decisionStart = 6;
-
+            // 从开篇计周期：质量第5章、策略第10章、优化第20章首次触发，
+            // 之后按动态间隔重复。前5章仍跑 EarlyChapterProtection，不再早返回挡住质量 Agent。
             if (ConfigCenter::get('agent.strategy_agent.enabled', true) &&
-                $chNum >= $decisionStart && ($chNum - $decisionStart) % $dynamicIntervals['strategy'] === 0) {
+                $this->shouldRunOnOpeningCadence($chNum, $baseIntervals['strategy'], $dynamicIntervals['strategy'])) {
                 $contextWithPredictions = array_merge($context, [
                     'predictions' => $results['predictions'],
                 ]);
-                $results['strategy'] = $this->strategyAgent->decideWithTimeout($contextWithPredictions);
+                $results['strategy'] = $this->strategyAgent->runDecision($contextWithPredictions);
             }
 
-            // H-2 修复（2026-07-25）：质量决策同样需要趋势预测数据，以便做预防性调整。
-            // 原代码仅向 strategy 注入 predictions，quality 收到的 $context 不含预测。
             if (ConfigCenter::get('agent.quality_agent.enabled', true) &&
-                $chNum >= $decisionStart && ($chNum - $decisionStart) % $dynamicIntervals['quality'] === 0) {
+                $this->shouldRunOnOpeningCadence($chNum, $baseIntervals['quality'], $dynamicIntervals['quality'])) {
                 $qualityContext = array_merge($context, [
                     'predictions' => $results['predictions'],
+                    // 审计修复（2026-08-17 写作逻辑 F）：显式区分「预测未运行」与
+                    // 「已跑但样本不足（各指标 insufficient_data）」，不拿空数组假装有预测。
+                    'predictions_status' => $results['predictions'] === [] ? 'not_run' : 'ran',
                 ]);
-                $results['quality'] = $this->qualityAgent->decideWithTimeout($qualityContext);
+                $results['quality'] = $this->qualityAgent->runDecision($qualityContext);
             }
 
             if (ConfigCenter::get('agent.optimization_agent.enabled', true) &&
-                $chNum >= $decisionStart && ($chNum - $decisionStart) % $dynamicIntervals['optimization'] === 0) {
+                $this->shouldRunOnOpeningCadence($chNum, $baseIntervals['optimization'], $dynamicIntervals['optimization'])) {
                 $optimizationContext = array_merge($context, [
                     'strategy_decision' => $results['strategy'],
                     'quality_decision' => $results['quality'],
                 ]);
-                $results['optimization'] = $this->optimizationAgent->decideWithTimeout($optimizationContext);
+                $results['optimization'] = $this->optimizationAgent->runDecision($optimizationContext);
             }
 
             // ===== 情节模式重复检测 =====
-            // 每 5 章触发；第5章已在早返回块中处理，此处仅覆盖 chNum >= 10 的周期触发
+            // 每 5 章触发；第5章已在开篇保护块中处理，此处覆盖 chNum >= 10
             if ($chNum >= 10 && $chNum % 5 === 0) {
                 $results['plot_pattern'] = $this->detectPlotPattern($chNum);
             }
 
-            // ===== 认知负荷检测 =====
-            // 每 3 章触发；第3章已在早返回块中处理，此处仅覆盖 chNum >= 6 的周期触发
+            // 每 3 章触发；第3章已在开篇保护块中处理，此处覆盖 chNum >= 6
             if ($chNum >= 6 && $chNum % 3 === 0) {
                 $results['cognitive_load'] = $this->checkCognitiveLoad($chNum);
             }
@@ -192,7 +194,7 @@ class AgentCoordinator
     {
         try {
             require_once __DIR__ . '/TrendPredictor.php';
-            $predictor = new TrendPredictor($this->novelId);
+            $predictor = new TrendPredictor($this->novelId, $this->getTargetChapterNumber());
             return $predictor->analyze();
         } catch (\Throwable $e) {
             error_log('AgentCoordinator::runPredictions 失败: ' . $e->getMessage());
@@ -213,14 +215,22 @@ class AgentCoordinator
             require_once __DIR__ . '/AgentDirectives.php';
             $nextChapter = $this->getTargetChapterNumber();
 
+            // 审计修复（2026-08-16 批次一）：目标分原硬编码 80，与 IterativeRefinementController
+            // 可配置的 iterative_refinement.target_score 脱节（用户改配置后预警文案不变）；
+            // 改为读同一配置源
+            $targetScore = (float)getSetting('iterative_refinement.target_score', 80.0, $this->novelId);
             $directive = sprintf(
-                '【趋势预警】质量分连续下降，当前%.1f分，目标80分。' .
+                '【趋势预警】质量分连续下降，当前%.1f分，目标%.0f分。' .
                 '建议：1.增加冲突密度 2.缩短铺垫段 3.确保每章有情绪爆发点。',
-                $qualityTrend['current'] ?? 70
+                $qualityTrend['current'] ?? 70,
+                $targetScore
             );
 
-            AgentDirectives::addCapped($this->novelId, $nextChapter, 'quality', $directive, 2, 48, 2);
-            $actions[] = ['type' => 'quality_prevention', 'status' => 'written'];
+            // 审计修复（2026-08-17 P3）修复8：handlePredictions 原丢弃 AgentDirectives
+            // 写入返回值——addCapped 被限流拒绝（返回 false）仍上报 status:'written'，
+            // 决策时间线失真。三处写入点统一接收返回值，失败/被限流记 capped_skipped。
+            $ok = AgentDirectives::addCapped($this->novelId, $nextChapter, 'quality', $directive, 2, 48, 2);
+            $actions[] = ['type' => 'quality_prevention', 'status' => $ok ? 'written' : 'capped_skipped'];
         }
 
         // 处理伏笔风险
@@ -236,8 +246,9 @@ class AgentCoordinator
                 $overdue
             );
 
-            AgentDirectives::add($this->novelId, $nextChapter, 'strategy', $directive, 3, 72);
-            $actions[] = ['type' => 'foreshadowing_prevention', 'status' => 'written'];
+            // 审计修复（2026-08-17 P3）修复8：同上，接收 add() 返回值再上报状态
+            $ok = AgentDirectives::add($this->novelId, $nextChapter, 'strategy', $directive, 3, 72);
+            $actions[] = ['type' => 'foreshadowing_prevention', 'status' => $ok ? 'written' : 'capped_skipped'];
         }
 
         // 处理爽点密度不足
@@ -256,8 +267,9 @@ class AgentCoordinator
                     $this->getRecommendedCoolPointType($predictions)
                 );
 
-                AgentDirectives::add($this->novelId, $nextChapter, 'strategy', $directive, 2, 48);
-                $actions[] = ['type' => 'coolpoint_prevention', 'status' => 'written'];
+                // 审计修复（2026-08-17 P3）修复8：同上，接收 add() 返回值再上报状态
+                $ok = AgentDirectives::add($this->novelId, $nextChapter, 'strategy', $directive, 2, 48);
+                $actions[] = ['type' => 'coolpoint_prevention', 'status' => $ok ? 'written' : 'capped_skipped'];
             }
         }
 
@@ -310,27 +322,29 @@ class AgentCoordinator
 
         // 推荐使用次数最少的类型
         if (!empty($distribution)) {
-            // 审计修复（2026-07-19 H-低2）：$types 初始化为中文键，但 TrendPredictor
-        // getCoolPointTypeDistribution() 返回 chapters.cool_point_type（英文键如 face_slap），
-        // isset($types[$type]) 永不命中 → 全 0 排序 → array_key_first 恒「打脸」。
-        // 改为英文键映射，与 DB 实际值对齐。
-        $types = [
-            'face_slap' => 0, 'comeback' => 0, 'treasure' => 0,
-            'hiding_power' => 0, 'wit_battle' => 0,
-        ];
-        $typeLabelMap = [
-            'face_slap' => '打脸', 'comeback' => '逆袭', 'treasure' => '获宝',
-            'hiding_power' => '扮猪吃虎', 'wit_battle' => '智斗',
-        ];
-        foreach ($distribution as $row) {
-            $type = $row['cool_point_type'] ?? '';
-            if (isset($types[$type])) {
-                $types[$type] = (int)$row['count'];
+            // 审计修复 P1（2026-09-27）：必须以 COOL_POINT_TYPES 的真实值域
+            // （chapters.cool_point_type 实际落盘键，共 9 个）统计使用次数。
+            // 2026-07-19 的"对齐修复"引入的 5 键表（comeback/treasure/
+            // hiding_power/wit_battle）中仅 face_slap 存在于真实值域，
+            // 其余计数恒 0，asort 后"最少使用的类型"恒从假键中选取，
+            // 爽点预警的优先类型建议长期失真。直接从常量取键保证永不漂移。
+            if (!defined('COOL_POINT_TYPES') || COOL_POINT_TYPES === []) {
+                return '打脸反转';
             }
-        }
-        asort($types);
-        $bestKey = array_key_first($types) ?: 'face_slap';
-        return $typeLabelMap[$bestKey] ?? '打脸';
+            $types = [];
+            foreach (array_keys(COOL_POINT_TYPES) as $key) {
+                $types[$key] = 0;
+            }
+            foreach ($distribution as $row) {
+                $type = (string)($row['cool_point_type'] ?? '');
+                if (isset($types[$type])) {
+                    $types[$type] += (int)($row['count']);
+                }
+            }
+            asort($types);
+            $bestKey = (string)array_key_first($types);
+            $name = (string)(COOL_POINT_TYPES[$bestKey]['name'] ?? '打脸反转');
+            return $name !== '' ? $name : '打脸反转';
         }
 
         return '打脸';
@@ -356,7 +370,6 @@ class AgentCoordinator
             if (empty($resolvedDirectives[$source])) continue;
 
             $directives = $resolvedDirectives[$source];
-            $this->writtenDirectives[$source] = true;
 
             switch ($source) {
                 case 'quality':
@@ -437,6 +450,9 @@ class AgentCoordinator
             'coolpoint_density_adjustment' => 8,
             'pacing_strategy' => 6,
             'foreshadowing_strategy' => 7,
+            // High-7: 专家知识指令——优先级低于具体策略调整，让字数/爽点/伏笔等
+            // 硬约束先落库，专家建议作为补充。同 type 冲突时被 resolveConflicts 去重。
+            'expert_advice' => 5,
         ];
         return $priorities[$decisionType] ?? 5;
     }
@@ -602,6 +618,12 @@ class AgentCoordinator
      */
     public function getAgent(string $agentType): ?BaseAgent
     {
+        // 审计修复（2026-08-16 批次一）：agent.enabled=false 时三个子 Agent 未初始化，
+        // 直接访问未初始化的 typed property 会抛 Error；禁用时统一返回 null
+        if (!$this->enabled) {
+            return null;
+        }
+
         switch ($agentType) {
             case 'strategy':
                 return $this->strategyAgent;
@@ -626,7 +648,7 @@ class AgentCoordinator
      * @param array  $context   额外上下文（title, genre, protagonist_name, model_id 等）
      * @return array{critic: array|null, style_guard: array|null, dialogue_voice: array|null, sensory_balance: array|null, deduped: int}
      */
-    public static function postWriteAgents(int $novelId, array $chapter, string $content, array $context): array
+    public static function postWriteAgents(int $novelId, array $chapter, string $content, array $context, ?array $precomputedCritic = null): array
     {
         $result = ['critic' => null, 'style_guard' => null, 'deduped' => 0];
 
@@ -640,7 +662,7 @@ class AgentCoordinator
         // 各 stage 内部自带 try/catch，失败时仅记录日志不阻塞其他 stage。
 
         // --- Stage 1: CriticAgent（读者评分 + 校准 + 弱维度指令）---
-        $criticResult = self::runCriticStage($novelId, $chapter, $content, $context);
+        $criticResult = self::runCriticStage($novelId, $chapter, $content, $context, $precomputedCritic);
         if ($criticResult !== null) {
             $result['critic'] = $criticResult;
         }
@@ -671,13 +693,79 @@ class AgentCoordinator
     }
 
     /**
+     * Freeze the only database input used by the Critic model before dispatch.
+     * Publication still runs in postWriteAgents, with its original ordering.
+     */
+    public static function freezeCriticInput(int $novelId, array $chapter, string $content, array $context): ?array
+    {
+        if (!ConfigCenter::get('agent.enabled', true)
+            || !getSystemSetting('ws_critic_enabled', true, 'bool')) {
+            return null;
+        }
+        $chapterNumber = (int)($chapter['chapter_number'] ?? 0);
+        $interval = max(1, (int)getSystemSetting('ws_critic_interval', 1, 'int'));
+        if ($interval > 1 && $chapterNumber > 0 && $chapterNumber % $interval !== 0) {
+            return null;
+        }
+        if ($novelId <= 0 || $chapterNumber <= 0 || trim($content) === '') {
+            throw new InvalidArgumentException('Critic computation requires a novel, chapter and content.');
+        }
+        $previous = DB::fetch(
+            'SELECT content FROM chapters WHERE novel_id=? AND chapter_number=? AND status="completed"',
+            [$novelId, $chapterNumber - 1]
+        );
+        return [
+            'novel_id' => $novelId,
+            'chapter_number' => $chapterNumber,
+            'content' => $content,
+            'source_hash' => hash('sha256', $content),
+            'prev_content' => (string)($previous['content'] ?? ''),
+            'context' => [
+                'title' => (string)($context['title'] ?? ''),
+                'genre' => (string)($context['genre'] ?? ''),
+                'protagonist_name' => (string)($context['protagonist_name'] ?? ''),
+                'chapter_title' => (string)($chapter['title'] ?? ''),
+                'outline' => (string)($chapter['outline'] ?? ''),
+                'model_id' => isset($context['model_id']) ? (int)$context['model_id'] : null,
+            ],
+        ];
+    }
+
+    /** No business-table reads or writes; settings/model routing use the caller's frozen scope. */
+    public static function computeCritic(array $input): array
+    {
+        if (!is_int($input['novel_id'] ?? null) || $input['novel_id'] <= 0
+            || !is_int($input['chapter_number'] ?? null) || $input['chapter_number'] <= 0
+            || !is_string($input['content'] ?? null) || trim($input['content']) === ''
+            || !is_string($input['prev_content'] ?? null)
+            || !is_string($input['source_hash'] ?? null)
+            || !hash_equals(hash('sha256', $input['content']), $input['source_hash'])
+            || !is_array($input['context'] ?? null)) {
+            throw new InvalidArgumentException('Invalid frozen Critic input.');
+        }
+        foreach (['title', 'genre', 'protagonist_name', 'chapter_title', 'outline'] as $key) {
+            if (!is_string($input['context'][$key] ?? null)) {
+                throw new InvalidArgumentException('Incomplete frozen Critic context.');
+            }
+        }
+        if (!array_key_exists('model_id', $input['context'])
+            || ($input['context']['model_id'] !== null && !is_int($input['context']['model_id']))) {
+            throw new InvalidArgumentException('Invalid frozen Critic model.');
+        }
+        require_once __DIR__ . '/CriticAgent.php';
+        return (new CriticAgent($input['novel_id']))->reviewCombined(
+            $input['content'], $input['prev_content'], $input['context'], true
+        );
+    }
+
+    /**
      * Stage 1: CriticAgent — 读者评分、相对评分校准、弱维度自适应指令
      *
      * 审计修复 B06（2026-06-16）：从 postWriteAgents 抽取，独立可测。
      *
      * @return array|null CriticAgent 结果（scores/weak_dims 等），未启用或失败时返回 null
      */
-    private static function runCriticStage(int $novelId, array $chapter, string $content, array $context): ?array
+    private static function runCriticStage(int $novelId, array $chapter, string $content, array $context, ?array $precomputedCritic = null): ?array
     {
         $criticResult = null;
         // --- CriticAgent ---
@@ -706,14 +794,15 @@ class AgentCoordinator
                 $prevChapter = null;
                 try {
                     $prevChapter = DB::fetch(
-                        'SELECT content, human_critic_scores FROM chapters WHERE novel_id=? AND chapter_number=? AND status="completed"',
+                        'SELECT chapter_number, content, critic_scores, human_critic_scores FROM chapters WHERE novel_id=? AND chapter_number=? AND status="completed"',
                         [$novelId, (int)$chapter['chapter_number'] - 1]
                     );
                 } catch (\Throwable $e) { error_log('AgentCoordinator prevChapter fetch failed: ' . $e->getMessage()); }
 
                 $prevContent = $prevChapter['content'] ?? '';
                 // P1-2: 先查静态缓存，命中则跳过 AI 调用；后续 DB 保存/校准/指令生成照常进行
-                $criticResult = CriticAgent::getCachedCombined($content, $prevContent, $criticContext)
+                $criticResult = $precomputedCritic
+                    ?? CriticAgent::getCachedCombined($content, $prevContent, $criticContext)
                     ?? $critic->reviewCombined($content, $prevContent, $criticContext);
                 // 从合并结果中取出相对评分，后续校准逻辑复用
                 $relative = $criticResult['relative'] ?? null;
@@ -722,15 +811,47 @@ class AgentCoordinator
                     // v1.10.3: 校准 — 相对评分 + 人工偏差修正
                     $calibrated = null;
                     try {
-                        // 人工评分（当前章节如有）
+                        // 使用同章模型/人工成对样本；历史人工绝对分不是本章评分。
                         $humanScores = json_decode($chapter['human_critic_scores'] ?? 'null', true);
-                        // 如果当前章没有，尝试取前一章的人工评分作为偏差参考
-                        if (!$humanScores && !empty($prevChapter['human_critic_scores'])) {
-                            $humanScores = json_decode($prevChapter['human_critic_scores'], true);
+                        $humanScores = is_array($humanScores) ? $humanScores : null;
+                        $referenceModelScores = $criticResult['scores'];
+                        $humanReference = $humanScores ? [
+                            'chapter_number' => (int)$chapter['chapter_number'],
+                            'model_scores' => $referenceModelScores,
+                            'human_scores' => $humanScores,
+                            'source' => 'current_chapter',
+                        ] : null;
+                        if (!$humanScores && !empty($prevChapter['human_critic_scores']) && !empty($prevChapter['critic_scores'])) {
+                            $previousHuman = json_decode($prevChapter['human_critic_scores'], true);
+                            $previousReview = json_decode($prevChapter['critic_scores'], true);
+                            $previousModel = $previousReview['scores'] ?? null;
+                            if (is_array($previousHuman) && is_array($previousModel)) {
+                                $pairedHuman = [];
+                                $pairedModel = [];
+                                foreach ($criticResult['scores'] as $dim => $_) {
+                                    if (isset($previousHuman[$dim], $previousModel[$dim])
+                                        && is_numeric($previousHuman[$dim]) && is_numeric($previousModel[$dim])
+                                        && $previousHuman[$dim] >= 1 && $previousHuman[$dim] <= 10
+                                        && $previousModel[$dim] >= 1 && $previousModel[$dim] <= 10) {
+                                        $pairedHuman[$dim] = $previousHuman[$dim];
+                                        $pairedModel[$dim] = $previousModel[$dim];
+                                    }
+                                }
+                                if ($pairedHuman !== []) {
+                                    $humanScores = $pairedHuman;
+                                    $referenceModelScores = $pairedModel;
+                                    $humanReference = [
+                                        'chapter_number' => (int)($prevChapter['chapter_number'] ?? ((int)$chapter['chapter_number'] - 1)),
+                                        'model_scores' => $pairedModel,
+                                        'human_scores' => $pairedHuman,
+                                        'source' => 'previous_chapter_pair',
+                                    ];
+                                }
+                            }
                         }
 
                         if ($humanScores || $relative) {
-                            $calibrated = $critic->calibrate($criticResult['scores'], $humanScores, $relative);
+                            $calibrated = $critic->calibrate($criticResult['scores'], $humanScores, $relative, $referenceModelScores);
                             $calibratedAvg = count($calibrated) > 0
                                 ? round(array_sum($calibrated) / count($calibrated), 1) : 0;
 
@@ -738,12 +859,17 @@ class AgentCoordinator
                                 'calibrated_critic_scores' => json_encode([
                                     'scores'   => $calibrated,
                                     'avg'      => $calibratedAvg,
-                                    'human'    => $humanScores,
+                                    'human'    => ($humanReference['source'] ?? '') === 'current_chapter' ? $humanScores : null,
+                                    'human_reference' => $humanReference,
                                     'relative' => $relative,
+                                    'complete' => $criticResult['complete'] ?? false,
                                 ], JSON_UNESCAPED_UNICODE),
                             ], 'id=?', [(int)$chapter['id']]);
+                        } else {
+                            DB::update('chapters', ['calibrated_critic_scores' => null], 'id=?', [(int)$chapter['id']]);
                         }
                     } catch (\Throwable $e) {
+                        if ($precomputedCritic !== null) throw $e;
                         error_log('CriticAgent calibration failed: ' . $e->getMessage());
                     }
 
@@ -754,15 +880,19 @@ class AgentCoordinator
                         ? round(array_sum($calibrated) / count($calibrated), 1)
                         : $criticResult['avg'];
                     addLog($novelId, 'info', sprintf(
-                        '读者评分：%.1f/10（爽感%d/代入%d/节奏%d/新鲜%d/追读%d）%s',
+                        '读者评分：%.1f/10（爽感%s/代入%s/节奏%s/新鲜%s/追读%s）%s',
                         $displayAvg,
-                        $calibrated['thrill'] ?? $criticResult['scores']['thrill'] ?? 0,
-                        $calibrated['immersion'] ?? $criticResult['scores']['immersion'] ?? 0,
-                        $calibrated['pacing'] ?? $criticResult['scores']['pacing'] ?? 0,
-                        $calibrated['freshness'] ?? $criticResult['scores']['freshness'] ?? 0,
-                        $calibrated['read_next'] ?? $criticResult['scores']['read_next'] ?? 0,
-                        $calibrated ? '（已校准）' : ''
+                        $calibrated['thrill'] ?? $criticResult['scores']['thrill'] ?? '未评分',
+                        $calibrated['immersion'] ?? $criticResult['scores']['immersion'] ?? '未评分',
+                        $calibrated['pacing'] ?? $criticResult['scores']['pacing'] ?? '未评分',
+                        $calibrated['freshness'] ?? $criticResult['scores']['freshness'] ?? '未评分',
+                        $calibrated['read_next'] ?? $criticResult['scores']['read_next'] ?? '未评分',
+                        ($calibrated ? '（已校准）' : '') . (empty($criticResult['complete']) ? '（部分维度缺测）' : '')
                     ));
+                } else {
+                    // Do not retain an old successful score after the new evaluation failed.
+                    DB::update('chapters', ['critic_scores' => null, 'calibrated_critic_scores' => null], 'id=?', [(int)$chapter['id']]);
+                    addLog($novelId, 'warn', '读者评分不可用：未获得有效维度，未生成质量整改指令。');
                 }
 
                 if (!empty($criticResult['weak_dims'])) {
@@ -771,19 +901,28 @@ class AgentCoordinator
                     // 消费端只截 3 条导致「系统以为生效、模型看不到」。
                     $parts = [];
                     $maxConsec = 1;
+                    $applyFrom = (int)$chapter['chapter_number'] + 1;
+                    // 审计修复（2026-08-09 R11-3）：下一章若为终章，read_next 改收束而非悬念
+                    $isFinalNext = false;
+                    try {
+                        $tc = (int)(DB::fetch(
+                            'SELECT target_chapters FROM novels WHERE id=?',
+                            [$novelId]
+                        )['target_chapters'] ?? 0);
+                        $isFinalNext = $tc > 0 && $applyFrom >= $tc;
+                    } catch (\Throwable) { /* ignore */ }
                     foreach ($criticResult['weak_dims'] as $wd) {
                         $dimLabel = (string)($wd['label'] ?? $wd['dim'] ?? '');
                         if ($dimLabel === '') continue;
                         $consecutive = (int)(($existingWeak[$dimLabel]['consecutive'] ?? 0) + 1);
                         $maxConsec = max($maxConsec, $consecutive);
-                        $parts[] = self::buildAdaptiveCriticDirective($wd, $consecutive);
+                        $parts[] = self::buildAdaptiveCriticDirective($wd, $consecutive, $isFinalNext);
                     }
                     if ($parts) {
                         $merged = count($parts) === 1
                             ? $parts[0]
                             : ('前章读者视角多项偏弱，本章优先改善：' . "\n- " . implode("\n- ", $parts));
                         // 同章 quality 已有 ≥2 条时不再追加，防指令洪水
-                        $applyFrom = (int)$chapter['chapter_number'] + 1;
                         AgentDirectives::addCapped(
                             $novelId, $applyFrom, 'quality',
                             mb_substr($merged, 0, 400),
@@ -792,6 +931,10 @@ class AgentCoordinator
                     }
                 }
             } catch (\Throwable $e) {
+                if ($precomputedCritic !== null || $e instanceof AIRequestCanceledException
+                    || $e instanceof WriteEnginePostprocessLeaseLostException) {
+                    throw $e;
+                }
                 addLog($novelId, 'warn', 'CriticAgent跳过：' . $e->getMessage());
             }
         }
@@ -938,10 +1081,18 @@ class AgentCoordinator
     }
 
     /**
-     * 去重：同类型、同章节范围的指令只保留最新的一条
+     * 去重：同类型、同起始章节的指令最多保留 maxActive 条（与 addCapped 默认值对齐）。
+     *
+     * P2-3 修复（2026-08-09）：原实现按 (type, apply_from) 分组只保留 1 条最新指令，
+     * 架空了 addCapped(maxActive=2) 设计——生产端允许写 2 条，去重端却把第二条静默停用，
+     * 导致“系统以为已写入第二条、消费端永远看不到”的语义不一致。
+     *
      * M-2 修复（2026-07-25）：原按 mb_strlen 保留"最详细"的一条，但冗长的低优先级指令
      * 可能覆盖简洁的高优先级指令。改为保留最新的一条（ORDER BY created_at DESC 已保证
      * 首条为最新），长度仅作为同时间戳的 tiebreaker。
+     *
+     * 现 P2-3 进一步保留前 maxActive 条最新指令，仅停用超出部分。maxActive 与
+     * AgentDirectives::addCapped 的默认值保持一致（=2）。
      */
     public static function deduplicateDirectives(int $novelId): int
     {
@@ -956,15 +1107,19 @@ class AgentCoordinator
             );
             if (!$all || count($all) < 2) return 0;
 
-            $keep = [];
+            // P2-3：与 AgentDirectives::addCapped 默认 maxActive 对齐。
+            // 同一 (type, apply_from) 组内最多保留 maxActive 条最新指令。
+            $maxActive = 2;
+            $keepCount = [];
             $toDeactivate = [];
             foreach ($all as $d) {
                 $key = $d['type'] . '|' . $d['apply_from'];
-                if (!isset($keep[$key])) {
-                    // 首条即最新（ORDER BY created_at DESC）
-                    $keep[$key] = $d;
-                } else {
-                    // M-2 修复：不再按长度替换，直接停用旧条目
+                if (!isset($keepCount[$key])) {
+                    $keepCount[$key] = 0;
+                }
+                $keepCount[$key]++;
+                if ($keepCount[$key] > $maxActive) {
+                    // 已保留 maxActive 条最新，超出部分停用（首条为最新因 ORDER BY created_at DESC）
                     $toDeactivate[] = (int)$d['id'];
                 }
             }
@@ -987,8 +1142,8 @@ class AgentCoordinator
             $recent = DB::fetchAll(
                 'SELECT directive FROM agent_directives
                  WHERE novel_id = ? AND type = "quality" AND is_active = 1
-                   AND apply_from >= ? AND directive LIKE ?',
-                [$novelId, max(1, $currentChapter - 5), '%读者视角%']
+                   AND apply_from >= ? AND apply_from <= ? AND directive LIKE ?',
+                [$novelId, max(1, $currentChapter - 5), $currentChapter, '%读者视角%']
             );
             $dims = [];
             foreach ($recent as $r) {
@@ -1013,7 +1168,7 @@ class AgentCoordinator
     /**
      * 根据连续弱项次数生成自适应指令
      */
-    private static function buildAdaptiveCriticDirective(array $weakDim, int $consecutive): string
+    private static function buildAdaptiveCriticDirective(array $weakDim, int $consecutive, bool $isFinalChapter = false): string
     {
         $label = $weakDim['label'] ?? $weakDim['dim'];
         $score = $weakDim['score'] ?? 0;
@@ -1026,15 +1181,49 @@ class AgentCoordinator
         };
 
         $dimAdvice = match($weakDim['dim'] ?? '') {
-            'thrill' => '确保至少有一个"读者看到这里会叫好"的高潮时刻，冲突必须以出人意料的方式解决。',
+            'thrill' => $isFinalChapter
+                ? '终章高潮须兑现主线冲突并给出情感落点，禁止再开新线高潮。'
+                : '确保至少有一个"读者看到这里会叫好"的高潮时刻，冲突必须以出人意料的方式解决。',
             'immersion' => '增加主角的感官描写（看到/听到/感觉到），减少旁白式叙述，让读者跟着主角的视角走。',
             'pacing' => '检查是否有连续超过300字无对话/无事件的段落，如有必须打断。节奏要像心跳一样有快有慢。',
             'freshness' => '至少引入一个读者意料之外的元素：角色的隐藏面、反常识的信息、反套路的剧情走向。',
-            'read_next' => '章末必须设置"无法放下的悬念"：要么是即将到来的巨大危机，要么是颠覆认知的反转。',
+            'read_next' => $isFinalChapter
+                ? '最终章须圆满收束与主题回响，不设新悬念钩子；用余韵/代价/新日常收尾。'
+                : '章末必须设置"无法放下的悬念"：要么是即将到来的巨大危机，要么是颠覆认知的反转。',
             default => "重点改善「{$label}」维度。",
         };
 
         return "前章读者视角「{$label}」偏低（{$score}/10）{$escalation}原因：{$reason}。{$dimAdvice}";
+    }
+
+    /**
+     * README / 配置中的开篇周期：质量 5、策略 10、优化 20。
+     */
+    private function baseAgentIntervals(): array
+    {
+        $strategyInterval = (int)ConfigCenter::get('agent.strategy_agent.decision_interval', 0);
+        if ($strategyInterval <= 0) {
+            $strategyInterval = (int)ConfigCenter::get('agent.strategy_agent.check_interval', 10);
+        }
+        return [
+            'strategy' => max(1, $strategyInterval),
+            'quality' => max(1, (int)ConfigCenter::get('agent.quality_agent.check_interval', 5)),
+            'optimization' => max(1, (int)ConfigCenter::get('agent.optimization_agent.optimization_interval', 20)),
+        ];
+    }
+
+    /**
+     * 从开篇计：首次在 base 章触发，之后按动态间隔重复。
+     */
+    private function shouldRunOnOpeningCadence(int $chNum, int $baseInterval, int $dynamicInterval): bool
+    {
+        if ($chNum < $baseInterval || $baseInterval < 1) {
+            return false;
+        }
+        if ($chNum === $baseInterval) {
+            return true;
+        }
+        return (($chNum - $baseInterval) % max(1, $dynamicInterval)) === 0;
     }
 
     private function calculateDynamicIntervals(array $context): array
@@ -1065,15 +1254,20 @@ class AgentCoordinator
             default => 1.0,
         };
 
-        $baseIntervals = [
-            'strategy' => 10,
-            'quality' => 5,
-            'optimization' => 20,
-        ];
+        // 审计修复（2026-08-09 R6）：原为硬编码 10/5/20，后台的间隔配置是假旋钮。
+        // 改为读取 ConfigCenter（与 install.php 默认值一致），配置改动即刻生效。
+        // 审计修复（2026-08-09 R7-3）：策略键统一为 decision_interval；兼容旧库仅有 check_interval。
+        $baseIntervals = $this->baseAgentIntervals();
 
         $finalIntervals = [];
         foreach ($baseIntervals as $type => $base) {
-            $adjusted = (int)round($base * $stageMultiplier * $speedAdjustment);
+            // 审计修复（2026-08-17 写作逻辑 F）：进度 <10% 时质量间隔乘数不超过 1.0
+            // （开篇更需要盯质量，间隔加倍会直接跳到第 15 章）；策略/优化仍可放宽。
+            $typeStageMultiplier = $stageMultiplier;
+            if ($type === 'quality' && $progress > 0 && $progress < 0.1 && $typeStageMultiplier > 1.0) {
+                $typeStageMultiplier = 1.0;
+            }
+            $adjusted = (int)round($base * $typeStageMultiplier * $speedAdjustment);
             $finalIntervals[$type] = max(1, min((int)round($base * 2), $adjusted));
         }
 
@@ -1093,7 +1287,7 @@ class AgentCoordinator
             require_once __DIR__ . '/AgentDirectives.php';
 
             $detector = new PlotPatternDetector($this->novelId);
-            $result = $detector->detect($currentChapter);
+            $result = $detector->detect(max(0, $currentChapter - 1));
 
             if ($result && in_array($result['severity'], ['high', 'medium'])) {
                 // 写入 Agent 指令
@@ -1104,13 +1298,16 @@ class AgentCoordinator
                     default => 'strategy',
                 };
 
-                AgentDirectives::add(
+                // 审计修复（2026-08-09 R4）：前写阶段 $currentChapter 即"正在写的章"，
+                // 原 +1 偏一章导致本章 prompt 看不到刚检出的套路警告；改 addCapped 与消费端限流对齐。
+                AgentDirectives::addCapped(
                     $this->novelId,
-                    $currentChapter + 1,
+                    $currentChapter,
                     $directiveType,
                     $result['directive'],
                     applyRange: 5,
                     expiresInHours: 48,
+                    maxActive: 2,
                     source: 'plot_pattern_detector'
                 );
 
@@ -1178,11 +1375,12 @@ class AgentCoordinator
 
             // 第2-3章：检查是否有足够钩子
             if ($chNum === 2 || $chNum === 3) {
+                // 审计修复（2026-08-09 R10-3）：schema 无 actual_hook_type，读死列会导致整段保护失败
                 $prevChapter = DB::fetch(
-                    'SELECT hook_type, actual_hook_type FROM chapters WHERE novel_id=? AND chapter_number=?',
+                    'SELECT hook_type FROM chapters WHERE novel_id=? AND chapter_number=?',
                     [$this->novelId, $chNum - 1]
                 );
-                if (empty($prevChapter['actual_hook_type']) && empty($prevChapter['hook_type'])) {
+                if (empty($prevChapter['hook_type'])) {
                     AgentDirectives::add(
                         $this->novelId,
                         $chNum,
@@ -1258,7 +1456,17 @@ class AgentCoordinator
             require_once __DIR__ . '/AgentDirectives.php';
 
             $monitor = new CognitiveLoadMonitor($this->novelId);
-            $status = $monitor->getStatus($currentChapter);
+            $history = $monitor->getTrend(max(0, $currentChapter - 1), 10);
+            $recent = array_slice($history, -5);
+            $previous = array_slice($history, -10, 5);
+            $recentSum = array_sum(array_column($recent, 'total_new'));
+            $recentAvg = $recentSum / max(1, count($recent));
+            $previousAvg = array_sum(array_column($previous, 'total_new')) / max(1, count($previous));
+            $status = [
+                'recent_5_new_elements' => $recentSum,
+                'trend' => count($history) >= 5 && $recentAvg > $previousAvg * 1.3 ? 'increasing' : 'stable',
+                'recommendation' => '',
+            ];
 
             // 只有在超标时才生成指令
             if ($status['recent_5_new_elements'] <= 12 && $status['trend'] !== 'increasing') {
@@ -1276,24 +1484,27 @@ class AgentCoordinator
             $directive .= "3. 深化已有设定而非新增设定\n";
             $directive .= "避免读者产生「人名地名太多记不住」的疲劳感。";
 
-            $nextChapter = $currentChapter + 1;
+            // 审计修复（2026-08-09 R4）：前写阶段 $currentChapter 即"正在写的章"，
+            // 原 +1 偏一章导致指令晚一章生效（directive 文案是"本章请…"）；改 addCapped 限流。
+            $targetChapter = $currentChapter;
             $existing = DB::fetch(
                 "SELECT id FROM agent_directives 
                  WHERE novel_id=? AND type='strategy' AND is_active=1
                    AND apply_from <= ? AND apply_to >= ?
                    AND directive LIKE '%认知负荷%'
                  LIMIT 1",
-                [$this->novelId, $nextChapter, $nextChapter]
+                [$this->novelId, $targetChapter, $targetChapter]
             );
             if ($existing) return null;
 
-            AgentDirectives::add(
+            AgentDirectives::addCapped(
                 $this->novelId,
-                $nextChapter,
+                $targetChapter,
                 'strategy',
                 $directive,
                 applyRange: 2,
                 expiresInHours: 48,
+                maxActive: 2,
                 source: 'cognitive_load_monitor'
             );
 

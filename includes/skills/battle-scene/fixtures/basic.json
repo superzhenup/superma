@@ -1,0 +1,6 @@
+{
+  "chapter_type": "battle",
+  "outline": "主角在狭窄石桥遭到伏击，利用地形脱身但手臂受伤。",
+  "expected": ["battle-scene"],
+  "must_preserve": ["狭窄石桥", "手臂受伤"]
+}

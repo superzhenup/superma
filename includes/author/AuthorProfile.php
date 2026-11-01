@@ -3,6 +3,7 @@
  * 作者画像数据模型 - 作者画像系统
  * 提供画像的 CRUD 操作和格式化输出
  */
+defined('APP_LOADED') or die('Direct access denied.');
 
 class AuthorProfile
 {
@@ -169,10 +170,16 @@ class AuthorProfile
 
         $updateData = array_intersect_key($data, array_flip($allowed));
 
+        // 审计修复（2026-10-31 B5）：M-4 的"幂等封装"仅消除了 PDOException，
+        // 但嵌套时 DB::beginTransaction() 静默返回 false，旧实现照常执行且
+        // commit/rollBack 会误提交/回滚外层事务。$ownTx 标记本层所有权，
+        // catch 仅在自有事务时回滚。
+        $ownTx = false;
         try {
-            // 审计修复 M-4（2026-07-01）：使用 DB::beginTransaction() 幂等封装，
-            // 避免外层已有事务时 $pdo->beginTransaction() 抛 PDOException
-            DB::beginTransaction();
+            $ownTx = DB::beginTransaction();
+            if (!$ownTx) {
+                throw new RuntimeException('画像更新事务开启失败（已存在活动事务）');
+            }
 
             if (isset($updateData['is_default']) && $updateData['is_default']) {
                 DB::update('author_profiles', ['is_default' => 0], 'id!=?', [$this->id]);
@@ -183,7 +190,7 @@ class AuthorProfile
             $this->data = array_merge($this->data, $updateData);
             return true;
         } catch (\Throwable $e) {
-            DB::rollBack();
+            if ($ownTx) DB::rollBack();
             error_log('AuthorProfile::update failed: ' . $e->getMessage());
             return false;
         }
@@ -191,15 +198,21 @@ class AuthorProfile
 
     public function delete(): bool
     {
+        // 审计修复（2026-10-31 B5）：同 update()，嵌套事务 fail closed，
+        // $ownTx 守卫 catch 的 rollBack 不误伤外层事务。
+        $ownTx = false;
         try {
-            DB::beginTransaction();
+            $ownTx = DB::beginTransaction();
+            if (!$ownTx) {
+                throw new RuntimeException('画像删除事务开启失败（已存在活动事务）');
+            }
             // author_uploaded_works 无外键级联，需手动清理
             DB::delete('author_uploaded_works', 'profile_id=?', [$this->id]);
             DB::delete('author_profiles', 'id=?', [$this->id]);
             DB::commit();
             return true;
         } catch (\Throwable $e) {
-            DB::rollBack();
+            if ($ownTx) DB::rollBack();
             error_log('AuthorProfile::delete failed: ' . $e->getMessage());
             return false;
         }

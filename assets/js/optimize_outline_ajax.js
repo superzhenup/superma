@@ -93,6 +93,8 @@ async function processBatch(novelId, batchIndex, lastOptimized, progressLabel, b
 
             const result = await response.json();
 
+            if (result.code === 'source_conflict') return result;
+
             if (result.success) {
                 return result;  // 成功
             }
@@ -138,7 +140,7 @@ async function processBatch(novelId, batchIndex, lastOptimized, progressLabel, b
                         });
                         if (r.ok) {
                             const d = await r.json();
-                            if (d.success) return d;
+                            if (d.success || d.code === 'source_conflict') return d;
                         }
                     } catch {}
                 }
@@ -221,6 +223,14 @@ async function optimizeOutlineLogicAjax() {
             progressLabel.textContent = `正在优化第 ${batchIndex * optimizeBatchSize + 1}～${(batchIndex + 1) * optimizeBatchSize} 章大纲逻辑...`;
 
             const result = await processBatch(novelId, batchIndex, lastOptimized, progressLabel, batchLog, streamBox);
+
+            if (result?.code === 'source_conflict') {
+                optimizeOutlineAjaxRunning = false;
+                progressLabel.textContent = result.message;
+                streamBox.textContent = result.message;
+                showToast(result.message, 'warning');
+                break;
+            }
 
             if (!result) {
                 // 批次失败（已自动重试耗尽），跳过继续下一批

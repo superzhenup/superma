@@ -25,6 +25,29 @@ unset($modelRow);
 
 pageHeader('拆书分析', 'analyze');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-analyze-cancel-step', function (event, element) { cancelStep(element.dataset.step); });
+AppEvents.register('page-analyze-toggle-section', function (event, element) { toggleSectionBody(element.dataset.step); });
+AppEvents.register('page-analyze-edit-step', function (event, element) { stepResults[element.dataset.step] = element.value; });
+AppEvents.register('page-analyze-edit-rewrite', function (event, element) { onRewriteEdit(element.dataset.field); });
+AppEvents.register('page-analyze-view-history', function (event, element) { viewHistory(Number(element.dataset.id)); });
+AppEvents.register('page-analyze-delete-history', function (event, element) { event.stopPropagation(); deleteHistory(Number(element.dataset.id)); });
+AppEvents.register('page-analyze-clear-uploaded-file-1', function (event, element) { clearUploadedFile(); });
+AppEvents.register('page-analyze-go-phase2-2', function (event, element) { goPhase2(); });
+AppEvents.register('page-analyze-run-step-3', function (event, element) { runStep('characters'); });
+AppEvents.register('page-analyze-run-step-4', function (event, element) { runStep('worldview'); });
+AppEvents.register('page-analyze-run-step-5', function (event, element) { runStep('storyline'); });
+AppEvents.register('page-analyze-run-step-6', function (event, element) { runStep('emotion'); });
+AppEvents.register('page-analyze-run-step-7', function (event, element) { runStep('explosive'); });
+AppEvents.register('page-analyze-run-step-8', function (event, element) { runStep('summary'); });
+AppEvents.register('page-analyze-run-all-steps-9', function (event, element) { runAllSteps(); });
+AppEvents.register('page-analyze-go-phase3-10', function (event, element) { goPhase3(); });
+AppEvents.register('page-analyze-go-phase1-11', function (event, element) { goPhase1(); });
+AppEvents.register('page-analyze-save-analysis-12', function (event, element) { saveAnalysis(); });
+AppEvents.register('page-analyze-do-rewrite-13', function (event, element) { doRewrite(); });
+AppEvents.register('page-analyze-create-novel-14', function (event, element) { createNovel(); });
+</script>
+
 
 <style>
 .analyze-container { max-width: 1200px; margin: 0 auto; }
@@ -190,13 +213,13 @@ pageHeader('拆书分析', 'analyze');
                     <div class="char-ct" id="charCounter">0 / 60,000 字（1M模型：200,000字）</div>
                     <div id="uploadedFileInfo" style="display:none" class="alert alert-success py-2 mt-2 mb-0">
                         <i class="bi bi-file-check me-1"></i><span id="uploadedFileName"></span>
-                        <button type="button" class="btn-close float-end p-0" style="font-size:10px" onclick="clearUploadedFile()"></button>
+                        <button type="button" class="btn-close float-end p-0" style="font-size:10px" data-csp-click="page-analyze-clear-uploaded-file-1"></button>
                     </div>
                 </div>
             </div>
         </div>
         <div class="text-center mt-3">
-            <button class="btn btn-primary btn-lg px-5" onclick="goPhase2()">
+            <button class="btn btn-primary btn-lg px-5" data-csp-click="page-analyze-go-phase2-2">
                 <i class="bi bi-arrow-right me-2"></i>开始拆书分析
             </button>
         </div>
@@ -209,39 +232,39 @@ pageHeader('拆书分析', 'analyze');
                 <div class="a-card">
                     <h6><i class="bi bi-list-check me-2"></i>分析步骤</h6>
                     <div id="stepButtons">
-                        <button class="step-btn" onclick="runStep('characters')" id="btn-characters">
+                        <button class="step-btn" data-csp-click="page-analyze-run-step-3" id="btn-characters">
                             <div class="si" style="background:rgba(99,102,241,.15);color:#6366f1">👤</div>
                             <div><div class="st">核心人设</div><div class="sd">主角、女主、配角设定</div></div>
                         </button>
-                        <button class="step-btn" onclick="runStep('worldview')" id="btn-worldview">
+                        <button class="step-btn" data-csp-click="page-analyze-run-step-4" id="btn-worldview">
                             <div class="si" style="background:rgba(16,185,129,.15);color:#10b981">🌍</div>
                             <div><div class="st">世界观设定</div><div class="sd">背景、金手指、势力</div></div>
                         </button>
-                        <button class="step-btn" onclick="runStep('storyline')" id="btn-storyline">
+                        <button class="step-btn" data-csp-click="page-analyze-run-step-5" id="btn-storyline">
                             <div class="si" style="background:rgba(245,158,11,.15);color:#f59e0b">📖</div>
                             <div><div class="st">故事线大纲</div><div class="sd">分幕剧情、转折、伏笔</div></div>
                         </button>
-                        <button class="step-btn" onclick="runStep('emotion')" id="btn-emotion">
+                        <button class="step-btn" data-csp-click="page-analyze-run-step-6" id="btn-emotion">
                             <div class="si" style="background:rgba(239,68,68,.15);color:#ef4444">📈</div>
                             <div><div class="st">情绪曲线</div><div class="sd">节奏、钩子、爽点公式</div></div>
                         </button>
-                        <button class="step-btn" onclick="runStep('explosive')" id="btn-explosive">
+                        <button class="step-btn" data-csp-click="page-analyze-run-step-7" id="btn-explosive">
                             <div class="si" style="background:rgba(168,85,247,.15);color:#a855f7">🔥</div>
                             <div><div class="st">爆款分析</div><div class="sd">社会情绪、代入感</div></div>
                         </button>
-                        <button class="step-btn" onclick="runStep('summary')" id="btn-summary">
+                        <button class="step-btn" data-csp-click="page-analyze-run-step-8" id="btn-summary">
                             <div class="si" style="background:rgba(6,182,212,.15);color:#06b6d4">💡</div>
                             <div><div class="st">总结公式</div><div class="sd">爆款公式提炼</div></div>
                         </button>
                     </div>
                     <div class="d-grid gap-2 mt-3">
-                        <button class="btn btn-primary" onclick="runAllSteps()" id="btnRunAll">
+                        <button class="btn btn-primary" data-csp-click="page-analyze-run-all-steps-9" id="btnRunAll">
                             <i class="bi bi-lightning-charge me-1"></i>一键全部分析
                         </button>
-                        <button class="btn btn-success" onclick="goPhase3()" id="btnGoPhase3" disabled>
+                        <button class="btn btn-success" data-csp-click="page-analyze-go-phase3-10" id="btnGoPhase3" disabled>
                             <i class="bi bi-arrow-right me-1"></i>下一步：一键改写
                         </button>
-                        <button class="btn btn-outline-secondary btn-sm" onclick="goPhase1()">
+                        <button class="btn btn-outline-secondary btn-sm" data-csp-click="page-analyze-go-phase1-11">
                             <i class="bi bi-arrow-left me-1"></i>返回修改输入
                         </button>
                     </div>
@@ -251,7 +274,7 @@ pageHeader('拆书分析', 'analyze');
                 <div class="a-card">
                     <div class="d-flex align-items-center justify-content-between mb-3">
                         <h6 class="mb-0"><i class="bi bi-pencil-square me-2"></i>分析结果 <small class="text-muted">（可直接编辑）</small></h6>
-                        <button class="btn btn-sm btn-outline-primary" onclick="saveAnalysis()">
+                        <button class="btn btn-sm btn-outline-primary" data-csp-click="page-analyze-save-analysis-12">
                             <i class="bi bi-save me-1"></i>保存
                         </button>
                     </div>
@@ -274,7 +297,7 @@ pageHeader('拆书分析', 'analyze');
                     <h6><i class="bi bi-magic me-2"></i>AI 开始改写 <small class="text-muted">（可编辑）</small></h6>
                     <div id="rewriteFields">
                         <div class="text-center text-muted py-4">
-                            <button class="btn btn-primary" onclick="doRewrite()" id="btnRewrite">
+                            <button class="btn btn-primary" data-csp-click="page-analyze-do-rewrite-13" id="btnRewrite">
                                 <i class="bi bi-stars me-1"></i>一键改写为小说设定
                             </button>
                         </div>
@@ -286,10 +309,10 @@ pageHeader('拆书分析', 'analyze');
                     <h6><i class="bi bi-book-half me-2"></i>新建小说预览</h6>
                     <div id="novelPreview" class="text-center text-muted py-4">改写完成后预览</div>
                     <div class="d-flex gap-2 mt-3" id="novelActions" style="display:none">
-                        <button class="btn btn-primary flex-fill" onclick="createNovel()">
+                        <button class="btn btn-primary flex-fill" data-csp-click="page-analyze-create-novel-14">
                             <i class="bi bi-plus-circle me-1"></i>确认并新建小说
                         </button>
-                        <button class="btn btn-outline-secondary" onclick="goPhase2()">
+                        <button class="btn btn-outline-secondary" data-csp-click="page-analyze-go-phase2-2">
                             <i class="bi bi-arrow-left me-1"></i>返回修改
                         </button>
                     </div>
@@ -306,7 +329,7 @@ pageHeader('拆书分析', 'analyze');
     </div>
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 const STEPS = ['characters','worldview','storyline','emotion','explosive','summary'];
 const STEP_NAMES = {
     characters:'核心人设', worldview:'世界观设定', storyline:'故事线大纲',
@@ -542,7 +565,7 @@ function ensureResultSection(step, streaming) {
         section.innerHTML = `
             <div class="result-header">
                 <h6>${STEP_ICONS[step]} ${STEP_NAMES[step]} <span class="badge bg-warning text-dark" style="font-size:11px">分析中...</span></h6>
-                <button class="btn btn-sm btn-outline-danger" onclick="cancelStep('${step}')"><i class="bi bi-stop"></i></button>
+                <button class="btn btn-sm btn-outline-danger" data-csp-click="page-analyze-cancel-step" data-step="${escHtml(step)}"><i class="bi bi-stop"></i></button>
             </div>
             <div class="stream-output" id="stream-${step}"><span class="stream-cursor"></span></div>
         `;
@@ -554,12 +577,12 @@ function finalizeResultSection(step, content) {
     const section = document.getElementById('section-' + step);
     if (!section) return;
     section.innerHTML = `
-        <div class="result-header" onclick="toggleSectionBody('${step}')">
+        <div class="result-header" data-csp-click="page-analyze-toggle-section" data-step="${escHtml(step)}">
             <h6>${STEP_ICONS[step]} ${STEP_NAMES[step]} <span class="badge bg-success" style="font-size:11px">✓</span></h6>
             <i class="bi bi-chevron-down"></i>
         </div>
         <div class="result-body">
-            <textarea id="result-${step}" onchange="stepResults['${step}']=this.value" rows="8">${escHtml(content)}</textarea>
+            <textarea id="result-${step}" data-csp-change="page-analyze-edit-step" data-step="${escHtml(step)}" rows="8">${escHtml(content)}</textarea>
         </div>
     `;
 }
@@ -722,8 +745,8 @@ function renderRewriteFields(fields) {
     for (const f of defs) {
         const val = escHtml(fields[f.key]||'');
         html += f.type==='textarea'
-            ? `<div class="rewrite-field"><label>${f.label}</label><textarea class="form-control" rows="${f.rows}" id="rw-${f.key}" onchange="onRewriteEdit('${f.key}')">${val}</textarea></div>`
-            : `<div class="rewrite-field"><label>${f.label}</label><input class="form-control" id="rw-${f.key}" value="${val}" onchange="onRewriteEdit('${f.key}')"></div>`;
+            ? `<div class="rewrite-field"><label>${f.label}</label><textarea class="form-control" rows="${f.rows}" id="rw-${f.key}" data-csp-change="page-analyze-edit-rewrite" data-field="${escHtml(f.key)}">${val}</textarea></div>`
+            : `<div class="rewrite-field"><label>${f.label}</label><input class="form-control" id="rw-${f.key}" value="${val}" data-csp-change="page-analyze-edit-rewrite" data-field="${escHtml(f.key)}"></div>`;
     }
     document.getElementById('rewriteFields').innerHTML = html;
 }
@@ -793,10 +816,10 @@ async function loadHistory() {
         if (res.success && res.data && res.data.length) {
             document.getElementById('historyEmpty').style.display = 'none';
             document.getElementById('analysisHistory').innerHTML = res.data.map(item => `
-                <div class="history-item" onclick="viewHistory(${item.id})">
+                <div class="history-item" data-csp-click="page-analyze-view-history" data-id="${Number(item.id)}">
                     <div><div style="font-weight:600">${escHtml(item.title)}</div>
                     <div style="font-size:12px;color:var(--text-muted)">${item.author?escHtml(item.author)+' · ':''}${item.genre?escHtml(item.genre)+' · ':''}${item.created_at}</div></div>
-                    <button class="btn btn-sm btn-outline-danger" onclick="event.stopPropagation();deleteHistory(${item.id})"><i class="bi bi-trash"></i></button>
+                    <button class="btn btn-sm btn-outline-danger" data-csp-click="page-analyze-delete-history" data-id="${Number(item.id)}"><i class="bi bi-trash"></i></button>
                 </div>`).join('');
         } else {
             document.getElementById('historyEmpty').style.display = '';

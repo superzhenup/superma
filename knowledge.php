@@ -27,6 +27,17 @@ $stats = [
 
 pageHeader('智能知识库 - ' . $novel['title'], 'home');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-knowledge-edit-character-1', function (event, element) { editCharacter(0); });
+AppEvents.register('page-knowledge-edit-worldbuilding-2', function (event, element) { editWorldbuilding(0); });
+AppEvents.register('page-knowledge-edit-plot-3', function (event, element) { editPlot(0); });
+AppEvents.register('page-knowledge-edit-style-4', function (event, element) { editStyle(0); });
+AppEvents.register('page-knowledge-save-character-5', function (event, element) { saveCharacter(); });
+AppEvents.register('page-knowledge-save-worldbuilding-6', function (event, element) { saveWorldbuilding(); });
+AppEvents.register('page-knowledge-save-plot-7', function (event, element) { savePlot(); });
+AppEvents.register('page-knowledge-save-style-8', function (event, element) { saveStyle(); });
+</script>
+
 <div class="mb-3">
   <a href="novel.php?id=<?= $id ?>" class="btn btn-outline-secondary btn-sm">
     <i class="bi bi-arrow-left me-1"></i>返回小说管理
@@ -114,7 +125,7 @@ pageHeader('智能知识库 - ' . $novel['title'], 'home');
   <div class="tab-pane fade show active" id="tab-characters">
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h6 class="mb-0">角色列表</h6>
-      <button class="btn btn-primary btn-sm" onclick="editCharacter(0)"><i class="bi bi-plus me-1"></i>添加角色</button>
+      <button class="btn btn-primary btn-sm" data-csp-click="page-knowledge-edit-character-1"><i class="bi bi-plus me-1"></i>添加角色</button>
     </div>
     <div class="table-responsive">
       <table class="table table-hover">
@@ -126,7 +137,7 @@ pageHeader('智能知识库 - ' . $novel['title'], 'home');
   <div class="tab-pane fade" id="tab-worldbuilding">
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h6 class="mb-0">世界观设定</h6>
-      <button class="btn btn-primary btn-sm" onclick="editWorldbuilding(0)"><i class="bi bi-plus me-1"></i>添加设定</button>
+      <button class="btn btn-primary btn-sm" data-csp-click="page-knowledge-edit-worldbuilding-2"><i class="bi bi-plus me-1"></i>添加设定</button>
     </div>
     <div class="table-responsive">
       <table class="table table-hover">
@@ -138,7 +149,7 @@ pageHeader('智能知识库 - ' . $novel['title'], 'home');
   <div class="tab-pane fade" id="tab-plots">
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h6 class="mb-0">情节与伏笔</h6>
-      <button class="btn btn-primary btn-sm" onclick="editPlot(0)"><i class="bi bi-plus me-1"></i>添加情节</button>
+      <button class="btn btn-primary btn-sm" data-csp-click="page-knowledge-edit-plot-3"><i class="bi bi-plus me-1"></i>添加情节</button>
     </div>
     <div class="table-responsive">
       <table class="table table-hover">
@@ -150,7 +161,7 @@ pageHeader('智能知识库 - ' . $novel['title'], 'home');
   <div class="tab-pane fade" id="tab-styles">
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h6 class="mb-0">写作风格参考</h6>
-      <button class="btn btn-primary btn-sm" onclick="editStyle(0)"><i class="bi bi-plus me-1"></i>添加风格</button>
+      <button class="btn btn-primary btn-sm" data-csp-click="page-knowledge-edit-style-4"><i class="bi bi-plus me-1"></i>添加风格</button>
     </div>
     <div class="table-responsive">
       <table class="table table-hover">
@@ -182,7 +193,7 @@ pageHeader('智能知识库 - ' . $novel['title'], 'home');
           </div>
         </form>
       </div>
-      <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button type="button" class="btn btn-primary" onclick="saveCharacter()">保存</button></div>
+      <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button type="button" class="btn btn-primary" data-csp-click="page-knowledge-save-character-5">保存</button></div>
     </div>
   </div>
 </div>
@@ -200,7 +211,7 @@ pageHeader('智能知识库 - ' . $novel['title'], 'home');
           <div class="mb-3"><label class="form-label">描述</label><textarea class="form-control" name="description" rows="4"></textarea></div>
         </form>
       </div>
-      <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button type="button" class="btn btn-primary" onclick="saveWorldbuilding()">保存</button></div>
+      <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button type="button" class="btn btn-primary" data-csp-click="page-knowledge-save-worldbuilding-6">保存</button></div>
     </div>
   </div>
 </div>
@@ -226,7 +237,7 @@ pageHeader('智能知识库 - ' . $novel['title'], 'home');
           </div>
         </form>
       </div>
-      <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button type="button" class="btn btn-primary" onclick="savePlot()">保存</button></div>
+      <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button type="button" class="btn btn-primary" data-csp-click="page-knowledge-save-plot-7">保存</button></div>
     </div>
   </div>
 </div>
@@ -262,7 +273,7 @@ pageHeader('智能知识库 - ' . $novel['title'], 'home');
           <div class="mb-3"><label class="form-label">详细风格说明</label><textarea class="form-control" name="content" rows="3"></textarea></div>
         </form>
       </div>
-      <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button type="button" class="btn btn-primary" onclick="saveStyle()">保存</button></div>
+      <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button type="button" class="btn btn-primary" data-csp-click="page-knowledge-save-style-8">保存</button></div>
     </div>
   </div>
 </div>

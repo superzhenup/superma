@@ -285,14 +285,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // 保存用户预设的卷结构
         if (!empty($volumePlan)) {
             foreach ($volumePlan as $vIdx => $vol) {
+                // 新旧两套卷列同值双写：读方优先 volume_index/chapter_from/chapter_to，
+                // 只写旧列时向导与卷边界判定会读到空值或错位的范围。
                 DB::insert('volume_outlines', [
                     'novel_id'      => (int)$id,
                     'volume_number' => $vIdx + 1,
+                    'volume_index'  => $vIdx + 1,
                     'title'         => $vol['title'] ?: "第" . ($vIdx + 1) . "卷",
                     'summary'       => '',
                     'theme'         => '',
                     'start_chapter' => $vol['start'],
                     'end_chapter'   => $vol['end'],
+                    'chapter_from'  => $vol['start'],
+                    'chapter_to'    => $vol['end'],
                     'key_events'    => '[]',
                     'character_focus' => '[]',
                     'conflict'      => '',
@@ -343,7 +348,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
   <div class="alert alert-danger m-3"><?= h($error) ?></div>
   <?php endif; ?>
 
-  <form method="post" enctype="multipart/form-data" class="p-4" onsubmit="return validateGenreConstraints()">
+  <form method="post" enctype="multipart/form-data" class="p-4">
     <input type="hidden" name="_token" value="<?= csrf_token() ?>">
     <?php if ($isEdit): ?>
     <input type="hidden" name="edit_id" value="<?= $editId ?>">
@@ -360,7 +365,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
         </div>
         <div class="col-md-3">
           <label class="form-label">小说类型</label>
-          <select name="genre" id="genre-select" class="form-select" onchange="toggleCustomInput('genre'); toggleGenreConstraints()">
+          <select name="genre" id="genre-select" class="form-select" data-csp-change="create.genre-change">
             <option value="">选择类型</option>
             <?php 
             $genreValue = $v['genre'] ?? '';
@@ -405,7 +410,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
       <div class="form-section-title"><i class="bi bi-image me-2"></i>封面设置</div>
       <div class="row g-3">
         <div class="col-md-4">
-          <div class="cover-preview-box" id="coverPreviewBox" style="width:180px;height:240px;border-radius:8px;overflow:hidden;background:linear-gradient(135deg,<?= h($v['cover_color'] ?? '#6366f1') ?>,<?= h($v['cover_color'] ?? '#6366f1') ?>99);display:flex;align-items:center;justify-content:center;cursor:pointer;position:relative" onclick="document.getElementById('cover-file-input').click()">
+          <div class="cover-preview-box" id="coverPreviewBox" style="width:180px;height:240px;border-radius:8px;overflow:hidden;background:linear-gradient(135deg,<?= h($v['cover_color'] ?? '#6366f1') ?>,<?= h($v['cover_color'] ?? '#6366f1') ?>99);display:flex;align-items:center;justify-content:center;cursor:pointer;position:relative" data-csp-click="create.choose-cover">
             <div id="coverPreviewContent" style="color:#fff;font-size:1.5rem;font-weight:700;text-align:center;padding:10px;text-shadow:0 2px 8px rgba(0,0,0,.5)">
               <?= h(safe_substr($v['title'] ?? '封面预览', 0, 4)) ?>
             </div>
@@ -414,17 +419,17 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
               <i class="bi bi-pencil"></i> 更换
             </div>
           </div>
-          <input type="file" id="cover-file-input" name="cover_file" accept="image/jpeg,image/png,image/webp" style="display:none" onchange="previewCoverFile(this)">
+          <input type="file" id="cover-file-input" name="cover_file" accept="image/jpeg,image/png,image/webp" style="display:none" data-csp-change="create.preview-cover">
           <input type="hidden" name="cover_image_path" id="cover-image-path" value="<?= h($v['cover_image'] ?? '') ?>">
         </div>
         <div class="col-md-8">
           <div class="mb-3">
             <label class="form-label small text-muted">上传封面图片</label>
             <div class="d-flex gap-2">
-              <button type="button" class="btn btn-outline-primary btn-sm" onclick="document.getElementById('cover-file-input').click()">
+              <button type="button" class="btn btn-outline-primary btn-sm" data-csp-click="create.choose-cover">
                 <i class="bi bi-upload me-1"></i>选择图片
               </button>
-              <button type="button" class="btn btn-outline-danger btn-sm" id="btn-remove-cover" style="display:none" onclick="removeCover()">
+              <button type="button" class="btn btn-outline-danger btn-sm" id="btn-remove-cover" style="display:none" data-csp-click="create.remove-cover">
                 <i class="bi bi-trash me-1"></i>移除封面
               </button>
             </div>
@@ -433,7 +438,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
             <label class="form-label small text-muted">AI 生成封面（基于 gpt-image-2）</label>
             <div class="input-group input-group-sm">
               <input type="text" class="form-control" id="cover-keyword" placeholder="输入封面描述关键词，如：仙侠少年持剑立于云端，背景是巍峨仙山">
-              <button type="button" class="btn btn-outline-info" id="btn-generate-cover" onclick="generateCoverAI()">
+              <button type="button" class="btn btn-outline-info" id="btn-generate-cover" data-csp-click="create.generate-cover">
                 <i class="bi bi-stars me-1"></i>AI 生成
               </button>
             </div>
@@ -468,10 +473,10 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
       <div class="mb-3">
         <label class="form-label small text-muted">👤 主角类型模板（可选快捷填充）</label>
         <div class="row g-2">
-          <div class="col-6 col-md-3"><button type="button" class="btn btn-outline-primary btn-sm w-100" onclick="fillProtagonist('underdog')">📉 废柴逆袭型</button></div>
-          <div class="col-6 col-md-3"><button type="button" class="btn btn-outline-primary btn-sm w-100" onclick="fillProtagonist('fallen')">⭐ 天骄陨落型</button></div>
-          <div class="col-6 col-md-3"><button type="button" class="btn btn-outline-primary btn-sm w-100" onclick="fillProtagonist('transmigrator')">🌀 穿越者型</button></div>
-          <div class="col-6 col-md-3"><button type="button" class="btn btn-outline-primary btn-sm w-100" onclick="fillProtagonist('raising')">🌱 养成型</button></div>
+          <div class="col-6 col-md-3"><button type="button" class="btn btn-outline-primary btn-sm w-100" data-csp-click="create.protagonist" data-protagonist="underdog">📉 废柴逆袭型</button></div>
+          <div class="col-6 col-md-3"><button type="button" class="btn btn-outline-primary btn-sm w-100" data-csp-click="create.protagonist" data-protagonist="fallen">⭐ 天骄陨落型</button></div>
+          <div class="col-6 col-md-3"><button type="button" class="btn btn-outline-primary btn-sm w-100" data-csp-click="create.protagonist" data-protagonist="transmigrator">🌀 穿越者型</button></div>
+          <div class="col-6 col-md-3"><button type="button" class="btn btn-outline-primary btn-sm w-100" data-csp-click="create.protagonist" data-protagonist="raising">🌱 养成型</button></div>
         </div>
     </div>
 
@@ -487,7 +492,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
           $svStyle = json_decode($v['style_vector'] ?? '{}', true)['style'] ?? '';
           $isCustomStyle = !in_array($svStyle, ['concise','ornate','humorous',''], true);
           ?>
-          <select name="vec_style" id="vec-style-select" class="form-select form-select-sm" onchange="toggleCustomInput('vec_style')">
+          <select name="vec_style" id="vec-style-select" class="form-select form-select-sm" data-csp-change="create.custom-input" data-field="vec_style">
             <option value="">— 文风 —</option>
             <option value="concise" <?= ($svStyle==='concise')?'selected':'' ?>>简洁干练</option>
             <option value="ornate" <?= ($svStyle==='ornate')?'selected':'' ?>>华丽铺陈</option>
@@ -505,7 +510,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
           $svPacing = json_decode($v['style_vector'] ?? '{}', true)['pacing'] ?? '';
           $isCustomPacing = !in_array($svPacing, ['fast','slow','alternating',''], true);
           ?>
-          <select name="vec_pacing" id="vec-pacing-select" class="form-select form-select-sm" onchange="toggleCustomInput('vec_pacing')">
+          <select name="vec_pacing" id="vec-pacing-select" class="form-select form-select-sm" data-csp-change="create.custom-input" data-field="vec_pacing">
             <option value="">— 节奏 —</option>
             <option value="fast" <?= ($svPacing==='fast')?'selected':'' ?>>快/爽点密集</option>
             <option value="slow" <?= ($svPacing==='slow')?'selected':'' ?>>慢/细腻铺陈</option>
@@ -523,7 +528,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
           $svEmotion = json_decode($v['style_vector'] ?? '{}', true)['emotion'] ?? '';
           $isCustomEmotion = !in_array($svEmotion, ['passionate','warm','dark',''], true);
           ?>
-          <select name="vec_emotion" id="vec-emotion-select" class="form-select form-select-sm" onchange="toggleCustomInput('vec_emotion')">
+          <select name="vec_emotion" id="vec-emotion-select" class="form-select form-select-sm" data-csp-change="create.custom-input" data-field="vec_emotion">
             <option value="">— 情感 —</option>
             <option value="passionate" <?= ($svEmotion==='passionate')?'selected':'' ?>>热血激情</option>
             <option value="warm" <?= ($svEmotion==='warm')?'selected':'' ?>>温馨治愈</option>
@@ -541,7 +546,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
           $svIntellect = json_decode($v['style_vector'] ?? '{}', true)['intellect'] ?? '';
           $isCustomIntellect = !in_array($svIntellect, ['strategy','power','balanced',''], true);
           ?>
-          <select name="vec_intellect" id="vec-intellect-select" class="form-select form-select-sm" onchange="toggleCustomInput('vec_intellect')">
+          <select name="vec_intellect" id="vec-intellect-select" class="form-select form-select-sm" data-csp-change="create.custom-input" data-field="vec_intellect">
             <option value="">— 智慧 —</option>
             <option value="strategy" <?= ($svIntellect==='strategy')?'selected':'' ?>>智斗/谋略向</option>
             <option value="power" <?= ($svIntellect==='power')?'selected':'' ?>>热血/力量向</option>
@@ -584,7 +589,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
         $ra = $v['ref_author'] ?? '';
         $isCustomAuthor = !in_array($ra, ['chendong','maoni','ergen','zhouzi',''], true);
         ?>
-        <select name="ref_author" id="ref-author-select" class="form-select form-select-sm" onchange="toggleCustomInput('ref_author')">
+        <select name="ref_author" id="ref-author-select" class="form-select form-select-sm" data-csp-change="create.custom-input" data-field="ref_author">
           <option value="">参考作者（可选）</option>
           <option value="chendong" <?= ($ra==='chendong')?'selected':'' ?>>辰东（华丽热血风）</option>
           <option value="maoni" <?= ($ra==='maoni')?'selected':'' ?>>猫腻（简洁智斗风）</option>
@@ -685,7 +690,7 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
       </div>
 
       <div class="d-flex gap-2 mt-2">
-        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="addVolume()">
+        <button type="button" class="btn btn-outline-secondary btn-sm" data-csp-click="create.add-volume">
           <i class="bi bi-plus-circle me-1"></i>添加卷
         </button>
         <span class="text-muted small align-self-center">章节范围根据目标章数自动推算，可手动修改</span>
@@ -708,7 +713,22 @@ pageHeader($isEdit ? '编辑设定 - ' . $novel['title'] : '新建小说', 'crea
 </div>
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
+// CSP delegated page actions. Values stay in data attributes, never executable code.
+window.AppEvents.register('create.genre-change', function(event, element) { toggleCustomInput('genre'); toggleGenreConstraints(); });
+window.AppEvents.register('create.choose-cover', function(event, element) { document.getElementById('cover-file-input').click(); });
+window.AppEvents.register('create.preview-cover', function(event, element) { previewCoverFile(element); });
+window.AppEvents.register('create.remove-cover', function(event, element) { removeCover(); });
+window.AppEvents.register('create.generate-cover', function(event, element) { generateCoverAI(); });
+window.AppEvents.register('create.add-volume', function(event, element) { addVolume(); });
+window.AppEvents.register('create.protagonist', function(event, element) { fillProtagonist(element.dataset.protagonist); });
+window.AppEvents.register('create.custom-input', function(event, element) { toggleCustomInput(element.dataset.field); });
+window.AppEvents.register('create.volume-title', function(event, element) { volumes[Number(element.dataset.volumeIndex)].title = element.value; });
+window.AppEvents.register('create.volume-start', function(event, element) { var index = Number(element.dataset.volumeIndex); volumes[index].start = Math.max(1, parseInt(element.value) || 1); syncVolumeBoundary(index); });
+window.AppEvents.register('create.volume-end', function(event, element) { var index = Number(element.dataset.volumeIndex); volumes[index].end = Math.max(volumes[index].start, parseInt(element.value) || 1); });
+window.AppEvents.register('create.remove-volume', function(event, element) { removeVolume(Number(element.dataset.volumeIndex)); });
+// End CSP delegated page actions.
+
 // ── 封面相关 ────────────────────────────────────────────────────
 function showCoverImage(src) {
     var img = document.getElementById('coverPreviewImg');
@@ -871,17 +891,17 @@ function renderVolumes() {
             '<span class="text-muted small" style="min-width:36px;text-align:right">第'+(idx+1)+'卷</span>' +
             '<input type="text" class="form-control form-control-sm" style="max-width:180px" ' +
                 'placeholder="卷标题（可选）" value="'+escHtml(vol.title)+'" ' +
-                'oninput="volumes['+idx+'].title=this.value">' +
+                'data-csp-input="create.volume-title" data-volume-index="'+idx+'">' +
             '<span class="text-muted small">章节范围</span>' +
             '<input type="number" class="form-control form-control-sm" style="max-width:80px" ' +
                 'min="1" value="'+vol.start+'" ' +
-                'oninput="volumes['+idx+'].start=Math.max(1,parseInt(this.value)||1);syncVolumeBoundary('+idx+')">' +
+                'data-csp-input="create.volume-start" data-volume-index="'+idx+'">' +
             '<span class="text-muted small">—</span>' +
             '<input type="number" class="form-control form-control-sm" style="max-width:80px" ' +
                 'min="1" value="'+vol.end+'" ' +
-                'oninput="volumes['+idx+'].end=Math.max(volumes['+idx+'].start,parseInt(this.value)||1)">' +
+                'data-csp-input="create.volume-end" data-volume-index="'+idx+'">' +
             (volumes.length > 1
-                ? '<button type="button" class="btn btn-outline-danger btn-sm px-2" onclick="removeVolume('+idx+')" title="删除此卷">' +
+                ? '<button type="button" class="btn btn-outline-danger btn-sm px-2" data-csp-click="create.remove-volume" data-volume-index="'+idx+'" title="删除此卷">' +
                   '<i class="bi bi-trash"></i></button>'
                 : '<span style="width:34px"></span>');
         container.appendChild(row);

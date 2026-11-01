@@ -26,7 +26,7 @@ ini_set('zlib.output_compression', 'Off');
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
@@ -70,7 +70,7 @@ $input   = json_decode(file_get_contents('php://input'), true) ?? [];
 $novelId = (int)($input['novel_id'] ?? 0);
 
 // 审计 P0（2026-06-12）：归属校验
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 if ($novelId > 0) checkNovelOwnership($novelId, $userId);
 
 $novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$novelId]);
@@ -291,7 +291,7 @@ foreach ($segments as $segIdx => $seg) {
                                 echo 'data: ' . json_encode(['t' => $token], JSON_UNESCAPED_UNICODE) . "\n\n";
                                 if (ob_get_level()) ob_flush();
                                 flush();
-                            });
+                            }, 'synopsis');
                         },
                         function (AIClient $nextAi, string $errMsg) use ($chNum) {
                             sse('model_switch', [
@@ -375,23 +375,21 @@ foreach ($segments as $segIdx => $seg) {
 
         // 获取卷大纲上下文
         $currentVolume = null;
-        $volumeRows = DB::fetchAll(
-            'SELECT * FROM volume_outlines WHERE novel_id=? AND start_chapter <= ? AND end_chapter >= ?',
-            [$novelId, $batchEnd, $current]
-        );
-        if (!empty($volumeRows)) {
-            $currentVolume = $volumeRows[0];
-        }
+        $volumeRows = fetchVolumeOutlinesOverlapping($novelId, $current, $batchEnd);
+        $currentVolume = $volumeRows[0] ?? null;
 
         // 取记忆上下文
         $queryText = trim(($novel['genre'] ?? '') . '：' . ($novel['plot_settings'] ?? ''));
         try {
+            // 审计修复（2026-08-09 R10-9）：top_k/预算走配置，禁止硬编码 6/5000
+            $semanticTopK = max(1, min(40, (int)getSystemSetting('ws_embedding_top_k', 5, 'int')));
+            $outlineBudget = max(2000, (int)getSystemSetting('ws_outline_memory_budget', 8000, 'int'));
             $memoryCtx = $engine->getPromptContext(
                 $current,
                 $queryText !== '：' ? $queryText : null,
-                5000,
+                $outlineBudget,
                 20,
-                6
+                $semanticTopK
             );
         } catch (Throwable $e) {
             $memoryCtx = null;
@@ -433,7 +431,8 @@ foreach ($segments as $segIdx => $seg) {
                 $memoryCtx['cool_point_history'] = $coolHistory;
 
                 $foreshadows = DB::fetchAll(
-                    'SELECT planted_chapter AS chapter, description AS desc, deadline_chapter AS deadline
+                    // desc 是保留字，别名必须加反引号，否则整条降级查询语法错误。
+                    'SELECT planted_chapter AS chapter, description AS `desc`, deadline_chapter AS deadline
                      FROM foreshadowing_items WHERE novel_id=? AND resolved_chapter IS NULL
                      ORDER BY planted_chapter ASC LIMIT 10',
                     [$novelId]
@@ -498,7 +497,7 @@ foreach ($segments as $segIdx => $seg) {
                             echo 'data: ' . json_encode(['t' => $token], JSON_UNESCAPED_UNICODE) . "\n\n";
                             if (ob_get_level()) ob_flush();
                             flush();
-                        }, 'creative', $onThinking);
+                        }, 'outline', $onThinking);
                     },
                     function (AIClient $nextAi, string $errMsg) use ($current, $batchEnd) {
                         sse('model_switch', [
@@ -574,11 +573,15 @@ foreach ($segments as $segIdx => $seg) {
         if (!empty($allChNums)) {
             $ph = implode(',', array_fill(0, count($allChNums), '?'));
             $existingRows = DB::fetchAll(
-                "SELECT id, chapter_number, status FROM chapters WHERE novel_id=? AND chapter_number IN ({$ph})",
+                "SELECT id, chapter_number, status, canonical_state FROM chapters WHERE novel_id=? AND chapter_number IN ({$ph})",
                 array_merge([$novelId], $allChNums)
             );
             foreach ($existingRows as $er) {
-                $existMap[(int)$er['chapter_number']] = ['id' => (int)$er['id'], 'status' => $er['status']];
+                $existMap[(int)$er['chapter_number']] = [
+                    'id' => (int)$er['id'],
+                    'status' => (string)$er['status'],
+                    'canonical_state' => (string)($er['canonical_state'] ?? 'none'),
+                ];
             }
         }
 
@@ -589,6 +592,13 @@ foreach ($segments as $segIdx => $seg) {
             $kpts    = $item['key_points']            ?? [];
             $hook    = trim($item['hook']             ?? '');
             if (!$chNum) continue;
+            // 审计修复（2026-08-02 H5）：越界章号（AI 幻觉）直接丢弃并记日志，
+            // 防止杂散章节入库 + 断点续传推进被批次外章号破坏。
+            if ($chNum < $current || $chNum > $batchEnd) {
+                sse('progress', ['msg' => "AI 返回了批次外的章号（第{$chNum}章），已跳过（本批次范围 {$current}~{$batchEnd}）"]);
+                addLog($novelId, 'warn', "补写：AI 返回批次外章号 {$chNum}（范围 {$current}-{$batchEnd}），已丢弃");
+                continue;
+            }
 
             // 标题去重：与已有章节（非本批）的标题精确匹配时，自动追加序号后缀
             if ($title !== '' && isset($existingTitles) && is_array($existingTitles)) {
@@ -610,9 +620,12 @@ foreach ($segments as $segIdx => $seg) {
             }
 
             $existing = $existMap[$chNum] ?? null;
-            // 数据保护：已完成章节不被补写大纲覆盖（保护正文）
-            if ($existing && $existing['status'] === 'completed') {
-                sse('progress', ['msg' => "第{$chNum}章已写完，跳过大纲覆盖（保护正文）"]);
+            $outlineMutableStatuses = ['pending', 'outlined', 'skipped', 'failed'];
+            if ($existing && (
+                !in_array($existing['status'], $outlineMutableStatuses, true)
+                || $existing['canonical_state'] !== 'none'
+            )) {
+                sse('progress', ['msg' => "第{$chNum}章已有正文或写作任务，跳过大纲覆盖（保护 Canon）"]);
                 continue;
             }
             $row = [
@@ -623,7 +636,25 @@ foreach ($segments as $segIdx => $seg) {
                 'status'     => 'outlined',
             ];
             if ($existing) {
-                DB::update('chapters', $row, 'id=? AND status<>"completed"', [$existing['id']]);
+                $affected = DB::update(
+                    'chapters',
+                    $row,
+                    'id=? AND status IN ("pending","outlined","skipped","failed")'
+                        . ' AND COALESCE(canonical_state,"none")="none"',
+                    [$existing['id']]
+                );
+                if ($affected < 1) {
+                    $stillMutable = DB::fetch(
+                        'SELECT id FROM chapters WHERE id=?'
+                            . ' AND status IN ("pending","outlined","skipped","failed")'
+                            . ' AND COALESCE(canonical_state,"none")="none" LIMIT 1',
+                        [$existing['id']]
+                    );
+                    if (!$stillMutable) {
+                        sse('progress', ['msg' => "第{$chNum}章状态已变化，跳过并发大纲覆盖"]);
+                        continue;
+                    }
+                }
             } else {
                 DB::insert('chapters', array_merge($row, [
                     'novel_id'       => $novelId,

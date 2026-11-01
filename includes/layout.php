@@ -4,6 +4,8 @@ defined('APP_LOADED') or die('Direct access denied.');
 // 产品版本单一来源：layout 会渲染 APP_VERSION，故自身兜底加载，
 // 不依赖调用方是否已通过 config.php 引入（兼容旧版安装生成的 config.php）。
 require_once __DIR__ . '/version.php';
+require_once __DIR__ . '/ContentSecurityPolicy.php';
+require_once __DIR__ . '/RequestSecurity.php';
 
 /**
  * 静态资源路径解析函数（已弃用）
@@ -28,13 +30,16 @@ function assetVersion(string $relPath): string {
 
 function sendSecurityHeaders(): void {
     if (headers_sent()) return;
+    ContentSecurityPolicy::send();
     header('X-Frame-Options: SAMEORIGIN');
     header('X-Content-Type-Options: nosniff');
     header('Referrer-Policy: strict-origin-when-cross-origin');
     // 安全加固（S2）：检测真实协议（兼容反向代理 X-Forwarded-Proto）
-    $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
-        || ((int)($_SERVER['SERVER_PORT'] ?? 0) === 443);
+    $isHttps = RequestSecurity::isHttps(
+        $_SERVER,
+        false,
+        defined('TRUSTED_PROXIES') && is_array(TRUSTED_PROXIES) ? TRUSTED_PROXIES : []
+    );
     if ($isHttps) {
         header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
     } elseif (defined('FORCE_HTTPS') && FORCE_HTTPS === true) {
@@ -63,13 +68,14 @@ function pageHeader(string $title = '', string $activeNav = ''): void {
 <meta charset="UTF-8">  
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <!-- CSRF token: 仅通过 JS 变量暴露，不放入 DOM meta 标签 -->
-<script>window.CSRF_TOKEN = '<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES) ?>';</script>
+<script nonce="<?= cspNonce() ?>">window.CSRF_TOKEN = '<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES) ?>';</script>
+<script src="assets/js/csp-events.js?v=<?= assetVersion('assets/js/csp-events.js') ?>"></script>
 <title><?= h($pageTitle) ?></title>
 <link rel="stylesheet" href="assets/vendor/bootstrap.min.css">
 <link rel="stylesheet" href="assets/vendor/bootstrap-icons.min.css">
 <link rel="stylesheet" href="assets/css/style.css?v=<?= assetVersion('assets/css/style.css') ?>">
 <!-- 立即读取主题，避免闪烁 -->
-<script>
+<script nonce="<?= cspNonce() ?>">
 (function(){
   var t = 'dark';
   try { t = localStorage.getItem('novel-theme') || 'dark'; } catch(e) {}
@@ -77,7 +83,7 @@ function pageHeader(string $title = '', string $activeNav = ''): void {
 })();
 </script>
 <!-- 全局 CSRF 拦截：为同源的写请求自动附加 X-CSRF-Token 头 -->
-<script>
+<script nonce="<?= cspNonce() ?>">
 (function(){
   var CSRF_TOKEN = window.CSRF_TOKEN || '';
   if (!CSRF_TOKEN) return;
@@ -127,7 +133,7 @@ function pageHeader(string $title = '', string $activeNav = ''): void {
 <body>
 
 <!-- Sidebar -->
-<div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
+<div class="sidebar-overlay" id="sidebar-overlay" data-csp-click="layout.toggleSidebar"></div>
 <div class="sidebar" id="sidebar">
   <div class="sidebar-brand">
     <span class="brand-icon">✦</span>
@@ -144,10 +150,6 @@ function pageHeader(string $title = '', string $activeNav = ''): void {
       <i class="bi bi-search-heart"></i> 拆书分析 </a>
     <a href="shorts.php"   class="nav-item <?= $activeNav==='shorts'   ? 'active':'' ?>">
       <i class="bi bi-journal-text"></i> 短篇创作 </a>
-    <a href="dramas.php"   class="nav-item <?= $activeNav==='dramas'   ? 'active':'' ?>">
-      <i class="bi bi-film"></i> 漫剧制作 </a>
-    <a href="hot_topics.php" class="nav-item <?= $activeNav==='hot_topics' ? 'active':'' ?>">
-      <i class="bi bi-fire"></i> 热门选题 </a>
     <a href="settings.php" class="nav-item <?= $activeNav==='settings' ? 'active':'' ?>">
       <i class="bi bi-cpu"></i> 模型设置 </a>
     <a href="writing_settings.php" class="nav-item <?= $activeNav==='writing_settings' ? 'active':'' ?>">
@@ -161,7 +163,7 @@ function pageHeader(string $title = '', string $activeNav = ''): void {
 <!-- Main content -->
 <div class="main-content">
   <div class="topbar">
-    <button class="sidebar-toggle" onclick="toggleSidebar()">
+    <button class="sidebar-toggle" data-csp-click="layout.toggleSidebar">
       <i class="bi bi-list fs-5"></i>
     </button>
     <h5 class="topbar-title mb-0"><?= h($title ?: $siteTitle) ?></h5>
@@ -179,7 +181,7 @@ function pageHeader(string $title = '', string $activeNav = ''): void {
       <span class="text-muted small d-none d-md-inline">
         <i class="bi bi-person-circle me-1"></i><?= htmlspecialchars($_SESSION['username']) ?>
       </span>
-      <form action="logout.php" method="post" class="m-0" onsubmit="return confirm('确定退出登录？')">
+      <form action="logout.php" method="post" class="m-0" data-csp-submit="layout.confirmLogout">
         <input type="hidden" name="_token" value="<?= h(csrf_token()) ?>">
         <button type="submit" class="btn btn-sm btn-outline-secondary py-1 px-2" title="退出登录">
           <i class="bi bi-box-arrow-right"></i>
@@ -199,16 +201,12 @@ function pageFooter(): void {
 </div><!-- .main-content -->
 
 <script src="assets/vendor/bootstrap.bundle.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"
-        integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a"
-        crossorigin="anonymous"
-        referrerpolicy="no-referrer"></script>
 <script src="assets/js/app.js?v=<?= assetVersion('assets/js/app.js') ?>"></script>
 <script src="assets/js/app-export-import.js?v=<?= assetVersion('assets/js/app-export-import.js') ?>"></script>
 <!-- 优化大纲 AJAX 方案 -->
 <script src="assets/js/optimize_outline_ajax.js?v=<?= assetVersion('assets/js/optimize_outline_ajax.js') ?>"></script>
 <script src="assets/js/optimize_manager.js?v=<?= assetVersion('assets/js/optimize_manager.js') ?>"></script>
-<script>
+<script nonce="<?= cspNonce() ?>">
 function toggleSidebar() {
   var sidebar = document.getElementById('sidebar');
   var overlay = document.getElementById('sidebar-overlay');
@@ -221,6 +219,8 @@ function toggleSidebar() {
     sidebar.classList.toggle('collapsed');
   }
 }
+AppEvents.register('layout.toggleSidebar', function () { toggleSidebar(); });
+AppEvents.register('layout.confirmLogout', function () { return confirm('确定退出登录？'); });
 </script>
 </body>
 </html>

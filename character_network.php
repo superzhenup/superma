@@ -35,6 +35,18 @@ $novel = requireNovelAccess($novel);
             integrity="sha384-6ox9IspbVlrc5vabD45kZcCJ8HeSwMAQjf9Iq48U/+srTVTNzsB7EqDC5oYpA0WC"
             crossorigin="anonymous"
             referrerpolicy="no-referrer"></script>
+    <script src="assets/js/csp-events.js"></script>
+
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-character-network-focus-selected-1', function (event, element) { CharacterNetworkStandalone.focusSelected(); });
+AppEvents.register('page-character-network-reset-view-2', function (event, element) { CharacterNetworkStandalone.resetView(); });
+AppEvents.register('page-character-network-toggle-physics-3', function (event, element) { CharacterNetworkStandalone.togglePhysics(); });
+AppEvents.register('page-character-network-search-4', function (event, element) { CharacterNetworkStandalone.search(this.value); });
+AppEvents.register('page-character-network-toggle-role-5', function (event, element) { CharacterNetworkStandalone.toggleRole('protagonist'); });
+AppEvents.register('page-character-network-toggle-role-6', function (event, element) { CharacterNetworkStandalone.toggleRole('major'); });
+AppEvents.register('page-character-network-toggle-role-7', function (event, element) { CharacterNetworkStandalone.toggleRole('minor'); });
+AppEvents.register('page-character-network-toggle-role-8', function (event, element) { CharacterNetworkStandalone.toggleRole('background'); });
+</script>
 </head>
 <body class="cn-page">
 
@@ -47,13 +59,13 @@ $novel = requireNovelAccess($novel);
             <h1 class="cn-page-title"><span><?= htmlspecialchars($novel['title'], ENT_QUOTES, 'UTF-8') ?></span> · 角色关系网络</h1>
         </div>
         <div class="cn-topbar-actions">
-            <button class="cn-btn" onclick="CharacterNetworkStandalone.focusSelected()" title="聚焦选中角色">
+            <button class="cn-btn" data-csp-click="page-character-network-focus-selected-1" title="聚焦选中角色">
                 <i class="bi bi-crosshair"></i>聚焦
             </button>
-            <button class="cn-btn" onclick="CharacterNetworkStandalone.resetView()" title="重置视图">
+            <button class="cn-btn" data-csp-click="page-character-network-reset-view-2" title="重置视图">
                 <i class="bi bi-arrows-fullscreen"></i>重置
             </button>
-            <button class="cn-btn" id="cn-physics-btn" onclick="CharacterNetworkStandalone.togglePhysics()" title="切换物理效果">
+            <button class="cn-btn" id="cn-physics-btn" data-csp-click="page-character-network-toggle-physics-3" title="切换物理效果">
                 <i class="bi bi-activity"></i>物理
             </button>
         </div>
@@ -78,7 +90,7 @@ $novel = requireNovelAccess($novel);
             <!-- 搜索 -->
             <div class="cn-search">
                 <i class="bi bi-search cn-search-icon"></i>
-                <input type="text" id="cn-search-input" placeholder="搜索角色..." oninput="CharacterNetworkStandalone.search(this.value)">
+                <input type="text" id="cn-search-input" placeholder="搜索角色..." data-csp-input="page-character-network-search-4">
             </div>
 
             <!-- 统计 -->
@@ -95,16 +107,16 @@ $novel = requireNovelAccess($novel);
 
             <!-- 图例 -->
             <div class="cn-legend-float">
-                <div class="cn-legend-item" onclick="CharacterNetworkStandalone.toggleRole('protagonist')">
+                <div class="cn-legend-item" data-csp-click="page-character-network-toggle-role-5">
                     <span class="cn-dot cn-dot-protagonist"></span>主角
                 </div>
-                <div class="cn-legend-item" onclick="CharacterNetworkStandalone.toggleRole('major')">
+                <div class="cn-legend-item" data-csp-click="page-character-network-toggle-role-6">
                     <span class="cn-dot cn-dot-major"></span>主要
                 </div>
-                <div class="cn-legend-item" onclick="CharacterNetworkStandalone.toggleRole('minor')">
+                <div class="cn-legend-item" data-csp-click="page-character-network-toggle-role-7">
                     <span class="cn-dot cn-dot-minor"></span>次要
                 </div>
-                <div class="cn-legend-item" onclick="CharacterNetworkStandalone.toggleRole('background')">
+                <div class="cn-legend-item" data-csp-click="page-character-network-toggle-role-8">
                     <span class="cn-dot cn-dot-dead"></span>背景
                 </div>
             </div>
@@ -129,7 +141,7 @@ $novel = requireNovelAccess($novel);
     </div>
 
     <script src="assets/js/character_network_standalone.js"></script>
-    <script>
+    <script nonce="<?= cspNonce() ?>">
         document.addEventListener('DOMContentLoaded', () => {
             CharacterNetworkStandalone.init(<?= $novelId ?>);
         });

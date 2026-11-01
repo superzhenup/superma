@@ -14,7 +14,7 @@ class ConstraintStateDB
 {
     private int $novelId;
 
-    public function __construct(int $novelId)
+    public function __construct(int $novelId, private bool $strict = false)
     {
         $this->novelId = $novelId;
     }
@@ -36,11 +36,13 @@ class ConstraintStateDB
             );
             $state = [];
             foreach ($rows as $row) {
-                $value = json_decode($row['state_value'], true) ?? [];
+                $value = json_decode($row['state_value'], true, 512,
+                    $this->strict ? JSON_THROW_ON_ERROR : 0) ?? [];
                 $state[$row['state_type']][$row['state_key']] = $value;
             }
             return $state;
         } catch (\Throwable $e) {
+            if ($this->strict) throw $e;
             error_log("ConstraintStateDB::loadAll failed: {$e->getMessage()}");
             return [];
         }
@@ -57,8 +59,10 @@ class ConstraintStateDB
                 [$this->novelId, $stateType, $stateKey]
             );
             if (!$row) return $default;
-            return json_decode($row['state_value'], true) ?? $default;
+            return json_decode($row['state_value'], true, 512,
+                $this->strict ? JSON_THROW_ON_ERROR : 0) ?? $default;
         } catch (\Throwable $e) {
+            if ($this->strict) throw $e;
             error_log("ConstraintStateDB::get failed: {$e->getMessage()}");
             return $default;
         }
@@ -74,7 +78,7 @@ class ConstraintStateDB
     public function set(string $stateType, string $stateKey, $value): void
     {
         try {
-            $json = json_encode($value, JSON_UNESCAPED_UNICODE);
+            $json = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
             DB::execute(
                 'INSERT INTO constraint_state (novel_id, state_type, state_key, state_value)
                  VALUES (?, ?, ?, ?)
@@ -83,6 +87,7 @@ class ConstraintStateDB
             );
         } catch (\Throwable $e) {
             error_log("ConstraintStateDB::set failed: {$e->getMessage()}");
+            throw $e;
         }
     }
 
@@ -95,9 +100,17 @@ class ConstraintStateDB
     {
         if (empty($entries)) return;
 
+        $pdo = DB::connect();
+        $ownTx = !$pdo->inTransaction();
+        $savepoint = 'constraint_batch_' . bin2hex(random_bytes(6));
+        $started = false;
         try {
-            $pdo = DB::connect();
-            $pdo->beginTransaction();
+            if ($ownTx) {
+                if (!$pdo->beginTransaction()) throw new RuntimeException('Cannot start constraint transaction.');
+            } else {
+                $pdo->exec('SAVEPOINT ' . $savepoint);
+            }
+            $started = true;
 
             $stmt = $pdo->prepare(
                 'INSERT INTO constraint_state (novel_id, state_type, state_key, state_value)
@@ -110,16 +123,26 @@ class ConstraintStateDB
                     $this->novelId,
                     $entry['type'],
                     $entry['key'],
-                    json_encode($entry['value'], JSON_UNESCAPED_UNICODE)
+                    json_encode($entry['value'], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR)
                 ]);
             }
 
-            $pdo->commit();
+            if ($ownTx) {
+                if (!$pdo->commit()) throw new RuntimeException('Cannot commit constraint state.');
+            } else {
+                $pdo->exec('RELEASE SAVEPOINT ' . $savepoint);
+            }
+            $started = false;
         } catch (\Throwable $e) {
-            if (isset($pdo) && $pdo->inTransaction()) {
-                $pdo->rollBack();
+            if ($started && $pdo->inTransaction()) {
+                if ($ownTx) $pdo->rollBack();
+                else {
+                    $pdo->exec('ROLLBACK TO SAVEPOINT ' . $savepoint);
+                    $pdo->exec('RELEASE SAVEPOINT ' . $savepoint);
+                }
             }
             error_log("ConstraintStateDB::setBatch failed: {$e->getMessage()}");
+            throw $e;
         }
     }
 
@@ -342,16 +365,17 @@ class ConstraintStateDB
             }
 
             $lastClimax = $this->getLastClimaxChapter();
+            $cooldown = ConstraintConfig::cooldownAfterClimax();
             if ($lastClimax > 0 && $currentChapter > $lastClimax) {
                 $gap = $currentChapter - $lastClimax;
-                if ($gap >= 5) {
+                if ($gap < $cooldown) {
+                    $lines[] = "上章刚高潮（间隔{$gap}/冷却{$cooldown}章）：本章须降温蓄势，禁止连续高潮。";
+                } elseif ($gap >= max(5, $cooldown + 3)) {
                     $lines[] = "距上次高潮已隔 {$gap} 章：本章宜安排冲突升级或爽点释放。";
-                } elseif ($gap <= 1) {
-                    $lines[] = "上章刚高潮：本章可略缓，避免连续高潮疲劳。";
                 }
             }
 
-            $history = $this->getConflictHistory(3);
+            $history = $this->getConflictHistory(max(3, ConstraintConfig::maxSameConflict() + 1));
             if ($history) {
                 $types = [];
                 foreach ($history as $h) {
@@ -359,11 +383,23 @@ class ConstraintStateDB
                     if ($t !== '') $types[] = $t;
                 }
                 if ($types) {
-                    $lines[] = "近章冲突类型：" . implode('、', array_unique($types)) . "——本章尽量换类型或换打法。";
+                    $sameLimit = ConstraintConfig::maxSameConflict();
+                    $recentSame = 0;
+                    $first = $types[0];
+                    foreach ($types as $t) {
+                        if ($t === $first) $recentSame++;
+                        else break;
+                    }
+                    if ($first !== 'mixed' && $recentSame > $sameLimit) {
+                        $lines[] = "近{$recentSame}章冲突都是「{$first}」（上限连续{$sameLimit}章）：本章必须换类型或换打法。";
+                    } else {
+                        $lines[] = "近章冲突类型：" . implode('、', array_unique($types)) . "——本章尽量换类型或换打法。";
+                    }
                 }
             }
 
             $bannedUsage = $this->getBannedWordUsage();
+            $bannedCap = ConstraintConfig::maxBannedWordUsage();
             if (is_array($bannedUsage) && $bannedUsage) {
                 arsort($bannedUsage);
                 $hot = [];
@@ -373,9 +409,50 @@ class ConstraintStateDB
                     }
                 }
                 if ($hot) {
-                    $lines[] = "禁用词累计偏高：" . implode('、', $hot) . "——本章回避或换说法。";
+                    $over = array_sum($bannedUsage) >= $bannedCap;
+                    $lines[] = ($over ? "禁用词累计已超上限{$bannedCap}：" : "禁用词累计偏高：")
+                        . implode('、', $hot) . "——本章回避或换说法。";
                 }
             }
+
+            $pendingFs = $this->getActiveForeshadowingCount();
+            $resolvedFs = $this->getResolvedForeshadowingCount();
+            $fsTotal = $pendingFs + $resolvedFs;
+            if ($fsTotal > 0 && $currentChapter > 0) {
+                $progress = 0.0;
+                try {
+                    $novel = DB::fetch('SELECT target_chapters FROM novels WHERE id=?', [$this->novelId]);
+                    $target = (int)($novel['target_chapters'] ?? 0);
+                    if ($target <= 0) {
+                        if (!function_exists('estimateNovelTargetChapters')) {
+                            require_once dirname(__DIR__) . '/memory.php';
+                        }
+                        $target = estimateNovelTargetChapters($this->novelId, $currentChapter, 100);
+                    }
+                    $progress = min(1.0, $currentChapter / max(1, $target));
+                } catch (\Throwable $e) {
+                    $progress = 0.0;
+                }
+                $minRate = ConstraintConfig::foreshadowingRecoveryMin() / 100;
+                $expected = (int)floor($fsTotal * $progress * $minRate);
+                if ($resolvedFs < $expected) {
+                    $lines[] = "伏笔回收偏低（已收{$resolvedFs}/建议≥{$expected}，待收{$pendingFs}）：本章优先回收一处到期伏笔。";
+                }
+            }
+
+            $combatMin = ConstraintConfig::combatRatioMin();
+            $combatMax = ConstraintConfig::combatRatioMax();
+            if ($history) {
+                $lastType = is_array($history[0] ?? null)
+                    ? trim((string)($history[0]['type'] ?? ''))
+                    : '';
+                if ($lastType === 'combat') {
+                    $lines[] = "上章偏武力冲突：本章武力戏份建议控制在约{$combatMin}–{$combatMax}%篇幅，其余用对话/计谋缓冲。";
+                }
+            }
+
+            $maxNewInfo = ConstraintConfig::maxNewInfoPerChapter();
+            $lines[] = "本章新设定/新势力不超过{$maxNewInfo}个，其余用已有人物与已埋线索推进。";
 
             $viol = $this->getRecentViolations(5);
             if (($viol['total'] ?? 0) >= 2) {

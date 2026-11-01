@@ -1,5 +1,6 @@
 <?php
 defined('APP_LOADED') or die('Direct access denied.');
+require_once dirname(__DIR__) . '/quality/ChapterGenerationIntegrity.php';
 
 /**
  * RewriteAgent — 迭代改进重写 Agent
@@ -43,7 +44,10 @@ class RewriteAgent
     private bool $useIterativeMode;
     private bool $useCriticAgent;
 
-    public function __construct(int $novelId, int $chapterId = 0)
+    // H8: 懒缓存小说级字数目标，供 quickQualityCheck 注入 Gate1
+    private ?int $novelChapterWords = null;
+
+    public function __construct(int $novelId, int $chapterId = 0, ?int $frozenRewriteLimit = null)
     {
         $this->novelId = $novelId;
         $this->chapterId = $chapterId;
@@ -53,7 +57,11 @@ class RewriteAgent
         require_once __DIR__ . '/IterativeRefinementController.php';
         require_once __DIR__ . '/ImprovementEvaluator.php';
 
-        $this->refinementController = new IterativeRefinementController($novelId, $chapterId);
+        $this->refinementController = new IterativeRefinementController(
+            $novelId,
+            $chapterId,
+            $frozenRewriteLimit
+        );
         $this->evaluator = new ImprovementEvaluator($novelId, $chapterId);
     }
 
@@ -76,7 +84,20 @@ class RewriteAgent
      * @param array $gateResults 五关检测结果
      * @param float $originalScore 原始质量分
      * @param int|null $modelId 模型ID
-     * @return array{rewritten: bool, new_score: float|null, content: string|null, message: string, iterations_used: int}
+     * @return array{
+     *   generation_attempted:bool,
+     *   rewritten:bool,
+     *   new_score:float|null,
+     *   content:string|null,
+     *   message:string,
+     *   iterations_used:int,
+     *   diagnostics?:array
+     * }
+     *
+     * `rewritten` is retained as a compatibility alias for
+     * `generation_attempted`; it no longer means that this Agent accepted the
+     * output.  The caller must freeze `content` as a Candidate and let the
+     * canonical quality gate decide whether it is promoted or quarantined.
      */
     public function rewriteIfNeeded(
         array $chapter,
@@ -113,6 +134,7 @@ class RewriteAgent
         // 检查是否需要重写
         if ($originalScore >= $this->threshold) {
             return [
+                'generation_attempted' => false,
                 'rewritten' => false,
                 'new_score' => null,
                 'content' => null,
@@ -126,6 +148,7 @@ class RewriteAgent
 
         if (empty($criticalIssues) && $originalScore >= $this->threshold - 10) {
             return [
+                'generation_attempted' => false,
                 'rewritten' => false,
                 'new_score' => null,
                 'content' => null,
@@ -163,9 +186,12 @@ class RewriteAgent
 
         try {
             // 准备上下文
+            // 批次二（2026-08-16）：把采纳门槛（min_gain）传给迭代控制器，
+            // 供其"已达采纳增益即提前收割"联动判定（见 refine() 内 adoption_gain）
             $context = [
                 'model_id' => $modelId,
                 'use_critic_agent' => $this->useCriticAgent,
+                'adoption_gain' => $this->minGain,
             ];
 
             // 获取章节基本信息
@@ -189,49 +215,113 @@ class RewriteAgent
                 ));
             }
 
-            // 检查是否采纳重写
-            $finalScore = $result['final_score'];
-            $gain = round($finalScore - $originalScore, 1);
+            // IterativeRefinementController keeps its historical best/fallback
+            // result for existing callers, but also exposes the last literal
+            // model output.
+            // 审计修复 P1（2026-09-27）：冻结候选从"末轮原始输出"改为控制器的
+            // final_content（含历史最优回溯）。原设计刻意把 raw 末轮稿交统一
+            // 质量门，但末轮可能是空/截断/低分尝试：门过则比中间轮更差的
+            // 退化稿晋升 Canon，门不过则更优的中间稿被白白丢弃——历史最优
+            // 稿从未获得门的评审机会。final_content 由控制器保证 best 回溯
+            // 语义（空稿回退原稿时与原文同 hash，由调用方跳过提交）；
+            // raw 保留为诊断字段。
+            $generationAttempted = !empty($result['generation_attempted']);
+            $rawContent = $generationAttempted && is_string($result['raw_content'] ?? null)
+                ? $result['raw_content']
+                : ($generationAttempted ? '' : null);
+            $candidateContent = $generationAttempted
+                ? (string)($result['final_content'] ?? $rawContent)
+                : null;
+            $integrity = (array)($result['generation_integrity'] ?? []);
+            if ($generationAttempted && $candidateContent !== $rawContent) {
+                // 候选来自历史最优回溯：末轮的证据不能描述候选。
+                // 审计修复 F07（2026-11-01）：原实现只清 finish_reason、保留末轮
+                // generation_error，健康的历史稿仍被统一门判为 content.truncated。
+                // 改用控制器按正文 hash 绑定的、候选自己那一轮的完成证据；拿不到
+                // 证据时保留末轮证据（失败关闭），绝不笼统清空错误。
+                $candidateIntegrity = $result['final_content_integrity'] ?? null;
+                if (is_array($candidateIntegrity)) {
+                    $integrity = [
+                        'finish_reason' => $candidateIntegrity['finish_reason'] ?? null,
+                        'generation_error' => $candidateIntegrity['generation_error'] ?? null,
+                    ];
+                }
+                $integrity['candidate_source'] = 'iteration_best';
+            }
+            $candidateScore = null;
+            if ($generationAttempted) {
+                $normalizedCandidate = trim((string)$candidateContent);
+                foreach (array_reverse((array)($result['history'] ?? [])) as $iterationResult) {
+                    if (!is_array($iterationResult)
+                        || !array_key_exists('improved_content', $iterationResult)
+                        || !is_string($iterationResult['improved_content'])
+                        || !hash_equals($normalizedCandidate, $iterationResult['improved_content'])) {
+                        continue;
+                    }
+                    if (is_numeric($iterationResult['after_score'] ?? null)) {
+                        $candidateScore = (float)$iterationResult['after_score'];
+                    }
+                    break;
+                }
+            }
+            $gain = $candidateScore !== null
+                ? round($candidateScore - $originalScore, 1)
+                : null;
+            $legacyGainMet = $gain !== null ? $gain >= $this->minGain : null;
 
-            if ($gain < $this->minGain) {
-                addLog($this->novelId, 'rewrite', sprintf(
-                    '第 %d 章迭代改进效果不佳：%.1f → %.1f（+%.1f 分），低于最低增益 %d 分，不采纳',
-                    $chNum,
-                    $originalScore,
-                    $finalScore,
-                    $gain,
-                    $this->minGain
-                ));
-
+            if (!$generationAttempted) {
                 return [
+                    'generation_attempted' => false,
                     'rewritten' => false,
-                    'new_score' => $finalScore,
+                    'new_score' => null,
                     'content' => null,
-                    'message' => "迭代改进后得分 {$finalScore}（+{$gain} 分），低于最低增益 {$this->minGain} 分，不采纳",
-                    'iterations_used' => $result['iterations_used'],
-                    'iteration_history' => $result['history'],
+                    'message' => '迭代检查完成，但未调用模型生成重写候选',
+                    'iterations_used' => (int)($result['iterations_used'] ?? 0),
+                    'iteration_history' => (array)($result['history'] ?? []),
                     'improvement_report' => $evaluation ?? null,
+                    'diagnostics' => [
+                        'controller_final_score' => is_numeric($result['final_score'] ?? null)
+                            ? (float)$result['final_score']
+                            : null,
+                        'legacy_min_gain' => $this->minGain,
+                        'legacy_gain_met' => null,
+                    ],
                 ];
             }
 
             addLog($this->novelId, 'rewrite', sprintf(
-                '第 %d 章迭代重写采纳：%.1f → %.1f（+%.1f 分），用时 %.0fms',
+                '第 %d 章迭代重写候选已生成：%d 字符（%s），旧增益门槛诊断=%s，用时 %.0fms',
                 $chNum,
-                $originalScore,
-                $finalScore,
-                $gain,
-                $result['execution_time_ms']
+                mb_strlen((string)$candidateContent),
+                $candidateContent !== $rawContent ? '历史最优稿' : '末轮稿',
+                $legacyGainMet === null ? '未评分' : ($legacyGainMet ? '达到' : '未达到'),
+                (float)($result['execution_time_ms'] ?? 0)
             ));
 
             return [
+                'generation_attempted' => true,
+                // Deprecated compatibility alias: generated, not accepted.
                 'rewritten' => true,
-                'new_score' => $finalScore,
-                'content' => $result['final_content'],
-                'message' => "迭代重写成功：{$originalScore} → {$finalScore}（+{$gain} 分）",
-                'iterations_used' => $result['iterations_used'],
-                'iteration_history' => $result['history'],
+                'new_score' => $candidateScore,
+                'content' => (string)$candidateContent,
+                'generation_integrity' => $integrity,
+                'message' => '迭代重写候选已生成，等待统一质量门判定',
+                'iterations_used' => (int)($result['iterations_used'] ?? 0),
+                'iteration_history' => (array)($result['history'] ?? []),
                 'improvement_report' => $evaluation ?? null,
-                'execution_time_ms' => $result['execution_time_ms'],
+                'execution_time_ms' => (float)($result['execution_time_ms'] ?? 0),
+                'diagnostics' => [
+                    'controller_final_score' => is_numeric($result['final_score'] ?? null)
+                        ? (float)$result['final_score']
+                        : null,
+                    'candidate_score' => $candidateScore,
+                    'gain' => $gain,
+                    'legacy_min_gain' => $this->minGain,
+                    'legacy_gain_met' => $legacyGainMet,
+                    'output_characters' => mb_strlen((string)$candidateContent),
+                    'short_output' => mb_strlen(trim((string)$candidateContent)) < 200,
+                    'candidate_source' => $candidateContent !== $rawContent ? 'iteration_best' : 'last_round',
+                ],
             ];
         } catch (\Throwable $e) {
             error_log('RewriteAgent::performIterativeRefinement 失败：' . $e->getMessage());
@@ -264,6 +354,7 @@ class RewriteAgent
 
         if (empty($criticalIssues)) {
             return [
+                'generation_attempted' => false,
                 'rewritten' => false,
                 'new_score' => null,
                 'content' => null,
@@ -276,13 +367,25 @@ class RewriteAgent
         $chapterTitle = $chapter['title'] ?? '';
         $outline = $chapter['outline'] ?? '';
 
+        // 审计修复（2026-08-09 R11-3）：注入精简铁律，避免重写剥掉钩子/禁词
+        $isFinal = false;
+        try {
+            $tc = (int)(DB::fetch('SELECT target_chapters FROM novels WHERE id=?', [$this->novelId])['target_chapters'] ?? 0);
+            $isFinal = $tc > 0 && (int)$chNum >= $tc;
+        } catch (\Throwable) { /* ignore */ }
+        if (!function_exists('rewriteIronRulesSnippet')) {
+            require_once dirname(__DIR__) . '/helpers.php';
+        }
+        $iron = rewriteIronRulesSnippet($isFinal);
+
         $system = <<<EOT
 你是一位资深网文编辑，擅长将初稿改写成高质量章节。
 按以下规则重写：
 1. 只修正指出的问题，不要改动已经合格的段落
 2. 保持原有的人物性格、情节走向、对话风格
 3. 保持原有字数范围
-4. 直接输出重写后的完整章节正文，不要加任何前缀或解释
+4. {$iron}
+5. 直接输出重写后的完整章节正文，不要加任何前缀或解释
 EOT;
 
         $user = <<<EOT
@@ -299,61 +402,85 @@ EOT;
 请输出重写后的完整章节正文：
 EOT;
 
+        $generationStarted = false;
+        $collected = '';
         try {
             // H-10 修复（2026-07-25）：原用非流式 $ai->chat()，长章节易静默超时。
             // 与 IterativeRefinementController::applyImprovements 统一，改用 chatStream + collector。
             $ai = getAIClient($modelId);
-            $collected = '';
+            $generationStarted = true;
             $ai->chatStream([
                 ['role' => 'system', 'content' => $system],
                 ['role' => 'user',   'content' => $user],
             ], function ($chunk) use (&$collected) {
                 $collected .= $chunk;
             }, 'creative');
-            $rewritten = trim($collected);
+            ChapterGenerationIntegrity::assertComplete($ai->lastFinishReason ?? null);
+            $rewritten = $collected;
+            $normalized = trim($rewritten);
+            $outputCharacters = mb_strlen($normalized);
 
-            if (empty($rewritten) || mb_strlen($rewritten) < 200) {
-                return [
-                    'rewritten' => false,
-                    'new_score' => null,
-                    'content' => null,
-                    'message' => '重写失败：AI返回内容过短（<200字）',
-                    'iterations_used' => 0,
-                ];
-            }
-
-            // 快速五关检测重写后的内容
-            $newScore = $this->quickQualityCheck($chapter, $rewritten);
-            $gain = round($newScore - $originalScore, 1);
-
-            if ($gain < $this->minGain) {
-                return [
-                    'rewritten' => false,
-                    'new_score' => $newScore,
-                    'content' => null,
-                    'message' => "重写后得分 {$newScore}（提升 {$gain} 分），低于最低增益 {$this->minGain} 分，不采纳",
-                    'iterations_used' => 1,
-                ];
-            }
+            // This legacy score is diagnostic only. Empty/short output is not
+            // discarded or locally accepted: WriteEngine persists the literal
+            // attempt first and CanonicalQualityGate owns the decision.
+            $newScore = $outputCharacters >= 200
+                ? $this->quickQualityCheck($chapter, $normalized)
+                : null;
+            $gain = $newScore !== null
+                ? round($newScore - $originalScore, 1)
+                : null;
+            $legacyGainMet = $gain !== null ? $gain >= $this->minGain : null;
 
             addLog($this->novelId, 'rewrite', sprintf(
-                '第 %d 章单次重写采纳：%.1f → %.1f（+%.1f 分）',
+                '第 %d 章单次重写候选已生成：%d 字符，旧增益门槛诊断=%s',
                 $chNum,
-                $originalScore,
-                $newScore,
-                $gain
+                $outputCharacters,
+                $legacyGainMet === null ? '未评分' : ($legacyGainMet ? '达到' : '未达到')
             ));
 
             return [
+                'generation_attempted' => true,
+                // Deprecated compatibility alias: generated, not accepted.
                 'rewritten' => true,
                 'new_score' => $newScore,
                 'content' => $rewritten,
-                'message' => "重写成功：{$originalScore} → {$newScore}（+{$gain} 分）",
+                'generation_integrity' => ['finish_reason' => $ai->lastFinishReason ?? null, 'generation_error' => null],
+                'message' => '单次重写候选已生成，等待统一质量门判定',
                 'iterations_used' => 1,
+                'diagnostics' => [
+                    'candidate_score' => $newScore,
+                    'gain' => $gain,
+                    'legacy_min_gain' => $this->minGain,
+                    'legacy_gain_met' => $legacyGainMet,
+                    'output_characters' => $outputCharacters,
+                    'short_output' => $outputCharacters < 200,
+                ],
             ];
         } catch (\Throwable $e) {
             error_log('RewriteAgent::performSingleRewrite 失败：' . $e->getMessage());
+            if ($generationStarted) {
+                // A thrown stream may still have yielded a partial body. Even
+                // zero yielded bytes are a real model attempt and therefore a
+                // Candidate for the canonical gate to quarantine explicitly.
+                return [
+                    'generation_attempted' => true,
+                    'rewritten' => true,
+                    'new_score' => null,
+                    'content' => $collected,
+                    'generation_integrity' => ['finish_reason' => $ai->lastFinishReason ?? null, 'generation_error' => $e->getMessage()],
+                    'message' => '重写流异常，保留已生成候选：' . $e->getMessage(),
+                    'iterations_used' => 1,
+                    'diagnostics' => [
+                        'generation_error' => $e->getMessage(),
+                        'legacy_min_gain' => $this->minGain,
+                        'legacy_gain_met' => null,
+                        'output_characters' => mb_strlen(trim($collected)),
+                        'short_output' => mb_strlen(trim($collected)) < 200,
+                    ],
+                ];
+            }
             return [
+                'generation_attempted' => false,
                 'rewritten' => false,
                 'new_score' => null,
                 'content' => null,
@@ -385,14 +512,22 @@ EOT;
 
     /**
      * 准备章节基本信息
+     *
+     * 审计修复（2026-08-02 H8）：补入 chapter_words。
+     * 原查询不含此列 → Gates::checkGate1_Structure 的 $ch['chapter_words'] 为未定义键
+     * → 回退全局 ws_chapter_words（默认 2000）→ 重写评分基于错误的字数目标，
+     * 与小说实际目标（可能 3000/4000）不符，导致合理字数的正文被误判扣分。
      */
     private function prepareChapterInfo(array $chapter): array
     {
         // 获取小说基本信息
         $novelInfo = DB::fetch(
-            'SELECT title, genre, protagonist_name FROM novels WHERE id = ?',
+            'SELECT title, genre, protagonist_name, chapter_words FROM novels WHERE id = ?',
             [$this->novelId]
         );
+
+        // H8: 缓存小说级字数目标，供单次重写路径 quickQualityCheck 复用，避免重复查询
+        $this->novelChapterWords = (int)($novelInfo['chapter_words'] ?? 0);
 
         return [
             'id' => $chapter['id'] ?? 0,
@@ -402,6 +537,8 @@ EOT;
             'novel_title' => $novelInfo['title'] ?? '',
             'genre' => $novelInfo['genre'] ?? '都市',
             'protagonist_name' => $novelInfo['protagonist_name'] ?? '主角',
+            // H8: 传递小说级字数目标给 Gate1；0/缺失时 Gate1 自身回退到全局 ws_chapter_words
+            'chapter_words' => $this->novelChapterWords,
         ];
     }
 
@@ -417,12 +554,28 @@ EOT;
             // daemon/SSE 场景下会导致进程被杀死、postProcess 后续步骤全部跳过。
             require_once __DIR__ . '/../quality/Gates.php';
 
+            // H8 修复：单次重写路径的 $chapter 来自外部调用方，通常不含 chapter_words。
+            // Gate1 在 $ch['chapter_words'] 缺失时会回退到全局 ws_chapter_words（默认 2000），
+            // 导致小说实际目标为 3000/4000 字的合理正文被误判"字数不足"扣 30 分。
+            // 此处注入小说级字数目标：优先复用 prepareChapterInfo 的缓存，未缓存则懒加载。
+            if (!isset($chapter['chapter_words']) || (int)$chapter['chapter_words'] <= 0) {
+                if ($this->novelChapterWords === null) {
+                    $novelInfo = DB::fetch(
+                        'SELECT chapter_words FROM novels WHERE id = ?',
+                        [$this->novelId]
+                    );
+                    $this->novelChapterWords = (int)($novelInfo['chapter_words'] ?? 0);
+                }
+                $chapter['chapter_words'] = $this->novelChapterWords;
+            }
+
             $results = [];
             $results[] = checkGate1_Structure($chapter, $content);
             $results[] = checkGate2_Characters($this->novelId, $content);
             $results[] = checkGate3_Description(null, $content);
             $results[] = checkGate4_CoolPoint($content, $chapter['outline'] ?? null);
             $results[] = checkGate5_Consistency($chapter['id'] ?? 0, $this->novelId, $content);
+            $results[] = checkGate6_OutlineAdherence($chapter, $content);
 
             $scores = array_column($results, 'score');
             return count($scores) > 0 ? round(array_sum($scores) / count($scores), 1) : 0;
@@ -480,11 +633,19 @@ EOT;
 EOT;
 
         try {
+            // 审计修复（2026-08-17 P3）修复9：原用非流式 $ai->chat()，全章正文进 prompt
+            // 有静默超时风险。照搬 performSingleRewrite 的 H-10 模式改为 chatStream +
+            // collector，保留原 'creative' 温度档与返回值 trim 处理。
             $ai = getAIClient($modelId);
-            $rewritten = trim($ai->chat([
+            $collected = '';
+            $ai->chatStream([
                 ['role' => 'system', 'content' => $system],
                 ['role' => 'user',   'content' => $user],
-            ], 'creative'));
+            ], function ($chunk) use (&$collected) {
+                $collected .= $chunk;
+            }, 'creative');
+            ChapterGenerationIntegrity::assertComplete($ai->lastFinishReason ?? null);
+            $rewritten = trim($collected);
 
             if (empty($rewritten) || mb_strlen($rewritten) < 200) {
                 return [
@@ -642,6 +803,19 @@ EOT;
                 $protagonist = $novel['protagonist_name'] ?? '';
             } catch (\Throwable $e) { error_log('RewriteAgent differentialRewrite novel fetch failed: ' . $e->getMessage()); }
             $rewrittenCount = 0;
+            // 审计修复（2026-08-17 P3）修复10：待重写段数原无上限——Editor 可能标注
+            // 大部分段落，逐段 AI 调用（每段 1 次）成本失控。上限 = max(5, 段落总数/3)，
+            // 超出取前 N 段（保键），截断信息记日志并附在返回 message 中。
+            $maxRewrite = max(5, intdiv(count($paragraphs), 3));
+            $truncated = 0;
+            if (count($toRewrite) > $maxRewrite) {
+                $truncated = count($toRewrite) - $maxRewrite;
+                addLog($this->novelId, 'rewrite', sprintf(
+                    '第%d章差分重写：Editor 标注 %d 段超上限 %d，仅重写前 %d 段（跳过 %d 段）',
+                    $chNum, count($toRewrite), $maxRewrite, $maxRewrite, $truncated
+                ));
+                $toRewrite = array_slice($toRewrite, 0, $maxRewrite, true);
+            }
             foreach ($toRewrite as $pIdx => $issue) {
                 // 修复：段落循环内检测取消标志，避免用户取消后仍继续烧 API（每段 1 次 AI 调用）。
                 // refine() 主体在每轮开头检查，但差分重写逐段循环（可能 5-10 段）期间无法中断。
@@ -681,11 +855,13 @@ EOT;
                 $chNum, $rewrittenCount, count($toRewrite)
             ));
 
+            // 修复10：截断信息附在 message 中，供调用方感知未全量处理
+            $truncationNote = $truncated > 0 ? "（另有{$truncated}段超单次上限未重写）" : '';
             return [
                 'success'              => true,
                 'content'              => $newContent,
                 'rewritten_paragraphs' => $rewrittenCount,
-                'message'              => "差分重写成功：修改{$rewrittenCount}个段落",
+                'message'              => "差分重写成功：修改{$rewrittenCount}个段落{$truncationNote}",
             ];
         } catch (\Throwable $e) {
             error_log('RewriteAgent::differentialRewrite 失败：' . $e->getMessage());

@@ -70,12 +70,13 @@ class CriticAgent
             // 提取平均分
             $avgs = [];
             foreach ($recentScores as $row) {
+                $scores = json_decode($row['critic_scores'] ?? '', true);
+                if (!is_array($scores) || ($scores['complete'] ?? true) === false) continue;
                 $calibrated = json_decode($row['calibrated_critic_scores'] ?? '', true);
-                if (isset($calibrated['avg'])) {
+                if (isset($calibrated['avg']) && is_numeric($calibrated['avg']) && $calibrated['avg'] > 0) {
                     $avgs[] = (float)$calibrated['avg'];
-                } else {
-                    $scores = json_decode($row['critic_scores'] ?? '', true);
-                    $avgs[] = (float)($scores['avg'] ?? 0);
+                } elseif (isset($scores['avg']) && is_numeric($scores['avg']) && $scores['avg'] > 0) {
+                    $avgs[] = (float)$scores['avg'];
                 }
             }
 
@@ -164,7 +165,7 @@ EOT;
 {$truncated}
 
 请输出严格JSON，格式如下：
-{{"thrill":分数,"thrill_reason":"原因","immersion":分数,"immersion_reason":"原因","pacing":分数,"pacing_reason":"原因","freshness":分数,"freshness_reason":"原因","read_next":分数,"read_next_reason":"原因"}}
+{"thrill":分数,"thrill_reason":"原因","immersion":分数,"immersion_reason":"原因","pacing":分数,"pacing_reason":"原因","freshness":分数,"freshness_reason":"原因","read_next":分数,"read_next_reason":"原因"}
 EOT;
 
         try {
@@ -187,49 +188,8 @@ EOT;
                 return $this->emptyResult();
             }
 
-            $scores = [];
-            $reasons = [];
-            $missingDims = [];
-            foreach (self::DIMENSIONS as $key => $label) {
-                // 修复：原代码缺失维度时 (int)0 → max(1,...) = 1 分，把"缺失"当"极差"，
-                // 拉低 avg 并制造虚假 weak_dims，触发不必要的重写与下章指令。
-                // 改为：缺失时按中性 5 分处理（不低于 6 分阈值，不触发 weak_dims）。
-                if (!isset($result[$key]) || !is_numeric($result[$key])) {
-                    $scores[$key] = 5;
-                    $reasons[$key] = 'AI未返回该维度评分，按中性处理';
-                    $missingDims[] = $key;
-                    continue;
-                }
-                $score = (int)$result[$key];
-                $scores[$key] = max(1, min(10, $score));
-                $reasons[$key] = (string)($result["{$key}_reason"] ?? '');
-            }
-            if (!empty($missingDims)) {
-                error_log("CriticAgent::review 缺失维度评分: " . implode(',', $missingDims));
-            }
-
-            $avg = count($scores) > 0 ? round(array_sum($scores) / count($scores), 1) : 0;
-
-            // 识别弱项（< 6分）
-            $weakDims = [];
-            foreach ($scores as $key => $score) {
-                if ($score < 6) {
-                    $weakDims[] = [
-                        'dim' => $key,
-                        'label' => self::DIMENSIONS[$key],
-                        'score' => $score,
-                        'reason' => $reasons[$key] ?? '',
-                    ];
-                }
-            }
-
-            $result = [
-                'scores'    => $scores,
-                'reasons'   => $reasons,
-                'avg'       => $avg,
-                'weak_dims' => $weakDims,
-            ];
-            self::$scoreCache[$cacheKey] = $result; // P1-2: 缓存成功结果
+            $result = $this->normalizeReview($result);
+            if ($result['complete']) self::$scoreCache[$cacheKey] = $result;
             return $result;
         } catch (\Throwable $e) {
             error_log('CriticAgent::review 失败：' . $e->getMessage());
@@ -252,10 +212,11 @@ EOT;
      * @param array  $context      上下文（title/genre/protagonist_name/chapter_title/outline/model_id）
      * @return array{scores:array,reasons:array,avg:float,weak_dims:array,relative:?array}
      */
-    public function reviewCombined(string $content, string $prevContent, array $context): array
+    public function reviewCombined(string $content, string $prevContent, array $context, bool $strict = false): array
     {
         // P1-2: 静态缓存，避免同章重复 AI 调用
-        $cacheKey = 'reviewCombined:' . md5($content . '|' . $prevContent . '|' . (string)($context['model_id'] ?? ''));
+        $cacheKey = ($strict ? 'reviewCombinedFrozen:' . hash('sha256', json_encode($context, JSON_THROW_ON_ERROR)) . ':' : 'reviewCombined:')
+            . md5($content . '|' . $prevContent . '|' . (string)($context['model_id'] ?? ''));
         if (isset(self::$scoreCache[$cacheKey])) {
             return self::$scoreCache[$cacheKey];
         }
@@ -320,66 +281,37 @@ EOT;
 
             $result = json_decode($raw, true);
             if (!is_array($result)) {
+                if ($strict) {
+                    throw new UnexpectedValueException('Critic did not return a valid JSON review.');
+                }
                 error_log("CriticAgent::reviewCombined JSON解析失败: " . json_last_error_msg() . " | raw: " . substr($raw, 0, 300));
                 return $this->emptyResult();
             }
 
-            $scores = [];
-            $reasons = [];
-            $missingDims = [];
-            foreach (self::DIMENSIONS as $key => $label) {
-                // 修复：原代码缺失维度时 (int)0 → max(1,...) = 1 分，把"缺失"当"极差"，
-                // 拉低 avg 并制造虚假 weak_dims，触发不必要的重写与下章指令。
-                // 改为：缺失时按中性 5 分处理（不低于 6 分阈值，不触发 weak_dims）。
-                if (!isset($result[$key]) || !is_numeric($result[$key])) {
-                    $scores[$key] = 5;
-                    $reasons[$key] = 'AI未返回该维度评分，按中性处理';
-                    $missingDims[] = $key;
-                    continue;
-                }
-                $score = (int)$result[$key];
-                $scores[$key] = max(1, min(10, $score));
-                $reasons[$key] = (string)($result["{$key}_reason"] ?? '');
-            }
-            if (!empty($missingDims)) {
-                error_log("CriticAgent::review 缺失维度评分: " . implode(',', $missingDims));
-            }
-
-            $avg = count($scores) > 0 ? round(array_sum($scores) / count($scores), 1) : 0;
-
-            $weakDims = [];
-            foreach ($scores as $key => $score) {
-                if ($score < 6) {
-                    $weakDims[] = [
-                        'dim' => $key,
-                        'label' => self::DIMENSIONS[$key],
-                        'score' => $score,
-                        'reason' => $reasons[$key] ?? '',
-                    ];
-                }
+            $normalized = $this->normalizeReview($result);
+            if ($strict && empty($normalized['scores'])) {
+                throw new UnexpectedValueException('Critic did not return any valid review dimensions.');
             }
 
             // 解析相对评分
             $relative = null;
             if ($hasPrev && isset($result['relative']) && is_array($result['relative'])) {
                 $relative = [];
-                foreach (self::DIMENSIONS as $key => $label) {
+                foreach ($normalized['scores'] as $key => $score) {
                     $v = strtolower(trim((string)($result['relative'][$key] ?? 'same')));
                     if (!in_array($v, ['better', 'worse', 'same'], true)) $v = 'same';
                     $relative[$key] = $v;
                 }
             }
 
-            $result = [
-                'scores'    => $scores,
-                'reasons'   => $reasons,
-                'avg'       => $avg,
-                'weak_dims' => $weakDims,
-                'relative'  => $relative,
-            ];
-            self::$scoreCache[$cacheKey] = $result; // P1-2: 缓存成功结果
+            $result = $normalized + ['relative' => $relative];
+            if ($result['complete']) self::$scoreCache[$cacheKey] = $result;
             return $result;
         } catch (\Throwable $e) {
+            if ($strict || $e instanceof AIRequestCanceledException
+                || $e instanceof WriteEnginePostprocessLeaseLostException) {
+                throw $e;
+            }
             error_log('CriticAgent::reviewCombined 失败：' . $e->getMessage());
             return $this->emptyResult();
         }
@@ -406,9 +338,10 @@ EOT;
      * @param array $rawScores 原始 CriticAgent 绝对分
      * @param array|null $humanScores 人工评分（如有）
      * @param array|null $relative 相对评分 better/worse/same（如有）
+     * @param array|null $referenceModelScores 与 humanScores 同章的模型分；null 表示当前章
      * @return array 校准后的分数组
      */
-    public function calibrate(array $rawScores, ?array $humanScores = null, ?array $relative = null): array
+    public function calibrate(array $rawScores, ?array $humanScores = null, ?array $relative = null, ?array $referenceModelScores = null): array
     {
         $calibrated = $rawScores;
 
@@ -424,32 +357,38 @@ EOT;
             ));
         }
 
-        // Step 1: 人工偏差修正
+        // Step 1: 人工偏差只来自同一章的模型/人工配对。
+        // 未提供历史模型分时，humanScores 必须属于当前章。
+        $referenceModelScores ??= $rawScores;
         if ($humanScores) {
-            foreach (self::DIMENSIONS as $key => $label) {
-                $sysScore = (float)($rawScores[$key] ?? 5);
-                $humanScore = (float)($humanScores[$key] ?? $sysScore);
-                $bias = $sysScore - $humanScore;
+            foreach ($rawScores as $key => $value) {
+                $sysScore = (float)$value;
+                $bias = isset($humanScores[$key], $referenceModelScores[$key])
+                    && is_numeric($humanScores[$key]) && is_numeric($referenceModelScores[$key])
+                    && $humanScores[$key] >= 1 && $humanScores[$key] <= 10
+                    && $referenceModelScores[$key] >= 1 && $referenceModelScores[$key] <= 10
+                    ? (float)$referenceModelScores[$key] - (float)$humanScores[$key]
+                    : 0.0;
                 $calibrated[$key] = max(1, min(10, round($sysScore - $bias * 0.5 + $anchorAdjustment, 1)));
             }
         } elseif ($anchorAdjustment !== 0) {
             // 无人工评分时，仅应用锚定调整
-            foreach (self::DIMENSIONS as $key => $label) {
-                $calibrated[$key] = max(1, min(10, round(($rawScores[$key] ?? 5) + $anchorAdjustment, 1)));
+            foreach ($rawScores as $key => $value) {
+                $calibrated[$key] = max(1, min(10, round($value + $anchorAdjustment, 1)));
             }
         }
 
         // Step 2: 相对评分微调（幅度较小）
         if ($relative) {
             $delta = 0.5; // 每次 better/worse 的调整幅度
-            foreach (self::DIMENSIONS as $key => $label) {
+            foreach ($calibrated as $key => $value) {
                 $adj = match ($relative[$key] ?? 'same') {
                     'better' => $delta,
                     'worse'  => -$delta,
                     default  => 0,
                 };
                 if ($adj !== 0) {
-                    $calibrated[$key] = max(1, min(10, round(($calibrated[$key] ?? 5) + $adj, 1)));
+                    $calibrated[$key] = max(1, min(10, round($value + $adj, 1)));
                 }
             }
         }
@@ -457,13 +396,30 @@ EOT;
         return $calibrated;
     }
 
+    /** Missing measurements never become invented scores or creative instructions. */
+    private function normalizeReview(array $raw): array
+    {
+        $scores = $reasons = $weak = $missing = [];
+        foreach (self::DIMENSIONS as $key => $label) {
+            if (!isset($raw[$key]) || !is_numeric($raw[$key]) || !is_finite((float)$raw[$key])
+                || (float)$raw[$key] < 1 || (float)$raw[$key] > 10) {
+                $missing[] = $key;
+                continue;
+            }
+            $score = (int)$raw[$key];
+            $scores[$key] = $score;
+            $reason = is_scalar($raw[$key . '_reason'] ?? null) ? (string)$raw[$key . '_reason'] : '';
+            $reasons[$key] = $reason;
+            if ($score < 6) $weak[] = ['dim' => $key, 'label' => $label, 'score' => $score, 'reason' => $reason];
+        }
+        return ['scores' => $scores, 'reasons' => $reasons,
+            'avg' => $scores === [] ? 0 : round(array_sum($scores) / count($scores), 1),
+            'weak_dims' => $weak, 'available' => $scores !== [],
+            'complete' => $missing === [], 'missing_dims' => $missing];
+    }
+
     private function emptyResult(): array
     {
-        return [
-            'scores'    => [],
-            'reasons'   => [],
-            'avg'       => 0,
-            'weak_dims' => [],
-        ];
+        return $this->normalizeReview([]);
     }
 }

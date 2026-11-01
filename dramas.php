@@ -14,7 +14,7 @@ require_once __DIR__ . '/includes/layout.php';
 require_once __DIR__ . '/includes/data.php';
 require_once __DIR__ . '/includes/drama/DramaService.php';
 
-$currentUserId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$currentUserId = currentUserId();
 $projects = DramaService::listProjectsByUser($currentUserId);
 
 $totalProjects = count($projects);
@@ -44,6 +44,11 @@ $stageColors = [
 
 pageHeader('漫剧项目', 'dramas');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-dramas-open', function (event, element) { location.href = 'drama.php?novel_id=' + Number(element.dataset.novelId); });
+AppEvents.register('page-dramas-stop-card-navigation', function (event, element) { event.stopPropagation(); });
+</script>
+
 
 <!-- Stats row -->
 <div class="row g-3 mb-4">
@@ -115,7 +120,7 @@ pageHeader('漫剧项目', 'dramas');
     $updated = !empty($p['updated_at']) ? substr((string)$p['updated_at'], 0, 16) : '-';
   ?>
   <div class="col-12 col-md-6 col-xl-4">
-    <div class="page-card" onclick="location.href='drama.php?novel_id=<?= (int)$p['novel_id'] ?>'">
+    <div class="page-card" data-csp-click="page-dramas-open" data-novel-id="<?= (int)$p['novel_id'] ?>">
       <div class="page-card-header d-flex align-items-center justify-content-between">
         <span class="text-truncate">
           <i class="bi bi-film me-2"></i><?= h($p['title'] ?: $p['novel_title'] ?: '未命名项目') ?>
@@ -133,7 +138,7 @@ pageHeader('漫剧项目', 'dramas');
           <span><i class="bi bi-clock me-1"></i><?= h($updated) ?></span>
         </div>
         <div class="d-flex justify-content-end mt-2">
-          <a href="drama.php?novel_id=<?= (int)$p['novel_id'] ?>" class="btn btn-outline-primary btn-sm" onclick="event.stopPropagation()">
+          <a href="drama.php?novel_id=<?= (int)$p['novel_id'] ?>" class="btn btn-outline-primary btn-sm" data-csp-click="page-dramas-stop-card-navigation">
             <i class="bi bi-box-arrow-in-right me-1"></i>进入项目
           </a>
         </div>

@@ -142,24 +142,39 @@ final class DramaService
             $snapshot = mb_substr($snapshot, 0, 50000);
         }
 
-        $nextNo = (int)DB::fetchColumn(
-            'SELECT COALESCE(MAX(episode_no),0)+1 FROM drama_episodes WHERE project_id=?',
-            [$projectId]
-        );
-        if ($title === '') {
-            $first = $chapters[0];
-            $title = '第' . $nextNo . '集';
-            if (!empty($first['title'])) $title .= ' ' . (string)$first['title'];
+        // 审计修复（2026-10-31 B4）：集号 MAX+1 原为读后写，并发建集会算出同一
+        // episode_no，后者撞 uk_project_episode 报错。锁项目行后在事务内读 MAX
+        // 并完成插入，同项目的集号分配串行化；默认标题依赖集号，随之移入事务内。
+        if (!DB::beginTransaction()) {
+            throw new RuntimeException('无法为集号分配开启事务');
         }
+        try {
+            if (!is_array(DB::fetch('SELECT id FROM drama_projects WHERE id=? FOR UPDATE', [$projectId]))) {
+                throw new RuntimeException('漫剧项目不存在');
+            }
+            $nextNo = (int)DB::fetchColumn(
+                'SELECT COALESCE(MAX(episode_no),0)+1 FROM drama_episodes WHERE project_id=?',
+                [$projectId]
+            );
+            if ($title === '') {
+                $first = $chapters[0];
+                $title = '第' . $nextNo . '集';
+                if (!empty($first['title'])) $title .= ' ' . (string)$first['title'];
+            }
 
-        DB::insert('drama_episodes', [
-            'project_id'    => $projectId,
-            'episode_no'    => $nextNo,
-            'chapter_start' => $chapterStart,
-            'chapter_end'   => $chapterEnd,
-            'title'         => $title,
-            'source_text'   => $snapshot,
-        ]);
+            DB::insert('drama_episodes', [
+                'project_id'    => $projectId,
+                'episode_no'    => $nextNo,
+                'chapter_start' => $chapterStart,
+                'chapter_end'   => $chapterEnd,
+                'title'         => $title,
+                'source_text'   => $snapshot,
+            ]);
+            DB::commit();
+        } catch (Throwable $e) {
+            if (DB::inTransaction()) DB::rollBack();
+            throw $e;
+        }
         $episode = self::getEpisode((int)DB::lastId());
         if (!$episode) throw new RuntimeException('剧集创建失败');
         return $episode;
@@ -249,7 +264,10 @@ final class DramaService
     /** 整集替换分镜（事务），供 AI 生成后落库。 */
     public static function replaceShots(int $episodeId, array $shots): void
     {
-        DB::beginTransaction();
+        // Task publication owns the outer transaction; never commit its lease early.
+        $pdo = DB::connect();
+        $ownsTransaction = !$pdo->inTransaction();
+        if ($ownsTransaction) $pdo->beginTransaction();
         try {
             DB::delete('drama_shots', 'episode_id=?', [$episodeId]);
             $no = 1;
@@ -267,10 +285,10 @@ final class DramaService
                     'duration'        => max(3, min(12, (int)($shot['duration'] ?? 5))),
                 ]);
             }
-            DB::update('drama_episodes', ['script_status' => 'storyboarded'], 'id=?', [$episodeId]);
-            DB::commit();
+            DB::update('drama_episodes', ['script_status' => 'storyboarded', 'status' => 'in_progress', 'final_video_path' => null], 'id=?', [$episodeId]);
+            if ($ownsTransaction) $pdo->commit();
         } catch (Throwable $e) {
-            if (DB::inTransaction()) DB::rollBack();
+            if ($ownsTransaction && $pdo->inTransaction()) $pdo->rollBack();
             throw $e;
         }
     }

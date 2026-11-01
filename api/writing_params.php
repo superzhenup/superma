@@ -10,6 +10,8 @@ require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/db.php';
 require_once __DIR__ . '/../includes/auth.php';
 require_once __DIR__ . '/../includes/helpers.php';
+require_once __DIR__ . '/../includes/daemon/DaemonSchedule.php';
+require_once __DIR__ . '/../includes/harness/HarnessEmergencyStop.php';
 requireLoginApi();
 
 header('Content-Type: application/json');
@@ -30,6 +32,35 @@ foreach ($wsDefaults as $key => $def) {
 
 try {
     switch ($action) {
+        case 'bump_harness_emergency_epoch':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+                throw new Exception('必须使用 POST 方法');
+            }
+            csrf_verify();
+
+            try {
+                $epoch = HarnessEmergencyStop::bump();
+            } catch (Throwable $bumpError) {
+                error_log(sprintf(
+                    '[HARNESS_EMERGENCY_STOP] user=%d bump_failed=%s',
+                    currentUserId(),
+                    $bumpError->getMessage()
+                ));
+                throw $bumpError;
+            }
+            error_log(sprintf(
+                '[HARNESS_EMERGENCY_STOP] user=%d epoch=%d->%d',
+                currentUserId(),
+                $epoch['previous_epoch'],
+                $epoch['current_epoch']
+            ));
+            echo json_encode([
+                'success' => true,
+                'message' => '紧急停止代际已递增；在途写作将在下一安全检查点停止',
+                'data' => $epoch,
+            ]);
+            break;
+
         case 'get':
             $currentValues = [];
             if (!empty($paramDefs)) {
@@ -65,6 +96,12 @@ try {
             $errors = [];
 
             foreach ($paramDefs as $key => $def) {
+                // Monotonic kill-switch state is never a generic form value.
+                // Silently skip it because the settings form submits every
+                // visible field; only the authenticated bump action may write.
+                if (HarnessEmergencyStop::isProtectedSetting((string)$key)) {
+                    continue;
+                }
                 $rawValue = $input[$key] ?? null;
                 if ($rawValue === null) {
                     continue;
@@ -85,6 +122,12 @@ try {
                         $val = max($def['min'], min($def['max'], (float)$rawValue));
                     } elseif ($def['type'] === 'select') {
                         $val = isset($def['options'][$rawValue]) ? $rawValue : $def['default'];
+                    } elseif ($def['type'] === 'time') {
+                        $val = trim((string)$rawValue);
+                        if (!DaemonSchedule::isValidTime($val)) {
+                            $errors[$key] = "{$def['label']} 必须是 HH:MM 格式的有效时间";
+                            continue;
+                        }
                     } else {
                         $val = trim((string)$rawValue);
                     }
@@ -114,8 +157,10 @@ try {
             clearSystemSettingsCache();
 
             echo json_encode([
-                'success' => true,
-                'message' => "已保存 {$savedCount} 项写作参数",
+                'success' => $errors === [],
+                'message' => $errors === []
+                    ? "已保存 {$savedCount} 项写作参数"
+                    : '部分参数格式无效，请修正后重试',
                 'saved_count' => $savedCount,
                 'errors' => $errors,
             ]);
@@ -130,6 +175,11 @@ try {
 
             $resetCount = 0;
             foreach ($paramDefs as $key => $def) {
+                // Resetting to zero would create a 0 -> 1 -> 0 ABA and could
+                // re-authorize an old worker. Epoch is increment-only forever.
+                if (HarnessEmergencyStop::isProtectedSetting((string)$key)) {
+                    continue;
+                }
                 $val = (string)$def['default'];
 
                 try {
@@ -158,7 +208,7 @@ try {
 
             echo json_encode([
                 'success' => true,
-                'message' => '所有写作参数已重置为系统默认值',
+                'message' => '可重置的写作参数已恢复默认值；紧急停止代际保持不变',
                 'reset_count' => $resetCount,
             ]);
             break;

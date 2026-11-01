@@ -11,7 +11,7 @@ ob_start();
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
@@ -46,6 +46,10 @@ try {
     $totalPages = max(1, (int)ceil($totalChapterCount / $perPage));
     $currentPage = max(1, min($totalPages, (int)($_GET['page'] ?? 1)));
     $chapters = getNovelChapters($id, $currentPage, $perPage);
+
+    // completed 警告章与旧版 failed 章都需展示质检提示。
+    $qualityWarningChapterIds = array_map(static fn($c) => (int)$c['id'], $chapters);
+    $hardFailMap = getFailedChapterReasons($id, $qualityWarningChapterIds);
 
     try {
         $pageNumbers = array_column($chapters, 'chapter_number');

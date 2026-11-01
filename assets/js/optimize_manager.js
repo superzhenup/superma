@@ -53,8 +53,10 @@ function cancelOptimizeOutline() {
             cancelOptimizeOutlineAjax();
         }
     } else {
-        if (typeof optimizeOutlineController !== 'undefined' && optimizeOutlineController) {
-            optimizeOutlineController.abort();
+        // 审计修复（2026-08-02 H12）：controller 由 app.js 的 optimizeOutlineLogic()
+        // 在发起 SSE 请求时创建并挂到 window.optimizeOutlineController。
+        if (window.optimizeOutlineController) {
+            window.optimizeOutlineController.abort();
         }
     }
 }

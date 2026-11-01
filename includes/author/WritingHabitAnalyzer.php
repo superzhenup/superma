@@ -3,6 +3,7 @@
  * 写作习惯分析器 - 作者画像系统
  * 分析用词偏好、句式结构、常用修辞等写作习惯
  */
+defined('APP_LOADED') or die('Direct access denied.');
 
 class WritingHabitAnalyzer
 {
@@ -63,7 +64,7 @@ class WritingHabitAnalyzer
                 }
             }
 
-            $dialogueCount += preg_match_all('/[""「」『』"\'][^""「」『』"\']*[""「」『』"\']/u', $text);
+            $dialogueCount += preg_match_all('/[“”‘’「」『』"\'][^“”‘’「」『』"\']*[“”‘’「」『』"\']/u', $text);
             $passiveCount += preg_match_all('/被[\p{L}]{1,5}/u', $text);
             $metaphorCount += $this->countMetaphors($text);
         }

@@ -14,7 +14,7 @@ ini_set('log_errors', '1');
 
 header('Content-Type: application/json; charset=utf-8');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
@@ -23,7 +23,7 @@ require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 require_once dirname(__DIR__) . '/includes/OutlineQualityGuard.php';
-require_once dirname(__DIR__) . '/includes/ChapterMutationService.php';
+require_once dirname(__DIR__) . '/includes/ChapterOutlinePersistence.php';
 
 try {
     requireLoginApi();
@@ -49,7 +49,7 @@ if (!$novelId) {
 }
 
 // 审计修复 IDOR（2026-06-18）：归属校验，防止跨用户优化他人小说大纲
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 checkNovelOwnership($novelId, $userId);
 
 // 获取小说信息
@@ -120,6 +120,22 @@ $batch = array_slice($chapters, $batchStart, $batchSize);
 $batchFrom = $batch[0]['chapter_number'];
 $batchTo = end($batch)['chapter_number'];
 
+$persistence = new ChapterOutlinePersistence(DB::connect(), $userId, $novelId);
+try {
+    $snapshot = $persistence->captureOptimizationBatch(
+        array_map(static fn(array $row): int => (int)$row['chapter_number'], $batch),
+        array_map(static fn(array $row): int => (int)$row['chapter_number'], array_slice($chapters, max(0, $batchStart - $batchSize), min($batchStart, $batchSize)))
+    );
+    $batch = $snapshot['chapters'];
+    $prevBatch = $snapshot['context'];
+    $novel = $snapshot['novel'];
+    $storyOutline = $snapshot['story'];
+} catch (ChapterOutlineSourceChangedException $error) {
+    echo json_encode(['success'=>false, 'code'=>'source_conflict', 'retryable'=>false, 'message'=>'章节或故事大纲已变化，本批未写入，请刷新后重试']);
+    exit;
+}
+
+
 // 构建设定摘要
 $truncate = fn(string $t, int $l) => safe_strlen($t) > $l ? safe_substr($t, 0, $l) . '…' : $t;
 $settingsSummary = implode("\n", array_filter([
@@ -131,27 +147,44 @@ $settingsSummary = implode("\n", array_filter([
 ]));
 
 $storyArcText = $truncate($storyOutline['story_arc'] ?? '', 400);
-$actDivision = is_string($storyOutline['act_division']) 
-    ? json_decode($storyOutline['act_division'], true) 
-    : ($storyOutline['act_division'] ?? []);
-$turningPoints = is_string($storyOutline['major_turning_points'])
-    ? json_decode($storyOutline['major_turning_points'], true)
-    : ($storyOutline['major_turning_points'] ?? []);
+// 审计修复 H6（2026-08-16）：act_division / major_turning_points 是 AI 生成的 JSON
+// （存自 story_outlines），无 schema 保证——逐字段兜底并过滤无效条目，
+// 避免未定义键警告与空值拼入 prompt 污染优化质量。
+$actDivisionRaw = $storyOutline['act_division'] ?? null;
+$actDivision = is_string($actDivisionRaw)
+    ? (json_decode($actDivisionRaw, true) ?: [])
+    : (is_array($actDivisionRaw) ? $actDivisionRaw : []);
+$turningPointsRaw = $storyOutline['major_turning_points'] ?? null;
+$turningPoints = is_string($turningPointsRaw)
+    ? (json_decode($turningPointsRaw, true) ?: [])
+    : (is_array($turningPointsRaw) ? $turningPointsRaw : []);
 
 // 整理幕信息
 $actText = '';
 if (!empty($actDivision)) {
     foreach ($actDivision as $act) {
+        if (!is_array($act)) continue;
+        $actChapters = trim((string)($act['chapters'] ?? ''));
+        $actTheme    = trim((string)($act['theme'] ?? ''));
+        if ($actChapters === '' && $actTheme === '') continue;
         $keyEvents = is_array($act['key_events'] ?? null)
             ? $act['key_events']
             : (json_decode($act['key_events'] ?? '[]', true) ?: []);
-        $actText .= "第{$act['chapters']}章（{$act['theme']}）：" . implode('、', $keyEvents) . "\n";
+        $keyEvents = array_values(array_filter(array_map(
+            static fn($ev) => trim((string)$ev),
+            is_array($keyEvents) ? $keyEvents : []
+        )));
+        $actText .= "第{$actChapters}章（{$actTheme}）：" . implode('、', $keyEvents) . "\n";
     }
 }
 $turningText = '';
 if (!empty($turningPoints)) {
     foreach ($turningPoints as $tp) {
-        $turningText .= "第{$tp['chapter']}章：{$tp['event']}\n";
+        if (!is_array($tp)) continue;
+        $tpChapter = trim((string)($tp['chapter'] ?? ''));
+        $tpEvent   = trim((string)($tp['event'] ?? ''));
+        if ($tpChapter === '' || $tpEvent === '') continue;
+        $turningText .= "第{$tpChapter}章：{$tpEvent}\n";
     }
 }
 
@@ -168,10 +201,7 @@ foreach ($batch as $ch) {
 
 // 前批大纲作为上下文
 $prevContext = '';
-$prevBatch = [];
-if ($batchStart > 0) {
-    $prevStart = max(0, $batchStart - $batchSize);
-    $prevBatch = array_slice($chapters, $prevStart, $batchSize);
+if ($prevBatch !== []) {
     $prevLines = [];
     foreach ($prevBatch as $ch) {
         $prevLines[] = "第{$ch['chapter_number']}章《{$ch['title']}》：{$ch['outline']}";
@@ -290,47 +320,33 @@ if (empty($batchResult)) {
 $qualityResult = repairOutlineBatchWithGuard($novel, $batchResult, $prevBatch, null);
 $batchResult = $qualityResult['outlines'];
 
-// 更新数据库
-$updatedCount = 0;
+// Publish exactly the captured batch. A conflict rolls back all outlines and progress.
+$updates = [];
 foreach ($batchResult as $item) {
     $chapterNum = (int)($item['chapter_number'] ?? 0);
-    if (!$chapterNum) continue;
-    
-    $updateData = [
-        'outline' => $item['summary'] ?? '',
-        'key_points' => json_encode($item['key_points'] ?? [], JSON_UNESCAPED_UNICODE),
+    if (isset($updates[$chapterNum])) {
+        echo json_encode(['success'=>false, 'retryable'=>false, 'message'=>'模型返回重复章节，本批未保存']);
+        exit;
+    }
+    $updates[$chapterNum] = [
+        'outline' => trim((string)($item['summary'] ?? '')),
+        'key_points' => json_encode($item['key_points'] ?? [], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
         'hook' => $item['hook'] ?? '',
     ];
-    
-    $existing = DB::fetch(
-        'SELECT id FROM chapters WHERE novel_id=? AND chapter_number=?',
-        [$novelId, $chapterNum]
-    );
-    if (!$existing) continue;
-
-    try {
-        $mutation = ChapterMutationService::mutateChapter(
-            (int)$existing['id'],
-            $novelId,
-            $updateData,
-            [
-                'backup_version' => false,
-                'force_outline_invalidation' => true,
-                'allowed_statuses' => ['pending', 'outlined', 'skipped', 'failed'],
-                'reason' => 'outline_logic_optimization',
-            ]
-        );
-    } catch (ChapterMutationConflict $e) {
-        continue;
-    }
-
-    if (($mutation['affected'] ?? 0) > 0) {
-        $updatedCount++;
-    }
 }
-
-// 更新进度
-DB::update('novels', ['optimized_chapter' => $batchTo], 'id=?', [$novelId]);
+try {
+    $saved = $persistence->saveOptimizedBatch($updates, (int)$batchTo);
+} catch (InvalidArgumentException $error) {
+    echo json_encode(['success'=>false, 'retryable'=>false, 'message'=>'模型未返回完整且有效的本批章节，本批未保存']);
+    exit;
+}
+if (!$saved) {
+    echo json_encode(['success'=>false, 'code'=>'source_conflict', 'retryable'=>false,
+        'message'=>'大纲、概要或小说设定已被修改，本批未写入，自动优化已停止，请刷新后重试']);
+    exit;
+}
+$updatedCount = count($updates);
+clearNovelCache($novelId);
 
 // 返回结果
 echo json_encode([

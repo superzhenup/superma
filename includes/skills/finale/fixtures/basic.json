@@ -1,0 +1,6 @@
+{
+  "chapter_type": "finale",
+  "outline": "最终章中主角履行旧约，关闭裂隙，并回到故乡面对失去的代价。",
+  "expected": ["finale"],
+  "must_preserve": ["履行旧约", "关闭裂隙", "失去的代价"]
+}

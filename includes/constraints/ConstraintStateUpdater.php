@@ -7,12 +7,12 @@
  * 更新内容（Phase 1）：
  *   - pacing: 冲突类型历史、最近高潮章节、本章功能标签
  *   - style:  禁用词使用计数
- *   - plot:   巧合计数、last_processed_chapter
+ *   - plot:   巧合计数、last_processed_chapter、processed_chapters
  *
  * 注意：protagonist_power 从 character_cards 同步（非正文猜测）。
- * 状态由 ConstraintStateDB::buildWritingPromptHints() 回灌下一章写作 prompt。
+ * 状态由 ConstraintStateDB 的 buildWritingPromptHints() 回灌下一章写作 prompt。
  *
- * 所有异常内部捕获，保证正文不受影响。
+ * 核心投影失败向任务层传播；正文已保存，后处理必须能够重试。
  *
  * @package ConstraintFramework
  */
@@ -31,7 +31,7 @@ class ConstraintStateUpdater
         $this->novelId = $novelId;
         $this->chapter = $chapter;
         $this->content = $content;
-        $this->db      = new ConstraintStateDB($novelId);
+        $this->db      = new ConstraintStateDB($novelId, true);
     }
 
     /**
@@ -43,46 +43,80 @@ class ConstraintStateUpdater
 
         // 审计修复（2026-07-19 H-中8）：增量计数非幂等。
         // 重试/重写后同章重复调用 updateAll 会把 coincidence_count、banned_word_usage、
-        // 冲突历史翻倍/重复写入。记录 last_processed_chapter，已处理过的章节不再增量计数。
+        // 冲突历史翻倍/重复写入。记录已处理章节，处理过的章节不再增量计数。
         $chNum = (int)($this->chapter['chapter_number'] ?? 0);
+        $batch = [];
         if ($chNum > 0) {
+            // 审计修复（2026-08-17 P3）：原门禁 $lastProcessed >= $chNum 会挡住乱序补写
+            // 历史章（先写第10章再补第5章时，第5章约束状态完全不更新）。改为按章号
+            // 集合 processed_chapters 精确匹配同一章重复；兼容旧键 last_processed_chapter
+            // （仅相等视为已处理，不含大于，避免旧值压住乱序补写）。
+            $processedChapters = $this->db->get('plot', 'processed_chapters', []);
+            if (!is_array($processedChapters)) $processedChapters = [];
             $lastProcessed = $this->db->get('plot', 'last_processed_chapter', 0);
-            if ($lastProcessed && (int)$lastProcessed >= $chNum) {
-                return; // 该章节已处理过，跳过增量计数
+
+            $alreadyProcessed = in_array($chNum, $processedChapters, true)
+                || ($lastProcessed && (int)$lastProcessed === $chNum);
+            if ($alreadyProcessed) {
+                return; // 精确同一章重复处理，跳过增量计数
             }
-            $this->db->set('plot', 'last_processed_chapter', $chNum);
+
+            // 追加本章到集合（去重、保持 int、截断保留最近 200 个防膨胀）
+            $processedChapters[] = $chNum;
+            $processedChapters = array_slice(
+                array_values(array_unique(array_map('intval', $processedChapters))),
+                -200
+            );
+            $batch[] = ['type' => 'plot', 'key' => 'processed_chapters', 'value' => $processedChapters];
+            // last_processed_chapter 保持向后兼容（取历史最大值，乱序补写不回退）
+            $batch[] = ['type' => 'plot', 'key' => 'last_processed_chapter', 'value' => max((int)$lastProcessed, $chNum)];
         }
 
         try {
-            $this->updatePacingState();
-            $this->updateStyleState();
-            $this->updatePlotState();
+            // 审计修复（2026-08-17 P3）：原先 last_processed_chapter 先行落库、三计数器
+            // 逐条 set 非原子（中途失败会造成"已标记未计数"的永久漏记）。改为收集全部
+            // 写入条目后 setBatch 单事务提交。读-改-写在单事务内提交，同小说写作进程
+            // 基本串行，可接受；如需强一致可升级 SELECT FOR UPDATE。
+            $batch = array_merge($batch, $this->updatePacingState());
+            $batch = array_merge($batch, $this->updateStyleState());
+            $batch = array_merge($batch, $this->updatePlotState());
+            $this->db->setBatch($batch);
             $this->updateProtagonistPowerState();
         } catch (\Throwable $e) {
             error_log("ConstraintStateUpdater::updateAll failed: {$e->getMessage()}");
+            throw $e;
         }
     }
 
     /**
      * 从 character_cards 同步主角境界/等级到 constraint_state（轻量回写）。
      */
-    private function updateProtagonistPowerState(): void
+    public function updateProtagonistPowerState(): void
     {
         try {
             $novel = DB::fetch('SELECT protagonist_name FROM novels WHERE id=?', [$this->novelId]);
             $name = trim((string)($novel['protagonist_name'] ?? ''));
-            if ($name === '') return;
+            if ($name === '') {
+                $this->clearProtagonistPowerState();
+                return;
+            }
 
             $card = DB::fetch(
                 'SELECT name, attributes FROM character_cards WHERE novel_id=? AND name=? LIMIT 1',
                 [$this->novelId, $name]
             );
-            if (!$card) return;
+            if (!$card) {
+                $this->clearProtagonistPowerState();
+                return;
+            }
 
             $attrs = json_decode((string)($card['attributes'] ?? ''), true);
             if (!is_array($attrs)) $attrs = [];
             $realm = trim((string)($attrs['realm'] ?? $attrs['level'] ?? ''));
-            if ($realm === '') return;
+            if ($realm === '') {
+                $this->clearProtagonistPowerState();
+                return;
+            }
 
             $this->db->set('character', 'protagonist_power', [
                 'name'           => (string)($card['name'] ?? $name),
@@ -92,16 +126,28 @@ class ConstraintStateUpdater
             ]);
         } catch (\Throwable $e) {
             error_log('ConstraintStateUpdater::updateProtagonistPowerState: ' . $e->getMessage());
+            throw $e;
         }
+    }
+
+    private function clearProtagonistPowerState(): void
+    {
+        DB::execute('DELETE FROM constraint_state WHERE novel_id=? AND state_type="character" AND state_key="protagonist_power"', [$this->novelId]);
     }
 
     // ============================================================
     //  节奏状态更新
     // ============================================================
 
-    private function updatePacingState(): void
+    /**
+     * 计算节奏状态条目。
+     * 审计修复（2026-08-17 P3）：改为计算并返回写入条目，由 updateAll 合并 setBatch 提交。
+     * @return array<int, array{type: string, key: string, value: mixed}>
+     */
+    private function updatePacingState(): array
     {
         $chNum = (int)($this->chapter['chapter_number'] ?? 0);
+        $entries = [];
 
         // 1. 更新冲突类型历史（保留最近 20 条）
         $conflictType = $this->detectConflictType();
@@ -111,19 +157,21 @@ class ConstraintStateUpdater
         // 截断至 20 条
         $history = array_slice($history, 0, 20);
 
-        $this->db->set('pacing', 'conflict_history', $history);
+        $entries[] = ['type' => 'pacing', 'key' => 'conflict_history', 'value' => $history];
 
         // 2. 检测是否为高潮章
         if ($this->isClimaxChapter()) {
-            $this->db->set('pacing', 'last_climax_chapter', $chNum);
+            $entries[] = ['type' => 'pacing', 'key' => 'last_climax_chapter', 'value' => $chNum];
         }
 
         // 3. 记录本章功能标签
         $function = $this->detectChapterFunction();
-        $this->db->set('pacing', 'last_chapter_function', [
+        $entries[] = ['type' => 'pacing', 'key' => 'last_chapter_function', 'value' => [
             'chapter'  => $chNum,
             'function' => $function,
-        ]);
+        ]];
+
+        return $entries;
     }
 
     /**
@@ -217,11 +265,17 @@ class ConstraintStateUpdater
     //  风格状态更新
     // ============================================================
 
-    private function updateStyleState(): void
+    /**
+     * 计算风格状态条目。
+     * 审计修复（2026-08-17 P3）：改为计算并返回写入条目，由 updateAll 合并 setBatch 提交。
+     * @return array<int, array{type: string, key: string, value: mixed}>
+     */
+    private function updateStyleState(): array
     {
+        $entries = [];
         // 禁用词使用计数
         $banned = ConstraintConfig::bannedWords();
-        if (empty($banned)) return;
+        if (empty($banned)) return $entries;
 
         $usage = $this->db->getBannedWordUsage();
         if (!is_array($usage)) $usage = [];
@@ -233,15 +287,23 @@ class ConstraintStateUpdater
             }
         }
 
-        $this->db->set('style', 'banned_word_usage', $usage);
+        $entries[] = ['type' => 'style', 'key' => 'banned_word_usage', 'value' => $usage];
+
+        return $entries;
     }
 
     // ============================================================
     //  情节状态更新
     // ============================================================
 
-    private function updatePlotState(): void
+    /**
+     * 计算情节状态条目。
+     * 审计修复（2026-08-17 P3）：改为计算并返回写入条目，由 updateAll 合并 setBatch 提交。
+     * @return array<int, array{type: string, key: string, value: mixed}>
+     */
+    private function updatePlotState(): array
     {
+        $entries = [];
         // 巧合计数
         $coincidenceKWs = ['恰好', '正巧', '刚好', '碰巧', '凑巧', '巧合', '恰逢', '不偏不倚', '鬼使神差'];
         $newCount = 0;
@@ -251,7 +313,9 @@ class ConstraintStateUpdater
 
         if ($newCount > 0) {
             $current = $this->db->getCoincidenceCount();
-            $this->db->set('plot', 'coincidence_count', $current + $newCount);
+            $entries[] = ['type' => 'plot', 'key' => 'coincidence_count', 'value' => $current + $newCount];
         }
+
+        return $entries;
     }
 }

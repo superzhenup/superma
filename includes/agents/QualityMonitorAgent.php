@@ -18,6 +18,7 @@
 defined('APP_LOADED') or die('Direct access denied.');
 
 require_once __DIR__ . '/BaseAgent.php';
+require_once __DIR__ . '/../quality/DialogueText.php';
 
 class QualityMonitorAgent extends BaseAgent
 {
@@ -33,20 +34,20 @@ class QualityMonitorAgent extends BaseAgent
     private array $chapterContentsCache = [];
 
     private static $QUANTIFIABLE_DIRECTIVES = [
+        // 审计修复（2026-08-09 R8-4 / R10-6）：章级 1 个核心爽点；全书目标用「有爽点章占比」量纲。
         'coolpoint_density' => [
-            'template' => '本章每{interval}字必须包含至少{min_count}个爽点元素，建议类型：{examples}',
+            'template' => '本章须安排至少{min_count}个核心爽点（全书目标约{density_target}有爽点章占比，禁止灌爽点），建议类型：{examples}；铺垫不超过30%，高潮段释放',
             'default_params' => [
-                'interval' => 1000,
-                'min_count' => 3,
+                'min_count' => 1,
+                'density_target' => '0.88',
                 'examples' => '打脸、越级战斗、获得宝物/传承/能力之一',
             ],
         ],
+        // 审计修复（2026-08-09 R8）：改为可见反应次数，避免「加大情绪词」与 Show-don't-tell 矛盾
         'emotion_intensity' => [
-            'template' => '本章情绪词密度不低于{ratio}，每{interval}字至少{count}个情绪词',
+            'template' => '本章至少增加{count}处可见情绪反应（微表情/肢体/生理反应），禁止堆砌「很愤怒/很高兴」等直述情绪词',
             'default_params' => [
-                'ratio' => 0.02,
-                'interval' => 1000,
-                'count' => 20,
+                'count' => 5,
             ],
         ],
         'pacing_accelerate' => [
@@ -139,6 +140,12 @@ class QualityMonitorAgent extends BaseAgent
         // 的指标方法）；daemon 路径仅 6-7 列无 content，由 fetchChapterContents 对缺 content
         // 的行按需补查；context 未提供时维持原有 DB 查询路径（10 章）不变。
         // 注：复用 context 时章节窗口由 10 章变 5 章，指标统计口径随之缩小，差异可接受。
+        if ($this->currentChapterNumber > 0 && isset($context['recent_chapters'])) {
+            $context['recent_chapters'] = array_values(array_filter($context['recent_chapters'],
+                fn($row) => (int)($row['chapter_number'] ?? 0) > 0
+                    && (int)$row['chapter_number'] < $this->currentChapterNumber
+                    && ($row['status'] ?? 'completed') === 'completed'));
+        }
         $recentChapters = (isset($context['recent_chapters'])
             && is_array($context['recent_chapters'])
             && !empty($context['recent_chapters']))
@@ -148,7 +155,10 @@ class QualityMonitorAgent extends BaseAgent
         return [
             'overall_quality' => $this->calculateOverallQuality($recentChapters),
             'structure_score' => $this->calculateStructureScore($recentChapters),
-            'character_consistency' => $this->calculateCharacterConsistency($recentChapters),
+            // Field changes describe plot state, not proof of out-of-character behaviour.
+            'character_consistency' => null,
+            'character_change_frequency' => $this->calculateCharacterChangeFrequency($recentChapters),
+            'character_change_frequency_basis' => '平均每个有变更记录角色的变更章占比；不评价人物性格一致性',
             'description_richness' => $this->calculateDescriptionRichness($recentChapters),
             'plot_coherence' => $this->calculatePlotCoherence($recentChapters),
             'coolpoint_effectiveness' => $this->calculateCoolPointEffectiveness($recentChapters),
@@ -163,12 +173,17 @@ class QualityMonitorAgent extends BaseAgent
      * @param array $metrics 质量指标
      * @return array 问题列表
      */
+    /**
+     * 识别质量问题。缺数据指标为 null，不得按 0 误报，也不得当满分跳过。
+     *
+     * @param array<string, mixed> $metrics
+     * @return array
+     */
     private function identifyQualityIssues(array $metrics): array
     {
         $issues = [];
-        
-        // 问题1: 整体质量下降
-        if ($metrics['overall_quality'] < $this->qualityThresholds['acceptable']) {
+
+        if ($this->metricBelow($metrics['overall_quality'] ?? null, $this->qualityThresholds['acceptable'])) {
             $issues[] = [
                 'type' => 'quality_decline',
                 'severity' => 'high',
@@ -177,9 +192,8 @@ class QualityMonitorAgent extends BaseAgent
                 'threshold' => $this->qualityThresholds['acceptable'],
             ];
         }
-        
-        // 问题2: 结构问题
-        if ($metrics['structure_score'] < $this->qualityThresholds['good']) {
+
+        if ($this->metricBelow($metrics['structure_score'] ?? null, $this->qualityThresholds['good'])) {
             $issues[] = [
                 'type' => 'structure_issue',
                 'severity' => 'medium',
@@ -188,9 +202,8 @@ class QualityMonitorAgent extends BaseAgent
                 'threshold' => $this->qualityThresholds['good'],
             ];
         }
-        
-        // 问题3: 角色一致性下降
-        if ($metrics['character_consistency'] < 0.8) {
+
+        if ($this->metricBelow($metrics['character_consistency'] ?? null, 0.8)) {
             $issues[] = [
                 'type' => 'character_inconsistency',
                 'severity' => 'high',
@@ -199,9 +212,8 @@ class QualityMonitorAgent extends BaseAgent
                 'threshold' => 0.8,
             ];
         }
-        
-        // 问题4: 描写贫乏
-        if ($metrics['description_richness'] < 0.6) {
+
+        if ($this->metricBelow($metrics['description_richness'] ?? null, 0.6)) {
             $issues[] = [
                 'type' => 'poor_description',
                 'severity' => 'medium',
@@ -210,9 +222,8 @@ class QualityMonitorAgent extends BaseAgent
                 'threshold' => 0.6,
             ];
         }
-        
-        // 问题5: 剧情不连贯
-        if ($metrics['plot_coherence'] < 0.75) {
+
+        if ($this->metricBelow($metrics['plot_coherence'] ?? null, 0.75)) {
             $issues[] = [
                 'type' => 'plot_incoherence',
                 'severity' => 'high',
@@ -221,9 +232,8 @@ class QualityMonitorAgent extends BaseAgent
                 'threshold' => 0.75,
             ];
         }
-        
-        // 问题6: 爽点效果不佳
-        if ($metrics['coolpoint_effectiveness'] < 0.7) {
+
+        if ($this->metricBelow($metrics['coolpoint_effectiveness'] ?? null, 0.7)) {
             $issues[] = [
                 'type' => 'weak_coolpoint',
                 'severity' => 'medium',
@@ -232,9 +242,8 @@ class QualityMonitorAgent extends BaseAgent
                 'threshold' => 0.7,
             ];
         }
-        
-        // 问题7: 字数控制不佳
-        if ($metrics['word_count_accuracy'] < 0.8) {
+
+        if ($this->metricBelow($metrics['word_count_accuracy'] ?? null, 0.8)) {
             $issues[] = [
                 'type' => 'word_count_issue',
                 'severity' => 'medium',
@@ -243,9 +252,8 @@ class QualityMonitorAgent extends BaseAgent
                 'threshold' => 0.8,
             ];
         }
-        
-        // 问题8: 伏笔利用率低
-        if ($metrics['foreshadowing_usage'] < 0.5) {
+
+        if ($this->metricBelow($metrics['foreshadowing_usage'] ?? null, 0.5)) {
             $issues[] = [
                 'type' => 'unused_foreshadowing',
                 'severity' => 'low',
@@ -254,8 +262,14 @@ class QualityMonitorAgent extends BaseAgent
                 'threshold' => 0.5,
             ];
         }
-        
+
         return $issues;
+    }
+
+    /** 缺测指标（null）既不告警也不当满分。 */
+    private function metricBelow(mixed $value, float $threshold): bool
+    {
+        return is_numeric($value) && (float)$value < $threshold;
     }
     
     /**
@@ -381,7 +395,19 @@ class QualityMonitorAgent extends BaseAgent
     public function execute(array $recommendations): array
     {
         $results = [];
-        
+
+        // 审计修复（2026-08-09 R9-6）：接线 agent.quality_agent.auto_fix
+        if (!ConfigCenter::get('agent.quality_agent.auto_fix', true, 'bool')) {
+            foreach ($recommendations as $rec) {
+                $results[] = [
+                    'action' => $rec['action'] ?? 'unknown',
+                    'status' => 'skipped',
+                    'message' => 'auto_fix 已关闭，跳过质量整改指令',
+                ];
+            }
+            return $results;
+        }
+
         foreach ($recommendations as $rec) {
             $result = $this->executeRecommendation($rec);
             $results[] = $result;
@@ -428,10 +454,23 @@ class QualityMonitorAgent extends BaseAgent
             $severity *= 100;
         }
 
+        // 审计修复（2026-08-09 R8-4）：coolpoint 保持章级 1 个核心爽点，不再按严重度灌到 2–4；
+        // emotion 改为可见反应次数（5–8），不再要求每千字 15–25 个情绪词。
         if ($type === 'coolpoint_density') {
-            $params['min_count'] = $severity < 40 ? 4 : ($severity < 60 ? 3 : 2);
+            $params['min_count'] = 1;
+            // 审计修复（2026-08-09 R11）：插值小说级密度目标，禁止硬编码 0.88
+            $densityTarget = 0.88;
+            if (class_exists('ConfigCenter', false)) {
+                $densityTarget = (float)ConfigCenter::getNovel(
+                    $this->novelId,
+                    'ws_cool_point_density_target',
+                    0.88,
+                    'float'
+                );
+            }
+            $params['density_target'] = (string)round(max(0.3, min(1.0, $densityTarget)), 2);
         } elseif ($type === 'emotion_intensity') {
-            $params['count'] = $severity < 40 ? 25 : ($severity < 60 ? 20 : 15);
+            $params['count'] = $severity < 40 ? 8 : ($severity < 60 ? 6 : 5);
         } elseif ($type === 'description_richness') {
             $params['count'] = $severity < 40 ? 3 : 2;
         }
@@ -445,6 +484,47 @@ class QualityMonitorAgent extends BaseAgent
         return $directive;
     }
 
+    /**
+     * 审计修复（2026-08-17 写作逻辑 C1）：收紧小说级动态容差并真正写库。
+     *
+     * 与策略 Agent 的调整路径共用 ConfigCenter::setNovel('ws_dynamic_tolerance_ratio')，
+     * 步长按 tolerance_reduction 比例换算（默认 5 个百分点），结果夹紧 [5, 20]；
+     * 同一写作周期内已有容差写入（toleranceWriteAlreadyDone 互斥守卫）则跳过。
+     * 成功写入后补记一条 action=adjust_word_tolerance 日志，供策略 Agent 侧守卫识别。
+     *
+     * @return array{current_pct:int,new_pct:int,skipped:bool,reason:string}
+     */
+    private function tightenWordTolerance(float $reductionRatio): array
+    {
+        $currentPct = (int)ConfigCenter::getNovel($this->novelId, 'ws_dynamic_tolerance_ratio', 10, 'int');
+        $result = [
+            'current_pct' => $currentPct,
+            'new_pct'     => $currentPct,
+            'skipped'     => true,
+            'reason'      => '',
+        ];
+        if ($this->toleranceWriteAlreadyDone($this->novelId)) {
+            $result['reason'] = '本写作周期已有容差写入（策略/质量互斥），仅下发本章指令';
+            return $result;
+        }
+        $stepPct = max(1, (int)round(abs($reductionRatio) * 100));
+        $newPct = max(5, min(20, $currentPct - $stepPct));
+        $result['new_pct'] = $newPct;
+        if (!ConfigCenter::setNovel($this->novelId, 'ws_dynamic_tolerance_ratio', $newPct, 'int')) {
+            $result['reason'] = '小说级容差配置保存失败，仅下发本章指令';
+            return $result;
+        }
+        $result['skipped'] = false;
+        // 互斥守卫的锚点日志：与策略 Agent 的 adjust_word_tolerance 同名同查。
+        $this->logAction($this->novelId, 'adjust_word_tolerance', 'success', [
+            'direction'  => 'tighten',
+            'old_ratio_pct' => $currentPct,
+            'ratio_pct'  => $newPct,
+            'writer'     => 'quality_agent',
+        ]);
+        return $result;
+    }
+
     private function executeRecommendation(array $rec): array
     {
         try {
@@ -453,11 +533,13 @@ class QualityMonitorAgent extends BaseAgent
                     // 审计修复 P2-12（2026-07-12）：移除 ConfigCenter::set('ws_quality_strictness', ...) 等
                     // 全局写入——这些 setting 没有任何 reader，且会污染其他小说。
                     // 改由 writeDirective()（已 novel-scoped）传递本章指令。
-                    $this->logAction($this->novelId, $rec['action'], 'success', $rec['params']);
+                    // 审计修复（2026-08-17 写作逻辑 C1）：诚实口径——本动作只写本章
+                    // 指令，不修改任何全局/小说级质检开关，消息不再宣称"已启用"全局。
+                    $this->logAction($this->novelId, $rec['action'], 'success', $rec['params'] + ['directive_only' => true]);
                     $quantitative = $this->generateQuantifiableDirective($rec['action'], $rec);
                     $directive = $quantitative ?? "本章启用严格质量检查。触发原因：整体质量评分{$rec['issue']['metric']}分，低于可接受阈值{$rec['issue']['threshold']}分。重点检查：结构完整性、角色一致性、剧情连贯性。";
                     $this->writeDirective('quality', $directive);
-                    return ['action' => $rec['action'], 'status' => 'success', 'message' => '已启用严格质量检查'];
+                    return ['action' => $rec['action'], 'status' => 'success', 'message' => '已注入严格质量检查指令（仅本章，不改全局设置）'];
 
                 case 'strengthen_character_tracking':
                     $this->logAction($this->novelId, $rec['action'], 'success', $rec['params']);
@@ -469,12 +551,15 @@ class QualityMonitorAgent extends BaseAgent
                 case 'adjust_coolpoint_strategy':
                     // 审计修复 P2-12：cool_point_intensity 全局 setting 无 reader，移除全局写入；
                     // 本章指令通过 writeDirective 下发，不污染其他小说。
+                    // 审计修复（2026-08-17 写作逻辑 C1）：诚实口径——爽点「强度」没有
+                    // 小说级 reader（ws_cool_point_density_target 是密度占比，量纲不同，
+                    // 不冒用），保持指令直发并标 directive_only，日志不再含糊。
                     $currentIntensity = 1.0;
-                    $this->logAction($this->novelId, $rec['action'], 'success', $rec['params']);
+                    $this->logAction($this->novelId, $rec['action'], 'success', $rec['params'] + ['directive_only' => true]);
                     $quantitative = $this->generateQuantifiableDirective($rec['action'], $rec);
                     $directive = $quantitative ?? "本章增加爽点强度，从{$currentIntensity}提升至" . ($currentIntensity + 0.2) . "。触发原因：爽点有效性{$rec['issue']['metric']}，低于0.7阈值。重点：增强冲突张力、加快剧情节奏、强化情感冲击。";
                     $this->writeDirective('quality', $directive);
-                    return ['action' => $rec['action'], 'status' => 'success', 'message' => '已调整爽点强度'];
+                    return ['action' => $rec['action'], 'status' => 'success', 'message' => '已注入爽点强度指令（仅本章，不改全局设置）'];
 
                 case 'enrich_description':
                     $this->logAction($this->novelId, $rec['action'], 'success', $rec['params']);
@@ -492,13 +577,32 @@ class QualityMonitorAgent extends BaseAgent
 
                 case 'refine_word_control':
                     // 审计修复 P2-12：word_count_tolerance 全局 setting 无 reader，移除全局写入。
-                    $currentTolerance = 0.1;
-                    $newTolerance = max(0.03, $currentTolerance - 0.05);
-                    $this->logAction($this->novelId, $rec['action'], 'success', $rec['params']);
+                    // 审计修复（2026-08-17 写作逻辑 C1）：此前「收紧字数容差」只写本章指令、
+                    // 实际不动库，宣称与效果不符。现与策略 Agent 共用同一 setter 写小说级
+                    // ws_dynamic_tolerance_ratio（方向：收紧，下限 5%）；同一写作周期已有
+                    // 容差写入（策略/质量互斥守卫）则跳过并打日志，指令仍照发。
+                    $tolResult = $this->tightenWordTolerance(
+                        (float)($rec['params']['tolerance_reduction'] ?? 0.05)
+                    );
+                    $this->logAction(
+                        $this->novelId,
+                        $rec['action'],
+                        empty($tolResult['skipped']) ? 'success' : 'skipped',
+                        ['tolerance_result' => $tolResult] + (array)($rec['params'] ?? [])
+                    );
+                    $currentPct = (int)$tolResult['current_pct'];
+                    $newPct = (int)$tolResult['new_pct'];
                     $quantitative = $this->generateQuantifiableDirective($rec['action'], $rec);
-                    $directive = $quantitative ?? "本章收紧字数容差，从{$currentTolerance}降至{$newTolerance}。触发原因：字数偏差{$rec['issue']['metric']}，超出可接受范围。重点：控制正文长度在目标字数±" . round($newTolerance * 100) . "%以内。";
+                    $directive = $quantitative ?? "本章收紧字数容差，从±{$currentPct}%降至±{$newPct}%。触发原因：字数偏差{$rec['issue']['metric']}，超出可接受范围。重点：控制正文长度在目标字数±{$newPct}%以内。";
                     $this->writeDirective('quality', $directive);
-                    return ['action' => $rec['action'], 'status' => 'success', 'message' => '已收紧字数容差'];
+                    if (!empty($tolResult['skipped'])) {
+                        return [
+                            'action'  => $rec['action'],
+                            'status'  => 'skipped',
+                            'message' => '容差写入跳过：' . ($tolResult['reason'] ?? '本周期已有写入'),
+                        ];
+                    }
+                    return ['action' => $rec['action'], 'status' => 'success', 'message' => "已收紧字数容差至±{$newPct}%（写库生效）"];
 
                 case 'schedule_foreshadowing':
                     $this->logAction($this->novelId, $rec['action'], 'success', $rec['params']);
@@ -538,11 +642,11 @@ class QualityMonitorAgent extends BaseAgent
         try {
             // 审计修复 PERF-C2（2026-07-01）：列裁剪，质量监控只需指标字段不需 LONGTEXT content
             return DB::fetchAll(
-                'SELECT id, novel_id, chapter_number, title, status, words, quality_score, critic_scores, ai_pattern_issues
+                'SELECT id, novel_id, chapter_number, title, status, words, quality_score, critic_scores, ai_pattern_issues, gate_results
                  FROM chapters
-                 WHERE novel_id = ? AND status = "completed"
+                 WHERE novel_id = ? AND status = "completed" AND chapter_number < ?
                  ORDER BY chapter_number DESC LIMIT ?',
-                [$this->novelId, $limit]
+                [$this->novelId, $this->currentChapterNumber ?: PHP_INT_MAX, $limit]
             );
         } catch (\Throwable $e) {
             return [];
@@ -609,175 +713,118 @@ class QualityMonitorAgent extends BaseAgent
         }
     }
     
-    private function calculateOverallQuality(array $chapters): float
+    private function calculateOverallQuality(array $chapters): ?float
     {
-        if (empty($chapters)) return 100.0;
-        
-        $total = 0;
+        if (empty($chapters)) return null;
+
+        $scores = [];
         foreach ($chapters as $ch) {
-            $total += (float)($ch['quality_score'] ?? 75);
+            if (!array_key_exists('quality_score', $ch) || $ch['quality_score'] === null || $ch['quality_score'] === '') {
+                continue;
+            }
+            if (!is_numeric($ch['quality_score'])) continue;
+            $scores[] = (float)$ch['quality_score'];
         }
-        
-        return $total / count($chapters);
+
+        return $scores === [] ? null : array_sum($scores) / count($scores);
     }
-    
-    private function calculateStructureScore(array $chapters): float
+
+    private function calculateStructureScore(array $chapters): ?float
     {
-        // 简化的结构评分
-        if (empty($chapters)) return 75.0;
+        if (empty($chapters)) return null;
 
         $contents = $this->fetchChapterContents($chapters);
         $total = 0;
+        $n = 0;
         foreach ($chapters as $ch) {
-            // 检查章节是否有合理的开头和结尾
-            $content = $contents[(int)($ch['id'] ?? 0)] ?? '';
-            $hasOpening = mb_strlen($content, 'UTF-8') > 100;
-            $hasEnding = preg_match('/[。！？][\s]*$/u', $content);
-
-            $score = ($hasOpening ? 50 : 0) + ($hasEnding ? 50 : 0);
-            $total += $score;
+            $content = trim($contents[(int)($ch['id'] ?? 0)] ?? '');
+            if ($content === '') continue;
+            $n++;
+            $len = mb_strlen($content, 'UTF-8');
+            $paras = preg_split('/\n\s*\n/u', $content) ?: [];
+            $paras = array_values(array_filter($paras, static fn($p) => trim((string)$p) !== ''));
+            $hasOpening = $len > 100;
+            $hasEnding = DialogueText::endsSentence($content);
+            $hasParas = count($paras) >= 3;
+            $hasDialogue = DialogueText::passages($content) !== [];
+            $total += ($hasOpening ? 30 : 0) + ($hasEnding ? 25 : 0) + ($hasParas ? 25 : 0) + ($hasDialogue ? 20 : 0);
         }
 
-        return count($chapters) > 0 ? $total / count($chapters) : 75.0;
+        return $n > 0 ? $total / $n : null;
     }
     
-    private function calculateCharacterConsistency(array $chapters): float
+    private function calculateCharacterChangeFrequency(array $chapters): ?float
     {
         try {
-            if (empty($chapters)) return 1.0;
+            if (empty($chapters)) return null;
             
             // 获取最近章节的章节号范围
-            $chapterNumbers = array_column($chapters, 'chapter_number');
+            $chapterNumbers = array_values(array_unique(array_filter(array_map('intval', array_column($chapters, 'chapter_number')), static fn($n) => $n > 0)));
+            if ($chapterNumbers === []) return null;
             $minChapter = min($chapterNumbers);
             $maxChapter = max($chapterNumbers);
             
             // 查询角色卡片变更历史
+            // character_card_history 没有 novel_id 列，须经 character_cards 归属到小说；
+            // 卡片修订标记 _card_revision_v1 不是字段变更，与其它历史读取口径一致地排除。
             $history = DB::fetchAll(
-                'SELECT card_id, chapter_number, field_name 
-                 FROM character_card_history 
-                 WHERE novel_id = ? AND chapter_number BETWEEN ? AND ?
-                 ORDER BY chapter_number ASC',
+                "SELECT h.card_id, h.chapter_number, h.field_name
+                 FROM character_card_history h
+                 INNER JOIN character_cards c ON c.id = h.card_id
+                 WHERE c.novel_id = ? AND h.chapter_number BETWEEN ? AND ?
+                   AND h.field_name <> '_card_revision_v1'
+                 ORDER BY h.chapter_number ASC",
                 [$this->novelId, $minChapter, $maxChapter]
             );
             
             if (empty($history)) {
-                // 没有变更记录，可能是新小说或角色状态稳定
-                return 1.0;
+                // 无变更记录 ≠ 角色稳定，只说明没有可观测数据
+                return null;
             }
             
-            // 统计每个角色的变更次数
+            // One chapter is one observed update, regardless of how many fields changed.
+            $allowedChapters = array_fill_keys($chapterNumbers, true);
             $cardChanges = [];
             foreach ($history as $record) {
                 $cardId = $record['card_id'];
-                if (!isset($cardChanges[$cardId])) {
-                    $cardChanges[$cardId] = 0;
-                }
-                $cardChanges[$cardId]++;
+                $changedChapter = (int)$record['chapter_number'];
+                if (isset($allowedChapters[$changedChapter])) $cardChanges[$cardId][$changedChapter] = true;
             }
             
-            // 计算变更频率得分
-            // 理想情况：每个角色在10章内变更1-2次（状态自然变化）
-            // 过于频繁的变更（每章都变）可能表示一致性有问题
             $totalCards = count($cardChanges);
-            if ($totalCards === 0) return 1.0;
+            if ($totalCards === 0) return null;
             
-            $chapterCount = count($chapters);
-            $frequentChanges = 0;
-            
-            foreach ($cardChanges as $changeCount) {
-                // 如果变更次数超过章节数的一半，认为过于频繁
-                if ($changeCount > $chapterCount / 2) {
-                    $frequentChanges++;
-                }
-            }
-            
-            // 计算一致性得分：频繁变更的角色比例越低，得分越高
-            $consistency = 1.0 - ($frequentChanges / $totalCards);
-            
-            // 确保得分在合理范围内
-            return max(0.0, min(1.0, $consistency));
+            $changedChapterCount = array_sum(array_map('count', $cardChanges));
+            return $changedChapterCount / ($totalCards * count($chapterNumbers));
         } catch (\Throwable $e) {
-            if (str_contains($e->getMessage(), 'character_card_history')
-                || str_contains($e->getMessage(), "doesn't exist")
-                || str_contains($e->getMessage(), 'Unknown column')) {
-                error_log("character_card_history 表不存在或字段缺失，使用备用一致性检查: " . $e->getMessage());
-                return $this->fallbackCharacterConsistencyCheck($chapters);
-            }
-            error_log('Character consistency check failed: ' . $e->getMessage());
-            return 0.8;
+            error_log('Character change frequency unavailable: ' . $e->getMessage());
+            return null;
         }
     }
 
-    private function fallbackCharacterConsistencyCheck(array $chapters): float
+    private function calculateDescriptionRichness(array $chapters): ?float
     {
-        if (empty($chapters) || count($chapters) < 2) {
-            return 1.0;
-        }
-
-        try {
-            $engine = new MemoryEngine($this->novelId);
-            $cards = $engine->cards()->listAll();
-
-            if (empty($cards)) {
-                return 1.0;
-            }
-
-            $cardNames = array_column($cards, 'name');
-            $chapterCount = count($chapters);
-            $contents = $this->fetchChapterContents($chapters);
-
-            $presenceCount = 0;
-            foreach ($chapters as $ch) {
-                $content = $contents[(int)($ch['id'] ?? 0)] ?? '';
-                if (empty($content)) continue;
-
-                foreach ($cardNames as $name) {
-                    if (mb_strpos($content, $name) !== false) {
-                        $presenceCount++;
-                        break;
-                    }
-                }
-            }
-
-            // 角色出场是正面信号：出场率越高，一致性越好
-            $consistency = min($presenceCount, $chapterCount) / $chapterCount;
-            return max(0.5, min(1.0, $consistency));
-        } catch (\Throwable $e) {
-            error_log('Fallback character consistency check failed: ' . $e->getMessage());
-            return 0.8;
-        }
-    }
-    
-    private function calculateDescriptionRichness(array $chapters): float
-    {
-        if (empty($chapters)) return 0.65;
+        if (empty($chapters)) return null;
 
         $contents = $this->fetchChapterContents($chapters);
         $totalScore = 0;
+        $n = 0;
         foreach ($chapters as $ch) {
             $content = $contents[(int)($ch['id'] ?? 0)] ?? '';
             if (empty($content)) continue;
             
-            // 统计描写性词汇比例
             $wordCount = mb_strlen(preg_replace('/\s+/', '', $content), 'UTF-8');
             if ($wordCount === 0) continue;
             
-            // 扩展的描写性词汇列表
-            // 审计修复（2026-07-19 H-中7）：移除虚词「着/了/过」，中文每百字出现数次
-            // 导致描写密度饱和失去区分度。改为仅保留有实际描写语义的模式。
             $descPatterns = [
-                // 形容词
                 '美丽|漂亮|英俊|丑陋|高大|矮小|强壮|虚弱|年轻|年老',
                 '明亮|黑暗|温暖|寒冷|炎热|凉爽|干燥|潮湿',
                 '安静|喧闹|热闹|冷清|繁华|荒凉|拥挤|空旷',
-                // 副词
                 '极其|非常|十分|格外|特别|尤其|相当|比较|稍微|略微',
                 '迅速|缓慢|轻轻|重重|悄悄|默默|静静|慢慢',
-                // 感官词汇
                 '看见|听到|闻到|尝到|摸到|感觉|察觉|发现',
                 '红色|蓝色|绿色|黄色|白色|黑色|金色|银色',
                 '声音|光线|气味|味道|触感|温度|湿度',
-                // 状态词汇（去掉虚词 着/了/过/正在/已经/曾经/将会/可能/似乎/好像）
                 '微笑|大笑|哭泣|愤怒|悲伤|高兴|惊讶|恐惧',
             ];
             
@@ -786,66 +833,75 @@ class QualityMonitorAgent extends BaseAgent
                 $descWords += preg_match_all('/(' . $pattern . ')/u', $content);
             }
             
-            // 计算描写密度：每100字有多少描写词汇
             $density = $descWords / ($wordCount / 100);
-            
-            // 将密度映射到0-1分数
-            // 理想密度：每100字5-15个描写词汇
             $richness = min(1.0, max(0.0, ($density - 2) / 13));
             
             $totalScore += $richness;
+            $n++;
         }
         
-        return count($chapters) > 0 ? $totalScore / count($chapters) : 0.65;
+        return $n > 0 ? $totalScore / $n : null;
     }
-    
-    private function calculatePlotCoherence(array $chapters): float
+
+    /**
+     * 剧情连贯性：取近章 Gate5（连贯性检查）均分，不再复用伏笔回收率。
+     */
+    private function calculatePlotCoherence(array $chapters): ?float
     {
-        try {
-            $stats = DB::fetch(
-                'SELECT COUNT(*) as total, 
-                        SUM(CASE WHEN resolved_chapter IS NOT NULL THEN 1 ELSE 0 END) as good 
-                 FROM foreshadowing_items
-                 WHERE novel_id = ?',
-                [$this->novelId]
-            );
-            
-            return $stats['total'] > 0 ? (int)$stats['good'] / (int)$stats['total'] : 1.0;
-        } catch (\Throwable $e) {
-            return 1.0;
+        if (empty($chapters) || count($chapters) < 2) {
+            return null;
         }
+
+        $scores = [];
+        foreach ($chapters as $ch) {
+            $raw = $ch['gate_results'] ?? null;
+            $decoded = is_array($raw) ? $raw : (is_string($raw) && $raw !== '' ? json_decode($raw, true) : null);
+            if (!is_array($decoded)) continue;
+            foreach ($decoded as $gate) {
+                if (!is_array($gate)) continue;
+                $name = (string)($gate['name'] ?? '');
+                if ($name === '' || !str_contains($name, '连贯')) continue;
+                if (!isset($gate['score']) || !is_numeric($gate['score'])) continue;
+                $scores[] = (float)$gate['score'];
+                break;
+            }
+        }
+
+        return $scores === [] ? null : (array_sum($scores) / count($scores)) / 100.0;
     }
     
-    private function calculateCoolPointEffectiveness(array $chapters): float
+    private function calculateCoolPointEffectiveness(array $chapters): ?float
     {
         try {
+            // memory_atoms 无 chapter_number 列，章节归属列是 source_chapter；
+            // 边界写法与 AtomRepo 一致：NULL 视为无章节归属的历史原子一并纳入。
             $coolPoints = DB::fetchAll(
                 'SELECT * FROM memory_atoms
                  WHERE novel_id = ? AND atom_type = "cool_point"
-                 ORDER BY created_at DESC LIMIT 20',
-                [$this->novelId]
+                   AND (source_chapter IS NULL OR source_chapter < ?)
+                 ORDER BY COALESCE(source_chapter, 0) DESC, id DESC LIMIT 20',
+                [$this->novelId, $this->currentChapterNumber ?: PHP_INT_MAX]
             );
             
-            if (empty($coolPoints)) return 1.0;
+            if (empty($coolPoints)) return null;
             
             $effective = 0;
             foreach ($coolPoints as $cp) {
                 $metadata = json_decode($cp['metadata'] ?? '{}', true);
-                // 检查是否有有效的爽点类型
                 if (!empty($metadata['cool_type']) && isset(\COOL_POINT_TYPES[$metadata['cool_type']])) {
                     $effective++;
                 }
             }
             
-            return count($coolPoints) > 0 ? $effective / count($coolPoints) : 1.0;
+            return count($coolPoints) > 0 ? $effective / count($coolPoints) : null;
         } catch (\Throwable $e) {
-            return 1.0;
+            return null;
         }
     }
     
-    private function calculateWordCountAccuracy(array $chapters): float
+    private function calculateWordCountAccuracy(array $chapters): ?float
     {
-        if (empty($chapters)) return 1.0;
+        if (empty($chapters)) return null;
         
         try {
             $targetWords = DB::fetch(
@@ -853,37 +909,51 @@ class QualityMonitorAgent extends BaseAgent
                 [$this->novelId]
             );
             
-            $target = (int)($targetWords['chapter_words'] ?? 3000);
-            $tolerance = $target * 0.1;
+            $target = (int)($targetWords['chapter_words'] ?? 0);
+            if ($target <= 0) return null;
+
+            if (!function_exists('calculateDynamicTolerance')) {
+                require_once dirname(__DIR__) . '/prompt.php';
+            }
+            $tol = calculateDynamicTolerance($target, $this->novelId);
+            $tolerance = (int)($tol['tolerance'] ?? 0);
+            if ($tolerance <= 0) {
+                $tolerance = (int)max(100, min(500, (int)($target * 0.1)));
+            }
             
             $accurate = 0;
+            $counted = 0;
             foreach ($chapters as $ch) {
                 $actual = (int)($ch['words'] ?? 0);
+                if ($actual <= 0) continue;
+                $counted++;
                 if (abs($actual - $target) <= $tolerance) {
                     $accurate++;
                 }
             }
             
-            return count($chapters) > 0 ? $accurate / count($chapters) : 1.0;
+            return $counted > 0 ? $accurate / $counted : null;
         } catch (\Throwable $e) {
-            return 1.0;
+            return null;
         }
     }
     
-    private function calculateForeshadowingUsage(): float
+    private function calculateForeshadowingUsage(): ?float
     {
         try {
             $stats = DB::fetch(
                 'SELECT COUNT(*) as total, 
-                        SUM(CASE WHEN resolved_chapter IS NOT NULL THEN 1 ELSE 0 END) as resolved 
+                        SUM(CASE WHEN resolved_chapter < ? THEN 1 ELSE 0 END) as resolved
                  FROM foreshadowing_items
-                 WHERE novel_id = ?',
-                [$this->novelId]
+                 WHERE novel_id = ? AND planted_chapter < ?',
+                [$this->currentChapterNumber ?: PHP_INT_MAX, $this->novelId, $this->currentChapterNumber ?: PHP_INT_MAX]
             );
             
-            return $stats['total'] > 0 ? (int)$stats['resolved'] / (int)$stats['total'] : 1.0;
+            $total = (int)($stats['total'] ?? 0);
+            if ($total <= 0) return null;
+            return (int)($stats['resolved'] ?? 0) / $total;
         } catch (\Throwable $e) {
-            return 1.0;
+            return null;
         }
     }
     

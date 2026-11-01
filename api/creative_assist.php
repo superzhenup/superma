@@ -12,7 +12,7 @@ ob_start();
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
@@ -38,7 +38,7 @@ try {
             $novelId = (int)($_GET['novel_id'] ?? 0);
             $chapterId = (int)($_GET['chapter_id'] ?? 0) ?: null;
             // 审计 P0（2026-06-12）：归属校验
-            $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+            $userId = currentUserId();
             if ($novelId > 0) checkNovelOwnership($novelId, $userId);
             if ($chapterId > 0) checkChapterOwnership($chapterId, $userId);
             if (!$novelId) throw new RuntimeException('缺少小说ID');
@@ -52,7 +52,7 @@ try {
             $chapterNumber = (int)($input['chapter_number'] ?? 0);
             $directive = trim((string)($input['directive'] ?? ''));
             // 审计 P0（2026-06-12）：归属校验
-            $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+            $userId = currentUserId();
             if ($novelId > 0) checkNovelOwnership($novelId, $userId);
             if (!$novelId) throw new RuntimeException('缺少小说ID');
 
@@ -64,7 +64,7 @@ try {
             $novelId = (int)($input['novel_id'] ?? ($_GET['novel_id'] ?? 0));
             $chapterId = (int)($input['chapter_id'] ?? ($_GET['chapter_id'] ?? 0)) ?: null;
             // 审计 P0（2026-06-12）：归属校验
-            $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+            $userId = currentUserId();
             if ($novelId > 0) checkNovelOwnership($novelId, $userId);
             if ($chapterId > 0) checkChapterOwnership($chapterId, $userId);
             if (!$novelId) throw new RuntimeException('缺少小说ID');

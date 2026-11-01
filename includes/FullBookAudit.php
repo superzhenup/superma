@@ -157,6 +157,8 @@ class FullBookAudit
                 "SELECT chapter_from, chapter_to, summary FROM arc_summaries WHERE novel_id=? ORDER BY chapter_from ASC",
                 [$novelId]
             );
+            require_once __DIR__ . '/memory/NarrativeSummary.php';
+            $arcs = NarrativeSummary::filterCurrentRows($novelId, $arcs, 'arc');
             if ($arcs) {
                 // 审计修复（2026-07-19 H-中9）：原实现 mb_substr($t, 0, 9000) 从头截断，
                 // 长书的最新弧段被丢弃，审计视图随书变长而退化。

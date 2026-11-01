@@ -3,6 +3,7 @@
  * 作品解析器 - 作者画像系统
  * 负责解析上传的小说文件（ TXT、DOCX 等格式）
  */
+defined('APP_LOADED') or die('Direct access denied.');
 
 require_once __DIR__ . '/TextProcessor.php';
 
@@ -60,6 +61,8 @@ class WorkParser
 
         $content = $this->extractContent($storedPath, $extension);
         if ($content === false) {
+            @unlink($storedPath);
+            $result['file_path'] = null;
             $result['error'] = '文件解析失败';
             return $result;
         }
@@ -113,19 +116,17 @@ class WorkParser
         if ($content === false) return false;
 
         $encoding = mb_detect_encoding($content, ['UTF-8', 'GBK', 'GB2312', 'BIG5'], true);
+        if ($encoding === false) return false;
         if ($encoding && $encoding !== 'UTF-8') {
             $content = mb_convert_encoding($content, 'UTF-8', $encoding);
         }
+        if (mb_strlen($content) > self::MAX_EXTRACTED_TEXT_CHARS) return false;
 
         return $content ?: false;
     }
 
     private function parseDocx(string $filePath): string|false
     {
-        if (!file_exists('zip://' . $filePath . '#word/document.xml')) {
-            return false;
-        }
-
         $zip = new ZipArchive();
         if ($zip->open($filePath) !== true) {
             return false;
@@ -142,11 +143,38 @@ class WorkParser
 
         if ($xml === false) return false;
 
-        $xml = preg_replace('/<[^>]+>/', ' ', $xml);
-        $xml = html_entity_decode($xml, ENT_XML1, 'UTF-8');
-
-        $content = preg_replace('/\s+/', ' ', $xml);
-        $content = trim($content);
+        // Text runs can split a single word; paragraphs must remain separate
+        // so chapter headings do not swallow all following prose.
+        $document = new DOMDocument();
+        $previousErrors = libxml_use_internal_errors(true);
+        try {
+            if (!$document->loadXML($xml, LIBXML_NONET) || $document->doctype !== null) {
+                return false;
+            }
+        } finally {
+            libxml_clear_errors();
+            libxml_use_internal_errors($previousErrors);
+        }
+        $namespace = $document->documentElement?->namespaceURI;
+        if (!in_array($namespace, [
+            'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
+            'http://purl.oclc.org/ooxml/wordprocessingml/main',
+        ], true)) return false;
+        $xpath = new DOMXPath($document);
+        $xpath->registerNamespace('w', $namespace);
+        $paragraphs = [];
+        foreach ($xpath->query('/w:document/w:body//w:p') as $paragraph) {
+            $text = '';
+            foreach ($xpath->query('.//w:t | .//w:tab | .//w:br | .//w:cr', $paragraph) as $token) {
+                $text .= match ($token->localName) {
+                    't' => $token->textContent,
+                    'tab' => "\t",
+                    default => "\n",
+                };
+            }
+            $paragraphs[] = $text;
+        }
+        $content = trim(implode("\n", $paragraphs));
         if (mb_strlen($content) > self::MAX_EXTRACTED_TEXT_CHARS) {
             return false;
         }
@@ -156,40 +184,57 @@ class WorkParser
 
     private function parseDoc(string $filePath): string|false
     {
-        // 检查 catdoc 是否可用
-        // shell_exec 在宝塔默认 disable_functions 中被禁用，调用被禁用函数会触发致命错误，
-        // @ 也无法抑制，故必须先 function_exists 守卫（否则解析 .doc 时整页 500）。
-        // Windows 下 catdoc/antiword 不可用，直接跳过 shell 调用
-        $shellOk = function_exists('shell_exec') && (PHP_OS_FAMILY !== 'Windows');
-        $catdocAvailable = $shellOk && @shell_exec('which catdoc 2>/dev/null');
-
-        if ($catdocAvailable) {
-            $content = @shell_exec('catdoc ' . escapeshellarg($filePath) . ' 2>/dev/null');
-            if ($content !== null && trim($content) !== '') {
-                return $content;
+        // 不依赖 shell_exec/which：宝塔常禁用 shell_exec，但允许更安全的 proc_open。
+        // 命令以数组形式传递，文件名不会进入 shell 解析。
+        foreach (['catdoc', 'antiword'] as $extractor) {
+            $content = $this->runDocExtractor($extractor, $filePath);
+            if ($content !== false && trim($content) !== '') {
+                $encoding = mb_detect_encoding($content, ['UTF-8', 'GBK', 'GB2312', 'BIG5'], true);
+                if ($encoding && $encoding !== 'UTF-8') {
+                    $content = mb_convert_encoding($content, 'UTF-8', $encoding);
+                }
+                if (mb_strlen($content) <= self::MAX_EXTRACTED_TEXT_CHARS) return $content;
+                return false;
             }
         }
 
-        // 回退方案1：尝试使用 antiword（另一个doc解析工具）
-        $antiwordAvailable = $shellOk && @shell_exec('which antiword 2>/dev/null');
-        if ($antiwordAvailable) {
-            $content = @shell_exec('antiword ' . escapeshellarg($filePath) . ' 2>/dev/null');
-            if ($content !== null && trim($content) !== '') {
-                return $content;
-            }
-        }
-
-        // 回退方案2：尝试读取为纯文本（可能包含乱码，但总比没有好）
+        // 仅对“扩展名为 .doc、实际内容是纯文本”的文件兜底。真正的 OLE .doc
+        // 不能把二进制控制字符删除后冒充正文，否则会把乱码送入画像分析并污染数据。
         $content = @file_get_contents($filePath);
-        if ($content !== false) {
-            // 尝试去除二进制控制字符
-            $content = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $content);
-            if (trim($content) !== '') {
-                return $content;
-            }
-        }
+        if ($content === false || str_starts_with($content, "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") || str_contains($content, "\0")) return false;
+        $encoding = mb_detect_encoding($content, ['UTF-8', 'GBK', 'GB2312', 'BIG5'], true);
+        if ($encoding === false) return false;
+        if ($encoding !== 'UTF-8') $content = mb_convert_encoding($content, 'UTF-8', $encoding);
+        if (trim($content) !== '' && mb_strlen($content) <= self::MAX_EXTRACTED_TEXT_CHARS) return $content;
 
         return false;
+    }
+
+    private function runDocExtractor(string $binary, string $filePath): string|false
+    {
+        if (!function_exists('proc_open')) return false;
+        $process = @proc_open(
+            [$binary, $filePath],
+            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes,
+            null,
+            null,
+            ['bypass_shell' => true]
+        );
+        if (!is_resource($process)) return false;
+        fclose($pipes[0]);
+        $stdout = stream_get_contents($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $code = proc_close($process);
+        if ($code !== 0 || $stdout === false || trim($stdout) === '') {
+            if ($stderr !== false && $stderr !== '') {
+                error_log('WorkParser ' . $binary . ' failed: ' . mb_substr(trim($stderr), 0, 300));
+            }
+            return false;
+        }
+        return $stdout;
     }
 
     public function parseText(string $text): array

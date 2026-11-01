@@ -31,6 +31,10 @@ class IndexMigrations
         self::addIndexIfMissing($pdo, 'novels', 'idx_updated',
             "ALTER TABLE `novels` ADD INDEX `idx_updated` (`updated_at`)", $errors);
 
+        // [v71] book_analyses.user_id 索引（拆书分析按用户列表/归属校验；原运行时 DDL 收编）
+        self::addIndexIfMissing($pdo, 'book_analyses', 'idx_user',
+            "ALTER TABLE `book_analyses` ADD INDEX `idx_user` (`user_id`)", $errors);
+
         self::addIndexIfMissing($pdo, 'writing_logs', 'idx_novel_created',
             "ALTER TABLE `writing_logs` ADD INDEX `idx_novel_created` (`novel_id`, `created_at`)", $errors);
 
@@ -55,6 +59,48 @@ class IndexMigrations
             "ALTER TABLE `memory_atoms` ADD INDEX `idx_novel_chapter` (`novel_id`, `source_chapter`)", $errors);
         // 旧单列索引在新复合索引就位后移除（仅存在于升级库，新建库 schema.php 已直接用复合索引）
         self::dropIndexIfExists($pdo, 'memory_atoms', 'idx_chapter', $errors);
+
+        // [v58] 中文全文检索：memory_atoms/foreshadowing_items 的 FULLTEXT 索引补
+        // ngram parser。默认 parser 按空白分词，中文内容整段算一个 token，MATCH
+        // ... AGAINST 对中文子串永不命中。要求 MySQL 5.7.6+（db.php 已要求 5.7+），
+        // 迁移失败走既有 $errors 通道，不中断整体迁移。
+        self::upgradeFulltextToNgram($pdo, 'memory_atoms', 'ft_content', 'content', $errors);
+        self::upgradeFulltextToNgram($pdo, 'foreshadowing_items', 'ft_description', 'description', $errors);
+    }
+
+    /**
+     * 将表的 FULLTEXT 索引升级为 ngram parser（幂等）。
+     * indexExists 只能判断索引存在与否，无法判断 parser 类型，
+     * 故通过 SHOW CREATE TABLE 检查索引定义是否已带 ngram。
+     */
+    private static function upgradeFulltextToNgram(PDO $pdo, string $table, string $index, string $column, array &$errors): void
+    {
+        try {
+            $stmt = $pdo->query("SHOW CREATE TABLE `{$table}`");
+            $row = $stmt ? $stmt->fetch(PDO::FETCH_ASSOC) : false;
+            if ($stmt) {
+                $stmt->closeCursor();
+            }
+            $createSql = is_array($row) ? (string)($row['Create Table'] ?? '') : '';
+            if ($createSql === '') {
+                return; // 表不存在等场景交由建表流程处理
+            }
+            foreach (explode("\n", $createSql) as $line) {
+                if (str_contains($line, "FULLTEXT KEY `{$index}`") || str_contains($line, "FULLTEXT INDEX `{$index}`")) {
+                    if (stripos($line, 'ngram') !== false) {
+                        return; // 已是 ngram，无需迁移
+                    }
+                    break;
+                }
+            }
+            $pdo->exec("ALTER TABLE `{$table}` DROP INDEX `{$index}`, ADD FULLTEXT KEY `{$index}` (`{$column}`) WITH PARSER ngram");
+        } catch (\Throwable $e) {
+            $message = "fulltext_ngram:{$table}.{$index} - " . $e->getMessage();
+            if (!SchemaMigrator::isIgnorableError($e)) {
+                $errors[] = $message;
+            }
+            error_log('DB Migrate: ' . $message);
+        }
     }
 
     /**

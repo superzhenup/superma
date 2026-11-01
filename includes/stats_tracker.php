@@ -15,6 +15,19 @@ class StatsTracker
     private string $table = 'usage_stats';
     private static bool $tableEnsured = false;
 
+    /**
+     * 详细日志：仅在 CFG_STATS_VERBOSE_LOG=true 时记录。
+     * 用于 reportRealtime 每次访问 novel.php 都会触发的路径，
+     * 避免在生产环境刷屏并把 STATS_SERVER_URL / payload / 远端响应体写入 error_log。
+     * 失败路径请直接调用 error_log()，不走此方法。
+     */
+    private static function verboseLog(string $message): void
+    {
+        if (defined('CFG_STATS_VERBOSE_LOG') && CFG_STATS_VERBOSE_LOG === true) {
+            error_log($message);
+        }
+    }
+
     private static function ensureTable(): void
     {
         if (self::$tableEnsured) return;
@@ -122,7 +135,7 @@ class StatsTracker
         $totalChapters = 0;
         $novelsActive = 0;
         try {
-            $totalWords = (int)DB::fetchColumn("SELECT COALESCE(MAX(total_words), 0) FROM novels");
+            $totalWords = (int)DB::fetchColumn("SELECT COALESCE(SUM(total_words), 0) FROM novels");
             $totalChapters = (int)DB::fetchColumn("SELECT COUNT(*) FROM chapters WHERE status = 'completed'");
             $novelsActive = (int)DB::fetchColumn("SELECT COUNT(*) FROM novels WHERE status IN ('writing','active')");
         } catch (\Throwable $e) {
@@ -195,17 +208,17 @@ class StatsTracker
     public static function reportRealtime(?array $novel = null): void
     {
         if (!self::isEnabled()) {
-            error_log('StatsTracker::reportRealtime skipped: disabled');
+            self::verboseLog('StatsTracker::reportRealtime skipped: disabled');
             return;
         }
 
         $serverUrl = self::getServerUrl();
         if (empty($serverUrl)) {
-            error_log('StatsTracker::reportRealtime skipped: no server URL');
+            self::verboseLog('StatsTracker::reportRealtime skipped: no server URL');
             return;
         }
 
-        error_log('StatsTracker::reportRealtime starting... URL=' . $serverUrl);
+        self::verboseLog('StatsTracker::reportRealtime starting... URL=' . $serverUrl);
 
         try {
             // 获取全站实时数据
@@ -229,7 +242,7 @@ class StatsTracker
                 'version' => APP_VERSION,
             ];
 
-            error_log('StatsTracker::reportRealtime payload: ' . json_encode($payload, JSON_UNESCAPED_UNICODE));
+            self::verboseLog('StatsTracker::reportRealtime payload: ' . json_encode($payload, JSON_UNESCAPED_UNICODE));
 
             // 异步发送（不阻塞页面）
             self::sendAsync($serverUrl, $payload);
@@ -271,10 +284,12 @@ class StatsTracker
         curl_close($ch);
 
         // v1.11.8: 记录发送结果用于调试
+        // 审计 2026-08-13 #1：成功路径降级为 verbose，避免每次访问 novel.php 都把
+        // 远端响应体写入日志；curl error 仍走 error_log 以便故障排查。
         if ($error) {
             error_log('StatsTracker::sendAsync curl error: ' . $error);
         } else {
-            error_log(sprintf('StatsTracker::sendAsync success: HTTP %d, response=%s', $httpCode, mb_substr($response ?? '', 0, 200)));
+            self::verboseLog(sprintf('StatsTracker::sendAsync success: HTTP %d, response=%s', $httpCode, mb_substr($response ?? '', 0, 200)));
         }
     }
 

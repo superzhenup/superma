@@ -3,13 +3,14 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
+require_once dirname(__DIR__) . '/includes/ChapterMutationService.php';
 requireLoginApi();
 
 header('Content-Type: application/json; charset=utf-8');
@@ -19,7 +20,7 @@ $chapterId = (int)($_POST['chapter_id'] ?? $_GET['chapter_id'] ?? 0);
 $action    = $_POST['action'] ?? $_GET['action'] ?? 'save';
 
 // 审计 P0（2026-06-12）：归属校验
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 if ($novelId > 0) checkNovelOwnership($novelId, $userId);
 if ($chapterId > 0) checkChapterOwnership($chapterId, $userId);
 
@@ -51,13 +52,38 @@ if ($action === 'save') {
         exit;
     }
 
-    DB::update('chapters', [
-        'human_critic_scores' => json_encode($clean, JSON_UNESCAPED_UNICODE),
-    ], 'id=? AND novel_id=?', [$chapterId, $novelId]);
+    $chapter = DB::fetch(
+        'SELECT chapter_number, content FROM chapters WHERE id=? AND novel_id=?',
+        [$chapterId, $novelId]
+    );
+    if (!$chapter) {
+        echo json_encode(['ok' => false, 'msg' => 'chapter not found']);
+        exit;
+    }
+    $expectedContentHash = hash('sha256', (string)($chapter['content'] ?? ''));
+
+    try {
+        ChapterMutationService::mutateChapter($chapterId, $novelId, [
+            'human_critic_scores' => json_encode($clean, JSON_UNESCAPED_UNICODE),
+        ], [
+            'backup_version' => false,
+            'prevent_writing' => true,
+            'expected_content_hash' => $expectedContentHash,
+            'reason' => 'manual_human_critic',
+        ]);
+    } catch (ChapterMutationConflict $e) {
+        http_response_code(409);
+        echo json_encode([
+            'ok' => false,
+            'code' => 'CHAPTER_REVISION_CHANGED',
+            'msg' => 'The chapter changed before the scores were saved. Please score it again.',
+        ], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
 
     addLog($novelId, 'info', sprintf(
         '人工评分已保存：第%d章（%d项）',
-        (int)(DB::fetch('SELECT chapter_number FROM chapters WHERE id=?', [$chapterId])['chapter_number'] ?? 0),
+        (int)($chapter['chapter_number'] ?? 0),
         count($clean)
     ));
 

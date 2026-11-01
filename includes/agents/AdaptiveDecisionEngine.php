@@ -19,7 +19,7 @@ class AdaptiveDecisionEngine
     private ?array $cachedOutcomes = null;
     private ?array $cachedTrends = null;
 
-    public function __construct(int $novelId)
+    public function __construct(int $novelId, private int $beforeChapter = PHP_INT_MAX)
     {
         $this->novelId = $novelId;
     }
@@ -82,7 +82,7 @@ class AdaptiveDecisionEngine
 
         try {
             require_once __DIR__ . '/AgentDirectives.php';
-            $this->cachedOutcomes = AgentDirectives::getOutcomeStats($this->novelId);
+            $this->cachedOutcomes = AgentDirectives::getOutcomeStats($this->novelId, $this->beforeChapter);
             // P0 修复：AgentDirectives::getOutcomeStats 的 by_type 是 GROUP BY 的
             // 数字索引行列表，而 getAdaptiveWeight() 按字符串键 $by_type[$decisionType]
             // 取值恒为 null，导致权重恒 1.0、自适应机制静默失效。此处重键为 type=>row。
@@ -137,6 +137,8 @@ class AdaptiveDecisionEngine
                     $emotionTrend['consecutive_below']
                 ),
                 'preventive_action' => '建议本章增加情绪描写，至少安排一个情绪爆发点',
+                // 症状短语与 KNOWLEDGE_BASE 子类型对齐（P1：供 matchSubtype 对症命中）
+                'symptoms' => ['情绪曲线平直'],
             ];
         }
 
@@ -152,28 +154,80 @@ class AdaptiveDecisionEngine
                     $foreshadowingRisk['overdue_count']
                 ),
                 'preventive_action' => '建议近期章节安排伏笔回收',
+                // 症状短语与 KNOWLEDGE_BASE 子类型对齐（P1：供 matchSubtype 对症命中）
+                'symptoms' => ['伏笔超期未回收'],
             ];
         }
 
-        // 预测4（爽点饥饿度）已移除：原 getCoolPointHunger() 查询 cool_point_hunger 表，
+        // 预测4：爽点密度不足（2026-08-16 P1 重做）
+        // 原预测4查询全库不存在的 cool_point_hunger 表（恒异常→恒不触发的死代码，
+        // 已移除）。改用 chapters 实际数据：近 20 章「有爽点章占比」与小说级
+        // ws_cool_point_density_target 同口径对比（与 WritingStrategyAgent /
+        // PIDController 的 R8-2 口径一致），使 coolpoint_low 域专家知识可达。
+        $coolPointRisk = $this->getCoolPointDensityRisk();
+        if ($coolPointRisk['triggered']) {
+            $predictions[] = [
+                'type' => 'coolpoint_low',
+                'severity' => $coolPointRisk['density'] < $coolPointRisk['target'] * 0.5 ? 'high' : 'medium',
+                'confidence' => 0.8,
+                'prediction' => sprintf(
+                    '近%d章爽点密度%.2f低于目标%.2f，读者爽感饥饿',
+                    $coolPointRisk['sample'],
+                    $coolPointRisk['density'],
+                    $coolPointRisk['target']
+                ),
+                'preventive_action' => '建议本章安排核心爽点（逆袭/打脸/获宝），保证压抑-爆发铺垫完整',
+                // 症状短语与 KNOWLEDGE_BASE 子类型对齐（P1：供 matchSubtype 对症命中）
+                'symptoms' => ['连续多章缺乏爽点'],
+            ];
+        }
+
+        // 预测5：节奏停滞（2026-08-16 P1 新增）
+        // 数据源：chapters.pacing（细纲阶段写入的 快/中/慢 标注）。
+        // 近 10 章慢节奏占比≥60% 且无快节奏章 → 中段疲软风险，使 pacing_issue
+        // 域专家知识可达（此前该域完全无预测入口）。
+        $pacingRisk = $this->getPacingStagnationRisk();
+        if ($pacingRisk['triggered']) {
+            $predictions[] = [
+                'type' => 'pacing_issue',
+                'severity' => $pacingRisk['slow_ratio'] >= 0.8 ? 'high' : 'medium',
+                'confidence' => 0.75,
+                'prediction' => sprintf(
+                    '近%d章慢节奏占比%.0f%%且无快节奏章，中段有疲软风险',
+                    $pacingRisk['sample'],
+                    $pacingRisk['slow_ratio'] * 100
+                ),
+                'preventive_action' => '建议本章加快节奏：提升事件密度、缩短段落、直接切入冲突',
+                // 症状短语与 KNOWLEDGE_BASE 子类型对齐（P1：供 matchSubtype 对症命中）
+                'symptoms' => ['连续慢节奏章节过多'],
+            ];
+        }
+
+        // 预测4（爽点饥饿度，旧版）已移除：原 getCoolPointHunger() 查询 cool_point_hunger 表，
         // 但该表在全库从未被 CREATE/INSERT，查询恒抛异常并被 catch 成 max_hunger=0，
-        // 该分支永不触发——属静默失效的死代码。如需此预测，须先补建表及其填充数据源。
+        // 该分支永不触发——属静默失效的死代码。上方预测4为基于 chapters 实际数据的重做版。
 
         return $predictions;
     }
+
+    /** 复审 T8（2026-10-31）：$metric 拼入 SQL 列名，白名单与 TrendPredictor::ALLOWED_METRICS 一致。 */
+    private const ALLOWED_METRICS = ['quality_score', 'emotion_score'];
 
     /**
      * 获取指标趋势
      */
     private function getMetricTrend(string $metric, int $window): array
     {
+        if (!in_array($metric, self::ALLOWED_METRICS, true)) {
+            throw new \InvalidArgumentException("Invalid metric: {$metric}");
+        }
         try {
             $chapters = DB::fetchAll(
                 "SELECT chapter_number, {$metric} as value
                  FROM chapters
-                 WHERE novel_id = ? AND status = 'completed' AND {$metric} IS NOT NULL
+                 WHERE novel_id = ? AND status = 'completed' AND {$metric} IS NOT NULL AND chapter_number < ?
                  ORDER BY chapter_number DESC LIMIT ?",
-                [$this->novelId, $window]
+                [$this->novelId, $this->beforeChapter, $window]
             );
 
             if (count($chapters) < 3) {
@@ -273,10 +327,15 @@ class AdaptiveDecisionEngine
         // 修复：predictIssues 产出的 type（quality_decline/emotion_deficit/foreshadowing_overdue）
         // 与 WritingExpertise::KNOWLEDGE_BASE 键（quality_low/emotion_low/foreshadowing_issue）
         // 命名不一致，导致 getAdvice 恒返回 found=false。此处做一层映射。
+        // 审计修复（2026-08-16 P1，C2）：补齐 coolpoint_low / pacing_issue 映射。
+        // 此前知识库 5 个顶级域中这两个域没有任何 predictIssues type 可达（死域），
+        // 约 80 行爽点/节奏专家知识整体不可触达。
         $issueTypeMap = [
             'quality_decline'        => 'quality_low',
             'emotion_deficit'        => 'emotion_low',
             'foreshadowing_overdue'  => 'foreshadowing_issue',
+            'coolpoint_low'          => 'coolpoint_low',
+            'pacing_issue'           => 'pacing_issue',
         ];
         $mappedType = $issueTypeMap[$issueType] ?? $issueType;
         return WritingExpertise::getAdvice($mappedType, $context);
@@ -309,24 +368,114 @@ class AdaptiveDecisionEngine
     {
         try {
             $currentChapter = DB::fetch(
-                "SELECT COALESCE(MAX(chapter_number), 0) as max_ch FROM chapters WHERE novel_id = ? AND status = 'completed'",
-                [$this->novelId]
+                "SELECT COALESCE(MAX(chapter_number), 0) as max_ch FROM chapters WHERE novel_id = ? AND status = 'completed' AND chapter_number < ?",
+                [$this->novelId, $this->beforeChapter]
             );
             $maxCh = (int)($currentChapter['max_ch'] ?? 0);
 
             $stats = DB::fetch(
                 "SELECT COUNT(*) as overdue_count
                  FROM foreshadowing_items
-                 WHERE novel_id = ?
-                   AND resolved_chapter IS NULL
+                 WHERE novel_id = ? AND planted_chapter < ?
+                   AND (resolved_chapter IS NULL OR resolved_chapter >= ?)
                    AND deadline_chapter IS NOT NULL
                    AND deadline_chapter < ?",
-                [$this->novelId, $maxCh]
+                [$this->novelId, $this->beforeChapter, $this->beforeChapter, $maxCh]
             );
 
             return ['overdue_count' => (int)($stats['overdue_count'] ?? 0)];
         } catch (\Throwable $e) {
             return ['overdue_count' => 0];
+        }
+    }
+
+    /**
+     * 爽点密度风险（2026-08-16 P1，替代已移除的 cool_point_hunger 死查询）
+     *
+     * 口径与 WritingStrategyAgent::getRecentCoolPointDensity 一致：近 20 章完成章中
+     * 「有爽点章」占比（actual_cool_point_types 优先，回退 cool_point_type），
+     * 与小说级 ws_cool_point_density_target 对比；触发系数 0.8 与
+     * analyzeCurrentState 的「爽点密度可提升」判定相同。
+     * 样本 <5 章不判定（开篇期误报防护）。
+     */
+    private function getCoolPointDensityRisk(): array
+    {
+        try {
+            $rows = DB::fetchAll(
+                'SELECT cool_point_type, actual_cool_point_types FROM chapters
+                 WHERE novel_id = ? AND status = "completed" AND chapter_number < ?
+                 ORDER BY chapter_number DESC LIMIT 20',
+                [$this->novelId, $this->beforeChapter]
+            );
+            $sample = count($rows);
+            if ($sample < 5) {
+                return ['triggered' => false];
+            }
+
+            $with = 0;
+            foreach ($rows as $r) {
+                $actual = json_decode((string)($r['actual_cool_point_types'] ?? ''), true);
+                if ((is_array($actual) && !empty($actual)) || !empty($r['cool_point_type'])) {
+                    $with++;
+                }
+            }
+            $density = $with / $sample;
+
+            require_once __DIR__ . '/../config_center.php';
+            $target = (float)ConfigCenter::getNovel($this->novelId, 'ws_cool_point_density_target', 0.88, 'float');
+
+            return [
+                'triggered' => $density < $target * 0.8,
+                'density'   => round($density, 2),
+                'target'    => $target,
+                'sample'    => $sample,
+            ];
+        } catch (\Throwable $e) {
+            return ['triggered' => false];
+        }
+    }
+
+    /**
+     * 节奏停滞风险（2026-08-16 P1 新增）
+     *
+     * 数据源：chapters.pacing（细纲阶段写入的 快/中/慢 标注）。
+     * 近 10 章慢节奏占比≥60% 且无快节奏章 → 判定中段疲软风险。
+     * 样本 <5 章不判定。
+     */
+    private function getPacingStagnationRisk(): array
+    {
+        try {
+            $rows = DB::fetchAll(
+                "SELECT pacing FROM chapters
+                 WHERE novel_id = ? AND status = 'completed' AND chapter_number < ?
+                   AND pacing IS NOT NULL AND pacing <> ''
+                 ORDER BY chapter_number DESC LIMIT 10",
+                [$this->novelId, $this->beforeChapter]
+            );
+            $sample = count($rows);
+            if ($sample < 5) {
+                return ['triggered' => false];
+            }
+
+            $slow = 0;
+            $fast = 0;
+            foreach ($rows as $r) {
+                $p = trim((string)$r['pacing']);
+                if ($p === '慢') {
+                    $slow++;
+                } elseif ($p === '快') {
+                    $fast++;
+                }
+            }
+            $slowRatio = $slow / $sample;
+
+            return [
+                'triggered'  => $slowRatio >= 0.6 && $fast === 0,
+                'slow_ratio' => round($slowRatio, 2),
+                'sample'     => $sample,
+            ];
+        } catch (\Throwable $e) {
+            return ['triggered' => false];
         }
     }
 

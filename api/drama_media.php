@@ -6,7 +6,7 @@
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
@@ -28,7 +28,7 @@ const DRAMA_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
 const DRAMA_IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
 
 function dramaMediaUserId(): int {
-    return (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    return currentUserId();
 }
 
 /** 读取并校验上传文件内容。 */

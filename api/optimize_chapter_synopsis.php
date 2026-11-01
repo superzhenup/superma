@@ -8,7 +8,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
@@ -16,6 +16,7 @@ require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
+require_once dirname(__DIR__) . '/includes/ChapterSynopsisPersistence.php';
 requireLoginApi();
 session_write_close();
 
@@ -31,7 +32,7 @@ $suggestions = trim($input['suggestions'] ?? '');
 $previewOnly = !empty($input['preview_only']);
 
 // 审计 P0（2026-06-12）：归属校验
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 if ($novelId > 0) checkNovelOwnership($novelId, $userId);
 
 if (!$novelId || !$chapterNumber || !$suggestions) {
@@ -39,29 +40,20 @@ if (!$novelId || !$chapterNumber || !$suggestions) {
     exit;
 }
 
-// 获取小说信息
-$novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$novelId]);
-if (!$novel) {
-    echo json_encode(['success' => false, 'error' => '小说不存在']);
+// Snapshot and prompt source are captured together before the model starts.
+$persistence = new ChapterSynopsisPersistence(DB::connect(), $userId, $novelId);
+try {
+    $snapshot = $persistence->capture($chapterNumber, true, false);
+    $novel = $snapshot['novel'];
+    $chapter = $snapshot['chapter'];
+    $currentSynopsis = $snapshot['synopsis'];
+    $storyOutline = $snapshot['story'];
+    $sourceRevision = $persistence->sourceRevision($chapterNumber);
+    if ($currentSynopsis === null) throw new ChapterSynopsisSourceChangedException('Synopsis missing.');
+} catch (ChapterSynopsisSourceChangedException $error) {
+    echo json_encode(['success'=>false, 'code'=>'source_conflict', 'error'=>'章节概要来源已变化或不存在，请刷新后重试']);
     exit;
 }
-
-// 获取章节信息
-$chapter = DB::fetch('SELECT * FROM chapters WHERE novel_id=? AND chapter_number=?', [$novelId, $chapterNumber]);
-if (!$chapter) {
-    echo json_encode(['success' => false, 'error' => '章节不存在']);
-    exit;
-}
-
-// 获取当前章节概要
-$currentSynopsis = DB::fetch('SELECT * FROM chapter_synopses WHERE novel_id=? AND chapter_number=?', [$novelId, $chapterNumber]);
-if (!$currentSynopsis) {
-    echo json_encode(['success' => false, 'error' => '章节概要不存在，请先生成概要']);
-    exit;
-}
-
-// 获取全书故事大纲
-$storyOutline = DB::fetch('SELECT * FROM story_outlines WHERE novel_id=?', [$novelId]);
 
 // 预检：至少要有一个模型
 try {
@@ -93,50 +85,32 @@ try {
         }
     );
     
-    $result = parseSynopsisResponse($rawResponse);
+    $result = ChapterSynopsisOutput::parseOptimization($rawResponse, $chapterNumber);
 
     if (!$result) {
         echo json_encode(['success' => false, 'error' => 'AI返回格式错误，请重试']);
         exit;
     }
 
-    $updateData = [];
-    if (!empty($result['synopsis'])) {
-        $updateData['synopsis'] = $result['synopsis'];
-    }
-    if (!empty($result['pacing'])) {
-        $updateData['pacing'] = $result['pacing'];
-    }
-    if (!empty($result['cliffhanger'])) {
-        $updateData['cliffhanger'] = $result['cliffhanger'];
-    }
-    if (!empty($result['scene_breakdown'])) {
-        $updateData['scene_breakdown'] = json_encode($result['scene_breakdown'], JSON_UNESCAPED_UNICODE);
-    }
-    if (!empty($result['dialogue_beats'])) {
-        $updateData['dialogue_beats'] = json_encode($result['dialogue_beats'], JSON_UNESCAPED_UNICODE);
-    }
-    if (!empty($result['sensory_details'])) {
-        $updateData['sensory_details'] = json_encode($result['sensory_details'], JSON_UNESCAPED_UNICODE);
-    }
-    if (!empty($result['foreshadowing'])) {
-        $updateData['foreshadowing'] = json_encode($result['foreshadowing'], JSON_UNESCAPED_UNICODE);
-    }
-    if (!empty($result['callbacks'])) {
-        $updateData['callbacks'] = json_encode($result['callbacks'], JSON_UNESCAPED_UNICODE);
+    $updateData = $result;
+    foreach (['scene_breakdown', 'dialogue_beats', 'sensory_details', 'foreshadowing', 'callbacks'] as $field) {
+        if (array_key_exists($field, $result)) {
+            $updateData[$field] = $result[$field] === [] ? null : json_encode($result[$field], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        }
     }
 
-    // 优化弹窗采用“生成预览 -> 用户确认 -> 保存”的两阶段流程。
-    // 预览请求不得在确认前覆盖数据库里的现有概要。
-    if (!$previewOnly && !empty($updateData)) {
-        DB::update('chapter_synopses', $updateData, 'novel_id=? AND chapter_number=?', [$novelId, $chapterNumber]);
+    // Both direct publication and later preview confirmation compare this exact source.
+    if (!$previewOnly && !$persistence->saveGenerated($chapterNumber, $updateData)) {
+        echo json_encode(['success'=>false, 'code'=>'source_conflict', 'error'=>'大纲或概要已被修改，已保留当前版本，请刷新后重试']);
+        exit;
     }
 
     echo json_encode([
         'success' => true,
         'data' => $result,
         'usage' => $usage,
-        'persisted' => !$previewOnly
+        'persisted' => !$previewOnly,
+        'source_revision' => $sourceRevision
     ]);
     
 } catch (Exception $e) {
@@ -156,7 +130,7 @@ function buildOptimizeSynopsisPrompt(array $novel, array $chapter, array $curren
     $prompt .= "【小说基本信息】\n";
     $prompt .= "标题：{$novel['title']}\n";
     $prompt .= "类型：{$novel['genre']}\n";
-    $prompt .= "风格：{$novel['style']}\n";
+    $prompt .= '风格：' . ($novel['writing_style'] ?? $novel['style'] ?? '') . "\n";
     if ($novel['protagonist_info']) {
         $prompt .= "主角信息：{$novel['protagonist_info']}\n";
     }
@@ -212,29 +186,4 @@ function buildOptimizeSynopsisPrompt(array $novel, array $chapter, array $curren
     return [
         ['role' => 'user', 'content' => $prompt]
     ];
-}
-
-/**
- * 解析AI返回的章节概要JSON
- */
-function parseSynopsisResponse(string $rawResponse): ?array {
-    if (preg_match('/\{[\s\S]*\}/m', $rawResponse, $matches)) {
-        $json = $matches[0];
-        $data = json_decode($json, true);
-
-        if (json_last_error() === JSON_ERROR_NONE && isset($data['synopsis'])) {
-            return [
-                'synopsis'        => $data['synopsis'],
-                'pacing'          => $data['pacing'] ?? '',
-                'cliffhanger'     => $data['cliffhanger'] ?? '',
-                'scene_breakdown' => $data['scene_breakdown'] ?? [],
-                'dialogue_beats'  => $data['dialogue_beats'] ?? [],
-                'sensory_details' => $data['sensory_details'] ?? [],
-                'foreshadowing'   => $data['foreshadowing'] ?? [],
-                'callbacks'       => $data['callbacks'] ?? [],
-            ];
-        }
-    }
-
-    return null;
 }

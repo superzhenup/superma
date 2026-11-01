@@ -16,6 +16,8 @@ class PowerSystem
 
     /** @var array|null 缓存的境界链 */
     private ?array $realmChain = null;
+    /** A default cached after a best-effort read cannot satisfy hard validation. */
+    private bool $realmChainStrictlyRead = false;
 
     /**
      * 分组默认境界链（按体系分类，消除歧义）
@@ -110,29 +112,25 @@ class PowerSystem
      * 尝试从数据库获取主角当前境界作为检测 hint
      * 用于 getDefaultRealmChain() 在无 worldbuilding 配置时智能选链
      */
-    private function fetchProtagonistRealmHint(): string
+    private function fetchProtagonistRealmHint(bool $strictRead = false): string
     {
         try {
             $card = DB::fetch(
-                "SELECT cc.attributes 
-                 FROM character_cards cc 
+                "SELECT cc.attributes
+                 FROM character_cards cc
                  JOIN novel_characters nc ON nc.name = cc.name AND nc.novel_id = cc.novel_id
-                 WHERE cc.novel_id=? AND nc.role_type='protagonist' 
+                 WHERE cc.novel_id=? AND nc.role_type='protagonist'
                  LIMIT 1",
                 [$this->novelId]
             );
-            if ($card && !empty($card['attributes'])) {
-                $attrs = is_string($card['attributes'])
-                    ? json_decode($card['attributes'], true)
-                    : $card['attributes'];
-                if (is_array($attrs) && !empty($attrs['realm'])) {
-                    return (string)$attrs['realm'];
-                }
-            }
+            $hit = $this->realmFromCardAttributes($card ? ['name' => '', 'attributes' => $card['attributes']] : null);
+            if ($hit['realm'] !== '') return $hit['realm'];
         } catch (\Throwable $e) {
+            if ($strictRead) throw $e;
             // 静默失败，返回空串触发兜底
         }
-        return '';
+        // 审计修复（2026-08-16 P1，B5）：向导链路回退（见 fetchWizardProtagonistCard 注释）
+        return $this->realmFromCardAttributes($this->fetchWizardProtagonistCard($strictRead))['realm'];
     }
 
     // ================================================================
@@ -143,12 +141,15 @@ class PowerSystem
      * 获取当前小说的境界链
      * 优先从 novel_worldbuilding(category='rule', name 含"境界/等级/修炼") 读取
      * 找不到则回退到硬编码默认值
+     * $strictRead distinguishes a successful empty result from a failed read.
+     * Validation may supply its already-read character realm to avoid a second
+     * lookup with a different protagonist-selection rule.
      * 
      * @return array ['realms' => ['炼气','筑基',...], 'source' => 'worldbuilding'|'default', 'power_system' => '修仙境界']
      */
-    public function getRealmChain(): array
+    public function getRealmChain(bool $strictRead = false, ?string $knownRealm = null): array
     {
-        if ($this->realmChain !== null) {
+        if ($this->realmChain !== null && (!$strictRead || $this->realmChainStrictlyRead)) {
             return $this->realmChain;
         }
 
@@ -166,6 +167,7 @@ class PowerSystem
                 foreach ($rules as $rule) {
                     $realms = $this->parseRealmChainFromRule($rule);
                     if (!empty($realms)) {
+                        $this->realmChainStrictlyRead = true;
                         $this->realmChain = [
                             'realms'       => $realms,
                             'source'       => 'worldbuilding',
@@ -176,12 +178,14 @@ class PowerSystem
                 }
             }
         } catch (\Throwable $e) {
+            if ($strictRead) throw $e;
             // 查询失败，回退默认
         }
 
         // 回退到智能默认：先尝试检测主角境界所属体系
-        $realmHint = $this->fetchProtagonistRealmHint();
+        $realmHint = $knownRealm ?? $this->fetchProtagonistRealmHint($strictRead);
         $this->realmChain = $this->buildDefaultRealmChain($realmHint);
+        $this->realmChainStrictlyRead = $strictRead;
         return $this->realmChain;
     }
 
@@ -385,22 +389,65 @@ class PowerSystem
                 );
             }
 
-            if ($card && !empty($card['attributes'])) {
-                $attrs = is_string($card['attributes']) 
-                    ? json_decode($card['attributes'], true) 
-                    : $card['attributes'];
-                if (is_array($attrs) && !empty($attrs['realm'])) {
-                    return [
-                        'name'  => $card['name'],
-                        'realm' => $attrs['realm'],
-                    ];
-                }
+            $hit = $this->realmFromCardAttributes($card);
+            if ($hit['realm'] !== '') {
+                return $hit;
             }
         } catch (\Throwable $e) {
             // 查询失败
         }
 
+        // 审计修复（2026-08-16 P1，B5）：向导链路回退（见 fetchWizardProtagonistCard 注释）
+        return $this->realmFromCardAttributes($this->fetchWizardProtagonistCard());
+    }
+
+    /**
+     * 从 character_cards 行提取 attributes['realm']
+     *
+     * @param array|null $card 形如 ['name'=>.., 'attributes'=>json字符串或数组]
+     * @return array{name:string, realm:string}
+     */
+    private function realmFromCardAttributes(?array $card): array
+    {
+        if ($card && !empty($card['attributes'])) {
+            $attrs = is_string($card['attributes'])
+                ? json_decode($card['attributes'], true)
+                : $card['attributes'];
+            if (is_array($attrs) && !empty($attrs['realm'])) {
+                return [
+                    'name'  => (string)($card['name'] ?? ''),
+                    'realm' => (string)$attrs['realm'],
+                ];
+            }
+        }
         return ['name' => '', 'realm' => ''];
+    }
+
+    /**
+     * 向导链路主角识别回退（审计修复 2026-08-16 P1，B5）
+     *
+     * novel_characters 仅由成文后的知识抽取（includes/embedding.php）写入，
+     * 向导创建的书在开篇期没有 role_type='protagonist' 行——getProtagonistRealm
+     * 上方两个查询恒落空，等级对标约束在向导链路上永不生效。
+     * 此处按 character_cards.title 识别主角（向导角色类型：主角/女主/男主，
+     * 注意「女主/男主」不含「主角」子串，需显式枚举），realm 仍读 attributes['realm']
+     * （由向导 save_char 的 P1 修复写入）。
+     */
+    private function fetchWizardProtagonistCard(bool $strictRead = false): ?array
+    {
+        try {
+            $card = DB::fetch(
+                "SELECT name, attributes FROM character_cards
+                 WHERE novel_id=? AND (title LIKE '%主角%' OR title IN ('女主','男主'))
+                   AND attributes LIKE '%\"realm\"%'
+                 ORDER BY id ASC LIMIT 1",
+                [$this->novelId]
+            );
+            return $card ?: null;
+        } catch (\Throwable $e) {
+            if ($strictRead) throw $e;
+            return null;
+        }
     }
 
     // ================================================================

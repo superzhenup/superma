@@ -3,12 +3,13 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 /**
  * 更新章节简介
  */
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
+require_once dirname(__DIR__) . '/includes/ChapterSynopsisPersistence.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -36,50 +37,37 @@ try {
     $userId = (int)($_SESSION['user_id'] ?? 0);
     checkNovelOwnership($novelId, $userId);
 
-    // 检查是否已存在
-    $exists = DB::fetch('SELECT id FROM chapter_synopses WHERE novel_id = ? AND chapter_number = ?', [$novelId, $chapterNumber]);
-
-    if ($exists) {
-        // 只更新调用方明确提交的可选字段。普通文本编辑不应顺带清空
-        // scene_breakdown / dialogue_beats 等已生成的详细概要数据。
-        $updateData = ['synopsis' => $synopsis];
-        foreach ([
-            'scene_breakdown' => $sceneBreakdown,
-            'dialogue_beats' => $dialogueBeats,
-            'sensory_details' => $sensoryDetails,
-            'foreshadowing' => $foreshadowing,
-            'callbacks' => $callbacks,
-        ] as $field => $value) {
-            if (array_key_exists($field, $input)) {
-                $updateData[$field] = $value ? json_encode($value, JSON_UNESCAPED_UNICODE) : null;
-            }
+    // 普通文本编辑保留未提交的结构化字段。与生成/大纲发布共用章节锁，
+    // 概要更新与父章节关联提交在同一事务，避免首次插入绕开来源比较。
+    $updateData = ['synopsis' => $synopsis];
+    foreach ([
+        'scene_breakdown' => $sceneBreakdown,
+        'dialogue_beats' => $dialogueBeats,
+        'sensory_details' => $sensoryDetails,
+        'foreshadowing' => $foreshadowing,
+        'callbacks' => $callbacks,
+    ] as $field => $value) {
+        if (array_key_exists($field, $input)) {
+            $updateData[$field] = $value ? json_encode($value, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) : null;
         }
-        if (array_key_exists('pacing', $input)) $updateData['pacing'] = $pacing;
-        if (array_key_exists('cliffhanger', $input)) $updateData['cliffhanger'] = $cliffhanger;
-
-        DB::update('chapter_synopses', $updateData, 'novel_id = ? AND chapter_number = ?', [$novelId, $chapterNumber]);
+    }
+    if (array_key_exists('pacing', $input)) $updateData['pacing'] = $pacing;
+    if (array_key_exists('cliffhanger', $input)) $updateData['cliffhanger'] = $cliffhanger;
+    $persistence = new ChapterSynopsisPersistence(DB::connect(), $userId, $novelId);
+    if (!empty($input['optimization']) || array_key_exists('source_revision', $input)) {
+        $revision = $input['source_revision'] ?? null;
+        if (!is_string($revision) || preg_match('/^[a-f0-9]{64}$/D', $revision) !== 1
+            || !$persistence->saveGenerated($chapterNumber, $updateData, $revision)) {
+            echo json_encode(['success'=>false, 'code'=>'source_conflict', 'message'=>'大纲或概要已被修改，未采用旧优化结果，请刷新后重新生成']);
+            exit;
+        }
     } else {
-        // 插入
-        $synopsisId = DB::insert('chapter_synopses', [
-            'novel_id' => $novelId,
-            'chapter_number' => $chapterNumber,
-            'synopsis' => $synopsis,
-            'scene_breakdown' => $sceneBreakdown ? json_encode($sceneBreakdown, JSON_UNESCAPED_UNICODE) : null,
-            'dialogue_beats' => $dialogueBeats ? json_encode($dialogueBeats, JSON_UNESCAPED_UNICODE) : null,
-            'sensory_details' => $sensoryDetails ? json_encode($sensoryDetails, JSON_UNESCAPED_UNICODE) : null,
-            'pacing' => $pacing,
-            'cliffhanger' => $cliffhanger,
-            'foreshadowing' => $foreshadowing ? json_encode($foreshadowing, JSON_UNESCAPED_UNICODE) : null,
-            'callbacks' => $callbacks ? json_encode($callbacks, JSON_UNESCAPED_UNICODE) : null
-        ]);
-
-        // 更新chapters表的synopsis_id
-        DB::update('chapters', ['synopsis_id' => $synopsisId], 'novel_id = ? AND chapter_number = ?', [$novelId, $chapterNumber]);
+        $persistence->saveManual($chapterNumber, $updateData);
     }
 
     echo json_encode(['success' => true, 'message' => '章节简介已保存']);
 
-} catch (Exception $e) {
+} catch (Throwable $e) {
     $rid = error_trace_id();
     error_log(sprintf('[%s] update_chapter_synopsis: %s in %s:%d', $rid, $e->getMessage(), $e->getFile(), $e->getLine()));
     echo json_encode(['success' => false, 'message' => '保存失败，请稍后重试', 'request_id' => $rid]);

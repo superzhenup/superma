@@ -19,6 +19,69 @@ require_once dirname(__DIR__) . '/helpers.php';
 
 class AgentDirectives
 {
+    public static function capturePrompt(array $chapter, array $directives, array $messages): void
+    {
+        $claim = (string)($chapter['claim_token'] ?? '');
+        if ($claim === '') return;
+        $text = implode("\n", array_column($messages, 'content'));
+        $used = array_values(array_filter($directives,
+            static fn($d) => ($d['rendered'] ?? '') !== '' && str_contains($text, $d['rendered'])));
+        self::persistUsage((int)$chapter['novel_id'], 'prompt_directives', [
+            'chapter_id' => (int)$chapter['id'],
+            'claim_token' => $claim,
+            'prompt_hash' => hash('sha256', json_encode($messages, JSON_THROW_ON_ERROR)),
+            'directives' => $used,
+        ]);
+    }
+
+    private static function persistUsage(int $novelId, string $action, array $snapshot): void
+    {
+        if (!DB::insert('agent_action_logs', [
+            'novel_id' => $novelId,
+            'agent_type' => 'directive_usage',
+            'action' => $action,
+            'status' => 'success',
+            'params' => json_encode($snapshot, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+            'created_at' => date('Y-m-d H:i:s'),
+        ])) {
+            throw new RuntimeException('Cannot persist Agent directive usage snapshot.');
+        }
+    }
+
+    public static function bindContentVersion(int $novelId, int $chapterId, string $claim, string $candidateUid, string $revisionHash, int $chapterNumber): void
+    {
+        $row = DB::fetch(
+            "SELECT params FROM agent_action_logs WHERE novel_id=? AND agent_type='directive_usage'
+             AND action='prompt_directives' AND JSON_UNQUOTE(JSON_EXTRACT(params, '$.claim_token'))=?
+             AND JSON_EXTRACT(params, '$.chapter_id')=? ORDER BY id DESC LIMIT 1",
+            [$novelId, $claim, $chapterId]
+        );
+        $snapshot = $row ? json_decode($row['params'], true, 512, JSON_THROW_ON_ERROR) : ['directives' => []];
+        $snapshot['chapter_id'] = $chapterId;
+        $snapshot['candidate_uid'] = $candidateUid;
+        $snapshot['revision_hash'] = $revisionHash;
+        self::persistUsage($novelId, 'content_directives', $snapshot);
+        // The Canon transaction replaces only the current-version outcome projection.
+        DB::delete('agent_directive_outcomes', 'novel_id=? AND chapter_number=?', [$novelId, $chapterNumber]);
+    }
+
+    public static function usedForContentVersion(int $novelId, array $chapter): array
+    {
+        $candidate = (string)($chapter['canonical_candidate_uid'] ?? '');
+        $revision = (string)($chapter['content_revision_hash'] ?? '');
+        if ($candidate === '' || $revision === '') return [];
+        $row = DB::fetch(
+            "SELECT params FROM agent_action_logs WHERE novel_id=? AND agent_type='directive_usage'
+             AND action='content_directives' AND JSON_UNQUOTE(JSON_EXTRACT(params, '$.candidate_uid'))=?
+             AND JSON_UNQUOTE(JSON_EXTRACT(params, '$.revision_hash'))=?
+             AND JSON_EXTRACT(params, '$.chapter_id')=? ORDER BY id DESC LIMIT 1",
+            [$novelId, $candidate, $revision, (int)$chapter['id']]
+        );
+        if (!$row) return [];
+        $snapshot = json_decode($row['params'], true, 512, JSON_THROW_ON_ERROR);
+        return $snapshot['directives'] ?? [];
+    }
+
     /**
      * 添加Agent指令
      * 
@@ -45,26 +108,48 @@ class AgentDirectives
                 ? date('Y-m-d H:i:s', time() + $expiresInHours * 3600)
                 : null;
 
-            // v2 去重：同类指令取前 80 字符指纹比对，匹配则刷新过期时间
-            // 审计修复 P3（2026-07-12）：转义 LIKE 通配符
-            $fingerprint = mb_substr($directive, 0, 80);
+            // v2 去重：同类型、同生效范围、指令文本完全一致时视为同一条，刷新窗口。
+            // 审计修复 M3（2026-09-27）：原实现取前 80 字符做 LIKE 前缀指纹，两条
+            // 前 80 字相同、后文不同（如多项弱维清单首行恰好相同但弱维列表不同）
+            // 的指令会命中 UPDATE 分支——仅延长旧指令的 apply_to/expires_at，新指令
+            // 文本永不落库，消费端看到的仍是上一章的旧建议。改为全文精确比对：
+            // 字节级相同的指令才去重续期，不同指令各自落库获得生效机会；指令
+            // 膨胀由消费端的 maxActive 同类型限流兜底，不依赖指纹吞并。
+            // 审计修复 P3（2026-07-12）：转义 LIKE 通配符（现已改为等值比对，无通配符）
+            // P2-4 修复（2026-08-09）：原查询只过滤 is_active=1，未检查 expires_at。
+            // 已过期但 is_active 仍为 1 的指令会被命中，add() 走 UPDATE 分支：
+            // 若新调用未传 expiresInHours，过期指令的 expires_at 不会被刷新，
+            // 指令保持过期状态——"复活"被静默吞掉。增加 expires_at 条件后，
+            // 过期指令不再命中指纹去重，add() 会 INSERT 新行实现真正的复活。
+            $now = date('Y-m-d H:i:s');
+            // 审计修复（2026-08-17 P3）修复7：指纹查询带出 apply_to 列。原 SELECT 只取 id，
+            // 命中后无条件 $update['apply_to'] = $applyTo——新值小于等于旧值时会缩短指令
+            // 生效窗口（或产生无谓写库）。改为取新旧较大值，仅当新值更大才写该键。
             $existing = DB::fetch(
-                "SELECT id FROM agent_directives
+                "SELECT id, apply_to FROM agent_directives
                  WHERE novel_id=? AND type=? AND is_active=1
                    AND apply_from <= ? AND apply_to >= ?
-                   AND directive LIKE ? ESCAPE '\\\\'
+                   AND directive = ?
+                   AND (expires_at IS NULL OR expires_at > ?)
                  LIMIT 1",
-                [$novelId, $type, $applyFrom, $applyFrom, escapeLikeWildcards($fingerprint) . '%']
+                [$novelId, $type, $applyFrom, $applyFrom, $directive, $now]
             );
             if ($existing) {
-                $update = ['apply_to' => $applyTo];
+                // 审计修复（2026-08-17 P3）修复7：apply_to 只增不减；相等则不写该键，
+                // 避免无谓写库。expires_at 仍按下方既有规则刷新。
+                $update = [];
+                if ($applyTo > (int)$existing['apply_to']) {
+                    $update['apply_to'] = max((int)$existing['apply_to'], $applyTo);
+                }
                 // 修复：原代码无条件覆盖 expires_at，当新调用未传 expiresInHours（null）时
                 // 会把已有指令从"限时"变成"永不过期"，生命周期被意外延长。
                 // 改为仅在新过期时间非空时才刷新该字段。
                 if ($expiresAt !== null) {
                     $update['expires_at'] = $expiresAt;
                 }
-                DB::update('agent_directives', $update, 'id=?', [$existing['id']]);
+                if (!empty($update)) {
+                    DB::update('agent_directives', $update, 'id=?', [$existing['id']]);
+                }
                 return true;
             }
 
@@ -383,7 +468,7 @@ class AgentDirectives
         try {
             // 1. 获取当前章节的 quality_score / tokens_used / duration_ms
             $chapter = DB::fetch(
-                'SELECT quality_score, tokens_used, duration_ms FROM chapters 
+                'SELECT id, canonical_candidate_uid, content_revision_hash, quality_score, tokens_used, duration_ms FROM chapters
                  WHERE novel_id = ? AND chapter_number = ? AND status = "completed"',
                 [$novelId, $chapterNumber]
             );
@@ -404,7 +489,7 @@ class AgentDirectives
         $baseline = DB::fetch(
             'SELECT AVG(t.q) as avg_q FROM (
                 SELECT quality_score as q FROM chapters
-                WHERE novel_id=? AND chapter_number < ? AND quality_score IS NOT NULL
+                WHERE novel_id=? AND chapter_number < ? AND quality_score IS NOT NULL AND status="completed"
                 ORDER BY chapter_number DESC LIMIT 5
             ) t',
             [$novelId, $chapterNumber]
@@ -417,15 +502,34 @@ class AgentDirectives
             }
             
             // 3. 获取本章有效的指令
-            $activeDirectives = self::active($novelId, $chapterNumber);
-            
-            foreach ($activeDirectives as $d) {
-                // 检查是否已评估过（幂等）
-                $exists = DB::fetch(
-                    'SELECT id FROM agent_directive_outcomes WHERE novel_id = ? AND directive_id = ? AND chapter_number = ?',
-                    [$novelId, (int)$d['id'], $chapterNumber]
+            $activeDirectives = self::usedForContentVersion($novelId, $chapter);
+
+            // 审计修复（2026-08-16 批次二）：归因纠偏。
+            // 原 quality_change 会记到本章全部活跃指令头上——多指令并存时该数值
+            // 是混合效果，无法区分谁在起作用；据此批量停用会误杀有效指令。
+            // 规则：仅当本章唯一活跃指令时，quality_change 才可归因到该指令并
+            // 参与停用判定；多指令章仍记录 outcome（供统计页展示），不作为停用依据。
+            $soloAttribution = count($activeDirectives) === 1;
+
+            // N+1 修复：循环前一次预查本章已记录的指令 outcome，构建 HashSet，
+            // 幂等语义与原逐条 SELECT（novel_id+directive_id+chapter_number）一致。
+            $existingOutcomeIds = [];
+            if ($activeDirectives) {
+                $directiveIds = array_map(static fn($d) => (int)$d['id'], $activeDirectives);
+                $placeholders = implode(',', array_fill(0, count($directiveIds), '?'));
+                $existingRows = DB::fetchAll(
+                    "SELECT directive_id FROM agent_directive_outcomes
+                     WHERE novel_id = ? AND chapter_number = ? AND directive_id IN ($placeholders)",
+                    array_merge([$novelId, $chapterNumber], $directiveIds)
                 );
-                if ($exists) continue;
+                foreach ($existingRows as $row) {
+                    $existingOutcomeIds[(int)$row['directive_id']] = true;
+                }
+            }
+
+            foreach ($activeDirectives as $d) {
+                // 已评估过则跳过（幂等，HashSet 预查见上）
+                if (isset($existingOutcomeIds[(int)$d['id']])) continue;
                 
                 $qualityChange = round($currentQuality - $qualityBefore, 1);
                 DB::insert('agent_directive_outcomes', [
@@ -438,12 +542,51 @@ class AgentDirectives
                     'tokens_used' => $tokensUsed,
                     'duration_ms' => $durationMs,
                 ]);
+                self::persistUsage($novelId, 'directive_outcome', [
+                    'chapter_id' => (int)$chapter['id'],
+                    'candidate_uid' => $chapter['canonical_candidate_uid'],
+                    'revision_hash' => $chapter['content_revision_hash'],
+                    'directive_id' => (int)$d['id'],
+                    'directive_version' => $d['version'],
+                    'quality_change' => $qualityChange,
+                ]);
                 $outcomes[] = [
                     'directive_id' => (int)$d['id'],
                     'type' => $d['type'],
                     'quality_change' => $qualityChange,
                 ];
                 $recorded++;
+
+                // 审计修复（2026-08-09 R11）：反馈环补"纠错"动作。
+                // 批次二加固（2026-08-16）：停用判定只统计"独占章"（该指令是当章
+                // 唯一活跃指令）的 outcome——同章多指令的 quality_change 是混合
+                // 结果，计入会误杀有效指令。独占章的识别无需新列：recordOutcomes
+                // 每章为全部活跃指令各写一行 outcome，故"当章无其他指令的 outcome
+                // 行"即为独占章。
+                if ($soloAttribution && $qualityChange < 0 && $d['type'] !== 'urgent') {
+                    $recent = DB::fetchAll(
+                        'SELECT o.quality_change FROM agent_directive_outcomes o
+                         WHERE o.novel_id = ? AND o.directive_id = ? AND o.chapter_number <= ?
+                           AND NOT EXISTS (
+                               SELECT 1 FROM agent_directive_outcomes o2
+                               WHERE o2.novel_id = o.novel_id
+                                 AND o2.chapter_number = o.chapter_number
+                                 AND o2.directive_id != o.directive_id
+                           )
+                         ORDER BY o.chapter_number DESC LIMIT 2',
+                        [$novelId, (int)$d['id'], $chapterNumber]
+                    );
+                    if (count($recent) >= 2
+                        && (float)$recent[0]['quality_change'] < 0
+                        && (float)$recent[1]['quality_change'] < 0) {
+                        $live = DB::fetch('SELECT type, directive FROM agent_directives WHERE id=? AND novel_id=?', [(int)$d['id'], $novelId]);
+                        if (!$live || !hash_equals((string)$d['version'], hash('sha256', $live['type'] . "\n" . $live['directive']))) {
+                            continue;
+                        }
+                        self::deactivate((int)$d['id'], $novelId);
+                        error_log("Agent指令 #{$d['id']} 连续2个独占章负收益已自动停用（novel {$novelId}）");
+                    }
+                }
             }
         } catch (\Throwable $e) {
             error_log("记录Agent指令效果失败: " . $e->getMessage());
@@ -496,7 +639,7 @@ class AgentDirectives
      * @param int $novelId 小说ID
      * @return array{by_type: array, top_effective: array, top_harmful: array}
      */
-    public static function getOutcomeStats(int $novelId): array
+    public static function getOutcomeStats(int $novelId, int $beforeChapter = PHP_INT_MAX): array
     {
         try {
             // 按类型统计
@@ -508,9 +651,9 @@ class AgentDirectives
                     SUM(CASE WHEN o.quality_change < 0 THEN 1 ELSE 0 END) as declined
                  FROM agent_directive_outcomes o
                  JOIN agent_directives d ON o.directive_id = d.id
-                 WHERE o.novel_id = ?
+                 WHERE o.novel_id = ? AND o.chapter_number < ?
                  GROUP BY d.type',
-                [$novelId]
+                [$novelId, $beforeChapter]
             ) ?: [];
             
             // 最有效的指令（改善最大）
@@ -518,19 +661,19 @@ class AgentDirectives
                 'SELECT o.*, d.type, d.directive 
                  FROM agent_directive_outcomes o
                  JOIN agent_directives d ON o.directive_id = d.id
-                 WHERE o.novel_id = ? AND o.quality_change > 0
+                 WHERE o.novel_id = ? AND o.quality_change > 0 AND o.chapter_number < ?
                  ORDER BY o.quality_change DESC LIMIT 5',
-                [$novelId]
+                [$novelId, $beforeChapter]
             ) ?: [];
             
-            // 最有副作用的指令
+            // 最有副作用的指令（与上两段同加目标章上界，防止未来章 outcome 泄入写前统计）
             $topHarmful = DB::fetchAll(
-                'SELECT o.*, d.type, d.directive 
+                'SELECT o.*, d.type, d.directive
                  FROM agent_directive_outcomes o
                  JOIN agent_directives d ON o.directive_id = d.id
-                 WHERE o.novel_id = ? AND o.quality_change < 0
+                 WHERE o.novel_id = ? AND o.quality_change < 0 AND o.chapter_number < ?
                  ORDER BY o.quality_change ASC LIMIT 5',
-                [$novelId]
+                [$novelId, $beforeChapter]
             ) ?: [];
             
             return [

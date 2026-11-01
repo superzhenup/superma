@@ -321,7 +321,7 @@ $chatHistory = array_reverse($chatHistory);
   </div>
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 (function(){
   var novelId = <?= (int)$novelId ?>;
   var streaming = false;

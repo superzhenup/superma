@@ -6,6 +6,8 @@ require_once __DIR__ . '/EmbeddingProvider.php';
 require_once __DIR__ . '/CharacterCardRepo.php';
 require_once __DIR__ . '/ForeshadowingRepo.php';
 require_once __DIR__ . '/AtomRepo.php';
+require_once __DIR__ . '/NarrativePosition.php';
+require_once __DIR__ . '/NarrativeSummary.php';
 
 /**
  * ================================================================
@@ -95,21 +97,28 @@ final class MemoryEngine
         try {
             $novelRow = DB::fetch('SELECT protagonist_name FROM novels WHERE id=?', [$this->novelId]);
             $canonicalProtagonist = trim($novelRow['protagonist_name'] ?? '');
-        } catch (\Throwable) {}
+        } catch (\Throwable $e) {
+            // 审计修复 M10（2026-08-16）：主角锚定失败会导致 AI 摘要使用变体名，
+            // 后续 character_cards 键名漂移——必须留痕而非静默降级。
+            error_log('MemoryEngine protagonist_name fetch failed (novel=' . $this->novelId . '): ' . $e->getMessage());
+        }
 
         // 1) 人物状态 → character_cards
         $charUpdates = $summary['character_updates'] ?? [];
         if (is_array($charUpdates)) {
             $charUpdates = $this->normalizeProtagonistKeys($charUpdates, $canonicalProtagonist);
-            foreach ($charUpdates as $name => $update) {
-                if (!is_string($name) || !is_array($update)) continue;
+            foreach ($charUpdates as $nameKey => $update) {
+                // 审计修复（2026-08-17 P3）：JSON 纯数字键被 PHP 转 int，原 !is_string($name)
+                // 兜底会把主角名"123"这类整条更新直接丢弃，改为字符串化后继续处理。
+                $name = (string)$nameKey;
+                if (!is_array($update)) continue;
                 try {
                     // 旧 summary 格式用中文 key('职务'/'处境'/'关键变化'),映射到新 schema
                     $mapped = $this->mapLegacyCharacterUpdate($update);
                     if (!empty($mapped)) {
                         $oldCard = $this->cards->getByName($name);
                         $isNewCard = ($oldCard === null);  // v1.11.2: 区分新增和更新
-                        $this->cards->upsert($name, $mapped, $chapterNumber);
+                        $this->cards->upsert($name, $mapped, $chapterNumber, 'chapter');
                         $report['cards_upserted']++;
                         if ($isNewCard) {
                             $report['cards_inserted']++;  // v1.11.2 Bug #4 修复
@@ -118,15 +127,19 @@ final class MemoryEngine
                         }
 
                         // 境界跳级检测
-                        $realmWarning = $this->detectRealmSkip($name, $oldCard, $mapped, $chapterNumber);
+                        // Replays can preserve an explicit manual field. Derive
+                        // bridge advice from the state actually applied, rather
+                        // than an AI update that the card repository rejected.
+                        $appliedCard = $this->cards->getByName($name) ?? $mapped;
+                        $realmWarning = $this->detectRealmSkip($name, $oldCard, $appliedCard, $chapterNumber);
                         if ($realmWarning) {
                             $report['warnings'][] = $realmWarning;
 
                             // 将跳级修复指引写入人物卡片，供下章 Prompt 自动过渡
-                            $bridgeSuggestion = $this->buildRealmBridgeSuggestion($name, $oldCard, $mapped, $chapterNumber);
+                            $bridgeSuggestion = $this->buildRealmBridgeSuggestion($name, $oldCard, $appliedCard, $chapterNumber);
                             if ($bridgeSuggestion) {
                                 try {
-                                    $this->cards->upsert($name, ['attributes' => $bridgeSuggestion], $chapterNumber);
+                                    $this->cards->upsert($name, ['attributes' => $bridgeSuggestion], $chapterNumber, 'chapter');
                                 } catch (\Throwable $e) { error_log('MemoryEngine card upsert failed: ' . $e->getMessage()); }
                             }
 
@@ -191,6 +204,18 @@ final class MemoryEngine
                         }
                     } else {
                         // 索引加载失败时的兜底（保持原行为）
+                        // 审计修复 R6（2026-08-10）：索引加载失败是罕见场景（DB 故障），
+                        // 此时逐条 DB::fetch 会产生 N+1 查询。保持逐条查询作为兜底
+                        // （每条独立 try-catch 容错），但首次进入兜底路径时记录 warning，
+                        // 便于运维定位 DB 健康问题。
+                        if (!isset($fallbackNplusOneWarned)) {
+                            error_log(sprintf(
+                                'MemoryEngine: character_trait dedup index load failed, falling back to per-trait query (novel=%d, batch_size=%d). N+1 queries expected.',
+                                $this->novelId,
+                                count($charTraits)
+                            ));
+                            $fallbackNplusOneWarned = true;
+                        }
                         try {
                             $dup = DB::fetch(
                                 "SELECT id FROM memory_atoms
@@ -343,7 +368,10 @@ final class MemoryEngine
             require_once __DIR__ . '/CharacterEmotionRepo.php';
             $emotionRepo = new CharacterEmotionRepo($this->novelId);
             $emotionRepo->deleteByChapter($chapterNumber);
-        } catch (\Throwable $e) { }
+        } catch (\Throwable $e) {
+            error_log("MemoryEngine ingestChapter: emotion cleanup failed (novel={$this->novelId}, chapter={$chapterNumber}): " . $e->getMessage());
+            $report['errors'][] = 'emotion_cleanup: ' . $e->getMessage();
+        }
 
         $characterEmotions = $summary['character_emotions'] ?? [];
         if (is_array($characterEmotions) && !empty($characterEmotions)) {
@@ -400,12 +428,52 @@ final class MemoryEngine
         }
 
         // ── Q1: novels 全局设定 ──────────────────────────────────────
-        $novel = DB::fetch(
-            'SELECT protagonist_name, protagonist_info, world_settings, plot_settings, writing_style, genre,
-                    extra_settings, style_vector, ref_author
-             FROM novels WHERE id=?',
-            [$this->novelId]
-        );
+        $promptCacheTtl = 0;
+        try {
+            if (!class_exists('ConfigCenter', false)) {
+                require_once dirname(__DIR__) . '/config_center.php';
+            }
+            $promptCacheTtl = (int)ConfigCenter::getNovel($this->novelId, 'ws_prompt_cache_ttl', 0, 'int');
+        } catch (\Throwable $e) {
+            $promptCacheTtl = 0;
+        }
+        $novel = null;
+        $l1CacheFile = '';
+        if ($promptCacheTtl > 0 && defined('CFG_PROGRESS_DIR') && CFG_PROGRESS_DIR !== '') {
+            $l1CacheFile = rtrim((string)CFG_PROGRESS_DIR, '/\\') . DIRECTORY_SEPARATOR . "l1_prompt_cache_{$this->novelId}.json";
+            if (is_file($l1CacheFile) && (time() - (int)@filemtime($l1CacheFile)) < $promptCacheTtl) {
+                $cached = json_decode((string)@file_get_contents($l1CacheFile), true);
+                if (is_array($cached) && array_key_exists('protagonist_name', $cached)) {
+                    // 审计修复（2026-08-17 P3）：TTL 内的文件缓存原先无任何失效点，
+                    // 小说设定改动后最长 TTL 秒内写作 prompt 仍用旧设定。写入时附带
+                    // novels.updated_at 版本戳，命中且未过期后再轻量比对时间戳
+                    // （只查 updated_at 一列，避免读 10 个大字段），不一致视为 miss 重建。
+                    // 旧格式缓存无版本戳，同样视为 miss 重建以完成迁移。
+                    $cachedStamp = (string)($cached['__novels_updated_at'] ?? '');
+                    try {
+                        $stampRow = DB::fetch('SELECT updated_at FROM novels WHERE id=?', [$this->novelId]);
+                        $freshStamp = (string)($stampRow['updated_at'] ?? '');
+                    } catch (\Throwable $e) {
+                        $freshStamp = $cachedStamp; // 时间戳查询失败时保守沿用缓存
+                    }
+                    if ($cachedStamp !== '' && $cachedStamp === $freshStamp) {
+                        $novel = $cached;
+                    }
+                }
+            }
+        }
+        if (!is_array($novel)) {
+            $novel = DB::fetch(
+                'SELECT protagonist_name, protagonist_info, world_settings, plot_settings, writing_style, genre,
+                        extra_settings, style_vector, ref_author, updated_at
+                 FROM novels WHERE id=?',
+                [$this->novelId]
+            );
+            if ($l1CacheFile !== '' && is_array($novel)) {
+                $novel['__novels_updated_at'] = (string)($novel['updated_at'] ?? '');
+                @file_put_contents($l1CacheFile, json_encode($novel, JSON_UNESCAPED_UNICODE));
+            }
+        }
 
         // ── Q2: novel_state 故事势能 ─────────────────────────────────
         $novelState = DB::fetch(
@@ -421,11 +489,32 @@ final class MemoryEngine
              ORDER BY chapter_to DESC LIMIT ' . max(1, (int)getSystemSetting('ws_arc_summary_limit', 50, 'int')),
             [$this->novelId, $currentChapter]
         );
+        $arcSummaries = NarrativeSummary::filterCurrentRows($this->novelId, $arcSummaries, 'arc');
+
+        // ── Q3v: volume_summaries 卷级摘要（远期骨架）───────────────
+        // 审计功能（2026-08-16 P3-卷级摘要）：两级衔接去重——卷级只注入
+        // chapter_to < 弧段窗口起点 的卷。窗口起点 = 注入端实际使用的最近
+        // 5 段弧段（Q3 DESC 序 slice(0,5)）中最早一段的 chapter_from；
+        // Q3 无结果时回退当前章号。消除卷切换过渡期同跨度双重注入
+        // （如第 51 章时近 5 段弧段仍覆盖 1-50 章，卷 1 摘要不得再注入）。
+        // 开关关闭时跳过查询（空数组）。
+        $volumeSummaries = [];
+        if (getSystemSetting('ws_volume_summary_enabled', true, 'bool')) {
+            $arcWindow = array_slice($arcSummaries, 0, 5);
+            $beforeCh  = $arcWindow !== []
+                ? (int)$arcWindow[count($arcWindow) - 1]['chapter_from']
+                : $currentChapter;
+            $volumeSummaries = $this->getVolumeSummaries(
+                $this->novelId,
+                $beforeCh,
+                max(1, (int)getSystemSetting('ws_volume_summary_limit', 12, 'int'))
+            );
+        }
 
         // ── Q4: chapters 三合一（近章大纲 + 前章尾文 + 钩子类型）──
         // 近章大纲（同一表，不同列）
         $recentChapters = DB::fetchAll(
-            "SELECT chapter_number, title, outline, hook, key_points, opening_type, emotion_score, emotion_density
+            "SELECT chapter_number, title, outline, hook, key_points, opening_type, actual_opening_type, emotion_score, emotion_density
              FROM chapters
              WHERE novel_id=? AND chapter_number < ? AND status = 'completed'
              ORDER BY chapter_number DESC LIMIT 8",
@@ -453,9 +542,12 @@ final class MemoryEngine
             if ($prev && !empty($prev['content'])) {
                 $content = $prev['content'];
                 $len = mb_strlen($content);
-                $tailLength = min(800, max(400, (int)($len * 0.15)));
+                $tailLength = min(1000, max(500, (int)($len * 0.15)));
                 $tailLength = min($tailLength, $len);
-                $previousTail = mb_substr($content, -$tailLength);
+                // 审计修复（2026-08-17 P3）：与 data.php getPreviousTail 对齐首尾空白处理，
+                // 取尾后 trim。主路径动态 500-1000、回退路径固定 1000 为既定双轨设计
+                // （P2 锁定），此处仅对齐首尾空白处理。
+                $previousTail = trim(mb_substr($content, -$tailLength));
             }
         }
 
@@ -506,30 +598,52 @@ final class MemoryEngine
         }
 
         // ── Q5: character_cards 人物状态 ────────────────────────────
+        // 审计修复 P1-2（2026-08-08）：补写历史章时排除「未来章节才更新过」的人物卡，
+        // 否则卡片上的境界/职务/装备是更晚章节的状态，AI 会按未来人物状态写过去章节
+        // （境界倒挂、死人复活）。last_updated_chapter IS NULL 的卡是大纲种子/初始设定，
+        // 不随章节演进，保留。
         $cards = DB::fetchAll(
-            'SELECT * FROM character_cards WHERE novel_id=? AND alive=1 ORDER BY name ASC',
-            [$this->novelId]
+            'SELECT * FROM character_cards WHERE novel_id=? AND alive=1
+               AND (last_updated_chapter IS NULL OR last_updated_chapter < ?)
+             ORDER BY name ASC',
+            [$this->novelId, $currentChapter]
         );
+
+        // ── Q5b: 已完成进度线（乱序补写判定）────────────────────────
+        // 当前章号 ≤ 已完成最大章号 = 历史补写。此时 novel_state 的
+        // story_momentum/current_arc_summary 反映的是进度线处的最新状态，
+        // 对历史章而言是未来信息，必须屏蔽（见 getPromptContext）。
+        $completedFrontier = (int)(DB::fetchColumn(
+            'SELECT COALESCE(MAX(chapter_number), 0) FROM chapters WHERE novel_id=? AND status="completed"',
+            [$this->novelId]
+        ) ?: 0);
 
         // ── Q6: foreshadowing_items 三合一 ──────────────────────────
         // 一次查询拉取所有未回收伏笔，在 PHP 侧按 deadline 分类，
         // 消除 listDueSoon + listOverdue + listPending 三次独立查询。
+        // 审计修复 P1-1（2026-08-08）：补 planted_chapter < 当前章 过滤。
+        // 乱序补写（先写第10章再补第5章）时，未来章节才埋设的伏笔会进入
+        // 历史章的 prompt 并被提前回收/剧透；全量上下文模式（getFullPromptContext）
+        // 本就有此过滤，标准模式此前漏了，两模式行为对齐。
         $allUnresolvedFs = DB::fetchAll(
             'SELECT id, description, planted_chapter, deadline_chapter
              FROM foreshadowing_items
              WHERE novel_id=? AND resolved_chapter IS NULL
+               AND planted_chapter < ?
              ORDER BY planted_chapter ASC',
-            [$this->novelId]
+            [$this->novelId, $currentChapter]
         );
 
         // 在 PHP 侧按 deadline 分类（替代 3 次 DB 查询）
+        // 审计修复（2026-08-17 P3）：逾期分界裸 3 改为 CFG_FORESHADOW_OVERDUE_BUFFER
+        // 常量（行为不变，值仍为 3），与 listOverdue 调用口径统一。
         $fsDueSoon = [];
         $fsOverdue = [];
         $fsOther   = [];
         foreach ($allUnresolvedFs as $f) {
             $dl = $f['deadline_chapter'];
             if ($dl !== null) {
-                if ($dl < $currentChapter - 3) {
+                if ($dl < $currentChapter - CFG_FORESHADOW_OVERDUE_BUFFER) {
                     $fsOverdue[] = $f;   // deadline 已过缓冲期
                 } elseif ($dl <= $currentChapter + 5) {
                     $fsDueSoon[] = $f;   // deadline 临近
@@ -583,9 +697,9 @@ final class MemoryEngine
         }
 
         $result = compact(
-            'novel', 'novelState', 'arcSummaries',
+            'novel', 'novelState', 'arcSummaries', 'volumeSummaries',
             'recentChapters', 'previousTail', 'hookTypeRows',
-            'cards',
+            'cards', 'completedFrontier',
             'currentOutline', 'returningCharacterRows',
             'allUnresolvedFs', 'fsDueSoon', 'fsOverdue', 'fsOther',
             'keyEventRows', 'coolPointRows'
@@ -607,20 +721,31 @@ final class MemoryEngine
         // ── v1.4 批量预取：一次性拉取所有关系型数据 ─────────────────
         $b = $this->buildBatch($currentChapter, $keyEventLimit);
 
+        // 审计修复 P1-2（2026-08-08）：乱序补写时屏蔽「未来状态」。
+        // - 补写章（章号 ≤ 已完成进度线）：story_momentum / current_arc_summary 反映的是
+        //   进度线处的最新状态，对本章是未来信息，置空（衔接由 L4 前章尾文兜底）。
+        // - current_location：仅当位置来自未来章节（location_chapter ≥ 当前章）时屏蔽；
+        //   位置会一直持续到下次变更，早于本章的位置对补写章仍然有效。
+        $isBackfillChapter = $currentChapter <= (int)($b['completedFrontier'] ?? 0);
+        $rawLocationChapter = $b['novelState']['location_chapter'] ?? null;
+        $locationFromFuture = $rawLocationChapter !== null
+            && (int)$rawLocationChapter >= $currentChapter;
+
         $ctx = [
             'L1_global_settings'    => [],
             'L2_arc_summaries'      => [],
+            'L2_volume_summaries'   => [],
             'L3_recent_chapters'    => [],
             'L4_previous_tail'      => $b['previousTail'],
             'character_states'      => [],
             'returning_characters'  => [],
             'key_events'            => [],
             'pending_foreshadowing' => [],
-            'story_momentum'        => $b['novelState']['story_momentum'] ?? '',
-            'current_location'      => $b['novelState']['current_location'] ?? '',
-            'location_chapter'      => $b['novelState']['location_chapter'] ?? null,
-            'location_transition'   => $b['novelState']['location_transition'] ?? '',
-            'current_arc_summary'   => $b['novelState']['current_arc_summary'] ?? '',
+            'story_momentum'        => $isBackfillChapter ? '' : ($b['novelState']['story_momentum'] ?? ''),
+            'current_location'      => $locationFromFuture ? '' : ($b['novelState']['current_location'] ?? ''),
+            'location_chapter'      => $locationFromFuture ? null : $rawLocationChapter,
+            'location_transition'   => $locationFromFuture ? '' : ($b['novelState']['location_transition'] ?? ''),
+            'current_arc_summary'   => $isBackfillChapter ? '' : ($b['novelState']['current_arc_summary'] ?? ''),
             'arc_summaries'         => [],
             'semantic_hits'         => [],
             'cool_point_history'    => [],
@@ -652,6 +777,11 @@ final class MemoryEngine
         $ctx['L2_arc_summaries'] = array_reverse($b['arcSummaries']);
         $ctx['arc_summaries'] = $ctx['L2_arc_summaries'];
 
+        // ── L2 卷级摘要（远期骨架；两级拼接的远期级）────────────────
+        // 审计功能（2026-08-16 P3-卷级摘要）：Q3v 已按弧段窗口起点去重
+        // 并恢复卷号正序，此处直接透传；Builder 端与近 5 段弧段两级拼接。
+        $ctx['L2_volume_summaries'] = $b['volumeSummaries'] ?? [];
+
         // ── L3 近章大纲 ──────────────────────────────────────────────
         $recentChapters = array_reverse($b['recentChapters']);
         foreach ($recentChapters as $ch) {
@@ -663,6 +793,7 @@ final class MemoryEngine
                 'hook'            => $ch['hook']        ?? '',
                 'key_points'      => json_decode($ch['key_points'] ?? '[]', true),
                 'opening_type'    => $ch['opening_type'] ?? '',
+                'actual_opening_type' => $ch['actual_opening_type'] ?? '',
                 'emotion_score'   => $ch['emotion_score'] ?? null,
                 'emotion_density' => $ch['emotion_density'] ?? null,
             ];
@@ -764,13 +895,30 @@ final class MemoryEngine
 
                 $currentEmotion = $this->detectEmotionTag($queryText);
                 if ($currentEmotion !== 'neutral' && !empty($hits)) {
+                    // 审计修复 H3（2026-08-16）：批量取 atom metadata，消除逐条查询 N+1。
+                    // top-k 命中（通常 10~20 个）原实现每个 atom 单独 SELECT 一次。
+                    $atomIds = [];
+                    foreach ($hits as $hit) {
+                        if (($hit['source'] ?? '') === 'atom' && (int)($hit['id'] ?? 0) > 0) {
+                            $atomIds[] = (int)$hit['id'];
+                        }
+                    }
+                    $metaById = [];
+                    if ($atomIds) {
+                        try {
+                            $placeholders = implode(',', array_fill(0, count($atomIds), '?'));
+                            $rows = DB::fetchAll(
+                                "SELECT id, metadata FROM memory_atoms WHERE id IN ({$placeholders})",
+                                $atomIds
+                            );
+                            foreach ($rows as $row) {
+                                $metaById[(int)$row['id']] = json_decode($row['metadata'] ?? '{}', true) ?: [];
+                            }
+                        } catch (\Throwable $e) { error_log('MemoryEngine metadata fetch failed: ' . $e->getMessage()); }
+                    }
                     foreach ($hits as &$hit) {
                         if (($hit['source'] ?? '') === 'atom') {
-                            $meta = null;
-                            try {
-                                $row = DB::fetch('SELECT metadata FROM memory_atoms WHERE id=?', [$hit['id'] ?? 0]);
-                                $meta = json_decode($row['metadata'] ?? '{}', true) ?: [];
-                            } catch (\Throwable $e) { error_log('MemoryEngine metadata fetch failed: ' . $e->getMessage()); }
+                            $meta = $metaById[(int)($hit['id'] ?? 0)] ?? [];
                             $hitEmotion = $meta['emotion_tag'] ?? '';
                             if ($hitEmotion !== '' && $hitEmotion === $currentEmotion) {
                                 $hit['score'] = ($hit['score'] ?? 0.5) * 1.3;
@@ -929,12 +1077,17 @@ final class MemoryEngine
         int $currentChapter,
         int $maxChapters = 0,
         ?string $queryText = null,
-        int $tokenBudget = 800000
+        int $tokenBudget = 800000,
+        int $semanticTopK = 5
     ): array
     {
-        $tokenBudget = max(100000, min(900000, $tokenBudget));
-        $baseBudget = min(100000, max(20000, intdiv($tokenBudget, 8)));
-        $ctx = $this->getPromptContext($currentChapter, $queryText, $baseBudget, 50, 20);
+        // 审计修复（2026-08-09 R11-1）：地板与 write_engine 对齐为 50k，禁止把已缩放预算抬回 100k
+        $tokenBudget = max(50000, min(900000, $tokenBudget));
+        // 审计修复（2026-08-09 R10-1）：base 下限随总预算缩放，避免 novel 收紧预算后仍卡 20k
+        $baseBudget = min(100000, max(2000, intdiv($tokenBudget, 8)));
+        // 审计修复（2026-08-09 R10-1）：透传 ws_embedding_top_k，禁止硬编码 20
+        $semanticTopK = max(1, min(40, $semanticTopK));
+        $ctx = $this->getPromptContext($currentChapter, $queryText, $baseBudget, 50, $semanticTopK);
 
         $ctx['debug']['mode'] = 'full_1m';
         $ctx['debug']['budget_used'] = 0;
@@ -1068,21 +1221,33 @@ final class MemoryEngine
 
         $ctx['characters_full'] = [];
         $charLimit = 15;
+        // 审计修复 P1-2（2026-08-08）：与标准模式人物卡/伏笔相同的章节边界——
+        // 卡片状态只反映当前章之前的更新，历史变更记录同样截断到当前章之前，
+        // 防止 1M 全量模式在乱序补写时泄漏未来人物状态（标准模式已在 Q5 过滤）。
+        // 注意参数顺序：SELECT 子查询的 ? 在 SQL 文本中先于 WHERE 的 ?。
         $cardsWithHistory = DB::fetchAll(
             "SELECT cc.id, cc.name, cc.title, cc.status, cc.alive, cc.attributes, cc.last_updated_chapter,
                     (SELECT JSON_ARRAYAGG(JSON_OBJECT('chapter', cch.chapter_number, 'field', cch.field_name, 'old', cch.old_value, 'new', cch.new_value))
-                     FROM character_card_history cch WHERE cch.card_id = cc.id ORDER BY cch.chapter_number ASC) as history
+                     FROM character_card_history cch WHERE cch.card_id = cc.id AND cch.chapter_number < ?
+                       AND cch.field_name <> '_card_revision_v1') as history
              FROM character_cards cc
              WHERE cc.novel_id=?
+               AND (cc.last_updated_chapter IS NULL OR cc.last_updated_chapter < ?)
              ORDER BY cc.last_updated_chapter DESC
              LIMIT ?",
-            [$this->novelId, $charLimit]
+            [$currentChapter, $this->novelId, $currentChapter, $charLimit]
         );
 
         foreach ($cardsWithHistory as $card) {
             $attrs = is_string($card['attributes']) ? json_decode($card['attributes'], true) : $card['attributes'];
             $history = is_string($card['history']) ? json_decode($card['history'], true) : $card['history'];
-            if (is_array($history) && count($history) > 10) {
+            // 聚合标量子查询里的 ORDER BY ... LIMIT 只作用于聚合后的那一行，
+            // 既不限条数也不定顺序（实测返回该卡全部历史）。在 PHP 侧按章号
+            // 升序稳定排序后取最近 10 条，保持消费方按时间线读取的语义。
+            if (is_array($history)) {
+                $history = array_values(array_filter($history, 'is_array'));
+                usort($history, static fn(array $a, array $b): int =>
+                    (int)($a['chapter'] ?? 0) <=> (int)($b['chapter'] ?? 0));
                 $history = array_slice($history, -10);
             }
             $ctx['characters_full'][] = [
@@ -1143,6 +1308,7 @@ final class MemoryEngine
             ['older_summaries', true],       // oldest summaries first
             ['full_outlines', true],         // oldest outlines first
             ['all_key_events', true],        // oldest key events first
+            ['L2_volume_summaries', true],   // 审计功能（2026-08-16 P3-卷级摘要）：卷级骨架，最旧卷先丢；保留优先级低于章级材料
             ['characters_full', false],      // least-recently updated cards last
             ['all_foreshadowing', false],    // lowest-priority items sorted last
             ['full_contents', false],        // contents are recent-first; drop oldest
@@ -1159,6 +1325,7 @@ final class MemoryEngine
             'total_outlines'    => count($ctx['full_outlines']),
             'full_content_chapters' => count($ctx['full_contents']),
             'older_summaries'   => count($ctx['older_summaries']),
+            'volume_summaries'  => count($ctx['L2_volume_summaries'] ?? []),
             'foreshadowing_count' => count($ctx['all_foreshadowing']),
             'character_count'   => count($ctx['characters_full']),
             'key_events_count'  => count($ctx['all_key_events']),
@@ -1166,6 +1333,17 @@ final class MemoryEngine
             'content_chars'     => $contentUsed,
             'dropped_full_content_chapters' => max(0, count($historyContents) - count($ctx['full_contents'])),
         ];
+
+        // 审计修复（2026-08-09 R10-8 / R11-4）：full_* 已覆盖近章/事件/人物史/伏笔全集，
+        // 清空压缩态重复键，避免 builder 双注入。
+        $ctx['L3_recent_chapters'] = [];
+        $ctx['key_events'] = [];
+        if (!empty($ctx['characters_full'])) {
+            $ctx['character_states'] = [];
+        }
+        if (!empty($ctx['all_foreshadowing'])) {
+            $ctx['pending_foreshadowing'] = [];
+        }
 
         $actualContextChars = mb_strlen(json_encode($ctx, JSON_UNESCAPED_UNICODE));
         $ctx['debug']['budget_used'] = $actualContextChars;
@@ -1182,119 +1360,30 @@ final class MemoryEngine
     // =================================================================
     // 四层记忆架构获取方法
     // =================================================================
-    
+
     /**
-     * L1 全局设定
-     * 从 novels 表读取主角信息、世界观、情节设定、写作风格等全局设定
+     * L2 卷级摘要（远期骨架）
+     * 审计功能（2026-08-16 P3-卷级摘要）：从 volume_summaries 表获取
+     * $beforeChapter（弧段窗口起点，两级衔接去重下界）之前的卷级摘要，
+     * 按 volume_number 倒序取最近 N 卷后恢复正序（远期→近期）。
+     * 查询异常（表未建等）返回空数组，prompt 照常组装。
      */
-    private function getGlobalSettings(): array
+    private function getVolumeSummaries(int $novelId, int $beforeChapter, int $limit): array
     {
-        $novel = DB::fetch(
-            'SELECT protagonist_name, protagonist_info, world_settings, plot_settings, writing_style, genre
-             FROM novels WHERE id=?',
-            [$this->novelId]
-        );
-        
-        if (!$novel) {
+        try {
+            $rows = DB::fetchAll(
+                'SELECT volume_number, chapter_from, chapter_to, summary
+                 FROM volume_summaries
+                 WHERE novel_id=? AND chapter_to < ?
+                 ORDER BY volume_number DESC LIMIT ' . max(1, $limit),
+                [$novelId, $beforeChapter]
+            );
+        } catch (\Throwable $e) {
+            error_log("MemoryEngine getVolumeSummaries(novel={$novelId}) failed: " . $e->getMessage());
             return [];
         }
-        
-        return [
-            'protagonist_name' => $novel['protagonist_name'] ?? '',
-            'protagonist_info' => $novel['protagonist_info'] ?? '',
-            'world_settings'   => $novel['world_settings'] ?? '',
-            'plot_settings'    => $novel['plot_settings'] ?? '',
-            'writing_style'    => $novel['writing_style'] ?? '',
-            'genre'            => $novel['genre'] ?? '',
-        ];
-    }
-    
-    /**
-     * L2 弧段摘要
-     * 从 arc_summaries 表获取当前章节之前的所有弧段摘要
-     * 提供全局历史记忆，防止 AI 对早期情节失忆
-     */
-    private function getArcSummaries(int $currentChapter): array
-    {
-        // 只取当前弧段的前 N 段,避免膨胀
-        $summaries = DB::fetchAll(
-            'SELECT arc_index, chapter_from, chapter_to, summary
-             FROM arc_summaries
-             WHERE novel_id=? AND chapter_to < ?
-             ORDER BY chapter_to DESC LIMIT ' . max(1, (int)getSystemSetting('ws_arc_summary_limit', 50, 'int')),
-            [$this->novelId, $currentChapter]
-        );
-        
-        // 恢复为正序
-        return array_reverse($summaries);
-    }
-    
-    /**
-     * L3 近章大纲
-     * 从 chapters 表获取最近8章的大纲、标题、钩子
-     * 确保新章节与近期情节无缝衔接
-     */
-    private function getRecentChapters(int $currentChapter, int $limit = 8): array
-    {
-        $chapters = DB::fetchAll(
-            'SELECT chapter_number, title, outline, hook, key_points
-             FROM chapters
-             WHERE novel_id=? AND chapter_number < ? AND status = "completed"
-             ORDER BY chapter_number DESC
-             LIMIT ?',
-            [$this->novelId, $currentChapter, $limit]
-        );
-        
-        // 恢复为正序
-        $chapters = array_reverse($chapters);
-        
-        // 格式化输出
-        $result = [];
-        foreach ($chapters as $ch) {
-            $result[] = [
-                'chapter_number' => (int)$ch['chapter_number'], // keep compatibility
-                'chapter'        => (int)$ch['chapter_number'],
-                'title'          => $ch['title'] ?? '',
-                'outline'        => $ch['outline'] ?? '',
-                'hook'           => $ch['hook'] ?? '',
-                'key_points'     => json_decode($ch['key_points'] ?? '[]', true),
-            ];
-        }
-        
-        return $result;
-    }
-    
-    /**
-     * L4 前章尾文
-     * 从前一章正文中截取最后500-1000字
-     * 作为直接衔接的上下文，保证场景和对话的连贯性
-     */
-    private function getPreviousTail(int $currentChapter): string
-    {
-        if ($currentChapter <= 1) {
-            return '';
-        }
-        
-        $prevChapter = DB::fetch(
-            'SELECT content FROM chapters
-             WHERE novel_id=? AND chapter_number = ? AND status = "completed"
-             LIMIT 1',
-            [$this->novelId, $currentChapter - 1]
-        );
-        
-        if (!$prevChapter || empty($prevChapter['content'])) {
-            return '';
-        }
-        
-        $content = $prevChapter['content'];
-        $len = mb_strlen($content);
-
-        // 截取比例：15%（原30%过高，对4000字章节会占用1200字token）
-        // 上限800字足以提供衔接语感，下限400字保证短章节也有足够上下文
-        $tailLength = min(800, max(400, (int)($len * 0.15)));
-        $tailLength = min($tailLength, $len);
-
-        return mb_substr($content, -$tailLength);
+        // 恢复为卷号正序（最旧卷在前，与弧段注入顺序一致）
+        return array_reverse(NarrativeSummary::filterCurrentRows($novelId, $rows, 'volume'));
     }
 
     /**
@@ -1382,6 +1471,12 @@ final class MemoryEngine
                      FROM foreshadowing_items
                      WHERE novel_id=? AND embedding IS NOT NULL AND resolved_chapter IS NULL";
                 $fsParams = [$this->novelId];
+                // 审计修复 P1-1（2026-08-08）：语义召回路同样排除未来章节埋设的伏笔，
+                // 与 buildBatch Q6 / getFullPromptContext 的章节边界一致。
+                if ($beforeChapter !== null) {
+                    $fsSql .= ' AND planted_chapter < ?';
+                    $fsParams[] = $beforeChapter;
+                }
                 if ($qModel !== '') {
                     $fsSql .= ' AND embedding_model=?';
                     $fsParams[] = $qModel;
@@ -1416,13 +1511,20 @@ final class MemoryEngine
         // 关键词路(只有 atoms) -> 用 "atom:{id}" 做 key 避免和 KB 的 id 冲突
         foreach ($kwHits as $r) {
             $key = 'atom:' . $r['id'];
+            // 审计修复 N1（2026-09-27）：FULLTEXT NATURAL LANGUAGE 的 _rel
+            // 无上界（常见 0~10+），与 0-1 余弦分直接混排不可比——高分词命中
+            // 在 max/统一排序中挤占全部 topK，真正语义相关的向量命中被丢弃。
+            // 用 _rel/(_rel+1) 饱和变换压入 0-1 区间（单调递增：1→0.5，
+            // 3→0.75，9→0.9），与余弦分可比后参与统一排序。缺失时按 1.0
+            // 计算（结果 0.5，保持原默认语义）。
+            $rel = max(0.0, (float)($r['_rel'] ?? 1.0));
             $merged[$key] = [
                 'id'       => (int)$r['id'],
                 'source'   => 'atom',
                 'type'     => $r['atom_type'],
                 'content'  => $r['content'],
                 'chapter'  => $r['source_chapter'] ? (int)$r['source_chapter'] : null,
-                'score'    => (float)($r['_rel'] ?? 0.5),
+                'score'    => $rel / ($rel + 1.0),
                 'via'      => 'keyword',
                 'category' => $getCategory('atom', $r['atom_type']),
             ];
@@ -1619,7 +1721,10 @@ final class MemoryEngine
                 'type'     => 'relationship',
                 'content'  => $content,
                 'chapter'  => (int)$r['source_chapter'],
-                'score'    => 1.0, // 图谱匹配直接赋予高优先级
+                // 审计修复 N1（2026-09-27）：1.0 硬编码高于一切余弦命中，且
+                // 1-hop+2-hop 可产出数十条同分命中——统一排序下整体挤占 topK。
+                // 降为 0.85：默认高置信，但可被最强语义命中公平超越。
+                'score'    => 0.85,
                 'via'      => 'graph',
                 'category' => 'plot_nodes',
             ];
@@ -1641,26 +1746,41 @@ final class MemoryEngine
         $merged = [];
         $seenContent = [];
 
-        // 图谱命中优先（score 高）
-        foreach ($graphHits as $hit) {
+        // 审计修复 N1（2026-09-27）：原实现"图谱命中优先全量保留、向量命中
+        // 补充"——1-hop+2-hop 可产出数十条同分图谱命中，topK（默认 15）被
+        // 图谱整体挤占，语义召回失效。改为统一按 score 排序竞争（图谱已降
+        // 为 0.85 可被强语义命中超越），并给图谱保底配额
+        // （min(5, topK/3) 条最高分图谱命中）保证关系拓扑不缺席。
+        foreach ([...$graphHits, ...$vectorHits] as $hit) {
             $contentKey = mb_substr(trim($hit['content']), 0, 80);
             if (isset($seenContent[$contentKey])) continue;
             $seenContent[$contentKey] = true;
             $merged[] = $hit;
         }
 
-        // 向量命中补充
-        foreach ($vectorHits as $hit) {
-            $contentKey = mb_substr(trim($hit['content']), 0, 80);
-            if (isset($seenContent[$contentKey])) continue;
-            $seenContent[$contentKey] = true;
-            $merged[] = $hit;
-        }
-
-        // 按 score 降序
         usort($merged, fn($a, $b) => ($b['score'] ?? 0) <=> ($a['score'] ?? 0));
 
-        return array_slice($merged, 0, $topK);
+        $graphQuota = min(5, max(1, intdiv($topK, 3)));
+        $selected = [];
+        $used = [];
+        // 第一轮：图谱保底配额——取排序后最高分的 quota 条图谱命中
+        foreach ($merged as $i => $hit) {
+            if (count($selected) >= $graphQuota) break;
+            if (($hit['via'] ?? '') === 'graph') {
+                $selected[] = $hit;
+                $used[$i] = true;
+            }
+        }
+        // 第二轮：其余按统一分数填充
+        foreach ($merged as $i => $hit) {
+            if (count($selected) >= $topK) break;
+            if (isset($used[$i])) continue;
+            $selected[] = $hit;
+        }
+
+        // 输出顺序仍按分数呈现
+        usort($selected, fn($a, $b) => ($b['score'] ?? 0) <=> ($a['score'] ?? 0));
+        return $selected;
     }
 
     // =================================================================
@@ -1676,13 +1796,27 @@ final class MemoryEngine
      */
     public function ensureEmbeddings(int $maxBatch = 50): array
     {
-        $report = ['atoms' => 0, 'foreshadowing' => 0, 'skipped' => 0, 'errors' => []];
+        $report = ['atoms' => 0, 'foreshadowing' => 0, 'knowledge_base' => 0, 'skipped' => 0, 'errors' => []];
 
         $cfg = EmbeddingProvider::getConfig();
         if (!$cfg) {
             $report['skipped'] = 1;
             $report['msg'] = '未配置全局 embedding 模型';
             return $report;
+        }
+
+        // 审计修复（2026-08-02 P3）：补齐异步模式下被延迟的 KnowledgeBase 向量
+        // （章节摘要 + 角色/世界观/情节/风格），在下一章语义检索前一次性补齐。
+        // 失败静默，不影响 atoms/foreshadowing 的补齐流程。
+        try {
+            require_once dirname(__DIR__) . '/embedding.php';
+            $kb = new KnowledgeBase($this->novelId);
+            // 与 atoms/foreshadowing 共享 maxBatch 预算：给 KB 最多一半配额，避免
+            // 大量待补齐的章节摘要挤占 atom 向量补齐通道。
+            $kbBudget = max(5, (int)floor($maxBatch / 2));
+            $report['knowledge_base'] = $kb->backfillPendingEmbeddings($kbBudget);
+        } catch (\Throwable $e) {
+            $report['errors'][] = 'kb_backfill: ' . $e->getMessage();
         }
 
         // --- atoms ---
@@ -1762,13 +1896,27 @@ final class MemoryEngine
 
     public function upsertNovelState(array $updates): void
     {
-        $existing = DB::fetch('SELECT novel_id FROM novel_state WHERE novel_id=?', [$this->novelId]);
-        if ($existing) {
-            DB::update('novel_state', $updates, 'novel_id=?', [$this->novelId]);
-        } else {
-            $updates['novel_id'] = $this->novelId;
-            DB::insert('novel_state', $updates);
+        // 审计修复（竞态）：原"先 SELECT 再 INSERT/UPDATE"两步在并发 ingest 下，
+        // 两个进程同时判定无记录后各自 INSERT，其一因 novel_id 主键冲突失败。
+        // novel_state 以 novel_id 为主键，改为单条原子 upsert。
+        if (empty($updates)) {
+            DB::query(
+                'INSERT INTO novel_state (novel_id) VALUES (?) ON DUPLICATE KEY UPDATE novel_id = novel_id',
+                [$this->novelId]
+            );
+            return;
         }
+        $columns = array_keys($updates);
+        $assigns = [];
+        foreach ($columns as $col) {
+            $assigns[] = "`{$col}` = VALUES(`{$col}`)";
+        }
+        DB::query(
+            'INSERT INTO novel_state (`novel_id`, `' . implode('`, `', $columns) . '`)
+             VALUES (?' . str_repeat(', ?', count($columns)) . ')
+             ON DUPLICATE KEY UPDATE ' . implode(', ', $assigns),
+            array_merge([$this->novelId], array_values($updates))
+        );
     }
 
     public function stats(): array
@@ -1838,26 +1986,17 @@ final class MemoryEngine
 
             $ctx['target_chapters']    = $targetChapters;
             $ctx['completed_chapters'] = $completedChapters;
-            $ctx['remaining_chapters'] = max(0, $targetChapters - $completedChapters);
-            $ctx['progress_pct']       = $targetChapters > 0
-                ? (int)round($completedChapters / $targetChapters * 100)
-                : 0;
+            $ctx['completion_pct'] = $targetChapters > 0 ? (int)round($completedChapters / $targetChapters * 100) : 0;
+            $ctx = array_replace($ctx, NarrativePosition::forChapter($currentChapter, $targetChapters));
 
             // ── 三幕定位 ─────────────────────────────────────────────
-            if ($targetChapters > 0) {
-                $pct = $completedChapters / $targetChapters;
-                if ($pct <= 0.2) {
-                    $ctx['act_phase'] = '第一幕（开局建立期）';
-                } elseif ($pct <= 0.8) {
-                    $ctx['act_phase'] = '第二幕（发展对抗期）';
-                } else {
-                    $ctx['act_phase'] = '第三幕（高潮收束期）';
-                }
-            }
+            $ctx['act_phase'] = NarrativePosition::phase(NarrativePosition::currentAct([], $currentChapter, $targetChapters));
 
             // ── 伏笔统计 ─────────────────────────────────────────────
             $allPending = $this->foreshadowing->listPending();
-            $overdueItems = $this->foreshadowing->listOverdue($currentChapter, 0);
+            // 审计修复（2026-08-17 P3）：缓冲 0 改 CFG_FORESHADOW_OVERDUE_BUFFER（=3），
+            // 与 buildBatch 分类口径统一（此前 0 缓冲会把刚到期伏笔提前算作逾期）。
+            $overdueItems = $this->foreshadowing->listOverdue($currentChapter, CFG_FORESHADOW_OVERDUE_BUFFER);
 
             $ctx['pending_foreshadowing_count'] = count($allPending);
             $ctx['overdue_foreshadowing_count'] = count($overdueItems);
@@ -1874,18 +2013,20 @@ final class MemoryEngine
                     "第{$p['planted_chapter']}章埋：{$p['description']}{$deadline}";
             }
 
-            // 所有逾期伏笔
-            foreach ($overdueItems as $ov) {
+            // 逾期伏笔：计入预算但必须有上限（审计修复 2026-08-09 R11-8）
+            foreach (array_slice($overdueItems, 0, 8) as $ov) {
                 $ctx['overdue_foreshadowing_list'][] =
                     "第{$ov['planted_chapter']}章埋、应{$ov['deadline_chapter']}章前回收：{$ov['description']}";
             }
 
             // ── 全书转折点（标注是否已过）────────────────────────────
             $storyOutline = DB::fetch(
-                'SELECT major_turning_points, character_arcs, recurring_motifs FROM story_outlines WHERE novel_id=?',
+                'SELECT major_turning_points, character_arcs, recurring_motifs, act_division FROM story_outlines WHERE novel_id=?',
                 [$this->novelId]
             );
             if ($storyOutline) {
+                $actDivision = json_decode($storyOutline['act_division'] ?? '{}', true) ?: [];
+                $ctx['act_phase'] = NarrativePosition::phase(NarrativePosition::currentAct($actDivision, $currentChapter, $targetChapters));
                 $turningPoints = json_decode($storyOutline['major_turning_points'] ?? '[]', true) ?: [];
                 foreach ($turningPoints as $tp) {
                     $tpChapter = (int)($tp['chapter'] ?? 0);
@@ -1912,15 +2053,14 @@ final class MemoryEngine
             )['cnt'] ?? 0);
 
             if ($totalVolumes > 0) {
-                $currentVol = DB::fetch(
-                    'SELECT volume_number, title FROM volume_outlines
-                     WHERE novel_id=? AND start_chapter <= ? AND end_chapter >= ?
-                     LIMIT 1',
-                    [$this->novelId, $currentChapter, $currentChapter]
-                );
+                if (!function_exists('fetchVolumeOutlinesOverlapping')) {
+                    require_once dirname(__DIR__) . '/memory.php';
+                }
+                $currentVol = fetchVolumeOutlinesOverlapping($this->novelId, $currentChapter, $currentChapter)[0] ?? null;
                 if ($currentVol) {
+                    $volNo = (int)($currentVol['volume_number'] ?? $currentVol['volume_index'] ?? 0);
                     $ctx['volume_progress'] =
-                        "第{$currentVol['volume_number']}卷《{$currentVol['title']}》/ 共{$totalVolumes}卷";
+                        "第{$volNo}卷《{$currentVol['title']}》/ 共{$totalVolumes}卷";
                 }
             }
 
@@ -2161,6 +2301,25 @@ EOT;
 
             $tag = "\n\n【过渡章·境界回溯】上章{$name}境界从「{$oldR}」跳至「{$newR}」跳过了「{$skipped}」。本章需用500-800字回忆/闪回补上中间历程：\n{$events}";
 
+            // 审计修复 L2（2026-09-27）：幂等化。原实现无条件
+            // $outline . $tag 追加，而 revertChapterMemory /
+            // resetGeneratedProjectionsForReingest 均不清理已注入的过渡
+            // 标记——重写/重放同一章后，detectRealmSkip 再次触发注入，
+            // 下一章大纲累积多份 500-800 字过渡块挤占 prompt 预算。
+            // 同一过渡块已存在 → 幂等跳过；存在旧块但境界三元组已变化 →
+            // 剥离旧块（注入恒为尾部追加，标记起截断即可）再追加新块。
+            $marker = '【过渡章·境界回溯】';
+            $markerPos = mb_strpos($outline, $marker);
+            if ($markerPos !== false) {
+                if (mb_strpos($outline, $tag) !== false) {
+                    addLog($this->novelId, 'bridge_outline', "第{$nextChapter['chapter_number']}章大纲已含相同境界过渡标记（{$name}：{$oldR}→{$skipped}→{$newR}），跳过重复注入");
+                    return;
+                }
+                $cut = max(0, $markerPos - 2); // 连同前导 "\n\n" 一并剥离
+                $outline = rtrim(mb_substr($outline, 0, $cut));
+                addLog($this->novelId, 'bridge_outline', "第{$nextChapter['chapter_number']}章大纲含旧境界过渡标记，已剥离后按新境界三元组重注入");
+            }
+
             $newOutline = $outline . $tag;
             DB::update('chapters', ['outline' => $newOutline], 'id=?', [$nextChapter['id']]);
             addLog($this->novelId, 'bridge_outline', "第{$nextChapter['chapter_number']}章大纲已注入境界过渡标记（{$name}：{$oldR}→{$skipped}→{$newR}）");
@@ -2199,7 +2358,7 @@ EOT;
 
         // ---- 1) 先给 P0 做硬上限兜底,防止人物卡或前章尾文本身就撑爆预算 ----
         // L4 tail:最多允许 30% budget
-        $l4Cap = (int)max(400, $budget * 0.3);
+        $l4Cap = (int)max(500, $budget * 0.3);
         if (mb_strlen($ctx['L4_previous_tail']) > $l4Cap) {
             // 从末尾截取(保留衔接作用最强的最末段)
             $ctx['L4_previous_tail'] = mb_substr($ctx['L4_previous_tail'], -$l4Cap);
@@ -2241,10 +2400,67 @@ EOT;
             $ctx['story_momentum'] = mb_substr($ctx['story_momentum'], 0, 200);
             $ctx['debug']['dropped'][] = 'story_momentum truncated to 200';
         }
+        // 审计修复 L1（2026-09-27）：恒不裁剪段的硬上限兜底。
+        // L1_global_settings 与 progress_context 被 sumUsed 计入预算，但
+        // 下方全部裁剪循环都不触碰这两个键、循环耗尽后也无最终检查——
+        // novels 的 world_settings 等 TEXT 全量进入 L1、story_outlines 的
+        // 全部 turning_points/character_arcs 进入 progress 时，恒定段可
+        // 独占任意预算，语义召回/伏笔等可裁段被无谓裁光（裁了也到不了
+        // 预算线）。L1 对超长设定字段按需截断（与下游 prompt 注入的字段级
+        // 500 字截断同向），帽 50% 预算（下限 3000 字）；progress_context
+        // 对超长字符串值截断，帽 25% 预算（下限 2000 字），结构键不动。
+        $l1Cap = (int)max(3000, (int)($budget * 0.5));
+        $l1Len = $this->approxLen($ctx['L1_global_settings'] ?? []);
+        if ($l1Len > $l1Cap) {
+            $l1Excess = $l1Len - $l1Cap;
+            foreach (['extra_settings', 'plot_settings', 'world_settings', 'protagonist_info'] as $l1Field) {
+                if ($l1Excess <= 0) break;
+                $current = $ctx['L1_global_settings'][$l1Field] ?? '';
+                if (!is_string($current)) continue;
+                $curLen = mb_strlen($current);
+                $keep = max(200, $curLen - $l1Excess);
+                if ($keep < $curLen) {
+                    $ctx['L1_global_settings'][$l1Field] = mb_substr($current, 0, $keep);
+                    $l1Excess -= ($curLen - $keep);
+                    $ctx['debug']['dropped'][] = "L1_global_settings.{$l1Field} truncated for budget cap";
+                }
+            }
+        }
+        $pcCap = (int)max(2000, (int)($budget * 0.25));
+        if ($this->approxLen($ctx['progress_context'] ?? []) > $pcCap) {
+            $pcExcess = $this->approxLen($ctx['progress_context']) - $pcCap;
+            array_walk_recursive($ctx['progress_context'], static function (&$value) use (&$pcExcess): void {
+                if ($pcExcess <= 0 || !is_string($value)) return;
+                $curLen = mb_strlen($value);
+                $keep = max(80, $curLen - $pcExcess);
+                if ($keep < $curLen) {
+                    $value = mb_substr($value, 0, $keep);
+                    $pcExcess -= ($curLen - $keep);
+                }
+            });
+            $ctx['debug']['dropped'][] = 'progress_context long strings truncated for budget cap';
+        }
+        // P2-5：current_arc_summary 为 TEXT 列，DB 不限长，而 ChapterPromptBuilder
+        // 注入时 safe_substr(0, 220)。此处同步封顶 220，使预算统计与最终注入一致，
+        // 避免原始长摘要把预算撑爆却又不真正进 prompt。
+        // current_location / location_transition 受 VARCHAR(200/300) 约束，无需额外封顶。
+        if (mb_strlen($ctx['current_arc_summary']) > 220) {
+            $ctx['current_arc_summary'] = mb_substr($ctx['current_arc_summary'], 0, 220);
+            $ctx['debug']['dropped'][] = 'current_arc_summary truncated to 220';
+        }
 
         // ---- 2) 小工具:实时算分段长度 ----
+        // P2-5 修复（2026-08-09）：原 lenOf/sumUsed 只统计 9 个段，而 buildBatchContext
+        // 实际注入了 returning_characters / current_location / location_transition /
+        // current_arc_summary / cool_point_history / recent_hook_types / progress_context
+        // 共 7 个段。这些段恒不裁剪，但占用未计入预算 → budget_used 比真实占用偏低，
+        // 裁剪判定失真、debug.sections_len 也不能反映真实分布。现补齐统计。
         $lenOf = function (string $key) use (&$ctx): int {
-            if ($key === 'L4_previous_tail' || $key === 'story_momentum') {
+            if ($key === 'L4_previous_tail'
+                || $key === 'story_momentum'
+                || $key === 'current_location'
+                || $key === 'location_transition'
+                || $key === 'current_arc_summary') {
                 return mb_strlen((string)$ctx[$key]);
             }
             return $this->approxLen($ctx[$key]);
@@ -2255,10 +2471,18 @@ EOT;
                  + $lenOf('character_states')
                  + $lenOf('story_momentum')
                  + $lenOf('L2_arc_summaries')
+                 + $lenOf('L2_volume_summaries')
                  + $lenOf('L3_recent_chapters')
                  + $lenOf('pending_foreshadowing')
                  + $lenOf('key_events')
-                 + $lenOf('semantic_hits');
+                 + $lenOf('semantic_hits')
+                 + $lenOf('returning_characters')
+                 + $lenOf('current_location')
+                 + $lenOf('location_transition')
+                 + $lenOf('current_arc_summary')
+                 + $lenOf('cool_point_history')
+                 + $lenOf('recent_hook_types')
+                 + $lenOf('progress_context');
         };
 
         // ---- 3) P2 裁剪(语义召回 → 关键事件,从末尾/最旧丢) ----
@@ -2289,6 +2513,18 @@ EOT;
             array_shift($ctx['L2_arc_summaries']);
         }
         $ctx['arc_summaries'] = $ctx['L2_arc_summaries']; // 同步兼容字段
+        // 审计修复（2026-08-09 R10）：cool_point_history / recent_hook_types / returning_characters
+        // 此前"计入预算却永不裁剪"，预算紧时反而先砍关键伏笔。动伏笔之前先裁这些低价值历史段：
+        // 钩子/爽点史各保底 3 条（防重复逻辑只看近 2-3 章），回归角色保底 1 个。
+        while ($sumUsed() > $budget && count($ctx['cool_point_history']) > 3) {
+            array_shift($ctx['cool_point_history']); // 最旧在前
+        }
+        while ($sumUsed() > $budget && count($ctx['recent_hook_types']) > 3) {
+            array_shift($ctx['recent_hook_types']);
+        }
+        while ($sumUsed() > $budget && count($ctx['returning_characters']) > 1) {
+            array_pop($ctx['returning_characters']);
+        }
         // pending_foreshadowing 已按紧急度排序；从尾部开始砍，只保证有限数量 critical。
         while ($sumUsed() > $budget && count($ctx['pending_foreshadowing']) > $minForeshadowKeep) {
             array_pop($ctx['pending_foreshadowing']);
@@ -2302,6 +2538,13 @@ EOT;
         }
         $ctx['arc_summaries'] = $ctx['L2_arc_summaries'];
 
+        // 审计功能（2026-08-16 P3-卷级摘要）：卷级骨架最后被裁——
+        // 先裁 P2 各段 → 弧段降至 3/2 段 → 最后才裁卷级（远期主线
+        // 连续性优先保留）。从最旧卷（数组开头）开始丢，极端预算下可全裁。
+        while ($sumUsed() > $budget && !empty($ctx['L2_volume_summaries'])) {
+            array_shift($ctx['L2_volume_summaries']);
+        }
+
         // ---- 5) debug 记录(用真实裁剪后数字) ----
         $ctx['debug']['sections_len'] = [
             'L1_global_settings'    => $lenOf('L1_global_settings'),
@@ -2309,10 +2552,19 @@ EOT;
             'character_states'      => $lenOf('character_states'),
             'story_momentum'        => $lenOf('story_momentum'),
             'L2_arc_summaries'      => $lenOf('L2_arc_summaries'),
+            'L2_volume_summaries'   => $lenOf('L2_volume_summaries'),
             'L3_recent_chapters'    => $lenOf('L3_recent_chapters'),
             'pending_foreshadowing' => $lenOf('pending_foreshadowing'),
             'key_events'            => $lenOf('key_events'),
             'semantic_hits'         => $lenOf('semantic_hits'),
+            // P2-5：补齐 buildBatchContext 实际注入但原未统计的 7 个段
+            'returning_characters'  => $lenOf('returning_characters'),
+            'current_location'      => $lenOf('current_location'),
+            'location_transition'   => $lenOf('location_transition'),
+            'current_arc_summary'   => $lenOf('current_arc_summary'),
+            'cool_point_history'    => $lenOf('cool_point_history'),
+            'recent_hook_types'     => $lenOf('recent_hook_types'),
+            'progress_context'      => $lenOf('progress_context'),
         ];
         $criticalKept = count(array_filter(
             $ctx['pending_foreshadowing'],
@@ -2359,18 +2611,25 @@ EOT;
         $remove = [];
 
         foreach ($keys as $k) {
-            if ($k === $canonical) {
+            // 审计修复（2026-08-17 P3）：JSON 纯数字键（如主角名"123"）会被 PHP 转 int，
+            // 原 $k === $canonical 恒 false，主角自身更新被误判为变体合并后 unset。
+            // 键比较统一字符串化（PHP 数组键归一化下 (string)$k 与 $canonical 指向同一元素）。
+            if ((string)$k === $canonical) {
                 $merged = $k;
                 continue;
             }
-            // 子串匹配收紧：仅当一方是另一方的前缀或后缀时才视为变体
-            // 避免单字如"林"误匹配"林冲"、"林黛玉"等不同角色
+            // 审计修复 N2（2026-09-27）：仅合并"更短的变体"（AI 用了简称/截断，
+            // 如 canonical"萧炎哥"→"萧炎"、"林黛玉"→"黛玉"）。原双向前缀/后缀
+            // 匹配会把"林冲之"这类真实不同的角色名（二字名 + 前缀扩展）并入
+            // "林冲"，其 title/status/attributes 覆盖主角真实状态，角色卡被
+            // 长期污染且不可逆。更长的名字不再自动合并——宁可独立建卡（信息
+            // 分散、canonical 名更新仍回流主角卡），不冒覆盖主角状态的风险。
+            $ks = (string)$k;
             $isVariant = false;
-            if (mb_strlen($k) >= 2 && mb_strlen($canonical) >= 2) {
-                // k 以 canonical 开头或结尾，或 canonical 以 k 开头或结尾
-                $isVariant = (mb_strpos($k, $canonical) === 0 || mb_strpos($canonical, $k) === 0)
-                          || (mb_substr($k, -mb_strlen($canonical)) === $canonical)
-                          || (mb_substr($canonical, -mb_strlen($k)) === $k);
+            if (mb_strlen($ks) >= 2 && mb_strlen($ks) < mb_strlen($canonical)) {
+                // 短名是 canonical 的前缀或后缀（截断/简称）
+                $isVariant = (mb_strpos($canonical, $ks) === 0)
+                          || (mb_substr($canonical, -mb_strlen($ks)) === $ks);
             }
             if (!$isVariant) continue;
 
@@ -2383,7 +2642,7 @@ EOT;
                 } else {
                     $updates[$merged] = $updates[$k];
                 }
-                $remove[] = $k;
+                $remove[] = $k; // 记录原始键，unset 时回原数组删除
             }
         }
 
@@ -2414,10 +2673,12 @@ EOT;
             if ($name === $canonical) {
                 continue;
             }
-            // 子串匹配：仅当一方是另一方的前缀或后缀时才视为变体
-            if (mb_strlen($name) >= 2 && mb_strlen($canonical) >= 2) {
-                $isVariant = (mb_strpos($name, $canonical) === 0 || mb_strpos($canonical, $name) === 0)
-                          || (mb_substr($name, -mb_strlen($canonical)) === $canonical)
+            // 审计修复 N2（2026-09-27）：同 normalizeProtagonistKeys——仅接受
+            // "更短的变体"（截断/简称）替换为 canonical 名；更长的名字
+            // （如"林冲之"之于"林冲"）是潜在的不同角色，保留原名独立记录，
+            // 防止情绪记录被错误归并到主角。
+            if (mb_strlen($name) >= 2 && mb_strlen($name) < mb_strlen($canonical)) {
+                $isVariant = (mb_strpos($canonical, $name) === 0)
                           || (mb_substr($canonical, -mb_strlen($name)) === $name);
                 if ($isVariant) {
                     $emo['name'] = $canonical;

@@ -6,7 +6,7 @@
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
@@ -32,7 +32,7 @@ if (!in_array($action, $readOnlyActions, true)) {
 }
 
 function dramaUserId(): int {
-    return (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    return currentUserId();
 }
 
 /** 客户端可读的错误文案白名单（前缀匹配）。 */
@@ -194,8 +194,23 @@ try {
         case 'add_shot': {
             $episodeId = (int)($jsonInput['episode_id'] ?? 0);
             DramaService::assertEpisodeAccess($episodeId, dramaUserId());
-            $nextNo = (int)DB::fetchColumn('SELECT COALESCE(MAX(shot_no),0)+1 FROM drama_shots WHERE episode_id=?', [$episodeId]);
-            DB::insert('drama_shots', ['episode_id' => $episodeId, 'shot_no' => $nextNo]);
+            // 审计修复（2026-10-31 B4）：镜号 MAX+1 原为读后写，并发双击会算出
+            // 同一 shot_no，后者撞 uk_episode_shot 报"添加失败"。锁剧集行后
+            // 在事务内读 MAX，同剧集的镜号分配全部串行化。
+            if (!DB::beginTransaction()) {
+                throw new RuntimeException('无法为镜号分配开启事务');
+            }
+            try {
+                if (!is_array(DB::fetch('SELECT id FROM drama_episodes WHERE id=? FOR UPDATE', [$episodeId]))) {
+                    throw new RuntimeException('剧集不存在');
+                }
+                $nextNo = (int)DB::fetchColumn('SELECT COALESCE(MAX(shot_no),0)+1 FROM drama_shots WHERE episode_id=?', [$episodeId]);
+                DB::insert('drama_shots', ['episode_id' => $episodeId, 'shot_no' => $nextNo]);
+                DB::commit();
+            } catch (Throwable $e) {
+                if (DB::inTransaction()) DB::rollBack();
+                throw $e;
+            }
             echo json_encode(['ok' => true, 'msg' => '已添加分镜', 'data' => ['shot_no' => $nextNo]], JSON_UNESCAPED_UNICODE);
             break;
         }
@@ -205,7 +220,11 @@ try {
             $shot = DramaService::getShot($shotId);
             if (!$shot) throw new RuntimeException('分镜不存在');
             [$episode] = DramaService::assertEpisodeAccess((int)$shot['episode_id'], dramaUserId());
-            DB::beginTransaction();
+            // 审计修复（2026-10-31 B5）：嵌套时 DB::beginTransaction() 静默返回 false，
+            // 旧实现忽略返回值继续执行，其后的 commit/rollBack 会误提交/回滚外层事务。
+            if (!DB::beginTransaction()) {
+                throw new RuntimeException('分镜删除事务开启失败（已存在活动事务）');
+            }
             try {
                 DB::delete('drama_shots', 'id=?', [$shotId]);
                 // 后续镜号前移，保持连续

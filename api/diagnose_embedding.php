@@ -7,7 +7,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  * 使用方式：GET /api/diagnose_embedding.php?novel_id=1
  * 部署后请删除此文件
  */
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
@@ -37,7 +37,7 @@ $checks = [];
 
 // 归属权校验
 if ($novelId) {
-    $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    $userId = currentUserId();
     checkNovelOwnership($novelId, $userId);
 }
 

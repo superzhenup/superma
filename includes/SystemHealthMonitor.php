@@ -81,6 +81,14 @@ class SystemHealthMonitor
             $score -= 20;
         }
 
+        // 6. 后处理积压（未配 worker 时最先露出的运维洞）
+        $ppResult = $this->checkPostprocessBacklog();
+        if ($ppResult['alert']) {
+            $alerts[] = $ppResult['alert'];
+            $ppPenalty = (($ppResult['alert']['level'] ?? '') === 'error') ? 25 : 10;
+            $score -= $ppPenalty;
+        }
+
         $recommendations = $this->generateRecommendations($alerts);
 
         return [
@@ -99,8 +107,8 @@ class SystemHealthMonitor
     {
         try {
             $failedCount = (int)(DB::fetch(
-                "SELECT COUNT(*) as cnt FROM agent_decision_logs
-                 WHERE novel_id = ? AND decision_data LIKE '%error%'
+                "SELECT COUNT(*) as cnt FROM agent_action_logs
+                 WHERE novel_id = ? AND status = 'failed'
                    AND created_at > DATE_SUB(NOW(), INTERVAL 1 DAY)",
                 [$this->novelId]
             )['cnt'] ?? 0);
@@ -125,7 +133,7 @@ class SystemHealthMonitor
 
             return ['alert' => null];
         } catch (\Throwable $e) {
-            return ['alert' => null];
+            return $this->unavailableAlert('agent_failure', $e);
         }
     }
 
@@ -175,7 +183,7 @@ class SystemHealthMonitor
 
             return ['alert' => null];
         } catch (\Throwable $e) {
-            return ['alert' => null];
+            return $this->unavailableAlert('critic_bias', $e);
         }
     }
 
@@ -212,7 +220,7 @@ class SystemHealthMonitor
 
             return ['alert' => null];
         } catch (\Throwable $e) {
-            return ['alert' => null];
+            return $this->unavailableAlert('directive_stagnation', $e);
         }
     }
 
@@ -248,7 +256,7 @@ class SystemHealthMonitor
 
             return ['alert' => null];
         } catch (\Throwable $e) {
-            return ['alert' => null];
+            return $this->unavailableAlert('chapter_stagnation', $e);
         }
     }
 
@@ -285,8 +293,67 @@ class SystemHealthMonitor
 
             return ['alert' => null];
         } catch (\Throwable $e) {
-            return ['alert' => null];
+            return $this->unavailableAlert('constraint_surge', $e);
         }
+    }
+
+    /**
+     * 后处理队列积压：未配 cron worker 时 queued/retry 会越积越多。
+     */
+    private function checkPostprocessBacklog(): array
+    {
+        try {
+            $row = DB::fetch(
+                "SELECT
+                    SUM(CASE WHEN state IN ('queued','retry') THEN 1 ELSE 0 END) AS waiting,
+                    SUM(CASE WHEN state = 'running' AND lease_expires_at < NOW() THEN 1 ELSE 0 END) AS stale_running
+                 FROM postprocess_jobs
+                 WHERE novel_id = ?",
+                [$this->novelId]
+            );
+            $waiting = (int)($row['waiting'] ?? 0);
+            $stale = (int)($row['stale_running'] ?? 0);
+
+            if ($waiting >= 5 || $stale >= 2) {
+                return [
+                    'alert' => [
+                        'level'   => 'error',
+                        'type'    => 'postprocess_backlog',
+                        'message' => "后处理积压 waiting={$waiting}、过期租约={$stale}，请确认 php bin/postprocess_worker.php 定时任务",
+                    ],
+                ];
+            }
+            if ($waiting >= 2 || $stale >= 1) {
+                return [
+                    'alert' => [
+                        'level'   => 'warning',
+                        'type'    => 'postprocess_backlog',
+                        'message' => "后处理有积压 waiting={$waiting}、过期租约={$stale}，记忆吞入可能落后",
+                    ],
+                ];
+            }
+
+            return ['alert' => null];
+        } catch (\Throwable $e) {
+            return $this->unavailableAlert('postprocess_backlog', $e);
+        }
+    }
+
+    /**
+     * 检查失败时不得装作健康。
+     *
+     * @return array{alert: array}
+     */
+    private function unavailableAlert(string $type, \Throwable $e): array
+    {
+        error_log("SystemHealthMonitor::{$type} unavailable: " . $e->getMessage());
+        return [
+            'alert' => [
+                'level'   => 'warning',
+                'type'    => 'health_check_error',
+                'message' => "健康检查「{$type}」暂时不可用，未当作系统健康",
+            ],
+        ];
     }
 
     private function isAgentEnabled(): bool
@@ -327,8 +394,8 @@ class SystemHealthMonitor
             }
 
             return ['alert' => null];
-        } catch (\Throwable) {
-            return ['alert' => null];
+        } catch (\Throwable $e) {
+            return $this->unavailableAlert('agent_no_data', $e);
         }
     }
 
@@ -348,6 +415,8 @@ class SystemHealthMonitor
                 'directive_stagnation' => '建议：检查Agent总开关（agent.enabled）和后台任务是否正常运行',
                 'chapter_stagnation'   => '建议：确认写作队列和后台Worker是否正常，检查是否有卡住的writing状态章节',
                 'constraint_surge'     => '建议：检查严格模式设置，P0违规过高时可暂时关闭严格模式避免阻塞',
+                'postprocess_backlog'  => '建议：每分钟执行 php bin/postprocess_worker.php --max=10，消化积压的记忆/质检任务',
+                'health_check_error'   => '建议：查看 PHP error_log，确认相关数据表与迁移已执行',
                 default                => '',
             };
         }

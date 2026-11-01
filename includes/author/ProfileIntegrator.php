@@ -3,6 +3,7 @@
  * 画像系统集成器 - 作者画像系统
  * 将作者画像数据集成到小说生成系统的各个模块
  */
+defined('APP_LOADED') or die('Direct access denied.');
 
 require_once __DIR__ . '/AuthorProfile.php';
 

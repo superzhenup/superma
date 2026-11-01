@@ -5,7 +5,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  *
  * 所有操作均归属 novel_id 校验，安全防跨小说污染。
  */
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/error_handler.php';
 registerApiErrorHandlers();
@@ -42,7 +42,7 @@ if ($novelId <= 0) {
     jsonResponse(false, null, '无效的 novel_id');
 }
 
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 checkNovelOwnership($novelId, $userId);
 
 $kb = new KnowledgeBase($novelId);

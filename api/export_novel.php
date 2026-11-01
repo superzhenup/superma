@@ -6,7 +6,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  * 输出 TXT 文件下载
  */
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 requireLoginApi();
@@ -18,7 +18,7 @@ registerApiErrorHandlers();
 $novelId = (int)($_GET['id'] ?? 0);
 
 // 审计 P0（2026-06-12）：归属校验，禁止跨用户导出他人小说全文
-$sessionUserId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$sessionUserId = currentUserId();
 if ($sessionUserId <= 0) {
     http_response_code(403);
     api_error('会话异常，请重新登录', 403);
@@ -99,9 +99,7 @@ foreach ($chapters as $ch) {
 
 $content = implode("\r\n", $lines);
 
-// 生成安全的文件名
-$safeTitle = preg_replace('/[\/\\\:\*\?\"\<\>\|]/', '', $novel['title']);
-$filename  = $safeTitle . '.txt';
+// 审计 T3（2026-10-31）：下载文件名统一经 contentDispositionAttachment()（RFC 6266/5987 双文件名），中文书名不再被 urlencode 破坏。
 
 // BOM 前缀确保 Windows 记事本正确识别 UTF-8
 $bom = "\xEF\xBB\xBF";
@@ -109,7 +107,7 @@ $output = $bom . $content;
 
 // 输出下载
 header('Content-Type: text/plain; charset=utf-8');
-header('Content-Disposition: attachment; filename="' . urlencode($filename) . '"');
+header('Content-Disposition: ' . contentDispositionAttachment($novel['title'] . '.txt'));
 header('Content-Length: ' . strlen($output));
 header('Cache-Control: no-cache, must-revalidate');
 

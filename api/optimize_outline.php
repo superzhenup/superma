@@ -41,14 +41,14 @@ function sendHeartbeatOptimize(): void {
 // 注册心跳发送函数（供 AI 流式回调中使用）
 $GLOBALS['sendHeartbeat'] = 'sendHeartbeatOptimize';
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 require_once dirname(__DIR__) . '/includes/OutlineQualityGuard.php';
-require_once dirname(__DIR__) . '/includes/ChapterMutationService.php';
+require_once dirname(__DIR__) . '/includes/ChapterOutlinePersistence.php';
 requireLoginApi();
 session_write_close();
 
@@ -69,7 +69,7 @@ $novelId = (int)($input['novel_id'] ?? 0);
 $startFrom = (int)($input['start_from'] ?? 0);  // 前端传入的起始章节
 
 // 审计 P0（2026-06-12）：归属校验，禁止跨用户优化他人小说大纲
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 if ($novelId > 0) checkNovelOwnership($novelId, $userId);
 
 $novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$novelId]);
@@ -117,42 +117,6 @@ $totalChapters = count($chapters);
 sse('progress', ['msg' => "开始优化 {$totalChapters} 章大纲逻辑...", 'total' => $totalChapters]);
 
 // ---- 构建全书设定摘要 ----
-$truncate = fn(string $t, int $l) => safe_strlen($t) > $l ? safe_substr($t, 0, $l) . '…' : $t;
-$settingsSummary = implode("\n", array_filter([
-    "书名：{$novel['title']}  类型：{$novel['genre']}  风格：{$novel['writing_style']}",
-    $novel['protagonist_info'] ? "主角：" . $truncate($novel['protagonist_info'], 400) : '',
-    $novel['plot_settings']    ? "情节：" . $truncate($novel['plot_settings'], 400)    : '',
-    $novel['world_settings']   ? "世界观：" . $truncate($novel['world_settings'], 400)  : '',
-    $novel['extra_settings']   ? "其他：" . $truncate($novel['extra_settings'], 200)    : '',
-]));
-
-$storyArcText     = $truncate($storyOutline['story_arc'] ?? '', 400);
-$actDivisionRaw   = $storyOutline['act_division'] ?? null;
-$actDivision      = is_string($actDivisionRaw)
-    ? (json_decode($actDivisionRaw, true) ?: [])
-    : (is_array($actDivisionRaw) ? $actDivisionRaw : []);
-$turningPointsRaw = $storyOutline['major_turning_points'] ?? null;
-$turningPoints    = is_string($turningPointsRaw)
-    ? (json_decode($turningPointsRaw, true) ?: [])
-    : (is_array($turningPointsRaw) ? $turningPointsRaw : []);
-
-// 整理幕信息
-$actText = '';
-if (!empty($actDivision)) {
-    foreach ($actDivision as $act) {
-        $keyEvents = is_array($act['key_events'] ?? null)
-            ? $act['key_events']
-            : (json_decode($act['key_events'] ?? '[]', true) ?: []);
-        $actText .= "第{$act['chapters']}章（{$act['theme']}）：" . implode('、', $keyEvents) . "\n";
-    }
-}
-$turningText = '';
-if (!empty($turningPoints)) {
-    foreach ($turningPoints as $tp) {
-        $turningText .= "第{$tp['chapter']}章：{$tp['event']}\n";
-    }
-}
-
 // 初始化记忆引擎（优化时也注入记忆上下文）
 require_once dirname(__DIR__) . '/includes/memory/MemoryEngine.php';
 $engine = new MemoryEngine($novelId);
@@ -192,6 +156,75 @@ for ($i = $startBatchIndex; $i < $totalChapters; $i += $batchSize) {
     $batchFrom = $batch[0]['chapter_number'];
     $batchTo   = end($batch)['chapter_number'];
 
+    $persistence = new ChapterOutlinePersistence(DB::connect(), $userId, $novelId);
+    try {
+        $snapshot = $persistence->captureOptimizationBatch(
+            array_map(static fn(array $row): int => (int)$row['chapter_number'], $batch),
+            array_map(static fn(array $row): int => (int)$row['chapter_number'], array_slice($chapters, max(0, $i - $batchSize * 2), min($i, $batchSize * 2)))
+        );
+        $batch = $snapshot['chapters'];
+        $prev2Batch = $snapshot['context'];
+        $novel = $snapshot['novel'];
+        $storyOutline = $snapshot['story'];
+    } catch (ChapterOutlineSourceChangedException $error) {
+        sse('error', ['code'=>'source_conflict', 'msg'=>'章节或故事大纲已变化，本批未写入，自动优化已停止，请刷新后重试']);
+        sseDone();
+        exit;
+    }
+
+    $truncate = fn(string $t, int $l) => safe_strlen($t) > $l ? safe_substr($t, 0, $l) . '…' : $t;
+    $settingsSummary = implode("\n", array_filter([
+        "书名：{$novel['title']}  类型：{$novel['genre']}  风格：{$novel['writing_style']}",
+        $novel['protagonist_info'] ? "主角：" . $truncate($novel['protagonist_info'], 400) : '',
+        $novel['plot_settings']    ? "情节：" . $truncate($novel['plot_settings'], 400)    : '',
+        $novel['world_settings']   ? "世界观：" . $truncate($novel['world_settings'], 400)  : '',
+        $novel['extra_settings']   ? "其他：" . $truncate($novel['extra_settings'], 200)    : '',
+    ]));
+
+    $storyArcText     = $truncate($storyOutline['story_arc'] ?? '', 400);
+    $actDivisionRaw   = $storyOutline['act_division'] ?? null;
+    $actDivision      = is_string($actDivisionRaw)
+        ? (json_decode($actDivisionRaw, true) ?: [])
+        : (is_array($actDivisionRaw) ? $actDivisionRaw : []);
+    $turningPointsRaw = $storyOutline['major_turning_points'] ?? null;
+    $turningPoints    = is_string($turningPointsRaw)
+        ? (json_decode($turningPointsRaw, true) ?: [])
+        : (is_array($turningPointsRaw) ? $turningPointsRaw : []);
+
+    // 整理幕信息
+    // 审计修复 H6（2026-08-16）：act_division / major_turning_points 是 AI 生成的 JSON
+    // （存自 story_outlines），无 schema 保证——逐字段兜底并过滤无效条目，
+    // 避免未定义键警告与空值拼入 prompt 污染优化质量。
+    $actText = '';
+    if (!empty($actDivision)) {
+        foreach ($actDivision as $act) {
+            if (!is_array($act)) continue;
+            $actChapters = trim((string)($act['chapters'] ?? ''));
+            $actTheme    = trim((string)($act['theme'] ?? ''));
+            if ($actChapters === '' && $actTheme === '') continue;
+            $keyEvents = is_array($act['key_events'] ?? null)
+                ? $act['key_events']
+                : (json_decode($act['key_events'] ?? '[]', true) ?: []);
+            $keyEvents = array_values(array_filter(array_map(
+                static fn($ev) => trim((string)$ev),
+                is_array($keyEvents) ? $keyEvents : []
+            )));
+            $actText .= "第{$actChapters}章（{$actTheme}）：" . implode('、', $keyEvents) . "\n";
+        }
+    }
+    $turningText = '';
+    if (!empty($turningPoints)) {
+        foreach ($turningPoints as $tp) {
+            if (!is_array($tp)) continue;
+            $tpChapter = trim((string)($tp['chapter'] ?? ''));
+            $tpEvent   = trim((string)($tp['event'] ?? ''));
+            if ($tpChapter === '' || $tpEvent === '') continue;
+            $turningText .= "第{$tpChapter}章：{$tpEvent}\n";
+        }
+    }
+
+
+
     // 构建本批大纲文本
     $batchText = '';
     foreach ($batch as $ch) {
@@ -206,7 +239,10 @@ for ($i = $startBatchIndex; $i < $totalChapters; $i += $batchSize) {
     // 获取记忆上下文（人物状态 + 关键事件 + 伏笔）
     $queryText = trim(($novel['genre'] ?? '') . '：' . ($novel['plot_settings'] ?? ''));
     try {
-        $memoryCtx = $engine->getPromptContext($batchTo, $queryText !== '：' ? $queryText : null, 4000, 15, 6);
+        // 审计修复（2026-08-09 R10-9）：top_k/预算走配置，禁止硬编码 6/4000
+        $semanticTopK = max(1, min(40, (int)getSystemSetting('ws_embedding_top_k', 5, 'int')));
+        $outlineBudget = max(2000, (int)getSystemSetting('ws_outline_memory_budget', 8000, 'int'));
+        $memoryCtx = $engine->getPromptContext($batchTo, $queryText !== '：' ? $queryText : null, $outlineBudget, 15, $semanticTopK);
     } catch (Throwable $e) {
         error_log("optimize_outline: MemoryEngine.getPromptContext failed: {$e->getMessage()}");
         $memoryCtx = null;
@@ -244,11 +280,8 @@ for ($i = $startBatchIndex; $i < $totalChapters; $i += $batchSize) {
 
     // 前批大纲作为上下文（最多前2批，增强长距离连贯性）
     $prevContext = '';
-    $prev2Batch = [];
-    if ($i > 0) {
+    if ($prev2Batch !== []) {
         $prevLines = [];
-        $prev2Start = max(0, $i - $batchSize * 2);
-        $prev2Batch = array_slice($chapters, $prev2Start, $batchSize * 2);
         foreach ($prev2Batch as $ch) {
             $prevLines[] = "第{$ch['chapter_number']}章《{$ch['title']}》：{$ch['outline']}";
         }
@@ -377,47 +410,32 @@ EOT
     );
     $optimized = $qualityResult['outlines'];
 
+    $updates = [];
     $changedCount = 0;
     foreach ($optimized as $item) {
-        $chNum   = (int)($item['chapter_number'] ?? 0);
-        $title   = trim($item['title']   ?? '');
-        $summary = trim($item['summary'] ?? '');
-        $kpts    = $item['key_points']   ?? [];
-        $hook    = trim($item['hook']    ?? '');
-        $changed = (bool)($item['changed'] ?? true);
-
-        if (!$chNum || !$summary) continue;
-
-        $existing = DB::fetch(
-            'SELECT id FROM chapters WHERE novel_id=? AND chapter_number=?',
-            [$novelId, $chNum]
-        );
-        if (!$existing) continue;
-
-        try {
-            ChapterMutationService::mutateChapter((int)$existing['id'], $novelId, [
-                'title'      => $title ?: null,
-                'outline'    => $summary,
-                'key_points' => json_encode($kpts, JSON_UNESCAPED_UNICODE),
-                'hook'       => $hook,
-            ], [
-                'backup_version' => false,
-                'force_outline_invalidation' => true,
-                'allowed_statuses' => ['pending', 'outlined', 'skipped', 'failed'],
-                'reason' => 'outline_logic_optimization',
-            ]);
-        } catch (ChapterMutationConflict $e) {
-            // 自动写作可能在 AI 优化期间认领/完成本章；保留写作所用版本。
-            continue;
+        $chNum = (int)($item['chapter_number'] ?? 0);
+        if (isset($updates[$chNum])) {
+            sse('error', ['msg'=>'模型返回重复章节，本批未保存，自动优化已停止']); sseDone(); exit;
         }
-
-        if ($changed) $changedCount++;
+        $updates[$chNum] = [
+            'title' => trim((string)($item['title'] ?? '')) ?: null,
+            'outline' => trim((string)($item['summary'] ?? '')),
+            'key_points' => json_encode($item['key_points'] ?? [], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+            'hook' => trim((string)($item['hook'] ?? '')),
+        ];
+        if ((bool)($item['changed'] ?? true)) $changedCount++;
     }
-
+    try {
+        $saved = $persistence->saveOptimizedBatch($updates, (int)$batchTo);
+    } catch (InvalidArgumentException $error) {
+        sse('error', ['msg'=>'模型未返回完整且有效的本批章节，本批未保存，自动优化已停止']); sseDone(); exit;
+    }
+    if (!$saved) {
+        sse('error', ['code'=>'source_conflict', 'msg'=>'大纲、概要或小说设定已被修改，本批未写入，自动优化已停止，请刷新后重试']);
+        sseDone(); exit;
+    }
+    clearNovelCache($novelId);
     $updatedTotal += $changedCount;
-
-    // 更新优化进度到数据库
-    DB::update('novels', ['optimized_chapter' => $batchTo], 'id=?', [$novelId]);
 
     sse('batch_done', [
         'msg'     => "第{$batchFrom}～{$batchTo}章优化完成，修改了 {$changedCount} 章",
@@ -458,6 +476,24 @@ if (!empty($allChapters)) {
 }
 
 addLog($novelId, 'optimize_outline', "大纲逻辑优化完成，共修改 {$updatedTotal} 章");
+
+// 审计功能（2026-08-16 P3-卷级摘要）：全书弧段重建完成后批量重建卷级摘要。
+// 大纲内容变了 → 弧段摘要已重生成 → 卷级摘要同步过期，此处一键补齐
+// （存量书经重优化即获得完整卷级骨架）。失败静默不阻断完成事件。
+try {
+    if (getSystemSetting('ws_volume_summary_enabled', true, 'bool')
+        && function_exists('rebuildAllVolumeSummaries')) {
+        sse('progress', ['msg' => '正在更新卷级摘要...']);
+        sendHeartbeatOptimize();
+        $volsRebuilt = rebuildAllVolumeSummaries($novelId, $novel['model_id'] ?? null);
+        if ($volsRebuilt > 0) {
+            addLog($novelId, 'info', "卷级摘要已重建 {$volsRebuilt} 卷");
+            sse('progress', ['msg' => "卷级摘要已重建 {$volsRebuilt} 卷"]);
+        }
+    }
+} catch (Throwable $e) {
+    error_log("optimize_outline: 卷级摘要重建失败: {$e->getMessage()}");
+}
 
 sse('complete', [
     'msg'     => "大纲逻辑优化完成！共修改 {$updatedTotal} 章，故事线摘要已同步更新。",

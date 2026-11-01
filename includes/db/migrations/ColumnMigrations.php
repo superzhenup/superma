@@ -178,6 +178,19 @@ class ColumnMigrations
             // [v45] 1.7 PRO 图谱关系起始章节
             ['novel_state', 'graph_start_chapter',
              "ALTER TABLE `novel_state` ADD COLUMN `graph_start_chapter` INT UNSIGNED DEFAULT NULL COMMENT '图谱关系起始构建章节号(NULL=未启用)' AFTER `last_ingested_chapter`"],
+            ['chapters', 'retry_count',
+             "ALTER TABLE `chapters` ADD COLUMN `retry_count` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '写作重试次数'"],
+            // [审计 P0 2026-08-04] 章节认领令牌：取消→立刻重启竞态下，旧任务的
+            // saveChapter CAS（WHERE status="writing"）会命中新任务刚预占的行，
+            // 导致已取消的半成品覆盖新正文。认领时写入随机 token，落盘 CAS 按 token 匹配。
+            // 不加 AFTER retry_count：旧库若无 retry_count，带 AFTER 的 ALTER 会 1054 失败，
+            // 列补齐被跳过，写作预占报 Unknown column 'claim_token'。
+            ['chapters', 'claim_token',
+             "ALTER TABLE `chapters` ADD COLUMN `claim_token` VARCHAR(40) NOT NULL DEFAULT '' COMMENT '章节认领令牌(审计P0:防取消→重启竞态覆盖正文)'"],
+            // [v71] 拆书分析按用户隔离。原由 api/analyze_book.php 在请求中运行时 ALTER，
+            // 现收编进统一迁移（Web 请求不再执行 DDL）。
+            ['book_analyses', 'user_id',
+             "ALTER TABLE `book_analyses` ADD COLUMN `user_id` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '归属用户ID（0=待认领的旧记录）' AFTER `id`"],
         ];
 
         // ② v9 知识库扩展字段（原 db.php line 804-851）
@@ -267,6 +280,95 @@ class ColumnMigrations
         // 审计修复 M4：book_analyses.created_at 补默认值
         self::ensureColumnDefault($pdo, 'book_analyses', 'created_at',
             "ALTER TABLE `book_analyses` MODIFY COLUMN `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP", $errors);
+
+        self::convergeVolumeOutlines($pdo, $errors);
+    }
+
+    /**
+     * [v71] volume_outlines 双列收编（原 includes/wizard/schema.php::wizardMigrateVolumeOutlines
+     * 在向导请求中运行时执行，现并入统一迁移）。
+     *
+     * 两套列并存：旧列 volume_number/start_chapter/end_chapter（安装器、新建页、卷纲生成），
+     * 新列 volume_index/chapter_from/chapter_to（向导）。所有写入方同值双写，读方优先新列、
+     * 为 NULL 时回退旧列。
+     *  1. 补齐新列，默认 NULL：旧版向导列默认 1/1/50，只写旧列的行会被读成"第 1 卷、1–50 章"；
+     *  2. 已存在的新列若仍带旧默认值或 NOT NULL，改为 NULL 默认；
+     *  3. theme 为 CHAR/VARCHAR/TINYTEXT 时扩容为 TEXT（已是 MEDIUMTEXT/LONGTEXT 不降级）；
+     *     旧列 volume_number/start_chapter/end_chapter/summary/conflict/resolution 放宽为可空，
+     *     使打开过与未打开过向导的库、以及新装库收敛到同一结构；
+     *  4. 旧列有效且与新列不一致时以旧列为准回填新列。现有写入方都同值双写，两者不一致
+     *     只可能来自只写旧列的行——此前回填条件只认 0/1，chapter_to 的默认 50 从未被修正。
+     * 每步幂等；只引用实际存在的列，向导自建的精简表同样适用。
+     */
+    public static function convergeVolumeOutlines(PDO $pdo, array &$errors): void
+    {
+        try {
+            $exists = $pdo->query("SHOW TABLES LIKE 'volume_outlines'");
+            $hasTable = $exists !== false && $exists->fetchColumn() !== false;
+            if ($exists !== false) $exists->closeCursor();
+            if (!$hasTable) return;
+            $columns = [];
+            foreach ($pdo->query('SHOW COLUMNS FROM `volume_outlines`')->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                $columns[(string)$row['Field']] = $row;
+            }
+        } catch (\Throwable $e) {
+            $errors[] = 'volume_outlines inspect - ' . $e->getMessage();
+            return;
+        }
+
+        $definitions = [
+            'volume_index' => "INT UNSIGNED DEFAULT NULL COMMENT '向导卷序号（与 volume_number 同值双写；NULL 时读方回退旧列）'",
+            'chapter_from' => "INT UNSIGNED DEFAULT NULL COMMENT '向导起始章（与 start_chapter 同值双写）'",
+            'chapter_to'   => "INT UNSIGNED DEFAULT NULL COMMENT '向导结束章（与 end_chapter 同值双写）'",
+        ];
+        foreach ($definitions as $column => $definition) {
+            if (!isset($columns[$column])) {
+                self::execAlter($pdo, "columns:volume_outlines.{$column}",
+                    "ALTER TABLE `volume_outlines` ADD COLUMN `{$column}` {$definition}", $errors);
+            } elseif ($columns[$column]['Default'] !== null || strtoupper((string)$columns[$column]['Null']) !== 'YES') {
+                self::execAlter($pdo, "modify:volume_outlines.{$column}",
+                    "ALTER TABLE `volume_outlines` MODIFY COLUMN `{$column}` {$definition}", $errors);
+            }
+        }
+
+        if (isset($columns['theme'])
+            && preg_match('/^(?:(?:var)?char\(|tinytext\b)/i', (string)$columns['theme']['Type'])) {
+            self::execAlter($pdo, 'modify:volume_outlines.theme',
+                "ALTER TABLE `volume_outlines` MODIFY COLUMN `theme` TEXT DEFAULT NULL COMMENT '本卷主题'", $errors);
+        }
+
+        // 旧 NOT NULL 列放宽为可空，与规范建表一致（旧运行时迁移在向导库上已放宽过，
+        // 未打开过向导的库仍是 NOT NULL；早期安装器的 summary/conflict/resolution 还没有默认值，
+        // 向导保存不写它们，严格模式下插入失败）。按规范定义 MODIFY，保留原注释语义。
+        $relaxed = [
+            'volume_number' => "INT DEFAULT NULL COMMENT '卷号，从1开始（与 volume_index 同值双写）'",
+            'start_chapter' => "INT DEFAULT NULL COMMENT '起始章节号（与 chapter_from 同值双写）'",
+            'end_chapter'   => "INT DEFAULT NULL COMMENT '结束章节号（与 chapter_to 同值双写）'",
+            'summary'       => "TEXT COMMENT '卷概要（300-500字）'",
+            'conflict'      => "VARCHAR(500) DEFAULT '' COMMENT '本卷核心冲突'",
+            'resolution'    => "VARCHAR(500) DEFAULT '' COMMENT '本卷解决方式'",
+        ];
+        foreach ($relaxed as $column => $definition) {
+            if (!isset($columns[$column]) || strtoupper((string)$columns[$column]['Null']) !== 'NO') continue;
+            // 只放宽可空性；实际类型与规范不同（如已改成 MEDIUMTEXT）时沿用实际类型，不缩小。
+            $actualType = preg_replace('/^(tinyint|smallint|mediumint|int|bigint)\(\d+\)/', '$1',
+                strtolower((string)$columns[$column]['Type']));
+            if (strtok($actualType, ' ') !== strtolower((string)strtok($definition, ' '))) {
+                $definition = $columns[$column]['Type'] . ' NULL DEFAULT NULL';
+            }
+            self::execAlter($pdo, "modify:volume_outlines.{$column}",
+                "ALTER TABLE `volume_outlines` MODIFY COLUMN `{$column}` {$definition}", $errors);
+        }
+
+        foreach (['volume_number' => 'volume_index', 'start_chapter' => 'chapter_from', 'end_chapter' => 'chapter_to'] as $old => $new) {
+            if (!isset($columns[$old])) continue;
+            try {
+                $pdo->exec("UPDATE `volume_outlines` SET `{$new}` = `{$old}`
+                            WHERE `{$old}` > 0 AND (`{$new}` IS NULL OR `{$new}` <> `{$old}`)");
+            } catch (\Throwable $e) {
+                $errors[] = "backfill:volume_outlines.{$old}->{$new} - " . $e->getMessage();
+            }
+        }
     }
 
     /**

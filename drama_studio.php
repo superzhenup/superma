@@ -19,11 +19,24 @@ if (!$episode) {
     header('Location: drama.php');
     exit;
 }
-$project = DramaService::assertProjectAccess((int)$episode['project_id'], (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0));
+$project = DramaService::assertProjectAccess((int)$episode['project_id'], currentUserId());
 $novel = getNovel((int)$project['novel_id']);
 
 pageHeader('漫剧工作台 - 第' . $episode['episode_no'] . '集', 'home');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-drama-studio-parse-script-1', function (event, element) { parseScript(this); });
+AppEvents.register('page-drama-studio-open-asset-modal-2', function (event, element) { openAssetModal(0); });
+AppEvents.register('page-drama-studio-generate-storyboard-3', function (event, element) { generateStoryboard(this); });
+AppEvents.register('page-drama-studio-add-shot-4', function (event, element) { addShot(this); });
+AppEvents.register('page-drama-studio-gen-shot-images-5', function (event, element) { genShotImages(this, null); });
+AppEvents.register('page-drama-studio-gen-shot-videos-6', function (event, element) { genShotVideos(this, null); });
+AppEvents.register('page-drama-studio-compose-episode-7', function (event, element) { composeEpisode(this); });
+AppEvents.register('page-drama-studio-export-zip-8', function (event, element) { exportZip(this); });
+AppEvents.register('page-drama-studio-cancel-tasks-9', function (event, element) { cancelTasks(this); });
+AppEvents.register('page-drama-studio-save-asset-from-modal-10', function (event, element) { saveAssetFromModal(this); });
+</script>
+
 
 <!-- 页头 -->
 <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
@@ -81,10 +94,10 @@ pageHeader('漫剧工作台 - 第' . $episode['episode_no'] . '集', 'home');
                         <button type="button" class="btn btn-outline-secondary" data-type="scene">场景</button>
                         <button type="button" class="btn btn-outline-secondary" data-type="prop">道具</button>
                     </div>
-                    <button type="button" class="btn btn-outline-info btn-sm" id="parse-script-btn" onclick="parseScript(this)">
+                    <button type="button" class="btn btn-outline-info btn-sm" id="parse-script-btn" data-csp-click="page-drama-studio-parse-script-1">
                         <i class="bi bi-file-text me-1"></i>解析剧本
                     </button>
-                    <button type="button" class="btn btn-success btn-sm" onclick="openAssetModal(0)">
+                    <button type="button" class="btn btn-success btn-sm" data-csp-click="page-drama-studio-open-asset-modal-2">
                         <i class="bi bi-plus-circle me-1"></i>手动新建资产
                     </button>
                 </div>
@@ -107,10 +120,10 @@ pageHeader('漫剧工作台 - 第' . $episode['episode_no'] . '集', 'home');
                         <span class="input-group-text">目标镜头数</span>
                         <input type="number" id="target-shots" class="form-control" min="1" max="60" value="12">
                     </div>
-                    <button type="button" class="btn btn-outline-primary btn-sm" id="gen-storyboard-btn" onclick="generateStoryboard(this)">
+                    <button type="button" class="btn btn-outline-primary btn-sm" id="gen-storyboard-btn" data-csp-click="page-drama-studio-generate-storyboard-3">
                         <i class="bi bi-magic me-1"></i>AI 生成分镜
                     </button>
-                    <button type="button" class="btn btn-success btn-sm" onclick="addShot(this)">
+                    <button type="button" class="btn btn-success btn-sm" data-csp-click="page-drama-studio-add-shot-4">
                         <i class="bi bi-plus-circle me-1"></i>添加分镜
                     </button>
                 </div>
@@ -123,6 +136,7 @@ pageHeader('漫剧工作台 - 第' . $episode['episode_no'] . '集', 'home');
 
     <!-- ================= Tab3 分镜图 ================= -->
     <div class="tab-pane fade" id="tab-images" role="tabpanel">
+        <div class="alert alert-info small">分镜图使用资产文字描述生成；定妆照用于人工比对，尚未作为参考图片传入生成接口。请筛选角色外观一致的分镜图后再生成视频。</div>
         <div class="page-card">
             <div class="page-card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
                 <span><i class="bi bi-images me-2"></i>分镜图</span>
@@ -136,7 +150,7 @@ pageHeader('漫剧工作台 - 第' . $episode['episode_no'] . '集', 'home');
                             <option value="4">4</option>
                         </select>
                     </div>
-                    <button type="button" class="btn btn-outline-primary btn-sm" id="gen-all-images-btn" onclick="genShotImages(this, null)">
+                    <button type="button" class="btn btn-outline-primary btn-sm" id="gen-all-images-btn" data-csp-click="page-drama-studio-gen-shot-images-5">
                         <i class="bi bi-stars me-1"></i>全部抽卡
                     </button>
                 </div>
@@ -154,7 +168,7 @@ pageHeader('漫剧工作台 - 第' . $episode['episode_no'] . '集', 'home');
         <div class="page-card">
             <div class="page-card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
                 <span><i class="bi bi-camera-reels me-2"></i>分镜视频</span>
-                <button type="button" class="btn btn-outline-primary btn-sm" id="gen-all-videos-btn" onclick="genShotVideos(this, null)">
+                <button type="button" class="btn btn-outline-primary btn-sm" id="gen-all-videos-btn" data-csp-click="page-drama-studio-gen-shot-videos-6">
                     <i class="bi bi-play-circle me-1"></i>全部生成视频
                 </button>
             </div>
@@ -194,13 +208,13 @@ pageHeader('漫剧工作台 - 第' . $episode['episode_no'] . '集', 'home');
                     </div>
                 </div>
                 <div class="d-flex flex-wrap gap-2 mb-3">
-                    <button type="button" class="btn btn-primary" id="compose-btn" onclick="composeEpisode(this)">
+                    <button type="button" class="btn btn-primary" id="compose-btn" data-csp-click="page-drama-studio-compose-episode-7">
                         <i class="bi bi-collection-play me-1"></i>合成成片
                     </button>
-                    <button type="button" class="btn btn-outline-success" id="export-btn" onclick="exportZip(this)">
+                    <button type="button" class="btn btn-outline-success" id="export-btn" data-csp-click="page-drama-studio-export-zip-8">
                         <i class="bi bi-file-zip me-1"></i>导出素材包
                     </button>
-                    <button type="button" class="btn btn-outline-danger" id="cancel-tasks-btn" onclick="cancelTasks(this)">
+                    <button type="button" class="btn btn-outline-danger" id="cancel-tasks-btn" data-csp-click="page-drama-studio-cancel-tasks-9">
                         <i class="bi bi-x-circle me-1"></i>取消全部待执行任务
                     </button>
                 </div>
@@ -254,7 +268,7 @@ pageHeader('漫剧工作台 - 第' . $episode['episode_no'] . '集', 'home');
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-                <button type="button" class="btn btn-primary" id="asset-save-btn" onclick="saveAssetFromModal(this)">
+                <button type="button" class="btn btn-primary" id="asset-save-btn" data-csp-click="page-drama-studio-save-asset-from-modal-10">
                     <i class="bi bi-check-circle me-1"></i>保存
                 </button>
             </div>
@@ -303,7 +317,7 @@ pageHeader('漫剧工作台 - 第' . $episode['episode_no'] . '集', 'home');
 #shot-table-wrap textarea { resize: vertical; min-height: 44px; }
 </style>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 const DRAMA_EPISODE_ID = <?= (int)$id ?>;
 const DRAMA_PROJECT_ID = <?= (int)$project['id'] ?>;
 </script>

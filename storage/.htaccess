@@ -1,18 +1,20 @@
-# 拒绝所有直接访问（除封面目录外）
+# 拒绝所有直接访问（封面及漫剧静态媒体除外）
 <IfModule mod_rewrite.c>
     RewriteEngine On
     # 仅允许 /storage/covers/ 下的文件直接访问
     RewriteRule ^covers/ - [L]
+    # Only direct media filenames; the drama child rules continue to reject scripts.
+    RewriteRule ^drama/(?:[^/.]+/)*[^/.]+\.(?:jpg|jpeg|png|webp|gif|mp4|webm|mov)$ - [L]
     # 其余全部拒绝
     RewriteRule .* - [F]
 </IfModule>
 
 <IfModule !mod_rewrite.c>
     <IfModule mod_authz_core.c>
-        # Apache 2.4
-        <DirectoryMatch "^.*$">
-            Require all denied
-        </DirectoryMatch>
+        # Apache 2.4。<DirectoryMatch> 不允许出现在 .htaccess 中（会令整个
+        # storage 返回 500），直接拒绝即可；covers/、drama/ 的子 .htaccess
+        # 自带媒体白名单，会覆盖此处规则。
+        Require all denied
     </IfModule>
     <IfModule !mod_authz_core.c>
         # Apache 2.2

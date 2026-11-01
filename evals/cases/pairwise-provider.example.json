@@ -1,0 +1,6 @@
+{
+  "schema": "harness.eval.judge_provider.v1",
+  "base_url": "https://api.example.com/v1",
+  "api_key_env": "PAIRWISE_JUDGE_API_KEY",
+  "timeout_seconds": 120
+}

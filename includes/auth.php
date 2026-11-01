@@ -1,13 +1,18 @@
 <?php
 defined('APP_LOADED') or die('Direct access denied.');
+require_once __DIR__ . '/RequestSecurity.php';
+require_once __DIR__ . '/ContentSecurityPolicy.php';
+require_once __DIR__ . '/maintenance.php';
+ContentSecurityPolicy::send();
 
 // 启动 Session
 if (session_status() === PHP_SESSION_NONE) {
     // 设置 session cookie 安全属性（S2：兼容反向代理协议检测）
-    $secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
-        || ((int)($_SERVER['SERVER_PORT'] ?? 0) === 443)
-        || (defined('FORCE_HTTPS') && FORCE_HTTPS === true);
+    $secure = RequestSecurity::isHttps(
+        $_SERVER,
+        defined('FORCE_HTTPS') && FORCE_HTTPS === true,
+        defined('TRUSTED_PROXIES') && is_array(TRUSTED_PROXIES) ? TRUSTED_PROXIES : []
+    );
     session_set_cookie_params([
         'lifetime' => 0,
         'path' => '/',
@@ -22,6 +27,12 @@ if (session_status() === PHP_SESSION_NONE) {
 // 审计优化 P3-9（2026-06-16）：加载 CLI 上下文标记类
 // 用于 requireLoginApi / enforceSessionLifecycle 短路 CLI worker 的会话检查
 require_once __DIR__ . '/CliContext.php';
+
+// 审计 2026-08-13 #3 修复补充（2026-08-19）：adminCredentialsConfigured()/doLogin()
+// 依赖 helpers.php 的 loadAdminCredentials()，但 login.php 等入口只加载本文件，
+// 导致 "Call to undefined function loadAdminCredentials()" 致命错误。
+// 此处显式加载（helpers.php 为纯工具函数，无 DB/反向依赖），保证本文件自洽可用。
+require_once __DIR__ . '/helpers.php';
 
 /**
  * 检测系统是否已完成安装（install.lock 存在即视为已安装）
@@ -47,6 +58,9 @@ function requireLogin(): void {
         header('Location: install.php');
         exit;
     }
+    // 审计修复 F02（2026-11-01）：恢复期间的维护标记必须挡住已登录会话的根页面
+    // （创建/设置/导入等页面的 POST 都在 requireLogin 之后才碰数据库）。
+    maintenanceGuardPage();
     if (empty($_SESSION['logged_in'])) {
         header('Location: login.php');
         exit;
@@ -94,6 +108,14 @@ function enforceSessionLifecycle(bool $api): void {
 }
 
 /**
+ * 获取当前登录用户 ID（统一会话键回退顺序）。
+ * 单用户系统下登录即管理员（user_id=1）。
+ */
+function currentUserId(): int {
+    return (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+}
+
+/**
  * API 级鉴权（适用于 api/ 目录接口，返回 JSON 而非跳转）
  *
  * 行为：
@@ -111,6 +133,10 @@ function requireLoginApi(bool $enforceCsrf = true): void {
     // 审计优化 P3-9（2026-06-16）：CLI worker 上下文跳过登录校验
     // CLI worker 由 write_start.php 在已验证登录后启动，无需重复校验
     if (CliContext::isActive()) return;
+
+    // 审计修复 F02：路由器已在入口检查维护标记；这里覆盖不经路由器直连的 API 文件
+    // （Nginx 未配置 api/ 拦截时），保证任何 HTTP 写入口在恢复期间都返回 503。
+    maintenanceGuardHttp();
 
     if (empty($_SESSION['logged_in'])) {
         if (ob_get_level()) ob_end_clean();
@@ -157,15 +183,17 @@ function requireHttpMethod($allowed): void {
     exit;
 }
 
-/** 管理员账号和 password_hash 散列是否已正确写入配置。 */
+/** 管理员账号和 password_hash 散列是否已正确写入配置。
+ *  审计 2026-08-13 #3：通过 loadAdminCredentials() 统一读取，
+ *  兼容 storage/admin_credentials.json（优先）与 config.php 常量（回退）。 */
 function adminCredentialsConfigured(): bool {
-    if (!defined('ADMIN_USER') || !defined('ADMIN_PASS') || ADMIN_USER === '') {
+    $cred = loadAdminCredentials();
+    if ($cred['user'] === '' || $cred['pass_hash'] === '') {
         return false;
     }
 
-    $hash = (string)ADMIN_PASS;
-    return $hash !== ''
-        && strlen($hash) >= 50
+    $hash = $cred['pass_hash'];
+    return strlen($hash) >= 50
         && preg_match('/^\$(2[axy]|argon2(i|id)?)\$/', $hash) === 1;
 }
 
@@ -179,8 +207,8 @@ function doLogin(string $user, string $pass): bool {
     if ($pass === '') {
         return false;
     }
-    $hash = (string)ADMIN_PASS;
-    return hash_equals(ADMIN_USER, $user) && password_verify($pass, $hash);
+    $cred = loadAdminCredentials();
+    return hash_equals($cred['user'], $user) && password_verify($pass, $cred['pass_hash']);
 }
 
 /**
@@ -258,8 +286,26 @@ function csrf_verify_api(): void {
 //
 // 旧实现把失败计数存在 $_SESSION 中——攻击者只要不带 session cookie
 // 每次请求就会拿到全新计数器，暴力破解防护形同虚设。
-// 这里改为按 REMOTE_ADDR 写文件持久化（不可通过丢弃 cookie / 伪造头绕过）。
+// 这里改为按 REMOTE_ADDR 持久化（不可通过丢弃 cookie / 伪造头绕过）。
+//
+// 审计修复（2026-08-02 H1-DB）：存储从文件锁迁移到数据库。
+//   - Windows NTFS 上 flock(LOCK_EX|LOCK_NB) 在某些 PHP 版本永远返回
+//     false → 旧实现会改为不加锁直接读改写，并发失败请求丢失计数，绕过锁定阈值。
+//   - 文件方案并发写还会触发 JSON 截断 / flock 饥饿。
+//   - DB 方案用 InnoDB 行锁 + 事务保证原子性，跨平台行为一致。
+//   - install.php 运行时表尚未建好，或 DB 不可用时降级回文件方案（锁定阈值不变）。
+//
+// 审计整改 C2（2026-10-31）：
+//   - login.php 原先从未加载 DB 类，上面的 DB 路径实际从没生效；现已加载。
+//   - 登录改为在校验密码之前由 loginThrottleAdmit() 原子地“判定 + 计数”。
+//   - 文件锁拿不到、DB 事务失败时一律拒绝本次尝试（busy），不再无锁读改写，
+//     也不在 DB 出错时改写文件。代价：若某平台 flock 始终失败且 DB 不可用，登录会被拒绝
+//     并在错误日志里留下原因——这比放开暴力破解更安全。
 // ============================================================
+
+/** 登录失败锁定阈值：达到 10 次锁定 15 分钟 */
+function loginThrottleLockoutThreshold(): int { return 10; }
+function loginThrottleLockoutSeconds(): int { return 15 * 60; }
 
 /**
  * 取连接方真实 IP。
@@ -271,7 +317,29 @@ function clientIp(): string {
     return filter_var($ip, FILTER_VALIDATE_IP) ? $ip : '0.0.0.0';
 }
 
-/** 限速数据目录（不存在则创建，并放置 deny-all .htaccess） */
+/**
+ * 检测 DB 限速表是否可用（install 阶段 / DB 故障时返回 false）。
+ * 单次请求内缓存结果，避免每次登录都做 information_schema 探测。
+ */
+function loginThrottleDbReady(): bool {
+    static $ready = null;
+    if ($ready !== null) return $ready;
+    try {
+        if (!class_exists('DB', false)) {
+            $ready = false;
+            return $ready;
+        }
+        // 用 SHOW TABLES 比 information_schema 查询轻量；
+        // 失败（连接错误/表不存在）一律降级到文件方案。
+        $row = \DB::fetch("SHOW TABLES LIKE 'login_throttle'");
+        $ready = !empty($row);
+    } catch (\Throwable $e) {
+        $ready = false;
+    }
+    return $ready;
+}
+
+/** 限速数据目录（文件降级路径用，不存在则创建，并放置 deny-all .htaccess） */
 function loginThrottleDir(): string {
     $dir = (defined('BASE_PATH') ? BASE_PATH : dirname(__DIR__)) . '/storage/login_throttle';
     if (!is_dir($dir)) {
@@ -284,7 +352,7 @@ function loginThrottleDir(): string {
     return $dir;
 }
 
-/** 单个 IP 的限速状态文件路径 */
+/** 单个 IP 的限速状态文件路径（仅文件降级路径使用） */
 function loginThrottleFile(string $ip): string {
     return loginThrottleDir() . '/' . sha1($ip) . '.json';
 }
@@ -294,8 +362,31 @@ function loginThrottleFile(string $ip): string {
  * @return array{attempts:int,last_attempt:int,lockout_until:int}
  */
 function loginThrottleState(string $ip): array {
-    $file = loginThrottleFile($ip);
     $default = ['attempts' => 0, 'last_attempt' => 0, 'lockout_until' => 0];
+
+    // DB 主路径
+    if (loginThrottleDbReady()) {
+        try {
+            $row = \DB::fetch(
+                'SELECT attempts, last_attempt, lockout_until FROM login_throttle WHERE ip_hash=? LIMIT 1',
+                [sha1($ip)]
+            );
+            if ($row) {
+                return [
+                    'attempts'      => (int)$row['attempts'],
+                    'last_attempt'  => (int)$row['last_attempt'],
+                    'lockout_until' => (int)$row['lockout_until'],
+                ];
+            }
+            return $default;
+        } catch (\Throwable $e) {
+            // DB 异常时降级到文件读取，确保登录页可用
+            error_log('loginThrottleState DB read failed, fallback to file: ' . $e->getMessage());
+        }
+    }
+
+    // 文件降级路径
+    $file = loginThrottleFile($ip);
     if (!is_file($file)) return $default;
     $data = json_decode((string)@file_get_contents($file), true);
     if (!is_array($data)) return $default;
@@ -306,7 +397,10 @@ function loginThrottleState(string $ip): array {
     ];
 }
 
-/** 写入限速状态 */
+/**
+ * 写入限速状态（仅文件降级路径使用）。
+ * 保留为 public 以便旧测试桩 monkey-patch；生产路径不调用。
+ */
 function loginThrottleSave(string $ip, array $state): void {
     $file = loginThrottleFile($ip);
     @file_put_contents(
@@ -318,79 +412,231 @@ function loginThrottleSave(string $ip, array $state): void {
 }
 
 /**
- * 记录一次登录失败，返回更新后的状态。
- * 达到 10 次锁定 15 分钟。
+ * 在存储的排他锁内对某 IP 的限速状态做一次“读-判-写”。
+ *
+ * 审计整改 C2（2026-10-31）：登录准入必须是原子的。DB 可用时用事务 + FOR UPDATE 行锁
+ * （先确保行存在，避免首次访问时锁不到行）；否则用文件 flock。拿不到锁、事务失败时
+ * 返回 null，由调用方按“失败即拒绝”处理——不再有无锁读改写回退，也不在 DB 出错时
+ * 改用文件，避免同一 IP 的计数分裂到两个存储里。
+ *
+ * @param callable(array{attempts:int,last_attempt:int,lockout_until:int}, int): array{0: ?array, 1: mixed} $mutate
+ *        返回 [要写回的新状态（null 表示不写）, 结果]
+ * @return array{result: mixed}|null
  */
-function loginThrottleRecordFail(string $ip): array {
+function loginThrottleMutate(string $ip, callable $mutate): ?array {
+    $normalize = static fn(array $s): array => [
+        'attempts'      => (int)($s['attempts'] ?? 0),
+        'last_attempt'  => (int)($s['last_attempt'] ?? 0),
+        'lockout_until' => (int)($s['lockout_until'] ?? 0),
+    ];
+
+    // ===== DB 主路径：事务 + FOR UPDATE 行锁 =====
+    if (loginThrottleDbReady()) {
+        $ipHash = sha1($ip);
+        for ($try = 1; $try <= 3; $try++) {
+            try {
+                \DB::execute(
+                    'INSERT INTO login_throttle (ip_hash, attempts, last_attempt, lockout_until) VALUES (?, 0, 0, 0)'
+                    . ' ON DUPLICATE KEY UPDATE ip_hash = ip_hash',
+                    [$ipHash]
+                );
+                if (!\DB::beginTransaction()) {
+                    throw new \RuntimeException('nested transaction');
+                }
+                try {
+                    $row = \DB::fetch(
+                        'SELECT attempts, last_attempt, lockout_until FROM login_throttle WHERE ip_hash=? FOR UPDATE',
+                        [$ipHash]
+                    );
+                    [$next, $result] = $mutate($normalize(is_array($row) ? $row : []), time());
+                    if ($next !== null) {
+                        $next = $normalize($next);
+                        \DB::execute(
+                            'UPDATE login_throttle SET attempts=?, last_attempt=?, lockout_until=? WHERE ip_hash=?',
+                            [$next['attempts'], $next['last_attempt'], $next['lockout_until'], $ipHash]
+                        );
+                    }
+                    \DB::commit();
+                    return ['result' => $result];
+                } catch (\Throwable $e) {
+                    \DB::rollBack();
+                    throw $e;
+                }
+            } catch (\Throwable $e) {
+                // 首次访问时并发插入同一键可能死锁（SQLSTATE 40001），重试即可；其他错误直接失败即拒绝。
+                $deadlock = $e instanceof \PDOException && (string)$e->getCode() === '40001';
+                if ($deadlock && $try < 3) continue;
+                error_log('login throttle DB update failed, denying this attempt: ' . $e->getMessage());
+                return null;
+            }
+        }
+        return null;
+    }
+
+    // ===== 文件路径：有界等待的排他 flock；拿不到锁就失败即拒绝 =====
     $file = loginThrottleFile($ip);
-
-    // M-6 修复（2026-07-20）：原无锁回退路径存在 TOCTOU 竞态——
-    // loginThrottleState() 无锁读取 → 内存 +1 → loginThrottleSave()
-    // 带锁写入，并发时丢失计数。改为 retry 方案：最多重试 3 次获取
-    // 文件锁，每次间隔 50ms，仍失败才走无锁回退（此时写入仍带 LOCK_EX，
-    // 已尽量降低丢失概率）。
-    $maxRetries = 3;
-    for ($retry = 0; $retry < $maxRetries; $retry++) {
-        $fp = @fopen($file, 'c+');
-        if ($fp !== false && flock($fp, LOCK_EX | LOCK_NB)) {
-            // 正常带锁路径
-            rewind($fp);
-            $data = json_decode((string)stream_get_contents($fp), true);
-            $s = is_array($data) ? [
-                'attempts'      => (int)($data['attempts'] ?? 0),
-                'last_attempt'  => (int)($data['last_attempt'] ?? 0),
-                'lockout_until' => (int)($data['lockout_until'] ?? 0),
-            ] : ['attempts' => 0, 'last_attempt' => 0, 'lockout_until' => 0];
-
-            $s['attempts']     = $s['attempts'] + 1;
-            $s['last_attempt'] = $now = time();
-
-            if ($now > $s['lockout_until'] && $s['lockout_until'] > 0) {
-                $s['attempts'] = 1;
-                $s['lockout_until'] = 0;
-            }
-
-            if ($s['attempts'] >= 10) {
-                $s['lockout_until'] = $now + 15 * 60;
-            }
-
+    $fp = @fopen($file, 'c+');
+    if ($fp === false) {
+        error_log('login throttle state file cannot be opened, denying this attempt: ' . $file);
+        return null;
+    }
+    $deadline = microtime(true) + 2.0;
+    while (!flock($fp, LOCK_EX | LOCK_NB)) {
+        if (microtime(true) >= $deadline) {
+            fclose($fp);
+            error_log('login throttle state file stayed locked for 2s, denying this attempt: ' . $file);
+            return null;
+        }
+        usleep(20000);
+    }
+    try {
+        rewind($fp);
+        $data = json_decode((string)stream_get_contents($fp), true);
+        [$next, $result] = $mutate($normalize(is_array($data) ? $data : []), time());
+        if ($next !== null) {
             rewind($fp);
             ftruncate($fp, 0);
-            fwrite($fp, json_encode($s, JSON_UNESCAPED_UNICODE));
+            fwrite($fp, json_encode($normalize($next), JSON_UNESCAPED_UNICODE));
             fflush($fp);
-            flock($fp, LOCK_UN);
-            fclose($fp);
-            @chmod($file, 0600);
-            return $s;
         }
-        if (is_resource($fp)) {
-            flock($fp, LOCK_UN);
-            fclose($fp);
-        }
-        if ($retry < $maxRetries - 1) {
-            usleep(50000); // 50ms 等待后重试
-        }
+        return ['result' => $result];
+    } finally {
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        @chmod($file, 0600);
     }
+}
 
-    // 重试耗尽，走无锁回退（仍尽量降低并发窗口）
-    $s = loginThrottleState($ip);
-    $s['attempts']++;
-    $s['last_attempt'] = $now = time();
-    if ($now > $s['lockout_until'] && $s['lockout_until'] > 0) {
-        $s['attempts'] = 1;
+/**
+ * 登录准入的判定（纯函数，在 loginThrottleMutate 的锁内调用）：
+ * 锁定期内拒绝；渐进延迟（每次尝试 +2 秒，最多 30 秒）未到拒绝；否则占用一次尝试额度，
+ * 达到阈值即同时设置锁定。被拒绝的请求不计数。
+ *
+ * @return array{0: ?array, 1: array{allowed:bool, reason:string, wait:int, state:array}}
+ */
+function loginThrottleAdmitDecision(array $s, int $now): array {
+    if ($s['lockout_until'] > $now) {
+        return [null, ['allowed' => false, 'reason' => 'locked', 'wait' => $s['lockout_until'] - $now, 'state' => $s]];
+    }
+    if ($s['lockout_until'] > 0) {
+        // 锁定期已过：重新计数
+        $s['attempts'] = 0;
         $s['lockout_until'] = 0;
     }
-    if ($s['attempts'] >= 10) {
-        $s['lockout_until'] = $now + 15 * 60;
+    $delay = min(30, $s['attempts'] * 2);
+    if ($delay > 0 && $now - $s['last_attempt'] < $delay) {
+        return [null, ['allowed' => false, 'reason' => 'wait', 'wait' => $delay, 'state' => $s]];
     }
-    loginThrottleSave($ip, $s);
-    return $s;
+    $s['attempts']++;
+    $s['last_attempt'] = $now;
+    if ($s['attempts'] >= loginThrottleLockoutThreshold()) {
+        $s['lockout_until'] = $now + loginThrottleLockoutSeconds();
+    }
+    return [$s, ['allowed' => true, 'reason' => '', 'wait' => 0, 'state' => $s]];
+}
+
+/**
+ * 在校验密码之前原子地占用一次尝试额度。
+ *
+ * 原流程先读状态、校验密码、失败后才记录：并发请求能同时通过读检查，渐进延迟和锁定阈值
+ * 都可被并发绕过。现在“判定 + 计数”在同一把锁内完成；登录成功再由 loginThrottleReset() 清零。
+ * 存储不可用（打不开、锁不住、事务失败）时拒绝本次尝试（reason=busy）。
+ *
+ * @return array{allowed:bool, reason:string, wait:int, state:array}
+ */
+function loginThrottleAdmit(string $ip): array {
+    $outcome = loginThrottleMutate($ip, 'loginThrottleAdmitDecision');
+    if ($outcome === null) {
+        return ['allowed' => false, 'reason' => 'busy', 'wait' => 0,
+            'state' => ['attempts' => 0, 'last_attempt' => 0, 'lockout_until' => 0]];
+    }
+    return $outcome['result'];
+}
+
+/**
+ * 记录一次登录失败，返回更新后的状态。
+ * 达到 loginThrottleLockoutThreshold() 次锁定 loginThrottleLockoutSeconds() 秒。
+ *
+ * 登录页已改用 loginThrottleAdmit() 在校验前计数；本函数保留给需要“事后记一次失败”的调用方，
+ * 与准入共用同一把锁。存储不可用时不写入、只记日志，返回当前读到的状态。
+ */
+function loginThrottleRecordFail(string $ip): array {
+    $outcome = loginThrottleMutate($ip, static function (array $s, int $now): array {
+        if ($s['lockout_until'] > 0 && $now > $s['lockout_until']) {
+            // 锁定期已过 → 复位为本次失败
+            $s['attempts'] = 1;
+            $s['lockout_until'] = 0;
+        } else {
+            $s['attempts']++;
+            if ($s['attempts'] >= loginThrottleLockoutThreshold()) {
+                $s['lockout_until'] = $now + loginThrottleLockoutSeconds();
+            }
+        }
+        $s['last_attempt'] = $now;
+        return [$s, $s];
+    });
+    if ($outcome === null) {
+        error_log('loginThrottleRecordFail could not lock the throttle store; failure not recorded');
+        return loginThrottleState($ip);
+    }
+    return $outcome['result'];
 }
 
 /** 登录成功后清除该 IP 的限速记录 */
 function loginThrottleReset(string $ip): void {
+    // DB 主路径
+    if (loginThrottleDbReady()) {
+        try {
+            \DB::execute('DELETE FROM login_throttle WHERE ip_hash=?', [sha1($ip)]);
+            return;
+        } catch (\Throwable $e) {
+            error_log('loginThrottleReset DB delete failed, fallback to file: ' . $e->getMessage());
+        }
+    }
+
+    // 文件降级路径
     $file = loginThrottleFile($ip);
     if (is_file($file)) @unlink($file);
+}
+
+/**
+ * 归属校验共用的“NULL 自动认领 + 竞态复核”（复审 T7，2026-10-31）。
+ *
+ * 原先在 checkNovelOwnership / checkChapterOwnership / requireNovelAccess /
+ * requireShortStoryAccess 中逐字重复，鉴权口径改动需同步四处。语义保持不变：
+ *   - 已有归属：仅当等于当前用户时通过，不写库；
+ *   - 归属为 NULL：条件 UPDATE 认领（H-NEW-1：并发时只有一方 affected=1），
+ *     affected=0 说明被抢先认领，复核最新归属是否为当前用户。
+ *   - 审计修复 F03（2026-11-01）：short_stories.user_id 是 NOT NULL DEFAULT 0，历史无主短篇
+ *     为 0（旧库可能是 NULL），两者都按无主认领；novels 仍只有 NULL 表示无主。无效用户一律拒绝。
+ *
+ * @param string $table        归属表（白名单：novels / short_stories）
+ * @param int    $id           行 ID
+ * @param int    $userId       当前用户（调用方应已确保 > 0，此处再次拒绝 <= 0）
+ * @param mixed  $currentOwner 已读取的 user_id（NULL=未认领；short_stories 的 0 同样未认领）
+ * @return bool 当前用户拥有该行（含刚认领成功）
+ */
+function claimOrVerifyOwner(string $table, int $id, int $userId, mixed $currentOwner): bool {
+    if (!in_array($table, ['novels', 'short_stories'], true)) {
+        throw new InvalidArgumentException('Unsupported ownership table.');
+    }
+    if ($userId <= 0) {
+        return false;
+    }
+    $zeroIsUnowned = $table === 'short_stories';
+    if ($currentOwner !== null && !($zeroIsUnowned && (int)$currentOwner === 0)) {
+        return (int)$currentOwner === $userId;
+    }
+    $unowned = $zeroIsUnowned ? '(user_id IS NULL OR user_id=0)' : 'user_id IS NULL';
+    $affected = DB::execute(
+        "UPDATE {$table} SET user_id=? WHERE id=? AND {$unowned}",
+        [$userId, $id]
+    );
+    if ($affected !== 0) {
+        return true;
+    }
+    $recheck = DB::fetch("SELECT user_id FROM {$table} WHERE id=?", [$id]);
+    return (int)($recheck['user_id'] ?? 0) === $userId;
 }
 
 /**
@@ -422,22 +668,8 @@ function checkNovelOwnership(int $novelId, int $userId): void {
         http_response_code(403);
         jsonResponse(false, null, '会话异常，请重新登录', 'forbidden');
     }
-    if ($novel['user_id'] === null) {
-        // 审计修复 H-NEW-1（2026-06-15）：自动认领后验证 UPDATE 确实影响了行，
-        // 防止并发请求竞态——两个请求同时通过 user_id IS NULL 检查。
-        // MySQL 行锁保证只有一方能成功 update，另一方 affected=0 须重新验证。
-        $affected = DB::execute(
-            'UPDATE novels SET user_id=? WHERE id=? AND user_id IS NULL',
-            [$userId, $novelId]
-        );
-        if ($affected === 0) {
-            $recheck = DB::fetch('SELECT user_id FROM novels WHERE id=?', [$novelId]);
-            if ((int)($recheck['user_id'] ?? 0) !== $userId) {
-                http_response_code(403);
-                jsonResponse(false, null, '无权操作此小说', 'forbidden');
-            }
-        }
-    } elseif ((int)$novel['user_id'] !== $userId) {
+    // 审计修复 H-NEW-1（2026-06-15）的认领竞态复核已收敛到 claimOrVerifyOwner()。
+    if (!claimOrVerifyOwner('novels', $novelId, $userId, $novel['user_id'])) {
         http_response_code(403);
         jsonResponse(false, null, '无权操作此小说', 'forbidden');
     }
@@ -482,20 +714,7 @@ function checkChapterOwnership(int $chapterId, int $userId): void {
         http_response_code(403);
         jsonResponse(false, null, '会话异常，请重新登录', 'forbidden');
     }
-    if ($chapter['user_id'] === null) {
-        // 审计修复 H-NEW-1（2026-06-15）：同 checkNovelOwnership 竞态修复
-        $affected = DB::execute(
-            'UPDATE novels SET user_id=? WHERE id=? AND user_id IS NULL',
-            [$userId, (int)$chapter['novel_id']]
-        );
-        if ($affected === 0) {
-            $recheck = DB::fetch('SELECT user_id FROM novels WHERE id=?', [(int)$chapter['novel_id']]);
-            if ((int)($recheck['user_id'] ?? 0) !== $userId) {
-                http_response_code(403);
-                jsonResponse(false, null, '无权操作此章节', 'forbidden');
-            }
-        }
-    } elseif ((int)$chapter['user_id'] !== $userId) {
+    if (!claimOrVerifyOwner('novels', (int)$chapter['novel_id'], $userId, $chapter['user_id'])) {
         http_response_code(403);
         jsonResponse(false, null, '无权操作此章节', 'forbidden');
     }
@@ -521,22 +740,13 @@ function requireNovelAccess($novel, string $redirect = 'index.php'): array {
         header('Location: ' . $redirect);
         exit;
     }
-    if (($novel['user_id'] ?? null) === null) {
-        $affected = DB::execute(
-            'UPDATE novels SET user_id=? WHERE id=? AND user_id IS NULL',
-            [$userId, (int)$novel['id']]
-        );
-        if ($affected === 0) {
-            $recheck = DB::fetch('SELECT user_id FROM novels WHERE id=?', [(int)$novel['id']]);
-            if ((int)($recheck['user_id'] ?? 0) !== $userId) {
-                header('Location: ' . $redirect);
-                exit;
-            }
-        }
-        $novel['user_id'] = $userId;
-    } elseif ((int)$novel['user_id'] !== $userId) {
+    $wasUnowned = ($novel['user_id'] ?? null) === null;
+    if (!claimOrVerifyOwner('novels', (int)$novel['id'], $userId, $novel['user_id'] ?? null)) {
         header('Location: ' . $redirect);
         exit;
+    }
+    if ($wasUnowned) {
+        $novel['user_id'] = $userId;
     }
     return $novel;
 }
@@ -560,22 +770,14 @@ function requireShortStoryAccess(?array $story, string $redirect = 'shorts.php')
         header('Location: ' . $redirect);
         exit;
     }
-    if (($story['user_id'] ?? null) === null) {
-        $affected = DB::execute(
-            'UPDATE short_stories SET user_id=? WHERE id=? AND user_id IS NULL',
-            [$userId, (int)$story['id']]
-        );
-        if ($affected === 0) {
-            $recheck = DB::fetch('SELECT user_id FROM short_stories WHERE id=?', [(int)$story['id']]);
-            if ((int)($recheck['user_id'] ?? 0) !== $userId) {
-                header('Location: ' . $redirect);
-                exit;
-            }
-        }
-        $story['user_id'] = $userId;
-    } elseif ((int)$story['user_id'] !== $userId) {
+    // short_stories 的历史无主值是 0（旧库可能为 NULL），与 claimOrVerifyOwner 口径一致。
+    $wasUnowned = ($story['user_id'] ?? null) === null || (int)$story['user_id'] === 0;
+    if (!claimOrVerifyOwner('short_stories', (int)$story['id'], $userId, $story['user_id'] ?? null)) {
         header('Location: ' . $redirect);
         exit;
+    }
+    if ($wasUnowned) {
+        $story['user_id'] = $userId;
     }
     return $story;
 }

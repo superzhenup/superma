@@ -8,7 +8,7 @@
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
@@ -48,12 +48,18 @@ try {
             $apiUrl = (string)getSystemSetting('video_gen_api_url', '');
             $providers = [];
             foreach (VideoGenerationProtocol::PROVIDERS as $key => $meta) {
-                $providers[] = ['key' => $key, 'label' => $meta['label'], 'default_base' => $meta['default_base']];
+                $providers[] = [
+                    'key' => $key,
+                    'label' => $meta['label'],
+                    'default_base' => $meta['default_base'],
+                    'default_model' => $meta['default_model'],
+                ];
             }
+            $storedModel = trim((string)getSystemSetting('video_gen_model', ''));
             echo json_encode(['ok' => true, 'data' => [
                 'provider'    => $provider,
                 'api_url'     => $apiUrl !== '' ? $apiUrl : VideoGenerationProtocol::defaultBaseUrl($provider),
-                'model'       => getSystemSetting('video_gen_model', ''),
+                'model'       => $storedModel !== '' ? $storedModel : VideoGenerationProtocol::defaultModel($provider),
                 'has_api_key' => $apiKey !== '',
                 'api_key_hint' => $apiKey !== '' ? '末四位 ' . substr($apiKey, -4) : '',
                 'providers'   => $providers,
@@ -69,6 +75,7 @@ try {
             $apiKey = trim((string)($jsonInput['api_key'] ?? ''));
             $model = trim((string)($jsonInput['model'] ?? ''));
             if ($apiUrl === '') $apiUrl = VideoGenerationProtocol::defaultBaseUrl($provider);
+            if ($model === '') $model = VideoGenerationProtocol::defaultModel($provider);
 
             DramaMediaClient::assertSafeEndpoint(VideoGenerationProtocol::submitEndpoint($provider, $apiUrl));
 
@@ -117,7 +124,7 @@ try {
                 default               => null,
             };
             if ($probeEndpoint !== null) {
-                $resp = DramaMediaClient::requestJson($probeEndpoint, ['Authorization: Bearer ' . $apiKey], null, 30);
+                $resp = DramaMediaClient::requestJson($probeEndpoint, VideoGenerationProtocol::queryHeaders($provider, $apiKey), null, 30);
                 if ($resp['status'] < 200 || $resp['status'] >= 300) {
                     error_log("Video API auth probe failed: HTTP {$resp['status']}, provider={$provider}");
                     throw new RuntimeException("视频生成服务鉴权探针返回 HTTP {$resp['status']}");
@@ -128,7 +135,7 @@ try {
                 $endpoint = VideoGenerationProtocol::submitEndpoint($provider, $apiUrl);
                 DramaMediaClient::assertSafeEndpoint($endpoint);
                 try {
-                    DramaMediaClient::requestJson($endpoint, ['Authorization: Bearer ' . $apiKey], null, 30, 64 * 1024);
+                    DramaMediaClient::requestJson($endpoint, VideoGenerationProtocol::queryHeaders($provider, $apiKey), null, 30, 64 * 1024);
                 } catch (RuntimeException $e) {
                     if (str_contains($e->getMessage(), '连接失败')) {
                         throw new RuntimeException('视频生成服务连接失败');

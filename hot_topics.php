@@ -9,6 +9,16 @@ require_once __DIR__ . '/includes/layout.php';
 
 pageHeader('热门选题', 'hot_topics');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-hot-topics-open-settings-modal-1', function (event, element) { openSettingsModal(); });
+AppEvents.register('page-hot-topics-apply-filter-2', function (event, element) { applyFilter(); });
+AppEvents.register('page-hot-topics-reset-filter-3', function (event, element) { resetFilter(); });
+AppEvents.register('page-hot-topics-close-detail-backdrop', function (event, element) { if(event.target===this)closeModal('detailModal'); });
+AppEvents.register('page-hot-topics-close-modal-5', function (event, element) { closeModal('detailModal'); });
+AppEvents.register('page-hot-topics-close-settings-backdrop', function (event, element) { if(event.target===this)closeModal('settingsModal'); });
+AppEvents.register('page-hot-topics-close-modal-7', function (event, element) { closeModal('settingsModal'); });
+</script>
+
 
 <style>
 .ht-wrap { padding: 1rem 1.2rem; }
@@ -156,7 +166,7 @@ pageHeader('热门选题', 'hot_topics');
 
 <div class="ht-title">
   <i class="bi bi-fire"></i> 热门选题
-  <button class="btn-setting" onclick="openSettingsModal()"><i class="bi bi-gear me-1"></i>设置</button>
+  <button class="btn-setting" data-csp-click="page-hot-topics-open-settings-modal-1"><i class="bi bi-gear me-1"></i>设置</button>
 </div>
 
 <!-- Source Tabs -->
@@ -197,8 +207,8 @@ pageHeader('热门选题', 'hot_topics');
   </select>
   <label>搜索：</label>
   <input type="text" id="filterKeyword" placeholder="书名/作者" style="min-width:200px">
-  <button onclick="applyFilter()">应用</button>
-  <button class="btn-secondary" onclick="resetFilter()">重置</button>
+  <button data-csp-click="page-hot-topics-apply-filter-2">应用</button>
+  <button class="btn-secondary" data-csp-click="page-hot-topics-reset-filter-3">重置</button>
 </div>
 
 <!-- Dashboard -->
@@ -231,17 +241,17 @@ pageHeader('热门选题', 'hot_topics');
 </div>
 
 <!-- Detail Modal -->
-<div class="ht-modal-bg" id="detailModal" onclick="if(event.target===this)closeModal('detailModal')">
+<div class="ht-modal-bg" id="detailModal" data-csp-click="page-hot-topics-close-detail-backdrop">
   <div class="ht-modal" id="detailModalBody">
-    <button class="close-btn" onclick="closeModal('detailModal')">&times;</button>
+    <button class="close-btn" data-csp-click="page-hot-topics-close-modal-5">&times;</button>
     <div id="detailContent">加载中…</div>
   </div>
 </div>
 
 <!-- Settings Modal -->
-<div class="ht-modal-bg" id="settingsModal" onclick="if(event.target===this)closeModal('settingsModal')">
+<div class="ht-modal-bg" id="settingsModal" data-csp-click="page-hot-topics-close-settings-backdrop">
   <div class="ht-modal ht-setting-modal">
-    <button class="close-btn" onclick="closeModal('settingsModal')">&times;</button>
+    <button class="close-btn" data-csp-click="page-hot-topics-close-modal-7">&times;</button>
     <h4><i class="bi bi-gear me-2"></i>热门选题 · 接入设置</h4>
     <div id="settingsContent">加载中…</div>
   </div>

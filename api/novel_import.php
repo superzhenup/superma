@@ -11,7 +11,7 @@ ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 ob_start();
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/error_handler.php';
 registerApiErrorHandlers();
@@ -19,6 +19,7 @@ require_once __DIR__ . '/../includes/auth.php';
 requireLoginApi();
 require_once __DIR__ . '/../includes/functions.php';
 require_once __DIR__ . '/../includes/db.php';
+require_once __DIR__ . '/../includes/NovelBackupContract.php';
 
 ob_end_clean();
 header('Content-Type: application/json; charset=utf-8');
@@ -71,6 +72,8 @@ try {
     if (json_last_error() !== JSON_ERROR_NONE) {
         throw new Exception('JSON格式错误：' . json_last_error_msg());
     }
+    if (!is_array($data)) throw new InvalidArgumentException('无法识别的文件格式');
+    NovelBackupContract::assertVersion($data);
 
     // 判断是单本还是多本格式
     $novels = [];
@@ -88,7 +91,7 @@ try {
     $pdo->beginTransaction();
 
     // 审计 P0：归属由 session userId 强制注入，禁止文件控制
-    $sessionUserId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    $sessionUserId = currentUserId();
     if ($sessionUserId <= 0) {
         $pdo->rollBack();
         http_response_code(403);
@@ -129,8 +132,32 @@ try {
  * 导入单本小说
  */
 function importSingleNovel(array $data, bool $skipContent, int $sessionUserId): array {
+    NovelBackupContract::assertVersion($data);
+    if ($sessionUserId <= 0) throw new InvalidArgumentException('导入需要有效用户');
     $srcNovel = $data['novel'] ?? [];
-    $title    = $srcNovel['title'] ?? '未命名小说';
+    if (!is_array($srcNovel)) throw new InvalidArgumentException('小说资料格式无效');
+    $payload = NovelBackupContract::importNovel($srcNovel);
+    $title = $payload['title'] ?? '未命名小说';
+    if (trim($title) === '') throw new InvalidArgumentException('小说标题不能为空');
+
+    $chapters = $data['chapters'] ?? [];
+    $synopses = $data['chapter_synopses'] ?? [];
+    if (!is_array($chapters) || !is_array($synopses)) throw new InvalidArgumentException('章节或概要格式无效');
+    $sourceSynopsisIds = [];
+    foreach (array_merge($chapters, $synopses) as $row) {
+        if (!is_array($row)) throw new InvalidArgumentException('章节或概要格式无效');
+        NovelBackupContract::assertSourceNovel($row, $srcNovel);
+    }
+    foreach ($synopses as $synopsis) {
+        $sourceId = $synopsis['id'] ?? null;
+        if ($sourceId === null) continue;
+        if ((!is_int($sourceId) && !is_string($sourceId))
+            || filter_var($sourceId, FILTER_VALIDATE_INT) === false || (int)$sourceId <= 0
+            || isset($sourceSynopsisIds[(int)$sourceId])) {
+            throw new InvalidArgumentException('概要源 ID 无效或重复');
+        }
+        $sourceSynopsisIds[(int)$sourceId] = true;
+    }
 
     // 检查同名小说
     $existing = DB::fetch('SELECT id FROM novels WHERE title = ?', [$title]);
@@ -139,51 +166,21 @@ function importSingleNovel(array $data, bool $skipContent, int $sessionUserId): 
         $title .= '_导入_' . date('md_His');
     }
 
-    // 1. 创建小说记录（去掉原ID，让数据库自动分配）
-    $novelFields = [];
-    $novelValues = [];
-    // 审计 P0（2026-06-12）：user_id 不再随导入文件覆盖，统一由 session 注入；
-    // 否则攻击者可在 JSON 中伪造 user_id 把书归属到他人账户、绕过任何归属审计。
-    $skipCols = ['id', 'user_id', 'cancel_flag', 'created_at', 'updated_at'];
-    // 白名单：只允许导入novels表中存在的字段
-    $allowedNovelCols = [
-        'title', 'genre', 'writing_style', 'protagonist_name', 'protagonist_info',
-        'plot_settings', 'world_settings', 'extra_settings', 'target_chapters',
-        'chapter_words', 'model_id', 'has_story_outline', 'optimized_chapter',
-        'status', 'current_chapter', 'total_words', 'daemon_write', 'cover_color',
-        'style_vector', 'ref_author'
-    ];
-
-    foreach ($srcNovel as $k => $v) {
-        if (in_array($k, $skipCols)) continue;
-        if (!in_array($k, $allowedNovelCols)) continue;
-        $novelFields[] = $k;
-        $novelValues[] = $v;
-    }
-
-    // 确保必填字段
-    if (!in_array('title', $novelFields)) {
-        $novelFields[] = 'title';
-        $novelValues[] = $title;
-    }
-    // 覆盖标题为处理后的标题
-    else {
-        $idx = array_search('title', $novelFields);
-        $novelValues[$idx] = $title;
-    }
-
-    $placeholders = array_fill(0, count($novelFields), '?');
+    // 1. Restore portable writing configuration. Instance foreign keys and
+    // active worker controls are deliberately excluded by the shared contract.
+    $payload['title'] = $title;
     // 审计 P0：归属强制为当前 session userId
-    $payload = array_combine($novelFields, $novelValues);
     $payload['user_id'] = $sessionUserId;
     $newNovelId = DB::insert('novels', $payload);
 
     $chapterCount   = 0;
     $characterCount = 0;
     $chapterIdMap   = []; // 旧ID => 新ID 映射
+    $completedChapters  = 0; // 实际以正文导入的已完成章
+    $completedWords     = 0;
+    $unfinishedChapters = 0; // pending/outlined/failed：整书不能再算已完成
 
     // 2. 导入章节
-    $chapters = $data['chapters'] ?? [];
 
     // v1.11.9: 导入前逻辑连贯性一致性前置审查，防编号断档导致 Resolve 闪退
     if (!empty($chapters)) {
@@ -202,37 +199,77 @@ function importSingleNovel(array $data, bool $skipContent, int $sessionUserId): 
 
     // 审计修复（2026-07-19 H-03）：synopsis_id 是源库自增 ID，原样导入会造成
     // 悬空/跨书引用。导入时不携带该列，待概要导入完成后按 旧ID→新ID 映射回写。
-    $pendingSynopsisLinks = []; // newChapterId => oldSynopsisId
+    $pendingSynopsisLinks = []; // newChapterId => original source chapter
     $synopsisIdMap = [];        // oldSynopsisId => newSynopsisId
+    $synopsisChapterMap = [];   // source chapter number => new IDs (must be unique)
 
     foreach ($chapters as $ch) {
         $oldId = $ch['id'] ?? 0;
-        $oldSynopsisId = (int)($ch['synopsis_id'] ?? 0);
+        $sourceChapter = $ch;
         unset($ch['id']);
         $ch['novel_id'] = $newNovelId;
 
-        // 可选跳过正文
-        if ($skipContent && isset($ch['content'])) {
+        // 可选跳过正文。已完成状态不能脱离正文单独导入，否则会形成
+        // completed + empty + non-Canon 的非法源状态。
+        if ($skipContent) {
             $ch['content'] = '';
+            $ch['words'] = 0;
+            if (($ch['status'] ?? '') === 'completed') {
+                $ch['status'] = trim((string)($ch['outline'] ?? '')) !== ''
+                    ? 'outlined'
+                    : 'pending';
+            }
         }
 
         // 只保留chapters表存在的字段（synopsis_id 除外，导入后统一回写）
-        $validCols = ['novel_id','chapter_number','title','outline','content','chapter_summary',
-                      'used_tropes','hook','status','words'];
-        $filtered = array_intersect_key($ch, array_flip($validCols));
+        $filtered = NovelBackupContract::importChapter($ch);
+        $filtered['novel_id'] = $newNovelId;
+
+        // Exported Candidate/policy identifiers are not authoritative in the
+        // new database. Imported completed prose is legacy Canon identified by
+        // its exact stored bytes; no Candidate, policy, or promotion timestamp
+        // is fabricated. Empty completed rows are downgraded to writable state.
+        $storedContent = (string)($filtered['content'] ?? '');
+        if (($filtered['status'] ?? '') === 'completed' && trim($storedContent) === '') {
+            $filtered['status'] = trim((string)($filtered['outline'] ?? '')) !== ''
+                ? 'outlined'
+                : 'pending';
+            $filtered['words'] = 0;
+        }
+        $isLegacyCanon = ($filtered['status'] ?? '') === 'completed'
+            && trim($storedContent) !== '';
+        $filtered['canonical_state'] = $isLegacyCanon ? 'legacy' : 'none';
+        $filtered['content_revision_hash'] = $isLegacyCanon
+            ? hash('sha256', $storedContent)
+            : null;
+        $filtered['canonicalized_at'] = null;
+        $filtered['canonical_candidate_uid'] = null;
+        $filtered['write_policy_snapshot_json'] = null;
 
         $newChapterId = DB::insert('chapters', $filtered);
         if ($oldId > 0) {
             $chapterIdMap[$oldId] = $newChapterId;
         }
-        if ($oldSynopsisId > 0) {
-            $pendingSynopsisLinks[$newChapterId] = $oldSynopsisId;
-        }
+        $pendingSynopsisLinks[$newChapterId] = $sourceChapter;
         $chapterCount++;
+        if ($isLegacyCanon) {
+            $completedChapters++;
+            $completedWords += max(0, (int)($filtered['words'] ?? 0));
+        } elseif (($filtered['status'] ?? 'pending') !== 'skipped') {
+            $unfinishedChapters++;
+        }
     }
 
+    // 审计修复 F05（2026-11-01）：主表进度必须由实际导入的章节重建。源文件的
+    // current_chapter/total_words/completed 在跳过正文（已完成章被降级）时不再成立；
+    // 口径与 updateNovelStats() 全量重算一致：已完成章数、已完成章字数之和。
+    $progress = ['current_chapter' => $completedChapters, 'total_words' => $completedWords];
+    if (($payload['status'] ?? '') === 'completed' && ($completedChapters === 0 || $unfinishedChapters > 0)) {
+        $progress['status'] = $completedChapters > 0 ? 'paused' : 'draft';
+    }
+    DB::update('novels', $progress, 'id = ?', [$newNovelId]);
+
     // 3. 导入章节概要
-    $synopses = $data['chapter_synopses'] ?? [];
     foreach ($synopses as $syn) {
         $oldSynopsisId = (int)($syn['id'] ?? 0);
         unset($syn['id']);
@@ -244,12 +281,15 @@ function importSingleNovel(array $data, bool $skipContent, int $sessionUserId): 
         if ($oldSynopsisId > 0) {
             $synopsisIdMap[$oldSynopsisId] = (int)$newSynopsisId;
         }
+        $synopsisChapterMap[(int)($syn['chapter_number'] ?? 0)][] = (int)$newSynopsisId;
     }
 
-    // 3.1 回写章节→概要关联（仅当旧 ID 有对应新概要，否则保持 NULL 走重新生成）
-    foreach ($pendingSynopsisLinks as $linkedChapterId => $oldSynId) {
-        if (isset($synopsisIdMap[$oldSynId])) {
-            DB::update('chapters', ['synopsis_id' => $synopsisIdMap[$oldSynId]], 'id = ?', [$linkedChapterId]);
+    // 3.1 Explicit links use local ID remapping. Legacy files without the key
+    // may infer a unique chapter-number match; explicit null never infers a link.
+    foreach ($pendingSynopsisLinks as $linkedChapterId => $sourceChapter) {
+        $linkedSynopsisId = NovelBackupContract::synopsisLink($sourceChapter, $synopsisIdMap, $synopsisChapterMap);
+        if ($linkedSynopsisId !== null) {
+            DB::update('chapters', ['synopsis_id' => $linkedSynopsisId], 'id = ? AND novel_id = ?', [$linkedChapterId, $newNovelId]);
         }
     }
 
@@ -389,6 +429,11 @@ function importSingleNovel(array $data, bool $skipContent, int $sessionUserId): 
                 'setting_key' => $key,
                 'setting_value' => $value,
             ]);
+        }
+        // 审计修复 L6（2026-08-16）：直写 novel_settings 后失效 ConfigCenter 的请求级
+        // 缓存桶，防止同请求内后续 getNovel 读到导入前的空桶而错误回退全局默认值。
+        if (class_exists('ConfigCenter')) {
+            ConfigCenter::invalidateNovelCache($newNovelId);
         }
     }
 

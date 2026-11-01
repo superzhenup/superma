@@ -1,0 +1,14 @@
+{
+  "id": "education-explanation",
+  "version": "1.0.0",
+  "description": "把必要知识融入人物目标、示范与反馈，避免说明书式灌输。",
+  "triggers": {
+    "chapter_types": ["education", "training", "explanation"],
+    "keywords": ["教学", "训练", "讲解", "原理"],
+    "outline_tags": ["education", "training"]
+  },
+  "priority": 120,
+  "token_budget": 550,
+  "requires": [],
+  "conflicts": []
+}

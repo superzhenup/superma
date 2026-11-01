@@ -3,7 +3,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 /**
  * 更新全书故事大纲
  */
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
@@ -47,17 +47,20 @@ try {
 
     // 检查是否已存在
     // M-22 修复：upsert 包裹事务，防止并发 INSERT 产生重复键
+    // 审计修复（2026-10-31 B5）：嵌套时 DB::beginTransaction() 静默返回 false，旧实现
+    // 照常执行且 commit/rollback 会误提交/回滚外层事务。$ownTx 标记本层所有权，
+    // catch 仅在自有事务时回滚，避免把外层事务一并回滚。
+    $ownTx = false;
     try {
-        DB::beginTransaction();
-        $exists = DB::fetch('SELECT id FROM story_outlines WHERE novel_id = ?', [$novelId]);
-
-        // 兜底：确保 character_progression 列存在
-        try {
-            $hasCol = DB::fetch("SHOW COLUMNS FROM story_outlines LIKE 'character_progression'");
-            if (!$hasCol) {
-                DB::query("ALTER TABLE `story_outlines` ADD COLUMN `character_progression` JSON DEFAULT NULL COMMENT '角色等级/境界发展轨迹' AFTER `character_endpoints`");
-            }
-        } catch (\Throwable $e) { error_log('update_story_outline DDL failed: ' . $e->getMessage()); }
+        $ownTx = DB::beginTransaction();
+        if (!$ownTx) {
+            throw new RuntimeException('故事大纲保存事务开启失败（已存在活动事务）');
+        }
+        // 与后台大纲发布使用同一小说行锁。人工编辑成功后，后台的内容哈希
+        // 校验会发现基线变化并保留此次编辑，避免生成完成时覆盖用户修改。
+        $lockedNovel = DB::fetch('SELECT id FROM novels WHERE id = ? AND user_id = ? FOR UPDATE', [$novelId, (int)($_SESSION['user_id'] ?? 0)]);
+        if (!$lockedNovel) throw new RuntimeException('Novel ownership changed before save.');
+        $exists = DB::fetch('SELECT id FROM story_outlines WHERE novel_id = ? FOR UPDATE', [$novelId]);
 
         if ($exists) {
         // 更新（审计修复 2026-07-19 H-02）：按 array_key_exists 部分更新，
@@ -93,7 +96,7 @@ try {
     }
         DB::commit();
     } catch (\Throwable $txE) {
-        DB::rollback();
+        if ($ownTx) DB::rollback();
         throw $txE;
     }
 

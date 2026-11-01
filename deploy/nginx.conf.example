@@ -19,6 +19,11 @@
 #   config/.htaccess    Require all denied                                 →  规则 4
 #   includes/.htaccess  Require all denied                                 →  规则 4
 #   tests/.htaccess     Require all denied                                 →  规则 4
+#   docs/.htaccess      Require all denied                                 →  规则 4
+#   output/.htaccess    Require all denied                                 →  规则 4
+#   vendor/.htaccess    Require all denied                                 →  规则 4
+#   evals/.htaccess     Require all denied                                 →  规则 4
+#   logs/.htaccess      Require all denied                                 →  规则 4
 #   storage/cache/.htaccess  Require all denied                            →  规则 4
 #   storage/.htaccess   Options -Indexes（封面可访问）                       →  autoindex off + 不拦 /storage/covers/
 # ============================================================
@@ -29,6 +34,9 @@ server {
     root /path/to/1.7-PRO;                     # ← 改成项目根目录绝对路径
     index index.php index.html;
 
+    # Largest router budget: 52 MiB (50 MiB file plus multipart overhead).
+    client_max_body_size 52m;
+
     # 关闭目录列举（等价 Apache 的 Options -Indexes）
     autoindex off;
 
@@ -37,7 +45,8 @@ server {
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-XSS-Protection "0" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'self'" always;
+    # PHP emits the nonce-based Content-Security-Policy response header.
+    # Pass it through; do not add a static duplicate or hide the upstream CSP header.
     # HSTS（仅 HTTPS 部署时取消注释，首次建议先用 max-age=300 测试）
     # add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
 
@@ -62,12 +71,31 @@ server {
     location ^~ /includes/      { deny all; }
     location ^~ /tests/         { deny all; }
     location ^~ /docs/          { deny all; }
+    location ^~ /output/        { deny all; }
+    location ^~ /vendor/        { deny all; }
+    location ^~ /evals/         { deny all; }
+    location ^~ /logs/          { deny all; }
+    location ^~ /bin/           { deny all; }
     location ^~ /storage/cache/ { deny all; }
     # 登录限速状态（auth.php 按 IP 写 sha1(ip).json，文件名可由 IP 推算）
     location ^~ /storage/login_throttle/ { deny all; }
     # 异步写作进度文件（含章节内容的 *.json / *.log / *.sh）
     location ^~ /storage/write_progress/ { deny all; }
     location ^~ /storage/author_works/ { deny all; }
+    # Assistant conversation history is private; never serve JSON as static content.
+    location ^~ /storage/good_moling/ { deny all; }
+    # 审计修复 H1（2026-08-16）：漫剧媒体目录。与 storage/drama/.htaccess 语义对齐——
+    # 仅放行媒体扩展名（drama_studio 前端 <img>/<video> 直接引用），其余全部拒绝。
+    # 文件名段不含点，阻挡双扩展名（如 x.php.jpg 之外的 x.jpg.php 不匹配即被拒）。
+    location ^~ /storage/drama/ {
+        if ($uri !~* "^/storage/drama/(.*/)?[^/.]+\\.(jpg|jpeg|png|webp|gif|mp4|webm|mov|zip)$") {
+            return 403;
+        }
+        try_files $uri =404;
+    }
+    # 审计修复 H1（2026-08-16）：管理员凭据（install.php 写入，含 bcrypt 哈希）。
+    # .json 不在规则 2 的扩展名黑名单内，必须显式拒绝，与 storage/.htaccess（deny all）对齐。
+    location = /storage/admin_credentials.json { deny all; }
     # 说明：/storage/ 其余内容（尤其 /storage/covers/ 封面图）保持可访问；
     #       日志等敏感文件已被规则 2 的扩展名拦截。
 
@@ -77,7 +105,8 @@ server {
     #     例外：
     #       - hot_novels_ingest.php：外部 Agent 推送，靠 X-Ingest-Key 认证
     #       - daemon_write.php：Cron 定时任务直接 HTTP 访问，靠 X-Daemon-Token 认证
-    location ~ ^/api/(?!index\.php|hot_novels_ingest\.php|daemon_write\.php).+\.php$ {
+    #       - drama_cron.php：漫剧任务队列 Cron 驱动入口，靠 drama cron Token 认证
+    location ~ ^/api/(?!index\.php|hot_novels_ingest\.php|daemon_write\.php|drama_cron\.php).+\.php$ {
         deny all;
     }
 

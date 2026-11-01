@@ -2,7 +2,7 @@
 /**
  * 热门选题前端查询 / 配置管理接口
  */
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 
 while (ob_get_level()) ob_end_clean();

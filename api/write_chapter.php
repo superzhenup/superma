@@ -30,8 +30,12 @@ require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 require_once dirname(__DIR__) . '/includes/write_engine.php';
+require_once dirname(__DIR__) . '/includes/NovelProjectionFence.php';
+require_once dirname(__DIR__) . '/includes/quality/WritePolicySnapshotFactory.php';
 require_once dirname(__DIR__) . '/includes/tasks/PostprocessRunner.php';
 require_once dirname(__DIR__) . '/includes/stats_tracker.php';
+require_once dirname(__DIR__) . '/includes/harness/runtime/bootstrap.php';
+require_once dirname(__DIR__) . '/includes/harness/stages/LegacyWriteEngineStageAdapter.php';
 requireLoginApi();
 session_write_close();
 
@@ -49,16 +53,49 @@ $asyncProgressFile = null;
 $asyncMessages = [];
 $_writingChapterId = null;
 $ssePreclaimedChapterId = 0;
+// 审计 P0（2026-08-04）：本请求预占章节时写入的认领令牌（取消→重启竞态防护）
+$ssePreclaimToken = '';
+$sseBaseChapterSnapshot = null;
+$writePolicySnapshot = null;
 
 require_once dirname(__DIR__) . '/includes/helpers.php';
 require_once dirname(__DIR__) . '/includes/sse_error_handler.php';
+
+if (!function_exists('write_chapter_persist_error')) {
+    function write_chapter_persist_error(string $rid, Throwable $e, string $where): void {
+        $line = sprintf('[%s] %s %s: %s in %s:%d',
+            $rid, $where, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine());
+        error_log($line);
+        $dir = defined('CFG_PROGRESS_DIR') ? CFG_PROGRESS_DIR : '';
+        if ($dir !== '' && is_dir($dir)) {
+            @file_put_contents(
+                $dir . '/last_write_error.log',
+                $line . "\n" . $e->getTraceAsString() . "\n"
+            );
+        }
+    }
+}
+
+if (!function_exists('write_chapter_preclaim_client_message')) {
+    function write_chapter_preclaim_client_message(Throwable $e, string $rid): string {
+        if ($e instanceof PDOException) {
+            $code = (int)($e->errorInfo[1] ?? 0);
+            if (in_array($code, [1205, 1213], true) || str_contains($e->getMessage(), 'Lock wait')) {
+                return '系统繁忙，请稍后重试';
+            }
+            if ($code === 1054 || str_contains($e->getMessage(), 'Unknown column')) {
+                return '数据库结构需要升级，请刷新页面后再试（追踪号 ' . $rid . '）';
+            }
+        }
+        return '写作启动失败，请稍后重试（追踪号 ' . $rid . '）';
+    }
+}
 
 set_exception_handler(function (Throwable $e) {
     global $asyncTaskId;
     // 审计 P0：异常细节只写服务端日志；异步任务与 SSE 都只回传友好文案 + 追踪号。
     $rid = error_trace_id();
-    error_log(sprintf('[%s] write_chapter uncaught %s: %s in %s:%d',
-        $rid, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine()));
+    write_chapter_persist_error($rid, $e, 'write_chapter uncaught');
     if ($asyncTaskId) {
         updateAsyncProgress([
             'status'     => 'error',
@@ -160,7 +197,9 @@ if (!$asyncTaskId) {
     header('X-Accel-Buffering: no');
     header('Connection: keep-alive');
     header('Content-Encoding: none');
-    header('Transfer-Encoding: chunked');
+    // 审计修复 P2-2（2026-10-18）：不得自行声明 Transfer-Encoding——这是逐跳头，
+    // 分块由 Web 服务器/SAPI 负责。脚本输出并非分块格式，直通该头的环境
+    // （如 php -S）里客户端会在首段正文处报 chunked 编码错误并断流。
 } else {
     // 异步模式：返回简单的 JSON 确认，Nginx 会很快关闭这个连接
     // 实际写作进度在后台进行，通过 write_poll.php 轮询
@@ -188,9 +227,51 @@ class SwitchModelException extends RuntimeException {
 
 class WriteSseChannel extends SseChannel {
     private int $writingChapterId = 0;
+    private int $writingNovelId = 0;
+    private string $writingClaimToken = '';
+    /** 审计修复 H2（2026-08-16）：DB 心跳节流时间戳，与父类 SSE 心跳节流对齐 */
+    private int $lastDbHeartbeat = 0;
+    /** 审计修复 E2（2026-09-27）：认领丢失标志。心跳在本类内被 SSE chunk 回调
+     * 驱动（可能运行于 cURL 回调内，禁止抛异常/exit），丢失时仅置位；由
+     * streamWrite 的 abortProbe 在安全边界消费并中止生成。 */
+    private bool $claimLost = false;
 
-    public function setWritingChapterId(int $id): void {
+    public function setWritingChapterId(int $id, int $novelId, string $claimToken): void {
         $this->writingChapterId = $id;
+        $this->writingNovelId = $novelId;
+        $this->writingClaimToken = $claimToken;
+    }
+
+    public function hasLostClaim(): bool {
+        return $this->claimLost;
+    }
+
+    protected function modifyProgress(callable $modifier): void {
+        // 审计修复 E1（2026-09-27）：SSE 写进度前校验文件仍属于本任务。
+        // 基类 modifyProgress 只有锁保护、无所有权校验——FastCGI 超时
+        // 残留的旧 SSE 进程会把过期 error/writing 状态写回已被新任务
+        // 重建的进度文件，污染新任务前端视图。worker 侧同类写入已有
+        // exact-lease 校验（writeWorkerProgressMatchesLease），此处对齐：
+        // 文件 _task_id 已变为其他任务时拒写。文件无 _task_id（纯 SSE
+        // 模式自建文件）时不设防，保持原行为。
+        $file = $this->sseProgressFile();
+        $taskId = $this->sseTaskId();
+        if ($file !== null && $taskId !== null && $taskId !== '' && is_file($file)) {
+            $probe = @fopen($file, 'r');
+            if ($probe !== false) {
+                $probeData = stream_get_contents($probe);
+                fclose($probe);
+                $probeArr = json_decode((string)$probeData, true);
+                if (is_array($probeArr)) {
+                    $fileTaskId = (string)($probeArr['_task_id'] ?? '');
+                    if ($fileTaskId !== '' && $fileTaskId !== $taskId) {
+                        error_log('[write_sse] progress file now belongs to task ' . $fileTaskId . '; dropping stale SSE write');
+                        return;
+                    }
+                }
+            }
+        }
+        parent::modifyProgress($modifier);
     }
 
     public function heartbeat(): void {
@@ -199,9 +280,35 @@ class WriteSseChannel extends SseChannel {
         // 场景：backupChapterVersion 持有 chapter_versions 行锁 + chapters 事务上下文时，
         // 心跳的 UPDATE chapters 会嵌入同一事务，若引发锁等待会拖长事务甚至死锁。
         // 事务期间章节 updated_at 由后续 saveChapter 落盘时刷新，无需心跳维护。
-        if ($this->writingChapterId > 0 && !DB::inTransaction()) {
+        //
+        // 审计修复 H2（2026-08-16）：DB 心跳增加 10 秒节流。
+        // chunk() 每个流式 token 都会调用 heartbeat()，原实现每个 token 执行一次
+        // UPDATE chapters（3000 字章节 ≈ 3000~5000 次 DB 往返）。updated_at 只被
+        // novel.php 的僵尸章节 watchdog 消费（阈值远大于 10 秒），节流后语义不变。
+        $now = time();
+        if ($this->writingChapterId > 0
+            && $this->writingNovelId > 0
+            && preg_match('/^[a-f0-9]{32}$/D', $this->writingClaimToken) === 1
+            && !DB::inTransaction()
+            && $now - $this->lastDbHeartbeat >= 10) {
             try {
-                DB::query('UPDATE chapters SET updated_at = NOW() WHERE id = ? AND status = "writing"', [$this->writingChapterId]);
+                // 审计修复 E2（2026-09-27）：校验认领存活。原实现 UPDATE 后
+                // 不检查受影响行数——认领已被取消/释放/新任务接管时
+                // （affected=0），本 SSE 进程仍继续生成直到落盘 CAS 才失败，
+                // 期间浪费整章模型费用且与新任务双写竞态。affected=0 时
+                // 置位 claimLost（cURL 回调内禁止抛异常），由 streamWrite
+                // 的 abortProbe 在 cURL 之外安全中止。
+                $affected = DB::execute(
+                    'UPDATE chapters SET updated_at=GREATEST('
+                    . 'NOW(), DATE_ADD(updated_at, INTERVAL 1 SECOND))'
+                    . ' WHERE id=? AND novel_id=? AND status="writing" AND claim_token=?',
+                    [$this->writingChapterId, $this->writingNovelId, $this->writingClaimToken]
+                );
+                if ($affected === 0) {
+                    $this->claimLost = true;
+                    error_log('[write_sse] chapter claim lost (heartbeat affected 0); generation will abort at next probe');
+                }
+                $this->lastDbHeartbeat = $now;
             } catch (\Throwable $e) { error_log('write_chapter heartbeat update failed: ' . $e->getMessage()); }
         }
         parent::heartbeat();
@@ -209,7 +316,26 @@ class WriteSseChannel extends SseChannel {
 
     public function chunk(string $text): void {
         $this->heartbeat();
-        if ($this->isAsync) {
+        if ($this->isAsync()) {
+            // 审计修复（2026-08-30 M-6）：与 SseChannel::chunk 同构——正文追加独立
+            // .content 文件（每 token O(1)），JSON 主文件只做节流后的元数据更新。
+            // 原实现每 token 全量重写整个进度 JSON（content 字段随正文线性增长），
+            // 3000 字章节 ≈ 3000~5000 次全量重写，累计 IO O(n²)。
+            // 读取端 write_poll.php 已兼容 _content_split；终态清理一并删除 .content。
+            if ($this->appendChunkToFile($text)) {
+                $elapsed = microtime(true) - ($this->_contentLastFlush ?? 0);
+                if ($elapsed < 2) return;
+                $this->_contentLastFlush = microtime(true);
+                $this->modifyProgress(function (array $progress): array {
+                    $progress['status'] = 'writing';
+                    $progress['progress'] = min(90, ($progress['progress'] ?? 0) + 1);
+                    $progress['_content_split'] = true;
+                    $progress['updated_at'] = time();
+                    return $progress;
+                });
+                return;
+            }
+            // 回退：.content 追加不可用（IO 故障）时保持旧全量路径，内容不丢。
             $fp = fopen($this->getProgressFile(), 'r+');
             if ($fp) {
                 flock($fp, LOCK_EX);
@@ -226,8 +352,8 @@ class WriteSseChannel extends SseChannel {
                 fclose($fp);
             }
         } else {
-            echo 'data: ' . json_encode(['chunk' => $text], JSON_UNESCAPED_UNICODE) . "\n\n";
-            $this->flush();
+            // The parent owns its private transport state and flush method.
+            parent::chunk($text);
         }
     }
 }
@@ -236,8 +362,26 @@ class WriteSseChannel extends SseChannel {
 $sse = new WriteSseChannel($asyncTaskId, $asyncProgressFile, defined('CFG_SSE_HEARTBEAT') ? CFG_SSE_HEARTBEAT : 10);
 
 function updateAsyncProgress(array $updates): void {
-    global $asyncProgressFile;
+    global $asyncProgressFile, $asyncTaskId;
     if (!$asyncProgressFile || !file_exists($asyncProgressFile)) return;
+    // 审计修复 E1（2026-09-27）：同 WriteSseChannel::modifyProgress 的任务归属
+    // 校验——进度文件已被新任务重建（_task_id 变化）时拒写，防止残留的旧
+    // SSE 进程把过期状态污染新任务的前端视图。文件无 _task_id 时保持原行为。
+    if (is_string($asyncTaskId) && $asyncTaskId !== '') {
+        $probe = @fopen($asyncProgressFile, 'r');
+        if ($probe !== false) {
+            $probeData = stream_get_contents($probe);
+            fclose($probe);
+            $probeArr = json_decode((string)$probeData, true);
+            if (is_array($probeArr)) {
+                $fileTaskId = (string)($probeArr['_task_id'] ?? '');
+                if ($fileTaskId !== '' && $fileTaskId !== $asyncTaskId) {
+                    error_log('[write_sse] progress file now belongs to task ' . $fileTaskId . '; updateAsyncProgress dropped');
+                    return;
+                }
+            }
+        }
+    }
     $fp = fopen($asyncProgressFile, 'r+');
     if (!$fp) return;
     flock($fp, LOCK_EX);
@@ -278,17 +422,10 @@ function sseDoneWrite(): void {
 }
 
 function recoverCommittedChapterForSse(int $novelId, array $chapter, string $generatedContent): ?array {
-    if ($generatedContent === '' || empty($chapter['id'])) return null;
-    $stored = DB::fetch(
-        'SELECT * FROM chapters WHERE id=? AND novel_id=? AND status="completed" LIMIT 1',
-        [(int)$chapter['id'], $novelId]
-    );
-    if (!$stored) return null;
-    $expected = stripMetaLeaks(stripSegmentMarkers($generatedContent));
-    if (!hash_equals(hash('sha256', $expected), hash('sha256', (string)($stored['content'] ?? '')))) {
-        return null;
-    }
-    return $stored;
+    // 审计修复 P2（2026-09-27）：本地弱校验版（仅 completed + 内容哈希）收敛为
+    // WriteEngine 的唯一强校验实现（canonical_state + claim_token 清空 +
+    // revision_hash 自洽），与 daemon/worker 路径同强度，消除三入口行为漂移。
+    return WriteEngine::recoverCommittedChapterSnapshot($novelId, $chapter, $generatedContent);
 }
 
 $GLOBALS['sendHeartbeat'] = 'sendHeartbeatWrite';
@@ -314,24 +451,46 @@ $sendWaitingCb = $GLOBALS['sendWaiting'];
 // 重置为 outlined，造成同一本书两路并发写作。
 // ============================================================
 if (!$asyncTaskId && $novelId > 0) {
-    $activeTask = WriteEngine::findActiveTask($novelId);
-    if ($activeTask !== null) {
-        sseMsgWrite(['error' => '该小说已有写作任务在运行中，请等待完成或先取消写作']);
-        sseDoneWrite();
-        exit;
-    }
+    $pdo = DB::connect();
+    $sseClaimProjectionFence = NovelProjectionFence::acquire($novelId, 30);
+    $releaseSseClaimProjectionFence = static function () use (&$sseClaimProjectionFence): void {
+        if ($sseClaimProjectionFence === null) {
+            return;
+        }
+        $token = $sseClaimProjectionFence;
+        $sseClaimProjectionFence = null;
+        NovelProjectionFence::release($token);
+    };
     // 数据库行级锁：防止两个 SSE 请求同时通过 findActiveTask 检查。
     // 修复：以前事务持有到写作完成（5 分钟以上），并把同一 PDO 单例的事务上下文
     // 传给 WriteEngine::resolveChapter，触发嵌套 beginTransaction 异常；
     // 同时长时间持有 novels 行级锁会阻塞所有针对该小说的并发只读/写操作。
     // 现在改为：守卫期间持锁→二次校验通过后立刻 commit 释放锁，
     // 之后的并发控制由进度文件 + chapters.status='writing' + cancel_flag 接管。
-    $pdo = DB::connect();
-    $pdo->beginTransaction();
     try {
+        $activeTask = WriteEngine::findActiveTask($novelId);
+        if ($activeTask !== null) {
+            $releaseSseClaimProjectionFence();
+            sseMsgWrite(['error' => '该小说已有写作任务在运行中，请等待完成或先取消写作']);
+            sseDoneWrite();
+            exit;
+        }
+        if (!$pdo->beginTransaction()) {
+            throw new RuntimeException('Could not start SSE chapter claim transaction.');
+        }
+        // 全部写作/取消入口统一采用 chapters -> novels 的加锁顺序。
+        // cancel_write.php 会先锁定本书章节再更新小说行；若 SSE 反向先锁
+        // novels，就会形成 SSE 等 chapter、cancel 等 novel 的确定性死锁。
+        // 这里锁完整章节集合也让下方 stale recovery 与自动选章共享同一
+        // 一致快照，避免选章期间插入/状态漂移造成新的并发窗口。
+        DB::fetchAll(
+            'SELECT id FROM chapters WHERE novel_id=? ORDER BY id FOR UPDATE',
+            [$novelId]
+        );
         $locked = DB::fetch('SELECT id FROM novels WHERE id=? FOR UPDATE', [$novelId]);
         if (!$locked) {
             $pdo->rollBack();
+            $releaseSseClaimProjectionFence();
             sseMsgWrite(['error' => '小说不存在']);
             sseDoneWrite();
             exit;
@@ -340,19 +499,26 @@ if (!$asyncTaskId && $novelId > 0) {
         $activeTask = WriteEngine::findActiveTask($novelId);
         if ($activeTask !== null) {
             $pdo->rollBack();
+            $releaseSseClaimProjectionFence();
             sseMsgWrite(['error' => '该小说已有写作任务在运行中，请等待完成或先取消写作']);
             sseDoneWrite();
             exit;
         }
         // 无活跃任务后先回收过期 writing，再选章；否则自动模式可能越过一个刚恢复的
         // 更早章节，直接预占后面的 outlined 章节，破坏章节顺序。
-        WriteEngine::recoverStaleWritingChapters($novelId);
+        try {
+            WriteEngine::recoverStaleWritingChapters($novelId);
+        } catch (\Throwable $e) {
+            error_log('[write_chapter] recoverStaleWritingChapters: ' . $e->getMessage());
+        }
         // 守卫通过：在同一事务中选章并占位。自动选章也必须预占，否则释放 novels
         // 行锁到 resolveChapter 真正 claim 之间仍有并发窗口。
         if ($chapterId > 0) {
-            // 人工显式指定：允许用户有意识地处理历史 outlined/skipped 缺口。
+            // 人工显式指定：允许用户有意识地处理历史 outlined/skipped 缺口；
+            // 审计修复（2026-08-17 写作逻辑 B0）：质检 failed 章也允许显式重写
+            // （保留正文作参考）。自动入口不受影响，仍只认 outlined/skipped。
             $claimChapter = DB::fetch(
-                'SELECT id FROM chapters WHERE id=? AND novel_id=? AND status IN ("outlined","skipped") FOR UPDATE',
+                'SELECT id FROM chapters WHERE id=? AND novel_id=? AND status IN ("outlined","skipped","failed") FOR UPDATE',
                 [$chapterId, $novelId]
             );
         } else {
@@ -361,30 +527,66 @@ if (!$asyncTaskId && $novelId > 0) {
             $claimChapter = $autoClaimChapterId ? ['id' => $autoClaimChapterId] : null;
         }
         if (!$claimChapter) {
-            $manualBackfill = WriteEngine::countManualBackfillChapters($novelId);
-            $message = $chapterId <= 0 && $manualBackfill > 0
-                ? "没有可安全自动写作的章节；{$manualBackfill}章历史缺口请人工显式选择。"
-                : '没有可写章节，或指定章节当前状态不可写作。';
-            throw new RuntimeException($message);
+            $message = $chapterId <= 0
+                ? WriteEngine::automaticWriteBlockMessage($novelId)
+                : '指定章节当前不可写作。仅「待写 / 已跳过 / 质检失败」的章节可以写作。';
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            $releaseSseClaimProjectionFence();
+            sseMsgWrite(['error' => $message]);
+            sseDoneWrite();
+            exit;
         }
 
         $claimChapterId = (int)$claimChapter['id'];
+        $claimBaseChapter = DB::fetch(
+            'SELECT ' . WriteEngine::chapterWriteSelectList()
+            . ' FROM chapters WHERE id=? AND novel_id=? FOR UPDATE',
+            [$claimChapterId, $novelId]
+        );
+        if (!$claimBaseChapter) {
+            throw new RuntimeException('The chapter disappeared before its writing claim.');
+        }
+        // 审计 P0（2026-08-04）：预占同时写入认领令牌。取消→立刻重启竞态下，
+        // 已取消旧任务的 saveChapter CAS 因令牌不匹配而无法命中本请求预占的行。
+        // 审计修复（2026-08-17 写作逻辑 B0）：显式章节预占允许 failed→writing。
+        $isExplicitChapterClaim = $chapterId > 0;
+        $claimStatusSql = $isExplicitChapterClaim ? '"outlined","skipped","failed"' : '"outlined","skipped"';
+        $ssePreclaimToken = WriteEngine::newClaimToken();
+        $sseBaseChapterSnapshot = WriteEngine::captureChapterBaseSnapshot(
+            $claimBaseChapter,
+            $ssePreclaimToken
+        );
         $claimAffected = DB::update(
             'chapters',
-            ['status' => 'writing'],
-            'id=? AND novel_id=? AND status IN ("outlined","skipped")',
+            ['status' => 'writing', 'claim_token' => $ssePreclaimToken],
+            "id=? AND novel_id=? AND status IN ({$claimStatusSql})",
             [$claimChapterId, $novelId]
         );
         if ($claimAffected !== 1) {
-            throw new RuntimeException('章节已被其他写作任务占用。');
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            $releaseSseClaimProjectionFence();
+            sseMsgWrite(['error' => '章节已被其他写作任务占用，请稍后重试。']);
+            sseDoneWrite();
+            exit;
         }
         DB::update('novels', ['status' => 'writing'], 'id=?', [$novelId]);
         $chapterId = $claimChapterId;
         $ssePreclaimedChapterId = $claimChapterId;
         $pdo->commit();
+        $releaseSseClaimProjectionFence();
     } catch (\Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
-        throw $e;
+        try {
+            $releaseSseClaimProjectionFence();
+        } catch (\Throwable $releaseError) {
+            error_log('[write_chapter] projection fence release failed: ' . $releaseError->getMessage());
+        }
+        // 审计修复（2026-08-19）：预占失败不得再 throw 给未捕获处理器。
+        $rid = error_trace_id();
+        write_chapter_persist_error($rid, $e, 'write_chapter preclaim');
+        sseMsgWrite(safe_sse_error_payload($e, write_chapter_preclaim_client_message($e, $rid)));
+        sseDoneWrite();
+        exit;
     }
 }
 
@@ -395,11 +597,24 @@ if (!$asyncTaskId && $novelId > 0) {
 sseMsgWrite(['waiting' => true, 'msg' => '正在解析章节状态...']);
 
 try {
-    $resolved   = WriteEngine::resolveChapter($novelId, $chapterId, $ssePreclaimedChapterId > 0);
+    $resolved   = WriteEngine::resolveChapter(
+        $novelId,
+        $chapterId,
+        $ssePreclaimedChapterId > 0,
+        // 审计修复（2026-08-16 S-2）：SSE 预占路径传入本请求的预占令牌，
+        // resolveChapter 复验令牌未被取消→重启的新任务覆写，杜绝毫秒窗口内
+        // 旧任务采纳新令牌通过 saveChapter CAS 覆盖新任务正文。
+        $ssePreclaimedChapterId > 0 ? $ssePreclaimToken : null,
+        $ssePreclaimedChapterId > 0 ? $sseBaseChapterSnapshot : null
+    );
     $novel      = $resolved['n'];
     $ch         = $resolved['ch'];
     $_writingChapterId = (int)$ch['id'];
-    $sse->setWritingChapterId($_writingChapterId);
+    $sse->setWritingChapterId(
+        $_writingChapterId,
+        $novelId,
+        (string)($ch['claim_token'] ?? '')
+    );
 
     // 小说自身的 chapter_words 优先，全局 ws_chapter_words 仅作为兜底默认值
     $novelWords = (int)($novel['chapter_words'] ?? 0);
@@ -410,17 +625,28 @@ try {
         $novelWords = (int)getSystemSetting('ws_chapter_words', 2000, 'int');
     }
     $novel['chapter_words'] = max(500, $novelWords);
+    $writePolicySnapshot = WritePolicySnapshotFactory::captureForChapter(
+        $novelId,
+        (int)$novel['chapter_words']
+    );
+    WritePolicySnapshotFactory::assertEmergencyEpochCurrent($writePolicySnapshot);
+    // 审计修复 P2（2026-09-27）：冻结本请求五关通过线，同任务的质检与
+    // 生成承诺不得随配置漂移。
+    WriteEngine::freezeQualityGateMinScore(WriteEngine::resolveQualityGateMinScore());
+    $chapterFeatureSnapshot = HarnessFeatureSnapshot::captureForNovel($novelId);
 } catch (Throwable $e) {
     // 仅释放本请求刚刚成功预占的章节；普通异步路径不进入此分支的恢复逻辑。
     if ($ssePreclaimedChapterId > 0) {
         try {
-            DB::update(
-                'chapters',
-                ['status' => 'outlined'],
-                'id=? AND novel_id=? AND status="writing"',
-                [$ssePreclaimedChapterId, $novelId]
+            // 审计 P0：按本请求的认领令牌精确释放，防误释放他人认领
+            WriteEngine::releaseChapterClaimAndPauseNovel(
+                $novelId,
+                $ssePreclaimedChapterId,
+                [
+                    'claim_token' => $ssePreclaimToken,
+                    '_base_snapshot' => $sseBaseChapterSnapshot ?? null,
+                ]
             );
-            DB::update('novels', ['status' => 'paused'], 'id=? AND status="writing"', [$novelId]);
             clearNovelCache($novelId);
         } catch (Throwable $recoverError) {
             error_log('write_chapter preclaim recovery failed: ' . $recoverError->getMessage());
@@ -428,6 +654,262 @@ try {
     }
     sseMsgWrite(safe_sse_error_payload($e, '写作失败，请稍后重试'));
     sseDoneWrite(); exit;
+}
+
+// P2 direct-SSE authority adapter. Snapshot capture above is the rollout
+// boundary; off/shadow requests continue through the unchanged legacy phases.
+if (!$asyncTaskId && ChapterRunService::shouldUseAuthority(
+    $writePolicySnapshot,
+    $chapterFeatureSnapshot
+)) {
+    $authoritySseClosed = false;
+    try {
+        $claimToken = (string)($ch['claim_token'] ?? '');
+        $baseSnapshot = $ch['_base_snapshot'] ?? null;
+        if (preg_match('/^[a-f0-9]{32}$/D', $claimToken) !== 1
+            || !is_array($baseSnapshot)) {
+            throw new PermanentStageException(
+                'Direct SSE authority path has no authenticated Chapter claim.'
+            );
+        }
+        $chapterInputSnapshot = ChapterRunInputSnapshotFactory::capture(
+            $resolved['n'],
+            $resolved['ch']
+        );
+        // 专项一（2026-09-28）：authority 编排骨架（invocation 组装、执行工厂、
+        // 恢复闭包、adapter 工厂、runToTerminal 调用与终态映射）收敛进
+        // ChapterWriteOrchestrator；本入口保留输出流回调与 [DONE] 收尾。
+        $transport = new CallbackLegacyChapterTransport([
+            'waiting' => static function (string $message): void {
+                sseMsgWrite(['waiting' => true, 'msg' => $message]);
+            },
+            'chunk' => static function (string $chunk): void {
+                sseChunkWrite($chunk);
+            },
+            'message' => static function (array $payload): void {
+                sseMsgWrite($payload);
+            },
+            'heartbeat' => static function (): void {
+                sendHeartbeatWrite();
+            },
+            'thinking' => static function (string $chunk): void {
+                sseThinkingWrite($chunk);
+            },
+            'acquired' => static function (
+                array $resolvedNovel,
+                array $resolvedChapter
+            ) use (&$novel, &$ch, &$sse, $novelId): void {
+                $novel = $resolvedNovel;
+                $ch = $resolvedChapter;
+                $sse->setWritingChapterId(
+                    (int)$ch['id'],
+                    $novelId,
+                    (string)$ch['claim_token']
+                );
+            },
+            'saved' => static function (array $saveResult) use (
+                &$ch,
+                &$fullContent,
+                &$authoritySseClosed
+            ): void {
+                $ch = $saveResult['chapter'];
+                $fullContent = (string)$saveResult['accepted_content'];
+                $words = (int)$saveResult['words'];
+                sseMsgWrite([
+                    'status' => 'saved',
+                    'stats' => "第{$ch['chapter_number']}章《{$ch['title']}》完成，共 {$words} 字"
+                        . (string)($saveResult['model_info'] ?? ''),
+                    'chapter_id' => (int)$ch['id'],
+                    'words' => $words,
+                    'done' => (bool)($saveResult['all_done'] ?? false),
+                    'next_chapter_id' => $saveResult['next_chapter_id'] ?? null,
+                    'next_chapter_num' => $saveResult['next_chapter_num'] ?? null,
+                    'model_used' => $saveResult['_model_label'] ?? null,
+                    'quality_warning' => !empty($saveResult['quality_warning']),
+                    'quality_warning_reason' =>
+                        (string)($saveResult['quality_warning_reason'] ?? ''),
+                    'postprocessing' => true,
+                ]);
+                StatsTracker::record($words, 1);
+                sseDoneWrite();
+                $authoritySseClosed = true;
+                if (function_exists('fastcgi_finish_request')) {
+                    fastcgi_finish_request();
+                } else {
+                    while (ob_get_level() > 0) {
+                        @ob_end_flush();
+                    }
+                    flush();
+                }
+            },
+            'postprocessed' => static function (array $result) use ($novelId): void {
+                if (!in_array(
+                    (string)($result['state'] ?? ''),
+                    ['done', 'stale', 'skipped'],
+                    true
+                )) {
+                    addLog(
+                        $novelId,
+                        'warn',
+                        '章节后处理已进入持久重试队列，任务ID：'
+                            . (int)($result['job_id'] ?? 0)
+                    );
+                }
+            },
+        ]);
+        $sseRestoreVerifier = static function (
+            RunContext $context,
+            array $restoredChapter,
+            array $authenticatedBase
+        ) use ($claimToken): void {
+            if (!hash_equals(
+                $claimToken,
+                (string)($restoredChapter['claim_token'] ?? '')
+            )) {
+                throw new StaleRevisionException(
+                    'Direct SSE Chapter claim was replaced.'
+                );
+            }
+        };
+        // 终态收尾：SSE 消息 + [DONE]；未落盘章节释放认领并暂停小说。
+        $sseTermination = new CallbackWriteTermination([
+            'succeeded' => static function (
+                WorkflowExecutionResult $result,
+                bool $contentSaved
+            ): void {
+                exit;
+            },
+            'quarantined' => static function (
+                WorkflowExecutionResult $result,
+                bool $contentSaved
+            ) use (&$ch, &$authoritySseClosed, $novelId): void {
+                if (!$authoritySseClosed) {
+                    sseMsgWrite([
+                        'error' => '章节未通过质量校验，已暂停写作',
+                        'validation_blocked' => true,
+                    ]);
+                    sseDoneWrite();
+                }
+                if (!$contentSaved) {
+                    WriteEngine::releaseChapterClaimAndPauseNovel(
+                        $novelId,
+                        (int)$ch['id'],
+                        $ch
+                    );
+                }
+                exit;
+            },
+            'canceled' => static function (
+                WorkflowExecutionResult $result,
+                bool $contentSaved
+            ) use (&$ch, &$authoritySseClosed, $novelId): void {
+                if (!$authoritySseClosed) {
+                    sseMsgWrite([
+                        'error' => $contentSaved
+                            ? '用户已取消，但本章正文已保存完成'
+                            : '用户已取消写作',
+                        'canceled' => true,
+                        'canceled_but_saved' => $contentSaved,
+                    ]);
+                    sseDoneWrite();
+                }
+                if (!$contentSaved) {
+                    WriteEngine::releaseChapterClaimAndPauseNovel(
+                        $novelId,
+                        (int)$ch['id'],
+                        $ch
+                    );
+                }
+                exit;
+            },
+            'failed' => static function (
+                WorkflowExecutionResult $result,
+                bool $contentSaved
+            ) use (&$ch, &$authoritySseClosed, $novelId): void {
+                if (!$authoritySseClosed) {
+                    sseMsgWrite([
+                        'error' => $contentSaved
+                            ? '正文已保存，但章节后处理未完成'
+                            : '写作工作流执行失败，请稍后重试',
+                    ]);
+                    sseDoneWrite();
+                }
+                if (!$contentSaved) {
+                    WriteEngine::releaseChapterClaimAndPauseNovel(
+                        $novelId,
+                        (int)$ch['id'],
+                        $ch
+                    );
+                }
+                exit;
+            },
+        ]);
+
+        $runRequest = new ChapterWriteRunRequest(
+            entryPoint: ChapterRunEntryPoint::SSE,
+            userId: $userId,
+            novelId: $novelId,
+            chapterId: (int)$ch['id'],
+            authorityIdentity: $claimToken,
+            policySnapshot: $writePolicySnapshot,
+            featureSnapshot: $chapterFeatureSnapshot,
+            inputSnapshot: $chapterInputSnapshot,
+            workerId: substr(
+                'sse:' . (gethostname() ?: 'localhost') . ':' . getmypid()
+                    . ':' . HarnessRuntime::randomHex(8),
+                0,
+                120
+            ),
+            transport: $transport,
+            acquireChapter: static fn (
+                Closure $restore,
+                RunContext $context
+            ): array => $resolved,
+            restoreBase: static fn (RunContext $context, array $chapter): array => $baseSnapshot,
+            restoreMissingMessage: 'Direct SSE recovery source disappeared.',
+            restoreInactiveMessage: 'Direct SSE Chapter claim is no longer active.',
+            postprocessWorkerId: substr(
+                'sse:' . (gethostname() ?: 'localhost') . ':' . getmypid(),
+                0,
+                120
+            ),
+            termination: $sseTermination,
+            baseSnapshot: $baseSnapshot,
+            restoreVerifier: $sseRestoreVerifier,
+            legacyCancellationProbe: static fn (): bool =>
+                file_exists(WriteEngine::cancelFlagPath($novelId)),
+            waitingCallback: $sendWaitingCb,
+            retryTick: static function (
+                string $runUid,
+                WorkflowExecutionResult $retryResult
+            ): ?WorkflowExecutionResult {
+                sendHeartbeatWrite();
+                return null;
+            }
+        );
+
+        (new ChapterWriteOrchestrator(DB::getPdo()))->run($runRequest);
+        // 四个终态回调内均已 exit；此兜底确保永不坠入下方 legacy 编排。
+        exit;
+    } catch (Throwable $authorityError) {
+        error_log(
+            '[write_chapter] authority Chapter Run failed ('
+            . $authorityError::class . '): ' . $authorityError->getMessage()
+        );
+        if (!$authoritySseClosed) {
+            WriteEngine::releaseChapterClaimAndPauseNovel(
+                $novelId,
+                (int)$ch['id'],
+                $ch
+            );
+            sseMsgWrite(safe_sse_error_payload(
+                $authorityError,
+                '写作工作流持久执行失败，请稍后重试'
+            ));
+            sseDoneWrite();
+        }
+        exit;
+    }
 }
 
 // 提前检测模型是否支持 1M 上下文（用于决定上下文构建模式）
@@ -460,7 +942,24 @@ try {
 
 sseMsgWrite(['waiting' => true, 'msg' => '正在构思中...']);
 
-$messages    = WriteEngine::buildPrompt($novel, $ch, $memoryCtx);
+try {
+    $messages = WriteEngine::buildPrompt(
+        $novel,
+        $ch,
+        $memoryCtx,
+        null,
+        $writePolicySnapshot,
+        null,
+        $chapterFeatureSnapshot
+    );
+} catch (Throwable $e) {
+    error_log('[write_chapter] Phase3 buildPrompt 失败: ' . $e->getMessage());
+    addLog($novelId, 'error', 'buildPrompt 失败：' . $e->getMessage());
+    WriteEngine::releaseChapterClaimAndPauseNovel($novelId, (int)$ch['id'], $ch);
+    sseMsgWrite(safe_sse_error_payload($e, '写作提示词构建失败，请稍后重试'));
+    sseDoneWrite();
+    exit;
+}
 $targetWords = (int)$novel['chapter_words'];
 $fullContent = '';
 $usedModel   = null;
@@ -480,19 +979,36 @@ try {
         $novel['model_id'] ? (int)$novel['model_id'] : null,
         (int)$ch['chapter_number'],
         (int)$novel['target_chapters'],
-        $sendWaitingCb
+        $sendWaitingCb,
+        function () use ($sse, $writePolicySnapshot): void {
+            // 审计修复 E2（2026-09-27）：认领丢失（心跳 affected=0 置位）时在
+            // abortProbe 安全边界中止生成——抛出的异常经 streamWrite 的
+            // abortFailure 通道在 cURL 之外 rethrow，Phase 4 catch 统一释放
+            // 与收尾（认领已丢失时释放为幂等 no-op）。
+            if ($sse->hasLostClaim()) {
+                throw new WriteEngineCanceledException('章节认领已被释放或接管，停止生成');
+            }
+            WritePolicySnapshotFactory::assertEmergencyEpochCurrent($writePolicySnapshot);
+        }
     );
     $fullContent       = $result['content'];
     $usedModel         = $result['model'];
     $streamUsage       = $result['usage'] ?? null;
     $streamDurationMs  = $result['duration_ms'] ?? null;
-} catch (Exception $e) {
+} catch (Throwable $e) {
     $msg = $e->getMessage();
     error_log("[write_chapter] Phase4 streamWrite 失败: {$msg}");
-    $isCancel = strpos($msg, '取消') !== false;
-    DB::update('chapters', ['status' => 'outlined'], 'id=?', [$ch['id']]);
-    // W-13 修复：streamWrite 失败属于可重试的瞬时错误（API 限流/网络），改 'draft' 让用户直接重试
-    DB::update('novels', ['status' => 'draft'], 'id=?', [$novelId]);
+    $isCancel = $e instanceof WriteEngineCanceledException;
+    // 审计修复（2026-08-02 M1）：恢复路径加状态守卫（AND status="writing"），
+    // 防止旧任务失败恢复时覆盖新任务已预占的同章状态（High-4 同源竞态的另一条路径）。
+    // 审计 P0（2026-08-04）：升级为按认领令牌精确释放。
+    // W-13 修复：streamWrite 失败属于可重试的瞬时错误（API 限流/网络），改 'draft' 让用户直接重试。
+    WriteEngine::releaseChapterClaimAndSetNovelStatus(
+        $novelId,
+        (int)$ch['id'],
+        $ch,
+        'draft'
+    );
     sseMsgWrite(['error' => $isCancel ? '用户已取消写作' : '模型生成失败，请稍后重试', 'canceled' => $isCancel]);
     sseDoneWrite();
     exit;
@@ -511,13 +1027,18 @@ try {
 
 // ---- Phase 5: WriteEngine 保存章节 ----
 try {
+    // H4 修复：把 task_id 注入 $ch，供 saveChapter 事务内查 writing_tasks.cancel_requested
+    // 做权威取消校验（文件取消标志可被新任务 B 清除，DB task 标记不可被 B 清除）。
+    $ch['_task_id'] = $asyncTaskId ?: null;
     $saveResult = WriteEngine::saveChapter(
-        (int)$ch['id'], $novelId, $fullContent, $targetWords, $usedModel, $ch, $streamUsage, $streamDurationMs
+        (int)$ch['id'], $novelId, $fullContent, $targetWords, $usedModel, $ch,
+        $streamUsage, $streamDurationMs, $writePolicySnapshot
     );
     $words        = $saveResult['words'];
     $ch           = $saveResult['chapter'];
     $modelInfo    = $saveResult['model_info'];
     $allDone      = $saveResult['all_done'];
+    $fullContent  = (string)$saveResult['accepted_content'];
 
     // ---- 【关键】正文已落盘，立即发送完成信号并结束 SSE 流 ----
     // 这样 Nginx/FPM 超时不会影响前端——前端已收到 [DONE] + 章节完成数据
@@ -531,6 +1052,8 @@ try {
         'next_chapter_id'  => $saveResult['next_chapter_id'] ?? null,
         'next_chapter_num' => $saveResult['next_chapter_num'] ?? null,
         'model_used' => $usedModel?->modelLabel,
+        'quality_warning' => !empty($saveResult['quality_warning']),
+        'quality_warning_reason' => (string)($saveResult['quality_warning_reason'] ?? ''),
         'postprocessing' => true,  // 告知前端后处理将在后台进行
     ]);
 
@@ -541,25 +1064,30 @@ try {
     $errMsg = $e->getMessage();
     error_log("[write_chapter] validation blocked: {$errMsg}");
     addLog($novelId, 'error', 'P0 strict validation blocked chapter save: ' . $errMsg);
-    DB::update('chapters', ['status' => 'outlined'], 'id=? AND status="writing"', [$ch['id']]);
-    DB::update('novels', ['status' => 'paused'], 'id=?', [$novelId]);
+    WriteEngine::releaseChapterClaimAndPauseNovel($novelId, (int)$ch['id'], $ch);
     sseMsgWrite(['error' => '章节未通过质量校验，已暂停写作', 'validation_blocked' => true]);
     sseDoneWrite(); exit;
 } catch (WriteEnginePersistenceException $e) {
     $errMsg = $e->getMessage();
-    if ($errMsg === 'canceled' || file_exists(WriteEngine::cancelFlagPath($novelId))) {
+    $isCancel = file_exists(WriteEngine::cancelFlagPath($novelId));
+    // 审计修复（2026-08-17 写作逻辑 D2）：取消与临近落盘竞态——事务已提交的正文
+    // 不因取消回滚。取消路径先探测是否已提交；已提交则如实告知「本章已保存，
+    // 自动写已停」并继续后处理；未提交才按纯取消终止。
+    $committed = recoverCommittedChapterForSse($novelId, $ch, $fullContent);
+    if ($isCancel && !$committed) {
         sseMsgWrite(['error' => '用户已取消写作', 'canceled' => true]);
         sseDoneWrite(); exit;
     }
-    addLog($novelId, 'error', '正文落盘异常：' . $errMsg);
-    $committed = recoverCommittedChapterForSse($novelId, $ch, $fullContent);
     if ($committed) {
         $ch = array_merge($ch, $committed);
         $fullContent = (string)$committed['content'];
         $words = (int)$committed['words'];
         sseMsgWrite([
             'status' => 'saved',
-            'warning' => '正文事务已提交，正在恢复后处理',
+            'canceled_but_saved' => $isCancel,
+            'warning' => $isCancel
+                ? '用户已取消，但本章正文已在取消前保存完成（不回滚），自动写已停'
+                : '正文事务已提交，正在恢复后处理',
             'stats' => "第{$ch['chapter_number']}章已保存，共 {$words} 字",
             'chapter_id' => $ch['id'],
             'words' => $words,
@@ -567,27 +1095,32 @@ try {
         ]);
         StatsTracker::record($words, 1);
     } else {
-        DB::update('chapters', ['status' => 'outlined'], 'id=? AND status="writing"', [$ch['id']]);
-        DB::update('novels', ['status' => 'paused'], 'id=?', [$novelId]);
+        addLog($novelId, 'error', '正文落盘异常：' . $errMsg);
+        WriteEngine::releaseChapterClaimAndPauseNovel($novelId, (int)$ch['id'], $ch);
         sseMsgWrite(['error' => '章节保存失败，请稍后重试']);
         sseDoneWrite(); exit;
     }
 } catch (Throwable $e) {
     $errMsg = $e->getMessage();
     error_log("[write_chapter] Unexpected save failure: {$errMsg}");
-    if ($errMsg === 'canceled' || file_exists(WriteEngine::cancelFlagPath($novelId))) {
+    $isCancel = $e instanceof WriteEngineCanceledException
+        || file_exists(WriteEngine::cancelFlagPath($novelId));
+    // 审计修复（2026-08-17 写作逻辑 D2）：同上——取消竞态下已提交正文不回滚。
+    $committed = recoverCommittedChapterForSse($novelId, $ch, $fullContent);
+    if ($isCancel && !$committed) {
         sseMsgWrite(['error' => '用户已取消写作', 'canceled' => true]);
         sseDoneWrite(); exit;
     }
-    addLog($novelId, 'error', 'Unexpected save failure: ' . $errMsg);
-    $committed = recoverCommittedChapterForSse($novelId, $ch, $fullContent);
     if ($committed) {
         $ch = array_merge($ch, $committed);
         $fullContent = (string)$committed['content'];
         $words = (int)$committed['words'];
         sseMsgWrite([
             'status' => 'saved',
-            'warning' => '正文已保存，正在恢复后处理',
+            'canceled_but_saved' => $isCancel,
+            'warning' => $isCancel
+                ? '用户已取消，但本章正文已在取消前保存完成（不回滚），自动写已停'
+                : '正文已保存，正在恢复后处理',
             'stats' => "第{$ch['chapter_number']}章已保存，共 {$words} 字",
             'chapter_id' => $ch['id'],
             'words' => $words,
@@ -595,8 +1128,8 @@ try {
         ]);
         StatsTracker::record($words, 1);
     } else {
-        DB::update('chapters', ['status' => 'outlined'], 'id=? AND status="writing"', [$ch['id']]);
-        DB::update('novels', ['status' => 'paused'], 'id=?', [$novelId]);
+        addLog($novelId, 'error', 'Unexpected save failure: ' . $errMsg);
+        WriteEngine::releaseChapterClaimAndPauseNovel($novelId, (int)$ch['id'], $ch);
         sseMsgWrite(['error' => '章节保存失败，请稍后重试']);
         sseDoneWrite(); exit;
     }
@@ -624,13 +1157,20 @@ if (function_exists('fastcgi_finish_request')) {
 // SSE 流已关闭，这些操作在后台执行，不阻塞前端连接
 // ignore_user_abort(true) 保证即使前端断开后端也继续运行
 // ============================================================
-$postprocessResult = PostprocessRunner::enqueueAndRun(
-    $novelId,
-    $ch,
-    $fullContent,
-    $engine,
-    'sse:' . (gethostname() ?: 'localhost') . ':' . getmypid()
-);
-if (!in_array((string)($postprocessResult['state'] ?? ''), ['done', 'stale'], true)) {
-    addLog($novelId, 'warn', '章节后处理已进入持久重试队列，任务ID：' . (int)($postprocessResult['job_id'] ?? 0));
+try {
+    $postprocessResult = PostprocessRunner::enqueueAndRun(
+        $novelId,
+        $ch,
+        $fullContent,
+        $engine,
+        'sse:' . (gethostname() ?: 'localhost') . ':' . getmypid(),
+        $writePolicySnapshot
+    );
+    if (!in_array((string)($postprocessResult['state'] ?? ''), ['done', 'stale', 'skipped'], true)) {
+        addLog($novelId, 'warn', '章节后处理已进入持久重试队列，任务ID：' . (int)($postprocessResult['job_id'] ?? 0));
+    }
+} catch (Throwable $e) {
+    // SSE 已结束；此处抛错会变成「服务器内部错误（追踪号）」，但正文可能已落盘。
+    error_log('[write_chapter] postprocess after SSE: ' . $e->getMessage());
+    addLog($novelId, 'warn', '章节后处理失败：' . $e->getMessage());
 }

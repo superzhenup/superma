@@ -3,6 +3,7 @@
  * 思想情感分析器 - 作者画像系统
  * 分析情感基调、思想深度、审美倾向等思想情感特征
  */
+defined('APP_LOADED') or die('Direct access denied.');
 
 class SentimentAnalyzer
 {

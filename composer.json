@@ -1,0 +1,107 @@
+{
+    "name": "local/ai-novel-system",
+    "description": "AI 小说创作系统 1.8.1 PRO（单用户自部署）",
+    "type": "project",
+    "license": "LicenseRef-GPLv3-NonCommercial",
+    "config": {
+        "platform": {
+            "php": "8.2.0"
+        }
+    },
+    "require": {
+        "php": ">=8.2",
+        "ext-pdo": "*",
+        "ext-pdo_mysql": "*",
+        "ext-curl": "*",
+        "ext-mbstring": "*",
+        "ext-json": "*",
+        "ext-dom": "*",
+        "ext-gd": "*",
+        "ext-openssl": "*",
+        "ext-zip": "*"
+    },
+    "suggest": {
+        "ext-fileinfo": "Required for image and uploaded-file MIME validation; optional for installation."
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": {
+        "classmap": [
+            "includes/"
+        ]
+    },
+    "scripts": {
+        "test": "phpunit --testsuite unit --fail-on-empty-test-suite --fail-on-skipped --fail-on-risky --fail-on-warning",
+        "test:frontend": [
+            "node tests/writing_pause_synopsis_frontend_behavior_test.js",
+            "node tests/short_story_frontend_behavior_test.js",
+            "node tests/story_outline_frontend_behavior_test.js",
+            "node tests/chapter_outline_frontend_behavior_test.js",
+            "node tests/chapter_outline_transport_behavior_test.js",
+            "node tests/chapter_quality_rewrite_frontend_behavior_test.js",
+            "node tests/drama_cron_frontend_behavior_test.js",
+            "node tests/cron_token_rotation_frontend_behavior_test.js",
+            "node tests/drama_studio_frontend_behavior_test.js",
+            "node tests/optimizer_frontend_behavior_test.js",
+            "node tests/csp_page_events_behavior_test.js",
+            "node tests/csp_novel_pages_behavior_test.js",
+            "node tests/novel_page_scripts_load_behavior_test.js",
+            "node tests/page_scripts_load_behavior_test.js",
+            "node tests/chapter_unsaved_edits_guard_behavior_test.js",
+            "node tests/chapter_compress_receipt_behavior_test.js",
+            "node tests/csp_dynamic_frontend_behavior_test.js",
+            "node tests/model_switch_receipt_frontend_behavior_test.js"
+        ],
+        "test:csp-browser": "node tests/csp_browser_behavior_test.js",
+        "test:component": "php tests/component/run_harness_worker_component.php",
+        "test:concurrency": "php tests/run_harness_profile.php concurrency",
+        "test:fault": "php tests/run_harness_profile.php fault",
+        "test:fault:process": "php tests/integration/harness_process_fault_probe.php",
+        "test:fault:canon": "php tests/integration/harness_canon_process_fault_probe.php",
+        "test:eval": "php bin/eval.php --suite=hard --workflow=chapter_generate_v1 --offline --seed=1 --no-write",
+        "test:integration": "phpunit --testsuite integration",
+        "test:all": "php tests/run_all_tests.php",
+        "test:quick": [
+            "@test",
+            "@test:all"
+        ],
+        "test:ci": "@test:release",
+        "test:full": [
+            "@test",
+            "@test:frontend",
+            "@test:integration",
+            "@test:all"
+        ],
+        "test:release": [
+            "@test:component",
+            "@test:concurrency",
+            "@test:fault",
+            "@test:fault:process",
+            "@test:fault:canon",
+            "@test:eval",
+            "@test",
+            "@test:frontend",
+            "phpunit --testsuite integration --fail-on-empty-test-suite --fail-on-skipped --fail-on-risky --fail-on-warning --log-junit .phpunit-cache/release-integration.xml --log-events-text .phpunit-cache/release-integration-events.txt",
+            "php tests/assert_integration_release_report.php .phpunit-cache/release-integration.xml .phpunit-cache/release-integration-events.txt",
+            "@test:all"
+        ]
+    },
+    "scripts-descriptions": {
+        "test:frontend": "Run writing, transport, drama, and CSP event behavior regressions; requires Node.js 18+ and makes no external requests.",
+        "test:csp-browser": "Verify report-only and enforced CSP against the production layout in an isolated local browser; requires Playwright and a Chromium browser, and does not load config.php or a database.",
+        "test:component": "Hard-kill and restart the real Harness worker mid-SSE, then verify expired-lease reclaim, fencing, exactly-once commit, and two local HTTP requests; NOVEL_TEST_DB_ISOLATED=1 is mandatory.",
+        "test:concurrency": "Repeat unit lease/fence contracts and run independent proc_open/PDO races; defaults to 100 release-grade repetitions, PR may explicitly select 5, NOVEL_TEST_DB_ISOLATED=1 is mandatory, and missing safe DB config is non-green.",
+        "test:fault": "Run crash, retry, recovery, and dead-letter contracts.",
+        "test:fault:process": "Run the isolated-DB proc_open OS hard-kill/restart matrix through production WorkflowRunner and M62 persistence; missing safe DB config is non-green.",
+        "test:fault:canon": "Run the isolated-DB four-point OS hard-kill/restart matrix through the production LegacyWriteEngineStageAdapter and real Canon transaction; missing safe DB config is non-green.",
+        "test:eval": "Run the offline hard suite bound to the production Canon gate and workflow hashes without writing a report.",
+        "test:ci": "Compatibility alias for the one authoritative test:release pipeline; it cannot drift into a weaker CI-only gate.",
+        "test": "运行无 DB 依赖的单元测试（tests/unit）",
+        "test:integration": "运行 DB 集成测试（需安全 NOVEL_TEST_DB_* 与 NOVEL_TEST_DB_ISOLATED=1，缺省自动 skip）",
+        "test:all": "运行 tests/ 根目录下全部过程式静态测试（tests/run_all_tests.php 聚合执行，支持 --filter=关键字 传参筛选）",
+        "test:quick": "日常快速门禁（数分钟）：unit + 全部静态契约测试；不含 DB/进程/前端套件，不能替代 test:release",
+        "test:full": "开发环境全量验证：unit + Node.js 前端行为测试 + integration（缺省 skip）+ 全部静态契约测试，任一失败整体非零退出",
+        "test:release": "唯一严格发布门禁：真实 worker component + 独立 PDO concurrency + 内存/真实进程 fault + Eval 漂移 + unit + Node.js 前端行为 + 必须零 skip 的 integration/evidence + 静态契约"
+    }
+}

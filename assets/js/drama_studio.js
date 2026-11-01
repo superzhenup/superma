@@ -4,6 +4,37 @@
  */
 'use strict';
 
+// Keep handler functions in this script; templates carry only action names and data.
+[
+    ['save-asset-field', saveAssetField], ['generate-asset-image', genAssetImage],
+    ['upload-asset-image', uploadAssetImage], ['delete-asset', deleteAsset],
+].forEach(function([action, handler]) {
+    window.AppEvents.register('drama-studio.' + action, function(event, element) {
+        return handler(element, parseInt(element.dataset.assetId, 10) || 0);
+    });
+});
+window.AppEvents.register('drama-studio.pick-asset-file', function(event, element) {
+    document.getElementById('asset-file-' + element.dataset.assetId).click();
+});
+window.AppEvents.register('drama-studio.delete-shot', function(event, element) {
+    return deleteShot(element, parseInt(element.dataset.shotId, 10) || 0);
+});
+window.AppEvents.register('drama-studio.select-shot-image', function(event, element) {
+    return selectShotImage(element.dataset.shotId, element.dataset.path);
+});
+window.AppEvents.register('drama-studio.generate-shot-images', function(event, element) {
+    return genShotImages(element, [parseInt(element.dataset.shotId, 10) || 0]);
+});
+window.AppEvents.register('drama-studio.pick-shot-file', function(event, element) {
+    document.getElementById('shot-file-' + element.dataset.shotId).click();
+});
+window.AppEvents.register('drama-studio.upload-shot-image', function(event, element) {
+    return uploadShotImage(element, parseInt(element.dataset.shotId, 10) || 0);
+});
+window.AppEvents.register('drama-studio.generate-shot-videos', function(event, element) {
+    return genShotVideos(element, [parseInt(element.dataset.shotId, 10) || 0]);
+});
+
 // ---------------------------------------------------------------- 状态
 
 let studioAssets = [];      // 资产列表
@@ -13,6 +44,11 @@ let studioEpisode = null;   // 剧集对象（含 final_video_path）
 let assetFilter = '';       // 资产类型筛选
 let studioPollTimer = null;
 let studioBusy = 0;         // 上一轮轮询的进行中任务数（用于状态翻转时全量刷新）
+// Editor drafts are independent of server snapshots and submitted save payloads.
+const shotEdits = new Map();
+let shotReadSequence = 0;
+let appliedShotRead = 0;
+let shotWriteRevision = 0;
 
 // 渲染签名：轮询时数据未变化则跳过对应区域重绘（避免打断视频播放 / 编辑输入）
 const renderSigs = { assets: '', shots: '', images: '', videos: '', compose: '' };
@@ -48,23 +84,27 @@ async function loadAssets() {
 }
 
 async function loadShots() {
+    const read = ++shotReadSequence;
+    const revision = shotWriteRevision;
     const res = await apiGet('drama_actions', { action: 'list_shots', episode_id: DRAMA_EPISODE_ID });
     if (!res.ok) {
         showToast(res.msg || '加载分镜失败', 'error');
         scheduleStudioPoll(15000);
         return;
     }
-    studioShots = (res.data && res.data.shots) || [];
+    applyShotSnapshot((res.data && res.data.shots) || [], read, revision);
     if (res.data && res.data.assets) studioAssets = res.data.assets;
     renderAll();
     scheduleStudioPoll(5000);
 }
 
 async function pollShots() {
+    const read = ++shotReadSequence;
+    const revision = shotWriteRevision;
     const res = await apiGet('drama_poll', { action: 'poll_shots', episode_id: DRAMA_EPISODE_ID });
     if (res.ok && res.data) {
         if (res.data.episode) studioEpisode = res.data.episode;
-        if (res.data.shots) studioShots = res.data.shots;
+        if (res.data.shots) applyShotSnapshot(res.data.shots, read, revision);
         studioTasks = res.data.tasks || [];
         const busy = studioTasks.filter(t => t.status === 'pending' || t.status === 'running').length;
         // 有任务在跑（或刚跑完）时同步刷新资产（解析剧本/定妆照会改资产）
@@ -78,6 +118,13 @@ async function pollShots() {
     } else {
         scheduleStudioPoll(15000);
     }
+}
+
+function applyShotSnapshot(shots, read, revision) {
+    // An old poll must not roll back a successful save or a newer read.
+    if (revision !== shotWriteRevision || read < appliedShotRead) return;
+    studioShots = shots;
+    appliedShotRead = read;
 }
 
 function scheduleStudioPoll(delay) {
@@ -174,18 +221,18 @@ function renderAssets() {
                     '<div class="d-flex align-items-center gap-2 mb-2">' +
                         '<span class="badge bg-secondary">' + escHtml(ASSET_TYPE_NAMES[a.type] || a.type) + '</span>' +
                         '<input type="text" class="form-control form-control-sm" value="' + escHtml(a.name) + '" ' +
-                            'onchange="saveAssetField(this, ' + escHtml(a.id) + ')" data-field="name">' +
+                            'data-csp-change="drama-studio.save-asset-field" data-asset-id="' + escHtml(a.id) + '" data-field="name">' +
                     '</div>' +
                     '<textarea class="form-control form-control-sm mb-2" rows="2" data-field="description" ' +
-                        'onchange="saveAssetField(this, ' + escHtml(a.id) + ')">' + escHtml(a.description || '') + '</textarea>' +
+                        'data-csp-change="drama-studio.save-asset-field" data-asset-id="' + escHtml(a.id) + '">' + escHtml(a.description || '') + '</textarea>' +
                     '<div class="d-flex flex-wrap gap-1">' +
-                        '<button type="button" class="btn btn-outline-primary btn-xs" onclick="genAssetImage(this, ' + escHtml(a.id) + ')">' +
+                        '<button type="button" class="btn btn-outline-primary btn-xs" data-csp-click="drama-studio.generate-asset-image" data-asset-id="' + escHtml(a.id) + '">' +
                             '<i class="bi bi-magic"></i> 生成定妆照</button>' +
-                        '<button type="button" class="btn btn-outline-secondary btn-xs" onclick="document.getElementById(\'asset-file-' + escHtml(a.id) + '\').click()">' +
+                        '<button type="button" class="btn btn-outline-secondary btn-xs" data-csp-click="drama-studio.pick-asset-file" data-asset-id="' + escHtml(a.id) + '">' +
                             '<i class="bi bi-upload"></i> 上传替换</button>' +
                         '<input type="file" id="asset-file-' + escHtml(a.id) + '" accept="image/*" style="display:none" ' +
-                            'onchange="uploadAssetImage(this, ' + escHtml(a.id) + ')">' +
-                        '<button type="button" class="btn btn-outline-danger btn-xs ms-auto" onclick="deleteAsset(this, ' + escHtml(a.id) + ')">' +
+                            'data-csp-change="drama-studio.upload-asset-image" data-asset-id="' + escHtml(a.id) + '">' +
+                        '<button type="button" class="btn btn-outline-danger btn-xs ms-auto" data-csp-click="drama-studio.delete-asset" data-asset-id="' + escHtml(a.id) + '">' +
                             '<i class="bi bi-trash"></i></button>' +
                     '</div>' +
                 '</div>' +
@@ -280,6 +327,10 @@ async function deleteAsset(btn, assetId) {
 
 function initShotTableEvents() {
     const wrap = document.getElementById('shot-table-wrap');
+    wrap.addEventListener('input', function (e) {
+        const row = e.target.closest('tr[data-shot-id]');
+        if (row) rememberShotDraft(row);
+    });
     // 下拉变更立即保存
     wrap.addEventListener('change', function (e) {
         const row = e.target.closest('tr[data-shot-id]');
@@ -295,7 +346,14 @@ function initShotTableEvents() {
 
 function renderShotsTable() {
     const wrap = document.getElementById('shot-table-wrap');
-    const sig = JSON.stringify(studioShots.map(s => [
+    // Preserve focus, selection and uncommitted IME input until the editor blurs.
+    if (document.activeElement && wrap.contains(document.activeElement)
+        && document.activeElement.matches('[data-field]')) return;
+    const visibleShots = studioShots.map(s => {
+        const edit = shotEdits.get(String(s.id));
+        return edit && edit.draft ? { ...s, ...edit.draft } : s;
+    });
+    const sig = JSON.stringify(visibleShots.map(s => [
         s.id, s.shot_no, s.scene_desc, s.shot_type, s.camera_movement, s.characters,
         s.dialogue, s.image_prompt, s.video_prompt, s.duration,
     ])) + '|' + studioAssets.length;
@@ -308,7 +366,7 @@ function renderShotsTable() {
         return;
     }
     const charAssets = studioAssets.filter(a => a.type === 'character');
-    const rows = studioShots.map(function (s) {
+    const rows = visibleShots.map(function (s) {
         const selChars = parseJsonArray(s.characters).map(String);
         const charOpts = charAssets.map(a =>
             '<option value="' + escHtml(a.id) + '"' + (selChars.includes(String(a.id)) ? ' selected' : '') + '>' +
@@ -332,7 +390,7 @@ function renderShotsTable() {
             '<td><select class="form-select form-select-sm" data-field="duration">' +
                 [5, 10].map(d => '<option value="' + d + '"' + (String(s.duration) === String(d) ? ' selected' : '') + '>' + d + ' 秒</option>').join('') +
             '</select></td>' +
-            '<td><button type="button" class="btn btn-outline-danger btn-xs" onclick="deleteShot(this, ' + escHtml(s.id) + ')">' +
+            '<td><button type="button" class="btn btn-outline-danger btn-xs" data-csp-click="drama-studio.delete-shot" data-shot-id="' + escHtml(s.id) + '">' +
                 '<i class="bi bi-trash"></i></button></td>' +
         '</tr>';
     }).join('');
@@ -344,38 +402,71 @@ function renderShotsTable() {
         '</tr></thead><tbody>' + rows + '</tbody></table></div>';
 }
 
-async function saveShot(row) {
-    const shotId = row.dataset.shotId;
+function readShotDraft(row) {
     const get = f => row.querySelector('[data-field="' + f + '"]');
-    const characters = Array.from(get('characters').selectedOptions).map(o => parseInt(o.value, 10));
-    const res = await apiPost('drama_actions', {
-        action: 'save_shot',
-        shot_id: parseInt(shotId, 10),
+    return {
         shot_type: get('shot_type').value,
         camera_movement: get('camera_movement').value,
         scene_desc: get('scene_desc').value,
-        characters: characters,
+        characters: JSON.stringify(Array.from(get('characters').selectedOptions).map(o => parseInt(o.value, 10))),
         dialogue: get('dialogue').value,
         image_prompt: get('image_prompt').value,
         video_prompt: get('video_prompt').value,
         duration: parseInt(get('duration').value, 10),
-    });
-    if (res.ok) {
-        // 同步本地状态，避免轮询重绘打断正在进行的编辑
-        const s = studioShots.find(x => String(x.id) === String(shotId));
-        if (s) {
-            s.shot_type = get('shot_type').value;
-            s.camera_movement = get('camera_movement').value;
-            s.scene_desc = get('scene_desc').value;
-            s.characters = JSON.stringify(characters);
-            s.dialogue = get('dialogue').value;
-            s.image_prompt = get('image_prompt').value;
-            s.video_prompt = get('video_prompt').value;
-            s.duration = get('duration').value;
-        }
-    } else {
-        showToast(res.msg || '分镜保存失败', 'error');
+    };
+}
+
+function rememberShotDraft(row) {
+    const shotId = String(row.dataset.shotId);
+    let edit = shotEdits.get(shotId);
+    if (!edit) {
+        edit = { draft: null, pending: null, saving: null };
+        shotEdits.set(shotId, edit);
     }
+    edit.draft = readShotDraft(row);
+    return edit;
+}
+
+function sameShotDraft(a, b) {
+    return !!a && !!b && Object.keys(a).every(key => String(a[key] ?? '') === String(b[key] ?? ''));
+}
+
+function saveShot(row) {
+    const shotId = String(row.dataset.shotId);
+    const edit = rememberShotDraft(row);
+    edit.pending = { ...edit.draft };
+    if (edit.saving) return edit.saving;
+
+    // Serialize saves for this row; change + focusout coalesce into one payload.
+    edit.saving = Promise.resolve().then(async function () {
+        while (edit.pending) {
+            const submitted = edit.pending;
+            edit.pending = null;
+            const saved = studioShots.find(s => String(s.id) === shotId);
+            if (!sameShotDraft(submitted, saved)) {
+                const res = await apiPost('drama_actions', {
+                    action: 'save_shot', shot_id: parseInt(shotId, 10),
+                    ...submitted, characters: JSON.parse(submitted.characters),
+                });
+                if (!res.ok) throw new Error(res.msg || '分镜保存失败');
+                shotWriteRevision++;
+                const current = studioShots.find(s => String(s.id) === shotId);
+                if (current) Object.assign(current, submitted);
+            }
+            // Only the acknowledged snapshot is saved; later typing remains a draft.
+            if (sameShotDraft(edit.draft, submitted)) edit.draft = null;
+        }
+        return true;
+    }).catch(function (error) {
+        edit.pending = null;
+        showToast((error.message || '分镜保存失败') + '，未保存内容已保留，请再次离开编辑框重试。', 'error');
+        return false;
+    }).finally(function () {
+        edit.saving = null;
+        if (!edit.draft) shotEdits.delete(shotId);
+        renderShotsTable();
+    });
+    return edit.saving;
 }
 
 async function generateStoryboard(btn) {
@@ -432,7 +523,7 @@ function renderShotImages() {
             ? '<div class="d-flex flex-wrap gap-1 mt-2">' + candidates.map(function (p) {
                 return '<img src="' + escHtml(p) + '" class="candidate-thumb' + (p === s.image_path ? ' selected' : '') + '" ' +
                     'data-shot-id="' + escHtml(s.id) + '" data-path="' + escHtml(p) + '" ' +
-                    'onclick="selectShotImage(this.dataset.shotId, this.dataset.path)" title="点击选定">';
+                    'data-csp-click="drama-studio.select-shot-image" title="点击选定">';
             }).join('') + '</div>'
             : '';
         return '<div class="col-md-6 col-xl-4">' +
@@ -449,12 +540,12 @@ function renderShotImages() {
                     '</div>' +
                     thumbs +
                     '<div class="d-flex gap-1 mt-2">' +
-                        '<button type="button" class="btn btn-outline-primary btn-xs" onclick="genShotImages(this, [' + escHtml(s.id) + '])">' +
+                        '<button type="button" class="btn btn-outline-primary btn-xs" data-csp-click="drama-studio.generate-shot-images" data-shot-id="' + escHtml(s.id) + '">' +
                             '<i class="bi bi-stars"></i> 抽卡</button>' +
-                        '<button type="button" class="btn btn-outline-secondary btn-xs" onclick="document.getElementById(\'shot-file-' + escHtml(s.id) + '\').click()">' +
+                        '<button type="button" class="btn btn-outline-secondary btn-xs" data-csp-click="drama-studio.pick-shot-file" data-shot-id="' + escHtml(s.id) + '">' +
                             '<i class="bi bi-upload"></i> 上传首帧图</button>' +
                         '<input type="file" id="shot-file-' + escHtml(s.id) + '" accept="image/*" style="display:none" ' +
-                            'onchange="uploadShotImage(this, ' + escHtml(s.id) + ')">' +
+                            'data-csp-change="drama-studio.upload-shot-image" data-shot-id="' + escHtml(s.id) + '">' +
                     '</div>' +
                 '</div>' +
             '</div>' +
@@ -520,10 +611,10 @@ function renderShotVideos() {
         let body = '';
         if (s.status === 'video_done' && s.video_path) {
             body += '<video controls class="w-100 rounded mb-2" src="' + escHtml(s.video_path) + '" style="background:#000"></video>';
-            body += '<button type="button" class="btn btn-outline-warning btn-xs" onclick="genShotVideos(this, [' + escHtml(s.id) + '])">' +
+            body += '<button type="button" class="btn btn-outline-warning btn-xs" data-csp-click="drama-studio.generate-shot-videos" data-shot-id="' + escHtml(s.id) + '">' +
                 '<i class="bi bi-arrow-repeat"></i> 重新生成</button>';
         } else if (s.status === 'image_ready') {
-            body += '<button type="button" class="btn btn-outline-primary btn-xs" onclick="genShotVideos(this, [' + escHtml(s.id) + '])">' +
+            body += '<button type="button" class="btn btn-outline-primary btn-xs" data-csp-click="drama-studio.generate-shot-videos" data-shot-id="' + escHtml(s.id) + '">' +
                 '<i class="bi bi-play-circle"></i> 生成视频</button>';
         } else if (s.status === 'video_running') {
             body += '<div class="text-primary small"><span class="spinner-border spinner-border-sm me-1"></span>视频生成中...</div>';

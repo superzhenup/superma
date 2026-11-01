@@ -17,13 +17,11 @@ $csrfToken = function_exists('csrf_token') ? csrf_token() : '';
 pageHeader('导入小说续写', 'create');
 ?>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 window.__xlsxReady = new Promise(function(resolve, reject){
   var srcs = [
-    'assets/dist/xlsx.full.min.js',
-    'https://cdn.jsdelivr.net/npm/xlsx@0.20.3/dist/xlsx.full.min.js',
-    'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.20.3/xlsx.full.min.js',
-    'https://unpkg.com/xlsx@0.20.3/dist/xlsx.full.min.js',
+    // SheetJS 官方分发地址；npm/CDN 镜像不提供 0.20.x 的浏览器构建文件。
+    'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js',
   ];
   var i = 0;
   function tryNext() {
@@ -242,7 +240,7 @@ window.__xlsxReady = new Promise(function(resolve, reject){
 
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 const CSRF_TOKEN = window.CSRF_TOKEN || '';
 const BATCH_SIZE = 50;
 // 本页脚本位于 pageFooter/app.js 之前，使用与 apiRouteUrl 等价的相对入口，
@@ -571,10 +569,16 @@ document.getElementById('btnStartAnalysis').onclick = async () => {
   btn.disabled = true; btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>启动中…';
 
   try {
-    await post('run_analysis', {
+    const r = await post('run_analysis', {
       novel_id: importState.novelId,
       tasks: tasks,
     }, 120000);
+    if (!r || !r.ok) {
+      // 审计修复（2026-08-30）：此前响应体被忽略——后端 ok:false 也直接宣布成功。
+      alert((r && r.msg) ? r.msg : '分析启动失败，请点击"跳过"');
+      btn.disabled = false; btn.innerHTML = '<i class="bi bi-stars me-1"></i>确认分析';
+      return;
+    }
     gotoFinish(true, tasks);
   } catch (e) {
     alert('分析启动失败：' + e.message);

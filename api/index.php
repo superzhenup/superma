@@ -13,6 +13,10 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 define('APP_LOADED', true);
 
+require_once dirname(__DIR__) . '/includes/maintenance.php';
+maintenanceGuardHttp();
+require_once dirname(__DIR__) . '/includes/RequestBody.php';
+
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
@@ -33,6 +37,10 @@ $ROUTES = [
     'hot_novels'          => ['file' => 'hot_novels.php',           'type' => 'json'],
     // 注意：hot_novels_ingest.php 是外部 Agent 推送接口，不经过 router（避免 requireLoginApi 拦截）
     // Agent 直接 POST 到 /api/hot_novels_ingest.php，仅靠 X-Ingest-Key 认证
+    // 审计修复 M3（2026-08-16）：daemon_write.php 同理不经过 router——它是 Cron 直连入口
+    // （X-Daemon-Token 鉴权，见文件头注释与 deploy/nginx.conf.example 规则5放行清单）。
+    // 前端挂机面板也直接 fetch('api/daemon_write.php')，不携带 route 参数；
+    // 原路由表项（需 session 登录的 json 路由）与文件的 token 鉴权互斥，属无效死配置，已移除。
     'import_novel_excel'  => ['file' => 'import_novel_excel.php',  'type' => 'json'],
     // 安装成功页尚未建立普通登录态；handler 使用短时一次性 token 自行鉴权。
     'install_models'      => ['file' => 'install_models.php',      'type' => 'json', 'auth' => 'handler'],
@@ -40,6 +48,13 @@ $ROUTES = [
     'export_short_story'  => ['file' => 'export_short_story.php',  'type' => 'json'],
     'write_start'         => ['file' => 'write_start.php',         'type' => 'json'],
     'write_poll'          => ['file' => 'write_poll.php',          'type' => 'json'],
+    'retry_chapter_postprocess' => ['file' => 'retry_chapter_postprocess.php', 'type' => 'json', 'max_body' => 8 * 1024],
+    'run_status'          => ['file' => 'run_status.php',          'type' => 'json'],
+    'chapter_candidates'  => ['file' => 'chapter_candidates.php',  'type' => 'json', 'max_body' => 8 * 1024],
+    'approval_decide'     => ['file' => 'approval_decide.php',     'type' => 'json', 'max_body' => 8 * 1024],
+    'approval_commit'     => ['file' => 'approval_commit.php',     'type' => 'json', 'max_body' => 8 * 1024],
+    'candidate_retry'     => ['file' => 'candidate_retry.php',     'type' => 'json', 'max_body' => 8 * 1024],
+    'branch_actions'      => ['file' => 'branch_actions.php',      'type' => 'json', 'max_body' => 5 * 1024 * 1024],
     'cancel_write'        => ['file' => 'cancel_write.php',        'type' => 'json'],
     'wizard'              => ['file' => 'wizard.php',              'type' => 'json', 'sse_actions' => ['chat', 'review_check']],
     'iterative_config'    => ['file' => 'iterative_config.php',    'type' => 'json'],
@@ -74,9 +89,9 @@ $ROUTES = [
     'get_story_outline'   => ['file' => 'get_story_outline.php',   'type' => 'json'],
     'update_story_outline' => ['file' => 'update_story_outline.php', 'type' => 'json'],
     'validate_consistency' => ['file' => 'validate_consistency.php', 'type' => 'json'],
-    'daemon_write'        => ['file' => 'daemon_write.php',        'type' => 'json'],
     'daemon_token'        => ['file' => 'daemon_token.php',        'type' => 'json'],
     'polish_selection'    => ['file' => 'polish_selection.php',    'type' => 'json'],
+    'chapter_rewrite'     => ['file' => 'chapter_rewrite.php',     'type' => 'json', 'max_body' => 8 * 1024],
     'drama_actions'       => ['file' => 'drama_actions.php',       'type' => 'json'],
     'drama_generate'      => ['file' => 'drama_generate.php',      'type' => 'json'],
     'drama_poll'          => ['file' => 'drama_poll.php',          'type' => 'json'],
@@ -88,28 +103,37 @@ $ROUTES = [
     'supplement_outline'  => ['file' => 'supplement_outline.php',  'type' => 'sse'],
     'polish_chapter'      => ['file' => 'polish_chapter.php',      'type' => 'sse'],
     'optimize_outline'    => ['file' => 'optimize_outline.php',    'type' => 'sse'],
-    'optimize_outline_v2' => ['file' => 'optimize_outline_v2.php', 'type' => 'sse'],
+    // 审计修复 H5（2026-08-16）：optimize_outline_v2 已删除——全项目（assets/js）无任何
+    // 调用方，属未上线的实验残留；活跃路径为 optimize_outline（SSE）与 optimize_outline_ajax（JSON）。
     'generate_volume_outline' => ['file' => 'generate_volume_outline.php', 'type' => 'sse'],
-    'generate_story_outline' => ['file' => 'generate_story_outline.php', 'type' => 'sse'],
+    'generate_story_outline' => ['file' => 'generate_story_outline.php', 'type' => 'json', 'max_body' => 8 * 1024],
+    'story_outline_status' => ['file' => 'story_outline_status.php', 'type' => 'json'],
+    'story_outline_cancel' => ['file' => 'story_outline_cancel.php', 'type' => 'json', 'max_body' => 8 * 1024],
     'workshop'            => ['file' => 'workshop.php',            'type' => 'json', 'sse_actions' => ['generate_stream']],
 ];
 
-// ---- 请求体大小限制（纵深防御：防止超大请求耗尽内存） ----
-// 读取 Content-Length 前置检查（不消耗 PHP 内存）
-$contentLength = (int)($_SERVER['CONTENT_LENGTH'] ?? $_SERVER['HTTP_CONTENT_LENGTH'] ?? 0);
+// ---- 请求体大小限制（Content-Length 仅预检，实际读取同样有界） ----
+$defaultMaxBodyBytes = 10 * 1024 * 1024;
+// 与最大上传路由一致；JSON 中才提供 route 时先受此全局硬上限保护。
+$globalMaxBodyBytes = 52 * 1024 * 1024;
 $preflightRoute = preg_replace('/[^a-zA-Z0-9_]/', '', (string)($_GET['route'] ?? ''));
-$maxBodyBytes = (int)($ROUTES[$preflightRoute]['max_body'] ?? (10 * 1024 * 1024));
-if ($contentLength > $maxBodyBytes) {
+$maxBodyBytes = $preflightRoute !== ''
+    ? (int)($ROUTES[$preflightRoute]['max_body'] ?? $defaultMaxBodyBytes)
+    : $globalMaxBodyBytes;
+$rawBody = readRequestBodyBounded($maxBodyBytes);
+$jsonInput = $rawBody !== null && $rawBody !== '' ? json_decode($rawBody, true) : [];
+$jsonInput = is_array($jsonInput) ? $jsonInput : [];
+$route = preg_replace('/[^a-zA-Z0-9_]/', '', (string)($_GET['route'] ?? ($jsonInput['route'] ?? '')));
+$resolvedMaxBodyBytes = (int)($ROUTES[$route]['max_body'] ?? $defaultMaxBodyBytes);
+// multipart 的原始流为空，仍按该路由的 Content-Length 预检，保留 $_FILES。
+$contentLength = (int)($_SERVER['CONTENT_LENGTH'] ?? $_SERVER['HTTP_CONTENT_LENGTH'] ?? 0);
+if ($rawBody === null || strlen($rawBody) > $resolvedMaxBodyBytes || $contentLength > $resolvedMaxBodyBytes) {
     ob_end_clean();
     http_response_code(413);
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode(['ok' => false, 'msg' => '请求体过大'], JSON_UNESCAPED_UNICODE);
     exit;
 }
-
-$rawBody = file_get_contents('php://input');
-$jsonInput = $rawBody !== '' ? (json_decode($rawBody, true) ?: []) : [];
-$route = preg_replace('/[^a-zA-Z0-9_]/', '', $_GET['route'] ?? ($jsonInput['route'] ?? ''));
 
 if ($route === '') {
     ob_end_clean();

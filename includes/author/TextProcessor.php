@@ -3,6 +3,7 @@
  * 文本预处理器 - 作者画像系统
  * 负责文本清洗、规范化、分章等预处理操作
  */
+defined('APP_LOADED') or die('Direct access denied.');
 
 class TextProcessor
 {
@@ -34,8 +35,8 @@ class TextProcessor
     {
         $text = $this->content;
 
-        $text = preg_replace('/["「」""]/u', '"', $text);
-        $text = preg_replace("/[''']/u", "'", $text);
+        $text = preg_replace('/[“”「」"]/u', '"', $text);
+        $text = preg_replace("/[‘’']/u", "'", $text);
 
         $text = preg_replace('/[…‹›«»]/u', '...', $text);
 

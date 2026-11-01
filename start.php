@@ -17,7 +17,7 @@ require_once __DIR__ . '/includes/functions.php';
 require_once __DIR__ . '/includes/layout.php';
 require_once __DIR__ . '/includes/writing_modes.php';
 
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 
 $hasOngoingWizard = false;
 $ongoingNovel = null;
@@ -47,6 +47,10 @@ $modes = getWritingModes();
 
 pageHeader('开始创作', 'create');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-start-open', function (event, element) { location.href = element.dataset.entryUrl; });
+</script>
+
 
 <style>
 .start-hero {
@@ -207,7 +211,7 @@ pageHeader('开始创作', 'create');
 <div class="entry-grid">
 <?php foreach ($modes as $mode): ?>
   <div class="entry-card <?= h($mode['card_class']) ?>"
-       onclick="location.href='<?= h($mode['entry_url']) ?>'">
+       data-csp-click="page-start-open" data-entry-url="<?= h($mode['entry_url']) ?>">
     <?php if (!empty($mode['recommended'])): ?>
     <span class="recommend-badge">⭐ 推荐</span>
     <?php endif; ?>

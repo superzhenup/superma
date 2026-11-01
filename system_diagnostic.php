@@ -224,7 +224,7 @@ pageHeader('系统功能诊断', 'diagnostic');
 }
 </style>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 document.addEventListener('DOMContentLoaded', function() {
     const byId = id => document.getElementById(id);
     const esc = value => String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({

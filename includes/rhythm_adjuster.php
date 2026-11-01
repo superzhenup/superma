@@ -123,9 +123,9 @@ class RhythmAdjuster
                     'climax' => 25,
                     'hook'   => 15,
                 ];
-                $result['require_cool_point'] = ($currentChapter % 5 == 0);  // 每5章一个爽点
+                // 审计修复（2026-08-09 R11-5）：require_cool_point 改由下方占比驱动，禁止 %5 模数
                 $result['instructions'][] = "📖 铺垫期：充分建立世界观和人物关系，节奏宜慢不宜快";
-                $result['instructions'][] = "建议：多描写环境、人物性格、世界观设定";
+                $result['instructions'][] = "建议：多描写环境、人物性格、世界观设定；有爽点章占比仍须贴近目标";
                 break;
                 
             case 'rising':
@@ -137,8 +137,7 @@ class RhythmAdjuster
                     'climax' => 30,
                     'hook'   => 15,
                 ];
-                $result['require_cool_point'] = ($currentChapter % 5 == 0);  // 每5章一个爽点
-                $result['instructions'][] = "📈 发展期：逐步提升冲突强度，每5章安排一个爽点";
+                $result['instructions'][] = "📈 发展期：逐步提升冲突强度，按全书有爽点章占比目标安排爽点";
                 $result['instructions'][] = "建议：逐步建立矛盾，埋设伏笔";
                 break;
                 
@@ -151,9 +150,8 @@ class RhythmAdjuster
                     'climax' => 40,
                     'hook'   => 15,
                 ];
-                $result['require_cool_point'] = ($currentChapter % 3 == 0);  // 每3章一个爽点
                 $result['cool_point_urgency'] = 'high';
-                $result['instructions'][] = "🔥 高潮期：密集爽点，每3章一个高潮，节奏加快";
+                $result['instructions'][] = "🔥 高潮期：冲突集中释放，有爽点章占比应贴近或高于目标，节奏加快";
                 $result['instructions'][] = "建议：集中释放冲突，制造大场面";
                 break;
                 
@@ -204,9 +202,15 @@ class RhythmAdjuster
         
         // ── 根据近期爽点历史调整 ─────────────────────────────────
         $recentCoolPoints = $this->getRecentCoolPoints($coolPointHistory, $currentChapter, 5);
-        $coolPointCount = count($recentCoolPoints);
+        // 审计修复（2026-08-09 R10-6）：按「有爽点章」去重计占比，与 Strategy/PID/UI 同量纲
+        $coolChapters = [];
+        foreach ($recentCoolPoints as $cp) {
+            $cn = (int)($cp['chapter'] ?? 0);
+            if ($cn > 0) $coolChapters[$cn] = true;
+        }
+        $coolPointCount = count($coolChapters);
         
-        // 计算爽点密度（近5章）
+        // 计算爽点密度（近5章有爽点章占比）
         // 审计修复（2026-07-19 H-中11）：分母固定 /5 导致前 5 章密度天然 ≤0.2，
         // 必然低于 target*0.6 开篇必报"爽点饥饿"。
         // 改为按实际可用窗口章数计算，min(5, currentChapter-1) 避免第1章除零。
@@ -214,18 +218,36 @@ class RhythmAdjuster
         $coolPointDensity = $coolPointCount / $windowSize;
         // 审计修复 P2-12（2026-07-12）：优先读取小说级配置，回退到全局默认
         $targetDensity = (float)ConfigCenter::getNovel($this->novelId, 'ws_cool_point_density_target', 0.88, 'float');
+        $targetDensity = max(0.3, min(1.0, $targetDensity));
         
+        // 占比驱动 require_cool_point（setup/rising/climax）；收束/结局阶段保持章级爽点
+        if (in_array($stage, ['setup', 'rising', 'climax'], true)) {
+            $result['require_cool_point'] = ($coolPointDensity < $targetDensity * 0.9);
+        }
+
         if ($coolPointDensity < $targetDensity * 0.6) {
             // 爽点饥饿：建议安排爽点
             $result['cool_point_type'] = $this->selectCoolPointType($coolPointHistory, $currentChapter);
             $result['require_cool_point'] = true;
             $result['cool_point_urgency'] = 'critical';
-            $result['warnings'][] = "💥 爽点饥饿：近5章爽点密度过低（{$coolPointDensity}），本章必须安排爽点";
+            $result['warnings'][] = sprintf(
+                '💥 爽点饥饿：近%d章有爽点章占比过低（%.2f < 目标%.2f），本章必须安排爽点',
+                $windowSize,
+                $coolPointDensity,
+                $targetDensity
+            );
             $result['tension_level'] = min(10, $result['tension_level'] + 1);
             
-        } elseif ($coolPointDensity > $targetDensity * 1.5) {
-            // 爽点过密：建议过渡章
-            $result['warnings'][] = "📉 爽点过密：近5章爽点密度过高（{$coolPointDensity}），建议安排过渡章节";
+        } elseif ($coolPointDensity > min(1.0, $targetDensity * 1.05) && $coolPointDensity >= 0.95) {
+            // 爽点过密：占比口径上限 1.0；接近顶格时建议过渡章
+            if (in_array($stage, ['setup', 'rising', 'climax'], true)) {
+                $result['require_cool_point'] = false;
+            }
+            $result['warnings'][] = sprintf(
+                '📉 爽点过密：近%d章有爽点章占比过高（%.2f），建议安排过渡/呼吸章',
+                $windowSize,
+                $coolPointDensity
+            );
             $result['tension_level'] = max(1, $result['tension_level'] - 1);
         }
         

@@ -10,7 +10,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  * 返回 JSON: { success, optimized_text, model }
  */
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
@@ -28,7 +28,7 @@ $contextBefore = trim($input['context_before'] ?? '');
 $contextAfter = trim($input['context_after'] ?? '');
 
 // 审计 P0（2026-06-12）：章节归属校验
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 if ($chapterId > 0) checkChapterOwnership($chapterId, $userId);
 
 if (empty($selectedText)) {
@@ -116,7 +116,8 @@ try {
 
     $result = $ai->chat($messages, 'creative');
 
-    $optimizedText = trim($result ?? '');
+    // 审计修复 P2-1（2026-10-18）：结果会回填编辑器，内联 <think> 推理内容须先剥离
+    $optimizedText = trim(stripInlineReasoning((string)($result ?? '')));
 
     if (empty($optimizedText)) {
         http_response_code(500);

@@ -10,7 +10,7 @@ ob_start();
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
@@ -120,6 +120,15 @@ try {
             }
             if (trim((string)($chapter['outline'] ?? '')) === '') {
                 throw new RuntimeException('请先为本章填写大纲，再重新生成正文');
+            }
+
+            // P2-7 修复（2026-08-09）：原实现先清空正文（mutateChapter）才进入
+            // write_chapter.php 的并发守卫。若此时该小说已有活跃写作任务在跑（如另一
+            // 章正在 SSE 流式写作），清空动作会破坏进行中的写作状态。改为在清空前
+            // 先用与 write_chapter.php 相同的 findActiveTask 守卫拦截。
+            require_once dirname(__DIR__) . '/includes/write_engine.php';
+            if (WriteEngine::findActiveTask((int)$chapter['novel_id']) !== null) {
+                throw new RuntimeException('该小说已有写作任务在运行中，请等待完成或先取消写作');
             }
 
             ChapterMutationService::mutateChapter((int)$chapter['id'], (int)$chapter['novel_id'], [

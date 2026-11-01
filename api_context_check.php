@@ -244,6 +244,11 @@ if ($action === 'check') {
 // ============================================================
 pageHeader('API 上下文检测', 'settings');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-api-context-check-do-check-1', function (event, element) { doCheck(); });
+AppEvents.register('page-api-context-check-toggle-raw-2', function (event, element) { toggleRaw(); });
+</script>
+
 
 <style>
 .dt-card { background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:24px; margin-bottom:20px; }
@@ -323,7 +328,7 @@ pageHeader('API 上下文检测', 'settings');
 
     <div class="dt-form-row">
         <label></label>
-        <button class="btn btn-primary" onclick="doCheck()">
+        <button class="btn btn-primary" data-csp-click="page-api-context-check-do-check-1">
             <i class="bi bi-search me-1"></i>开始检测
         </button>
     </div>
@@ -346,12 +351,12 @@ pageHeader('API 上下文检测', 'settings');
     <div id="msgDetails"></div>
 
     <div style="margin-top:16px">
-        <span class="dt-raw-toggle" onclick="toggleRaw()"><i class="bi bi-code-slash me-1"></i>查看完整 Prompt 原文</span>
+        <span class="dt-raw-toggle" data-csp-click="page-api-context-check-toggle-raw-2"><i class="bi bi-code-slash me-1"></i>查看完整 Prompt 原文</span>
         <div class="dt-raw-content" id="rawContent"></div>
     </div>
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 async function doCheck() {
     const novelId = document.getElementById('selNovel').value;
     if (!novelId) { showToast('请选择小说','error'); return; }

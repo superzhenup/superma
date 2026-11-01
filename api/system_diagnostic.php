@@ -24,6 +24,16 @@ if (!CFG_DIAGNOSTIC_ENABLED) {
     exit;
 }
 
+// 审计修复 L1（2026-08-16）：诊断端点暴露 DB 表结构存在性、记忆引擎/向量/知识库
+// 计数等内部拓扑信息，与 diagnose_embedding.php / daemon_token.php 统一为仅管理员可访问，
+// 防止未来多用户化后非管理员枚举内部实现细节。
+if (!isAdmin()) {
+    http_response_code(403);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['ok' => false, 'msg' => '仅管理员可访问诊断工具'], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 $input = json_decode(file_get_contents('php://input'), true) ?: $_GET;
 $novelId = (int)($input['novel_id'] ?? 0);
 $testType = $input['test_type'] ?? 'all';
@@ -33,7 +43,7 @@ if (!$novelId) {
     exit;
 }
 
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 checkNovelOwnership($novelId, $userId);
 
 $novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$novelId]);

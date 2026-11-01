@@ -378,6 +378,32 @@ PROMPT;
 }
 
 /**
+ * Collect a structured model response through the same observable streaming
+ * transport used by long-form generation. This keeps outline repair workers
+ * alive on providers that otherwise hold a non-streaming response open for a
+ * long time, while preserving the existing JSON parser contract.
+ */
+function collectStructuredOutlineStream(
+    AIClient $ai,
+    array $messages,
+    ?callable $checkpoint = null
+): string
+{
+    $raw = '';
+    $ai->chatStream(
+        $messages,
+        static function (string $chunk) use (&$raw, $checkpoint): void {
+            $raw .= $chunk;
+            if ($checkpoint !== null) {
+                $checkpoint();
+            }
+        },
+        'structured'
+    );
+    return $raw;
+}
+
+/**
  * Run deterministic outline checks, ask AI for local repairs when needed, then
  * return the best current outline batch.
  *
@@ -388,7 +414,8 @@ function repairOutlineBatchWithGuard(
     array $batch,
     array $history = [],
     ?callable $report = null,
-    int $maxAttempts = 2
+    int $maxAttempts = 2,
+    ?callable $streamCheckpoint = null
 ): array {
     $guard = new OutlineQualityGuard();
     $current = $batch;
@@ -424,8 +451,8 @@ function repairOutlineBatchWithGuard(
         try {
             withModelFallback(
                 !empty($novel['model_id']) ? (int)$novel['model_id'] : null,
-                function ($ai) use ($messages, &$raw) {
-                    $raw = $ai->chat($messages, 'structured');
+                function ($ai) use ($messages, &$raw, $streamCheckpoint) {
+                    $raw = collectStructuredOutlineStream($ai, $messages, $streamCheckpoint);
                 },
                 null,
                 'structured'
@@ -488,7 +515,14 @@ function repairOutlineBatchWithGuard(
  *
  * @return array{outlines:array, missing:array, repaired:bool}
  */
-function enforceTurningPoints(array $novel, int $startCh, int $endCh, array $outlines, ?callable $report = null): array
+function enforceTurningPoints(
+    array $novel,
+    int $startCh,
+    int $endCh,
+    array $outlines,
+    ?callable $report = null,
+    ?callable $streamCheckpoint = null
+): array
 {
     $out = ['outlines' => $outlines, 'missing' => [], 'repaired' => false];
     if (!getSystemSetting('ws_turning_point_check', true, 'bool')) return $out;
@@ -549,7 +583,9 @@ function enforceTurningPoints(array $novel, int $startCh, int $endCh, array $out
         $raw = '';
         withModelFallback(
             !empty($novel['model_id']) ? (int)$novel['model_id'] : null,
-            function ($ai) use ($messages, &$raw) { $raw = $ai->chat($messages, 'structured'); },
+            function ($ai) use ($messages, &$raw, $streamCheckpoint) {
+                $raw = collectStructuredOutlineStream($ai, $messages, $streamCheckpoint);
+            },
             null,
             'structured'
         );
@@ -578,6 +614,98 @@ function enforceTurningPoints(array $novel, int $startCh, int $endCh, array $out
         if ($report) $report('quality_issue', ['msg' => '转折点返修失败，保留原细纲：' . $e->getMessage(), 'issues' => []]);
     }
 
+    return $out;
+}
+
+/**
+ * 审计功能（2026-08-16 P3-黄金三章）：开篇里程碑核验与定向返修。
+ *
+ * 三层链路的第二层：对批次内第 1-3 章做确定性核验（词表命中制，
+ * GoldenThreeChapters::verifyOutlineBatch 纯函数），未达成则定向返修
+ * （最多 2 轮，消息由 GoldenThreeChapters::buildRepairMessages 生成）。
+ * 返修管线编排在本函数（镜像 enforceTurningPoints 的合并/幂等语义），
+ * 核验规则与消息内容在 GoldenThreeChapters（单一来源原则）。
+ * 失败不阻断：异常/返修失败均返回入参细纲原样。
+ *
+ * @param array $novel     小说行（含 model_id / opening_type / *_settings）
+ * @param int   $startCh   本批起始章号
+ * @param int   $endCh     本批结束章号
+ * @param array $outlines  已落库的本批细纲
+ * @param ?callable $report SSE 回调（后台段传 null）
+ * @return array{outlines: array, issues: array, repaired: bool}
+ */
+function enforceGoldenThree(
+    array $novel,
+    int $startCh,
+    int $endCh,
+    array $outlines,
+    ?callable $report = null,
+    ?callable $streamCheckpoint = null
+): array
+{
+    $out = ['outlines' => $outlines, 'issues' => [], 'repaired' => false];
+    try {
+        require_once __DIR__ . '/GoldenThreeChapters.php';
+        if (!GoldenThreeChapters::enabled()) return $out;
+        if (!GoldenThreeChapters::appliesToBatch($startCh, $endCh)) return $out;
+
+        $current = $outlines;
+        $maxAttempts = 2;
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            $v = GoldenThreeChapters::verifyOutlineBatch($current, $novel);
+            if ($v['passed']) {
+                if ($attempt > 1) {
+                    $out['repaired'] = true;
+                    if ($report) $report('quality_pass', ['msg' => '黄金三章里程碑已融入细纲', 'issues' => []]);
+                }
+                $out['outlines'] = $current;
+                return $out;
+            }
+            $out['issues'] = $v['issues'];
+            if ($report) {
+                $report('quality_issue', [
+                    'msg'    => "检测到黄金三章开篇里程碑未达成，定向返修（{$attempt}/{$maxAttempts}）",
+                    'issues' => array_map(fn($i) => $i['hint'], $v['issues']),
+                ]);
+            }
+
+            $messages = GoldenThreeChapters::buildRepairMessages($current, $v['issues'], $novel);
+            $raw = '';
+            withModelFallback(
+                !empty($novel['model_id']) ? (int)$novel['model_id'] : null,
+                function ($ai) use ($messages, &$raw, $streamCheckpoint) {
+                    $raw = collectStructuredOutlineStream($ai, $messages, $streamCheckpoint);
+                },
+                null,
+                'structured'
+            );
+            $repaired = extractOutlineObjects($raw);
+            if (empty($repaired)) {
+                if ($report) $report('quality_issue', ['msg' => '黄金三章返修解析失败，保留当前细纲', 'issues' => []]);
+                break;
+            }
+
+            // 章号白名单字段级合并（镜像 enforceTurningPoints 的 H-中10 语义：
+            // 返修版字段覆盖同名字段，原条目独有字段保留，AI 多返回章不混入）
+            $byNum = [];
+            foreach ($current as $it) $byNum[(int)($it['chapter_number'] ?? 0)] = $it;
+            foreach ($repaired as $it) {
+                $cn = (int)($it['chapter_number'] ?? 0);
+                if ($cn > 0 && isset($byNum[$cn])) {
+                    $byNum[$cn] = array_merge($byNum[$cn], $it);
+                }
+            }
+            ksort($byNum);
+            $current = array_values($byNum);
+        }
+
+        // 轮次耗尽/解析失败：保留最后版本；复检一次以报告准确的残留问题（不阻断）
+        $out['outlines'] = $current;
+        $finalV = GoldenThreeChapters::verifyOutlineBatch($current, $novel);
+        $out['issues'] = $finalV['issues'];
+    } catch (\Throwable $e) {
+        if ($report) $report('quality_issue', ['msg' => '黄金三章核验异常，保留原细纲：' . $e->getMessage(), 'issues' => []]);
+    }
     return $out;
 }
 

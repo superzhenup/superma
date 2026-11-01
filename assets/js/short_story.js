@@ -10,6 +10,8 @@
     chapters: Array.isArray(window.SHORT_STORY_CHAPTERS) ? window.SHORT_STORY_CHAPTERS.slice() : [],
     currentIdx: -1,
     editMode: isChapterMode() ? 'chapter' : 'full',
+    drafts: {}, // Unconfirmed/local text is separate from persisted chapters.
+    savedFullContent: null, // null uses the textarea's original server-rendered value.
   };
 
   // 审计修复 M-3（2026-06-22）：统一 api() 错误处理。
@@ -72,6 +74,7 @@
   };
 
   window.generateBrief = function() {
+    if (!allowEditorAction()) return;
     var btn = document.getElementById('btnBrief');
     btnLoading(btn, '生成中...');
     api('generate_brief', { id: getStoryId(), model_id: getModelId() })
@@ -87,6 +90,7 @@
   };
 
   window.generateBeats = function() {
+    if (!allowEditorAction()) return;
     var btn = document.getElementById('btnBeats');
     btnLoading(btn, '生成中...');
     api('generate_beats', { id: getStoryId(), model_id: getModelId() })
@@ -103,17 +107,120 @@
 
   var draftSseController = null;
   var allChaptersStop = false;
+  var editorBusy = false;
 
-  window.writeDraft = function() {
-    var btn = document.getElementById('btnDraft');
+  function editorNotice(message, warning) {
+    var notice = document.getElementById('editorSaveNotice');
+    if (!notice) return;
+    notice.hidden = !message;
+    notice.textContent = message || '';
+    notice.className = 'small px-3 py-2 ' + (warning ? 'text-warning' : 'text-success');
+  }
+
+  function allowEditorAction() {
+    if (!editorBusy) return true;
+    editorNotice('请等待当前操作结束，或先停止生成。', true);
+    return false;
+  }
+
+  function setEditorBusy(busy) {
+    editorBusy = busy;
+    var save = document.getElementById('btnSave');
+    if (save) save.disabled = busy || (isChapterMode() && state.editMode === 'full');
+    var ta = document.getElementById('editorContent');
+    if (ta) ta.readOnly = busy || (isChapterMode() && state.editMode === 'full');
+  }
+
+  function rememberChapterDraft() {
+    if (!isChapterMode() || state.editMode !== 'chapter' || state.currentIdx < 0) return;
+    var ta = document.getElementById('editorContent');
+    if (!ta) return;
+    if (ta.value !== (state.chapters[state.currentIdx].content || '')) state.drafts[state.currentIdx] = ta.value;
+    else delete state.drafts[state.currentIdx];
+  }
+
+  function chapterEditorContent(idx) {
+    return Object.prototype.hasOwnProperty.call(state.drafts, idx)
+      ? state.drafts[idx] : (state.chapters[idx].content || '');
+  }
+
+  function showChapterDraftNotice(idx) {
+    editorNotice(Object.prototype.hasOwnProperty.call(state.drafts, idx)
+      ? '本章有未确认保存的内容，请核对后点击保存。' : '', true);
+  }
+
+  function abortError() {
+    var error = new Error('生成已停止');
+    error.name = 'AbortError';
+    return error;
+  }
+
+  // Only an explicit server terminal with a persistence acknowledgement can
+  // complete a generation. EOF, transport errors and aborts are never saves.
+  async function consumeShortStream(action, body, controller, onContent) {
+    var headers = jsonHeaders();
+    headers.Accept = 'text/event-stream';
+    var resp = await fetch(apiRouteUrl('short_story', 'action=' + action), {
+      method: 'POST', headers: headers, body: JSON.stringify(body), signal: controller.signal,
+    });
+    if (!resp.ok) throw new Error('请求失败（HTTP ' + resp.status + '）');
+    if (!resp.body) throw new Error('服务器未返回生成数据');
+    var reader = resp.body.getReader();
+    var decoder = new TextDecoder('utf-8');
+    var buffer = '';
+    try {
+      while (true) {
+        if (controller.signal.aborted) throw abortError();
+        var chunk = await reader.read();
+        if (controller.signal.aborted) throw abortError();
+        if (chunk.done) throw new Error('连接已结束，但未收到生成完成和保存确认');
+        buffer += decoder.decode(chunk.value, { stream: true });
+        var blocks = buffer.split(/\r?\n\r?\n/);
+        buffer = blocks.pop();
+        for (var i = 0; i < blocks.length; i++) {
+          var payload = blocks[i].split(/\r?\n/).filter(function(line) {
+            return line.indexOf('data:') === 0;
+          }).map(function(line) { return line.substring(5).trim(); }).join('\n');
+          if (!payload) continue;
+          var event;
+          try { event = JSON.parse(payload); }
+          catch (error) { throw new Error('服务器返回了无法识别的生成数据'); }
+          if (!event || typeof event !== 'object') throw new Error('服务器返回了无法识别的生成数据');
+          if (event.error || event.ok === false) {
+            var failure = new Error(event.error || event.msg || '生成失败');
+            // The server rejected an incomplete model result: the preview is known truncated text.
+            failure.discardPartial = event.incomplete === true;
+            throw failure;
+          }
+          if (typeof event.content === 'string') onContent(event);
+          if (event.done === true) {
+            if (event.saved !== true) throw new Error(event.msg || '生成已结束，但服务器未确认保存');
+            return;
+          }
+        }
+      }
+    } finally {
+      try { await reader.cancel(); } catch (ignored) {}
+    }
+  }
+
+  async function runShortGeneration(chapterIndex) {
+    if (!allowEditorAction()) return false;
+    var chapterMode = chapterIndex !== null;
+    var btn = document.getElementById(chapterMode ? 'btnWriteChapter' : 'btnDraft');
     var btnStop = document.getElementById('btnStop');
     var ta = document.getElementById('editorContent');
     var preview = document.getElementById('ssePreview');
     var progress = document.getElementById('sseProgress');
     var bar = document.getElementById('sseBar');
     var wcEl = document.getElementById('sseWordCount');
-
-    btnLoading(btn, '生成中...');
+    var fullContent = '';
+    var saved = false;
+    var controller = new AbortController();
+    draftSseController = controller;
+    setEditorBusy(true);
+    editorNotice('', false);
+    if (btn) btnLoading(btn, '生成中...');
     btnStop.style.display = '';
     ta.style.display = 'none';
     preview.style.display = 'block';
@@ -121,155 +228,119 @@
     progress.style.display = 'block';
     bar.style.width = '0%';
     wcEl.textContent = '0字';
-
-    draftSseController?.abort();
-    draftSseController = new AbortController();
-
-    var body = JSON.stringify({ id: getStoryId(), model_id: getModelId() });
-    var headers = jsonHeaders();
-    headers['Accept'] = 'text/event-stream';
-
-    fetch(apiRouteUrl('short_story', 'action=write_draft'), {
-      method: 'POST',
-      headers: headers,
-      body: body,
-      signal: draftSseController.signal,
-    }).then(function(resp) {
-      if (!resp.ok) {
-        return resp.text().then(function(t) {
-          throw new Error('HTTP ' + resp.status + ': ' + t);
-        });
+    var body = { id: getStoryId(), model_id: getModelId() };
+    if (chapterMode) body.chapter_index = chapterIndex;
+    try {
+      await consumeShortStream(chapterMode ? 'write_chapter' : 'write_draft', body, controller, function(event) {
+        fullContent += event.content;
+        preview.innerHTML = escHtml(fullContent) + '<span class="sse-cursor"></span>';
+        wcEl.textContent = fullContent.replace(/\s+/g, '').length.toLocaleString() + '字';
+        if (event.progress) bar.style.width = Math.min(event.progress, 100) + '%';
+        preview.scrollTop = preview.scrollHeight;
+      });
+      if (!fullContent.trim()) throw new Error('未收到正文，请刷新核对保存结果');
+      saved = true;
+      if (chapterMode) {
+        state.chapters[chapterIndex].content = fullContent;
+        state.chapters[chapterIndex].status = 'written';
+        delete state.drafts[chapterIndex];
+        renderSavedChapter(chapterIndex);
+      } else {
+        state.savedFullContent = fullContent;
       }
-      var reader = resp.body.getReader();
-      var decoder = new TextDecoder('utf-8');
-      var buf = '';
-      var fullContent = '';
-
-      function read() {
-        reader.read().then(function(result) {
-          if (result.done) {
-            finishDraft(fullContent);
-            return;
-          }
-          buf += decoder.decode(result.value, { stream: true });
-          var blocks = buf.split('\n\n');
-          buf = blocks.pop();
-
-          for (var i = 0; i < blocks.length; i++) {
-            var b = blocks[i].trim();
-            if (!b || b.charAt(0) === ':') continue;
-            var payload = '';
-            var lines = b.split('\n');
-            for (var j = 0; j < lines.length; j++) {
-              if (lines[j].indexOf('data:') === 0) {
-                payload += lines[j].substring(5).trim();
-              }
-            }
-            if (!payload) continue;
-            var d;
-            try { d = JSON.parse(payload); } catch(e) { continue; }
-
-            if (d.error) {
-              alert(d.error);
-              resetDraftUI();
-              return;
-            }
-            if (d.done) {
-              finishDraft(fullContent, d.saved);
-              return;
-            }
-            if (d.content) {
-              fullContent += d.content;
-              preview.innerHTML = escHtml(fullContent) + '<span class="sse-cursor"></span>';
-              if (d.wordCount) wcEl.textContent = d.wordCount.toLocaleString() + '字';
-              if (d.progress) bar.style.width = Math.min(d.progress, 100) + '%';
-              preview.scrollTop = preview.scrollHeight;
-            }
-          }
-          read();
-        }).catch(function(e) {
-          if (e.name === 'AbortError') {
-            if (fullContent) {
-              finishDraft(fullContent, false);
-            } else {
-              resetDraftUI();
-            }
-          } else {
-            alert('读取错误：' + e.message);
-            resetDraftUI();
-          }
-        });
+      editorNotice('服务器已确认保存。', false);
+      showToast(chapterMode ? '第 ' + (chapterIndex + 1) + ' 章已生成并保存' : '初稿已生成并保存');
+    } catch (error) {
+      allChaptersStop = true;
+      if (error.discardPartial) {
+        // A truncated result rejected by the server is never kept as a draft that could be saved over the original.
+        fullContent = '';
+        editorNotice('生成中断：' + error.message + '。原内容未改动。', true);
+      } else {
+        if (chapterMode && fullContent) state.drafts[chapterIndex] = fullContent;
+        var reason = error.name === 'AbortError' ? '生成已停止' : ('生成中断：' + error.message);
+        editorNotice(reason + '。未收到保存确认；已接收内容保留在编辑器，请核对后保存。', true);
       }
-      read();
-    }).catch(function(e) {
-      if (e.name !== 'AbortError') {
-        alert('请求失败：' + e.message);
-      }
-      resetDraftUI();
-    });
-  };
-
-  function finishDraft(content, saved) {
-    var ta = document.getElementById('editorContent');
-    var preview = document.getElementById('ssePreview');
-    var progress = document.getElementById('sseProgress');
-    var btn = document.getElementById('btnDraft');
-    var btnStop = document.getElementById('btnStop');
-
-    ta.value = content;
-    ta.style.display = '';
-    preview.style.display = 'none';
-    progress.style.display = 'none';
-    btnStop.style.display = 'none';
-    btnRestore(btn);
-    updateWordCount();
-    draftSseController = null;
-
-    if (saved !== false) {
-      api('save_content', { id: getStoryId(), content: content, note: 'SSE生成初稿' })
-        .then(function(d) {
-          if (d.ok) showToast('初稿已生成并保存');
-          else showToast('初稿已生成，但保存失败：' + (d.msg || ''));
-        });
-    } else {
-      showToast('生成已停止，内容已填入编辑器');
+    } finally {
+      // With zero received text, preserve the editor's existing content.
+      if (fullContent) ta.value = fullContent;
+      ta.style.display = '';
+      preview.style.display = 'none';
+      progress.style.display = 'none';
+      btnStop.style.display = 'none';
+      if (btn) btnRestore(btn);
+      draftSseController = null;
+      setEditorBusy(false);
+      if (chapterMode) showChapterHeader();
+      updateWordCount();
     }
+    return saved;
   }
 
-  function resetDraftUI() {
-    var ta = document.getElementById('editorContent');
-    var preview = document.getElementById('ssePreview');
-    var progress = document.getElementById('sseProgress');
-    var btn = document.getElementById('btnDraft');
-    var btnStop = document.getElementById('btnStop');
-
-    ta.style.display = '';
-    preview.style.display = 'none';
-    progress.style.display = 'none';
-    btnStop.style.display = 'none';
-    btnRestore(btn);
-    draftSseController = null;
+  function renderSavedChapter(idx) {
+    var item = document.querySelector('.chapter-item[data-idx="' + idx + '"]');
+    if (!item) return;
+    var chapter = state.chapters[idx];
+    var written = !!(chapter.content || '').trim();
+    var status = item.querySelector('.ch-status-pending, .ch-status-written, .ch-status-polished');
+    if (status) {
+      status.textContent = written ? '● 已写' : '○ 待写';
+      status.className = written ? 'ch-status-written' : 'ch-status-pending';
+    }
+    var meta = item.querySelector('.ch-meta');
+    if (meta) meta.innerHTML = '<span class="' + (written ? 'ch-status-written' : 'ch-status-pending') + '">'
+      + (written ? '● 已写' : '○ 待写') + '</span> · ' + (chapter.content || '').replace(/\s+/g, '').length
+      + '/' + (parseInt(chapter.word_budget) || 0) + '字';
   }
+
+  window.writeDraft = function() {
+    if (isChapterMode()) {
+      editorNotice('分章模式请使用写本章或连续写作。', true);
+      return Promise.resolve(false);
+    }
+    return runShortGeneration(null);
+  };
 
   window.stopDraft = function() {
     allChaptersStop = true;
-    if (draftSseController) {
-      draftSseController.abort();
-    }
+    if (draftSseController) draftSseController.abort();
   };
 
-  window.saveContent = function() {
+  window.saveContent = async function() {
+    if (!allowEditorAction()) return false;
     var ta = document.getElementById('editorContent');
-    if (!ta) return;
-    api('save_content', { id: getStoryId(), content: ta.value, note: '手动保存' })
-      .then(function(d) {
-        if (d.ok) {
-          showToast('保存成功');
-        } else {
-          alert(d.msg || '保存失败');
-        }
-      })
-      .catch(function(e){ alert('网络错误：' + e.message); });
+    if (!ta) return false;
+    if (isChapterMode() && (state.editMode !== 'chapter' || state.currentIdx < 0)) {
+      editorNotice('请先选择要保存的当前章节。', true);
+      return false;
+    }
+    var idx = isChapterMode() ? state.currentIdx : null;
+    var content = ta.value;
+    var body = { id: getStoryId(), content: content, note: '手动保存' };
+    if (idx !== null) body.chapter_index = idx;
+    setEditorBusy(true);
+    try {
+      var result = await api(idx === null ? 'save_content' : 'save_chapter_content', body);
+      if (!result.ok) throw new Error(result.msg || '保存失败');
+      if (idx !== null) {
+        state.chapters[idx].content = content;
+        state.chapters[idx].status = content.trim() ? 'written' : 'pending';
+        delete state.drafts[idx];
+        renderSavedChapter(idx);
+        showChapterHeader();
+      } else {
+        state.savedFullContent = content;
+      }
+      editorNotice('服务器已确认保存。', false);
+      showToast(idx === null ? '保存成功' : '本章已保存');
+      return true;
+    } catch (error) {
+      if (idx !== null) state.drafts[idx] = content;
+      editorNotice('未确认保存：' + error.message + '。内容仍保留在编辑器。', true);
+      return false;
+    } finally {
+      setEditorBusy(false);
+    }
   };
 
   window.toggleBriefEdit = function() {
@@ -280,7 +351,6 @@
       display.style.display = 'none';
       edit.style.display = 'block';
       btn.innerHTML = '<i class="bi bi-x-lg"></i>取消编辑';
-      btn.onclick = cancelBriefEdit;
     } else {
       cancelBriefEdit();
     }
@@ -293,10 +363,10 @@
     display.style.display = '';
     edit.style.display = 'none';
     btn.innerHTML = '<i class="bi bi-pencil"></i>编辑概要';
-    btn.onclick = toggleBriefEdit;
   };
 
   window.saveBriefEdit = function() {
+    if (!allowEditorAction()) return;
     var brief = {
       logline: document.getElementById('editLogline').value,
       theme: document.getElementById('editTheme').value,
@@ -325,7 +395,6 @@
       display.style.display = 'none';
       edit.style.display = 'block';
       btn.innerHTML = '<i class="bi bi-x-lg"></i>取消编辑';
-      btn.onclick = cancelBeatsEdit;
     } else {
       cancelBeatsEdit();
     }
@@ -338,10 +407,10 @@
     display.style.display = '';
     edit.style.display = 'none';
     btn.innerHTML = '<i class="bi bi-pencil"></i>编辑节拍';
-    btn.onclick = toggleBeatsEdit;
   };
 
   window.saveBeatsEdit = function() {
+    if (!allowEditorAction()) return;
     var fields = document.querySelectorAll('.beat-field');
     var beatsMap = {};
     fields.forEach(function(f) {
@@ -365,20 +434,52 @@
       .catch(function(e){ alert('网络错误：' + e.message); });
   };
 
-  window.polishShort = function(mode) {
-    if (!confirm('确认进行' + (mode === 'full' ? '全文润色' : mode === 'opening' ? '开头强化' : mode === 'ending' ? '结尾强化' : mode === 'dialogue' ? '对话优化' : '润色') + '？当前内容将被覆盖。')) return;
-    api('polish', { id: getStoryId(), mode: mode, model_id: getModelId() })
-      .then(function(d) {
-        if (d.ok && d.data) {
-          var ta = document.getElementById('editorContent');
-          if (ta && d.data.content) ta.value = d.data.content;
-          updateWordCount();
-          showToast('润色完成');
-        } else {
-          alert(d.msg || '润色失败');
-        }
-      })
-      .catch(function(e){ alert('网络错误：' + e.message); });
+  window.polishShort = async function(mode) {
+    if (!allowEditorAction()) return false;
+    var idx = isChapterMode() ? state.currentIdx : null;
+    if (isChapterMode() && (state.editMode !== 'chapter' || idx < 0)) {
+      editorNotice('请先选择要润色的当前章节。', true);
+      return false;
+    }
+    var ta = document.getElementById('editorContent');
+    var savedContent = idx === null
+      ? (state.savedFullContent === null ? ta.defaultValue : state.savedFullContent)
+      : (state.chapters[idx].content || '');
+    if (ta.value !== savedContent) {
+      editorNotice((idx === null ? '正文' : '当前章节') + '有未保存内容，请先保存后再润色。', true);
+      return false;
+    }
+    var scope = idx === null ? '全文' : '当前章';
+    if (!confirm('确认润色' + scope + '？已保存的内容将被替换，并保留修改前版本。')) return false;
+    var body = { id: getStoryId(), mode: mode, model_id: getModelId() };
+    if (idx !== null) body.chapter_index = idx;
+    setEditorBusy(true);
+    try {
+      var result = await api('polish', body);
+      if (!result.ok || !result.data) throw new Error(result.msg || '润色失败');
+      if (idx !== null) {
+        var chapter = result.data.chapters_json && result.data.chapters_json[idx];
+        if (!chapter || typeof chapter.content !== 'string') throw new Error('未收到当前章节的保存结果，请刷新核对');
+        state.chapters[idx] = chapter;
+        delete state.drafts[idx];
+        ta.value = chapter.content;
+        renderSavedChapter(idx);
+        showChapterHeader();
+      } else {
+        if (typeof result.data.content !== 'string') throw new Error('未收到正文保存结果，请刷新核对');
+        ta.value = result.data.content;
+        state.savedFullContent = result.data.content;
+      }
+      updateWordCount();
+      editorNotice(scope + '润色已保存。', false);
+      showToast(scope + '润色已保存');
+      return true;
+    } catch (error) {
+      editorNotice('润色未确认成功：' + error.message, true);
+      return false;
+    } finally {
+      setEditorBusy(false);
+    }
   };
 
   window.optimizeTitle = function() {
@@ -473,6 +574,7 @@
   };
 
   window.rollbackVersion = function(versionId) {
+    if (!allowEditorAction()) return;
     if (!confirm('确认回滚到此版本？当前内容将被替换。')) return;
     api('rollback', { id: getStoryId(), version_id: versionId })
       .then(function(d) {
@@ -518,6 +620,8 @@
   // ============== 章节模式 ==============
 
   window.switchEditMode = function(mode) {
+    if (!allowEditorAction()) return;
+    rememberChapterDraft();
     state.editMode = mode;
     var tabC = document.getElementById('tabChapter');
     var tabF = document.getElementById('tabFull');
@@ -531,7 +635,8 @@
       tabC && tabC.classList.add('active');
       tabF && tabF.classList.remove('active');
       if (state.currentIdx >= 0 && state.chapters[state.currentIdx]) {
-        ta.value = state.chapters[state.currentIdx].content || '';
+        ta.value = chapterEditorContent(state.currentIdx);
+        showChapterDraftNotice(state.currentIdx);
         ta.readOnly = false;
         showChapterHeader();
         if (btnWriteCh) btnWriteCh.disabled = false;
@@ -546,6 +651,7 @@
       tabC && tabC.classList.remove('active');
       tabF && tabF.classList.add('active');
       ta.value = mergeChaptersClient();
+      editorNotice('全文预览展示已保存的章节。', false);
       ta.readOnly = true;
       if (header) header.style.display = 'none';
       if (btnWriteCh) btnWriteCh.disabled = true;
@@ -580,7 +686,8 @@
   }
 
   window.selectChapter = function(idx) {
-    if (!state.chapters[idx]) return;
+    if (!allowEditorAction() || !state.chapters[idx]) return;
+    rememberChapterDraft();
     state.currentIdx = idx;
     // 高亮
     var items = document.querySelectorAll('.chapter-item');
@@ -592,7 +699,8 @@
       switchEditMode('chapter');
     } else {
       var ta = document.getElementById('editorContent');
-      ta.value = state.chapters[idx].content || '';
+      ta.value = chapterEditorContent(idx);
+      showChapterDraftNotice(idx);
       ta.readOnly = false;
       showChapterHeader();
       var btnWriteCh = document.getElementById('btnWriteChapter');
@@ -602,6 +710,7 @@
   };
 
   window.generateChapters = function() {
+    if (!allowEditorAction()) return;
     var btn = document.getElementById('btnChapters');
     if (!btn) return;
     if (btn.disabled) { alert('请先生成「叙事节拍」'); return; }
@@ -626,7 +735,6 @@
       list.style.display = 'none';
       edit.style.display = 'block';
       btn.innerHTML = '<i class="bi bi-x-lg"></i>取消编辑';
-      btn.onclick = cancelChaptersEdit;
     } else {
       cancelChaptersEdit();
     }
@@ -639,10 +747,10 @@
     list.style.display = '';
     edit.style.display = 'none';
     btn.innerHTML = '<i class="bi bi-pencil"></i>编辑章节大纲';
-    btn.onclick = toggleChaptersEdit;
   };
 
   window.saveChaptersEdit = function() {
+    if (!allowEditorAction()) return;
     var fields = document.querySelectorAll('.chapter-field');
     var map = {};
     fields.forEach(function(f) {
@@ -674,10 +782,12 @@
 
   window.writeCurrentChapter = function() {
     if (state.currentIdx < 0) { alert('请先选择左侧章节'); return; }
-    runWriteChapter(state.currentIdx).catch(function(e){ alert(e.message || String(e)); });
+    if (state.editMode !== 'chapter') { editorNotice('请先选择要生成的当前章节。', true); return; }
+    return runWriteChapter(state.currentIdx);
   };
 
   window.writeAllChapters = function() {
+    if (!allowEditorAction()) return;
     if (!state.chapters.length) { alert('尚未生成章节大纲'); return; }
     if (!confirm('将按顺序为所有未完成章节生成正文,可能耗时较长。继续?')) return;
     allChaptersStop = false;
@@ -696,8 +806,8 @@
       }
       if (allChaptersStop) return;
       selectChapter(i);
-      runWriteChapter(i).then(function() {
-        if (!allChaptersStop) loop(i + 1);
+      runWriteChapter(i).then(function(saved) {
+        if (saved && !allChaptersStop) loop(i + 1);
       }).catch(function(e) {
         alert('第 ' + (i+1) + ' 章生成失败:' + (e.message || e));
       });
@@ -705,150 +815,6 @@
   };
 
   function runWriteChapter(idx) {
-    return new Promise(function(resolve, reject) {
-      var btn = document.getElementById('btnWriteChapter');
-      var btnStop = document.getElementById('btnStop');
-      var ta = document.getElementById('editorContent');
-      var preview = document.getElementById('ssePreview');
-      var progress = document.getElementById('sseProgress');
-      var bar = document.getElementById('sseBar');
-      var wcEl = document.getElementById('sseWordCount');
-
-      // 锁定 UI
-      btn && btnLoading(btn, '生成中...');
-      btnStop.style.display = '';
-      ta.style.display = 'none';
-      preview.style.display = 'block';
-      preview.innerHTML = '';
-      progress.style.display = 'block';
-      bar.style.width = '0%';
-      wcEl.textContent = '0字';
-
-      draftSseController?.abort();
-    draftSseController = new AbortController();
-      var headers = jsonHeaders();
-      headers['Accept'] = 'text/event-stream';
-
-      fetch(apiRouteUrl('short_story', 'action=write_chapter'), {
-        method: 'POST',
-        headers: headers,
-        body: JSON.stringify({ id: getStoryId(), model_id: getModelId(), chapter_index: idx }),
-        signal: draftSseController.signal,
-      }).then(function(resp) {
-        if (!resp.ok) return resp.text().then(function(t){ throw new Error('HTTP ' + resp.status + ': ' + t); });
-        var reader = resp.body.getReader();
-        var decoder = new TextDecoder('utf-8');
-        var buf = '';
-        var full = '';
-
-        function read() {
-          reader.read().then(function(result) {
-            if (result.done) { finishChapterStream(idx, full, btn); resolve(); return; }
-            buf += decoder.decode(result.value, { stream: true });
-            var blocks = buf.split('\n\n');
-            buf = blocks.pop();
-            for (var i = 0; i < blocks.length; i++) {
-              var b = blocks[i].trim();
-              if (!b || b.charAt(0) === ':') continue;
-              var payload = '';
-              var lines = b.split('\n');
-              for (var j = 0; j < lines.length; j++) {
-                if (lines[j].indexOf('data:') === 0) payload += lines[j].substring(5).trim();
-              }
-              if (!payload) continue;
-              var d;
-              try { d = JSON.parse(payload); } catch(e){ continue; }
-
-              if (d.error) { finishChapterStream(idx, full, btn); reject(new Error(d.error)); return; }
-              if (d.done)  { finishChapterStream(idx, full, btn, d.saved); resolve(); return; }
-              if (d.content) {
-                full += d.content;
-                preview.innerHTML = escHtml(full) + '<span class="sse-cursor"></span>';
-                if (d.wordCount) wcEl.textContent = d.wordCount.toLocaleString() + '字';
-                if (d.progress)  bar.style.width = Math.min(d.progress, 100) + '%';
-                preview.scrollTop = preview.scrollHeight;
-              }
-            }
-            read();
-          }).catch(function(e) {
-            if (e.name === 'AbortError') {
-              finishChapterStream(idx, full, btn, false);
-              resolve();
-            } else {
-              finishChapterStream(idx, full, btn, false);
-              reject(e);
-            }
-          });
-        }
-        read();
-      }).catch(function(e) {
-        finishChapterStream(idx, '', btn, false);
-        if (e.name !== 'AbortError') reject(e); else resolve();
-      });
-    });
+    return runShortGeneration(idx);
   }
-
-  function finishChapterStream(idx, content, btn, saved) {
-    var ta = document.getElementById('editorContent');
-    var preview = document.getElementById('ssePreview');
-    var progress = document.getElementById('sseProgress');
-    var btnStop = document.getElementById('btnStop');
-
-    if (content) {
-      state.chapters[idx].content = content;
-      state.chapters[idx].status = 'written';
-    }
-    ta.value = content || '';
-    ta.style.display = '';
-    preview.style.display = 'none';
-    progress.style.display = 'none';
-    btnStop.style.display = 'none';
-    if (btn) btnRestore(btn);
-    showChapterHeader();
-    updateWordCount();
-    draftSseController = null;
-
-    if (saved === false && content) {
-      // 用户主动停止：写一次保存
-      api('save_chapter_content', { id: getStoryId(), chapter_index: idx, content: content })
-        .then(function(){ showToast('已停止并保存第 ' + (idx+1) + ' 章'); });
-    } else if (saved !== false) {
-      // 刷新左侧章节卡片显示
-      var item = document.querySelector('.chapter-item[data-idx="' + idx + '"]');
-      if (item) {
-        var st = item.querySelector('.ch-status-pending, .ch-status-written, .ch-status-polished');
-        if (st) { st.textContent = '● 已写'; st.className = 'ch-status-written'; }
-        var meta = item.querySelector('.ch-meta');
-        if (meta) {
-          var wc = content.replace(/\s+/g, '').length;
-          meta.innerHTML = '<span class="ch-status-written">● 已写</span> · ' + wc + '/' + (parseInt(state.chapters[idx].word_budget) || 0) + '字';
-        }
-      }
-      showToast('第 ' + (idx+1) + ' 章生成完成');
-    }
-  }
-
-  // 改写 saveContent: 分章模式下保存当前章节
-  var origSaveContent = window.saveContent;
-  window.saveContent = function() {
-    var ta = document.getElementById('editorContent');
-    if (!ta) return;
-    if (isChapterMode() && state.editMode === 'chapter') {
-      if (state.currentIdx < 0) { alert('请先选择左侧章节'); return; }
-      api('save_chapter_content', { id: getStoryId(), chapter_index: state.currentIdx, content: ta.value })
-        .then(function(d) {
-          if (d.ok) {
-            state.chapters[state.currentIdx].content = ta.value;
-            state.chapters[state.currentIdx].status = ta.value.trim() ? 'written' : 'pending';
-            showToast('本章已保存');
-            showChapterHeader();
-          } else {
-            alert(d.msg || '保存失败');
-          }
-        })
-        .catch(function(e){ alert('网络错误:' + e.message); });
-      return;
-    }
-    return origSaveContent();
-  };
 })();

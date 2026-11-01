@@ -1,0 +1,14 @@
+{
+  "id": "battle-scene",
+  "version": "1.0.0",
+  "description": "在不破坏正史战力与伤势约束的前提下组织清晰、递进的战斗场景。",
+  "triggers": {
+    "chapter_types": ["battle", "climax"],
+    "keywords": ["战斗", "决战", "交锋", "追杀"],
+    "outline_tags": ["combat", "battle"]
+  },
+  "priority": 100,
+  "token_budget": 650,
+  "requires": [],
+  "conflicts": []
+}

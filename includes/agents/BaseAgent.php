@@ -168,17 +168,44 @@ abstract class BaseAgent
     
     /**
      * 清空内存中的决策历史
-     * 
+     *
      * @return void
      */
     public function clearMemoryHistory(): void
     {
         $this->decisionHistory = [];
     }
-    
+
+    /**
+     * 审计修复（2026-08-17 写作逻辑 C）：小说级字数容差写入互斥守卫。
+     *
+     * 质量 Agent（收紧）与策略 Agent（放宽/收紧）共用 ws_dynamic_tolerance_ratio
+     * 一个旋钮；同一写作周期内（默认 20 分钟窗口，约一章节奏）只允许第一个
+     * Agent 成功写入，后来者跳过并记日志，避免两个 Agent 同章互相覆盖打架。
+     */
+    protected function toleranceWriteAlreadyDone(int $novelId, int $windowMinutes = 20): bool
+    {
+        try {
+            if (!class_exists('DB')) {
+                return false;
+            }
+            $row = DB::fetch(
+                'SELECT id FROM agent_action_logs
+                 WHERE novel_id=? AND action="adjust_word_tolerance" AND status="success"
+                   AND created_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE)
+                 LIMIT 1',
+                [$novelId, $windowMinutes]
+            );
+            return (bool)$row;
+        } catch (\Throwable $e) {
+            error_log('toleranceWriteAlreadyDone probe failed: ' . $e->getMessage());
+            return false;
+        }
+    }
+
     /**
      * 记录动作执行日志
-     * 
+     *
      * @param int $novelId 小说ID
      * @param string $action 动作名称
      * @param string $status 执行状态
@@ -348,20 +375,24 @@ abstract class BaseAgent
         ];
     }
 
-    protected function writeDirective(string $type, string $directive, int $applyRange = 8, ?int $expiresInHours = 72): void
+    // 审计修复（2026-08-09 R5）：原为 add() + applyRange=8——前写指令不限流、生效窗口过长，
+    // 与 post 侧 addCapped(max=2) 不对称，堆积后再被消费端截 3 条，"写入成功"≠"模型看到"。
+    // 改走 addCapped 并把默认窗口收到 3 章，与消费端上限对齐。
+    protected function writeDirective(string $type, string $directive, int $applyRange = 3, ?int $expiresInHours = 72): void
     {
         try {
             require_once __DIR__ . '/AgentDirectives.php';
             $nextChapter = $this->currentChapterNumber > 0
                 ? $this->currentChapterNumber
                 : $this->getCurrentChapterNumber();
-            AgentDirectives::add(
+            AgentDirectives::addCapped(
                 $this->novelId,
                 $nextChapter,
                 $type,
                 $directive,
                 $applyRange,
-                $expiresInHours
+                $expiresInHours,
+                maxActive: 2
             );
         } catch (\Throwable $e) {
             error_log("写入Agent指令失败: " . $e->getMessage());
@@ -389,6 +420,17 @@ abstract class BaseAgent
         } catch (\Throwable $e) {
             return 1;
         }
+    }
+
+    /**
+     * Public decision entry point for orchestrators.
+     *
+     * The timeout/error normalization remains an implementation detail; callers
+     * get one stable orchestration boundary without exposing the protected guard.
+     */
+    public function runDecision(array $context): array
+    {
+        return $this->decideWithTimeout($context);
     }
 
     protected function decideWithTimeout(array $context): array

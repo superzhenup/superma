@@ -18,12 +18,13 @@ ini_set('zlib.output_compression', 'Off');
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/ChapterMutationService.php';
+require_once dirname(__DIR__) . '/includes/quality/ChapterGenerationIntegrity.php';
 require_once dirname(__DIR__) . '/includes/ChapterMemoryFinalizer.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 requireLoginApi();
@@ -55,7 +56,7 @@ $chapterId   = (int)($input['chapter_id'] ?? 0);
 $targetWords = (int)($input['target_words'] ?? 2000);
 
 // 审计 P0（2026-06-12）：章节归属校验
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 if ($chapterId > 0) checkChapterOwnership($chapterId, $userId);
 
 $ch = DB::fetch('SELECT * FROM chapters WHERE id=?', [$chapterId]);
@@ -165,6 +166,10 @@ try {
             'creative'
         );
 
+        // A terminal event can still mean token truncation or filtering.
+        // Reject this attempt before fallback reports success or any body is saved.
+        ChapterGenerationIntegrity::assertComplete($ai->lastFinishReason);
+
         // 如果 chatStream 返回了但 content 为空，打印 usage 信息用于调试
         if (trim($fullContent) === '' && !empty($usage)) {
             error_log("compress_chapter.php: 模型 {$usedModel} 返回了 usage 但 content 为空. tokens: " . json_encode($usage));
@@ -182,6 +187,8 @@ try {
 }
 
 // ---- 保存压缩结果 ----
+// 审计修复 P2-1（2026-10-18）：先剥离内联 <think> 推理内容，纯推理输出按空结果拒绝
+$fullContent = stripInlineReasoning($fullContent);
 if (trim($fullContent) === '') {
     $detail = $modelTried ? '（已尝试模型: ' . implode(', ', $modelTried) . '）' : '';
     $extra  = $lastModelErr ? ' 最后错误: ' . $lastModelErr : '';
@@ -218,6 +225,10 @@ try {
     sseDone();
     exit;
 }
+// 审计整改 A2（2026-10-31）：正文一落库就发保存回执，带服务端版本哈希（与页面 data-content-hash
+// 同一算法）。之后的记忆刷新可能较慢，连接即使在那时中断，前端也能确认本次压缩已保存。
+$savedContentHash = hash('sha256', $fullContent);
+sse('message', ['saved' => true, 'content_hash' => $savedContentHash, 'words' => $words]);
 updateNovelStats($novelId);
 
 // 只让压缩后的最终正文成为记忆来源；失败时旧记忆已由变更服务清除。
@@ -237,6 +248,7 @@ try {
 
 sse('message', [
     'content' => $fullContent,
+    'content_hash' => $savedContentHash,
     'stats' => "压缩完成：{$currentWords} → {$words} 字（减少 " . ($currentWords - $words) . " 字），模型：{$usedModel}",
 ]);
 sseDone();

@@ -80,7 +80,7 @@ class DialogueVoiceChecker
 
         // Pattern 1: "xxx" 后跟说话人  ——  "你好啊"张三说道
         preg_match_all(
-            '/[「""\'](.+?)[」""\'][ \t]*(?:,|，)?\s*([^\n。！？]{0,8}?)' . $dialogueTags . '/u',
+            '/[「“"‘\'](.+?)[」”"’\'][ \t]*(?:,|，)?\s*([^\n。！？]{0,8}?)' . $dialogueTags . '/u',
             $content, $m1, PREG_SET_ORDER
         );
         foreach ($m1 as $m) {
@@ -90,7 +90,7 @@ class DialogueVoiceChecker
 
         // Pattern 2: 说话人在前 ——  张三说："xxx"
         preg_match_all(
-            '/([^\n。！？]{1,8}?)' . $dialogueTags . '[：:"][ \t]*[「""\'](.+?)[」""\']/u',
+            '/([^\n。！？]{1,8}?)' . $dialogueTags . '[：:"][ \t]*[「“"‘\'](.+?)[」”"’\']/u',
             $content, $m2, PREG_SET_ORDER
         );
         foreach ($m2 as $m) {
@@ -124,7 +124,7 @@ class DialogueVoiceChecker
 
         // Pattern 5: 无标签但有缩进的对话（段落以空格或tab开头+引号）
         preg_match_all(
-            '/^[ \t]{0,3}([「『""\'](.+?)[」』""\'])[ \t]*$/um',
+            '/^[ \t]{0,3}([「『“"‘\'](.+?)[」』”"’\'])[ \t]*$/um',
             $content, $m5, PREG_SET_ORDER
         );
         foreach ($m5 as $m) {

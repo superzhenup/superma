@@ -36,23 +36,27 @@ class TitleSanitizer
     ];
 
     /**
-     * 清洗标题中的禁用词。
+     * When $frozenBannedWords is supplied, this path is pure and never reads
+     * ConstraintConfig. Null retains the temporary legacy live-config path.
      *
-     * @param string        $title         原标题
-     * @param int           $chapterNumber 章节号（用于同义词轮换，保证确定性）
-     * @param string[]|null $bannedWords   禁用词表；为 null 时读 ConstraintConfig::bannedWords()
-     * @return array{title:string, changed:bool, hit_words:string[]}
+     * @param string $title Original title.
+     * @param int $chapterNumber Deterministic synonym-rotation seed.
+     * @param ?list<string> $frozenBannedWords
+     * @return array{title:string, changed:bool, hit_words:list<string>}
      */
-    public static function sanitize(string $title, int $chapterNumber, ?array $bannedWords = null): array
-    {
+    public static function sanitize(
+        string $title,
+        int $chapterNumber,
+        ?array $frozenBannedWords = null
+    ): array {
         $original = $title;
 
-        if ($bannedWords === null) {
+        if ($frozenBannedWords === null) {
             require_once __DIR__ . '/ConstraintConfig.php';
-            $bannedWords = ConstraintConfig::bannedWords();
+            $frozenBannedWords = ConstraintConfig::bannedWords();
         }
         $bannedWords = array_values(array_filter(
-            array_map('trim', $bannedWords),
+            array_map('trim', $frozenBannedWords),
             static fn($w) => $w !== ''
         ));
 

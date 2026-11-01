@@ -14,6 +14,17 @@ $meta = $progress ? (json_decode($progress['metadata'] ?? '{}', true) ?: []) : [
 $planningDoc = $meta['planning_doc'] ?? $novel['plot_settings'] ?? '';
 $worldDoc = $meta['world_doc'] ?? $novel['world_settings'] ?? '';
 
+// 审计功能（2026-08-16 P3-金手指设计模板）：加载已有金手指设定（worldbuilding 表）
+require_once dirname(__DIR__) . '/GoldenFinger.php';
+$gfSetting = (new GoldenFinger((int)$novelId))->get();
+$gfProgressionLines = '';
+if ($gfSetting && !empty($gfSetting['progression'])) {
+    $gfProgressionLines = implode("\n", array_map(
+        fn($p) => implode('|', [$p['tier'], $p['from_chapter'], $p['to_chapter'], $p['abilities']]),
+        $gfSetting['progression']
+    ));
+}
+
 $chatHistory = DB::fetchAll(
     "SELECT role, content FROM novel_wizard_chats WHERE novel_id = ? AND stage = 'blueprint' AND role IN ('user','assistant') ORDER BY id DESC LIMIT 24",
     [$novelId]
@@ -49,6 +60,17 @@ $chatHistory = array_reverse($chatHistory);
 .chat-msg.user .msg-bubble { background: rgba(99,102,241,.2); color: #c0c0ff; }
 .chat-msg.assistant .msg-bubble { background: rgba(34,197,94,.1); color: #b0d0b0; }
 .chat-input-row { display: flex; gap: .5rem; }
+
+/* 审计功能（2026-08-16 P3-金手指设计模板）：第三面板表单 */
+.gf-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem .8rem; }
+@media (max-width: 768px) { .gf-grid { grid-template-columns: 1fr; } }
+.gf-grid label { display: block; color: #a0a0c0; font-size: .75rem; margin-bottom: .2rem; }
+.gf-grid input, .gf-grid textarea {
+  width: 100%; background: transparent; border: 1px solid #2d2d4e; border-radius: 6px;
+  color: #d0d0f0; font-size: .85rem; line-height: 1.5; padding: .35rem .5rem; resize: vertical;
+}
+.gf-grid input:focus, .gf-grid textarea:focus { outline: none; border-color: #6366f1; }
+.gf-grid textarea { min-height: auto; }
 </style>
 
 <div class="blueprint-panels">
@@ -59,6 +81,37 @@ $chatHistory = array_reverse($chatHistory);
   <div class="doc-panel">
     <h6><i class="bi bi-globe me-1"></i>世界观文档</h6>
     <textarea id="world-doc" placeholder="点击下方「AI 生成蓝图」自动填充..."><?= h($worldDoc) ?></textarea>
+  </div>
+</div>
+
+<!-- 审计功能（2026-08-16 P3-金手指设计模板）：第三 APPLY 面板（可选设定） -->
+<div class="doc-panel" style="grid-column: 1 / -1; margin-top: 1rem; min-height: auto;">
+  <h6><i class="bi bi-lightning-charge me-1"></i>金手指设计（可选——名称留空则不启用；勾选「金手指」爽点标签后 AI 生成蓝图会自动带出）</h6>
+  <div class="gf-grid">
+    <div>
+      <label>名称</label>
+      <input id="gf-name" maxlength="60" placeholder="如：吞天鼎 / 签到系统" value="<?= h($gfSetting['name'] ?? '') ?>">
+    </div>
+    <div>
+      <label>获得章号（第几章获得）</label>
+      <input id="gf-acquire-ch" type="number" min="1" value="<?= (int)($gfSetting['acquire_chapter'] ?? 1) ?>">
+    </div>
+    <div style="grid-column: 1 / -1;">
+      <label>获得场景（一句话，供获得章写作参考）</label>
+      <input id="gf-acquire-scene" maxlength="200" value="<?= h($gfSetting['acquire_scene'] ?? '') ?>">
+    </div>
+    <div style="grid-column: 1 / -1;">
+      <label>升级路线（每行：档位名|起始章|结束章|能力描述，3-5 档对齐全书章数）</label>
+      <textarea id="gf-progression" rows="4" placeholder="一阶·器灵初醒|1|40|吞噬丹药转化修为（每日一次）&#10;二阶·鼎纹初现|41|90|可吞噬法器精铁；解锁鼎内空间"><?= h($gfProgressionLines) ?></textarea>
+    </div>
+    <div>
+      <label>使用代价（每次使用必须体现，须可叙事化）</label>
+      <textarea id="gf-cost" rows="2" placeholder="如：每次吞噬后经脉灼痛半日"><?= h($gfSetting['cost'] ?? '') ?></textarea>
+    </div>
+    <div>
+      <label>限制条件（须能制造剧情困境）</label>
+      <textarea id="gf-limit" rows="2" placeholder="如：鼎灵每月沉睡三日无法使用"><?= h($gfSetting['limit'] ?? '') ?></textarea>
+    </div>
   </div>
 </div>
 
@@ -106,11 +159,54 @@ $chatHistory = array_reverse($chatHistory);
   </div>
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 (function(){
   var novelId = <?= (int)$novelId ?>;
   var planningEl = document.getElementById('planning-doc');
   var worldEl = document.getElementById('world-doc');
+
+  // ── 审计功能（2026-08-16 P3-金手指设计模板）：第三面板元素与工具 ──
+  var gfEls = {
+    name: document.getElementById('gf-name'),
+    acquireCh: document.getElementById('gf-acquire-ch'),
+    acquireScene: document.getElementById('gf-acquire-scene'),
+    progression: document.getElementById('gf-progression'),
+    cost: document.getElementById('gf-cost'),
+    limit: document.getElementById('gf-limit')
+  };
+  var lastGfName = gfEls.name ? gfEls.name.value.trim() : '';
+
+  function gfSnapshot(){
+    if (!gfEls.name) return '';
+    return [
+      gfEls.name.value.trim(), gfEls.acquireCh ? gfEls.acquireCh.value : '1',
+      gfEls.acquireScene ? gfEls.acquireScene.value.trim() : '',
+      gfEls.progression ? gfEls.progression.value : '',
+      gfEls.cost ? gfEls.cost.value.trim() : '',
+      gfEls.limit ? gfEls.limit.value.trim() : ''
+    ].join('\u0001');
+  }
+  var lastGfSnap = gfSnapshot();
+
+  // AI 的 golden_finger APPLY 块（JSON）→ 填充五字段（progression 数组转多行竖线格式）
+  function fillGoldenFinger(jsonText){
+    try {
+      var cleaned = String(jsonText || '').replace(/^```(?:json)?/mg, '').replace(/```$/mg, '').trim();
+      var d = JSON.parse(cleaned);
+      if (!d || typeof d !== 'object') return;
+      if (gfEls.name && d.name) gfEls.name.value = String(d.name);
+      if (gfEls.acquireCh) gfEls.acquireCh.value = parseInt(d.acquire_chapter, 10) || 1;
+      if (gfEls.acquireScene) gfEls.acquireScene.value = String(d.acquire_scene || '');
+      if (gfEls.cost) gfEls.cost.value = String(d.cost || '');
+      if (gfEls.limit) gfEls.limit.value = String(d.limit || '');
+      if (gfEls.progression && d.progression && d.progression.length !== undefined) {
+        gfEls.progression.value = d.progression.map(function(p){
+          return [p.tier || p.name || '', p.from_chapter || p.from || '', p.to_chapter || p.to || '', p.abilities || ''].join('|');
+        }).join('\n');
+      }
+    } catch(_) { /* AI 未按 JSON 输出则忽略，用户可手填 */ }
+  }
+
   var statusEl = document.getElementById('autosave-status');
   var generateBtn = document.getElementById('btn-generate-blueprint');
   var streaming = false;
@@ -194,6 +290,9 @@ $chatHistory = array_reverse($chatHistory);
           markDirty(false);
         } else if (b.target === 'world' && worldEl) {
           worldEl.value = b.content;
+          markDirty(false);
+        } else if (b.target === 'golden_finger') {
+          fillGoldenFinger(b.content);
           markDirty(false);
         }
       });
@@ -279,6 +378,7 @@ $chatHistory = array_reverse($chatHistory);
           if (d.apply && d.apply.target) {
             if (d.apply.target === 'planning' && planningEl) planningEl.value = d.apply.content;
             if (d.apply.target === 'world' && worldEl) worldEl.value = d.apply.content;
+            if (d.apply.target === 'golden_finger') fillGoldenFinger(d.apply.content);
             markDirty(false);
             contentReceived = true;
           }
@@ -330,7 +430,7 @@ $chatHistory = array_reverse($chatHistory);
   var dirty = false;
   var saving = false;
   var saveTimer = null;
-  var lastSnapshot = (planningEl ? planningEl.value : '') + '\0' + (worldEl ? worldEl.value : '');
+  var lastSnapshot = snapshot();
 
   function setStatus(text, cls){
     if (!statusEl) return;
@@ -344,7 +444,38 @@ $chatHistory = array_reverse($chatHistory);
   }
 
   function snapshot(){
-    return (planningEl ? planningEl.value : '') + '\0' + (worldEl ? worldEl.value : '');
+    return (planningEl ? planningEl.value : '') + '\0' + (worldEl ? worldEl.value : '') + '\0' + gfSnapshot();
+  }
+
+  // 审计功能（2026-08-16 P3-金手指设计模板）：金手指面板保存
+  // （与 save_doc 并行触发；快照未变跳过；名称清空=按 prev_name 删除）
+  function saveGoldenFinger(){
+    if (!gfEls.name) return;
+    if (gfSnapshot() === lastGfSnap) return;
+    fetch(apiRouteUrl('wizard', 'action=save_golden_finger'), {
+      method: 'POST',
+      headers: {'Content-Type':'application/json','X-CSRF-Token': window.CSRF_TOKEN||''},
+      body: JSON.stringify({
+        novel_id: novelId,
+        name: gfEls.name.value.trim(),
+        prev_name: lastGfName,
+        acquire_chapter: parseInt(gfEls.acquireCh && gfEls.acquireCh.value, 10) || 1,
+        acquire_scene: gfEls.acquireScene ? gfEls.acquireScene.value : '',
+        progression_lines: gfEls.progression ? gfEls.progression.value : '',
+        cost: gfEls.cost ? gfEls.cost.value : '',
+        limit: gfEls.limit ? gfEls.limit.value : ''
+      })
+    })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.ok) {
+        lastGfSnap = gfSnapshot();
+        lastGfName = gfEls.name ? gfEls.name.value.trim() : '';
+      } else {
+        setStatus('金手指保存失败：' + (d.msg || ''), 'text-danger');
+      }
+    })
+    .catch(function(){ /* 网络错误由 save_doc 链路统一呈现，避免双报错 */ });
   }
 
   function saveBlueprint(callback){
@@ -353,6 +484,7 @@ $chatHistory = array_reverse($chatHistory);
     if (snap === lastSnapshot && !dirty && !callback) return;
     saving = true;
     setStatus('保存中…', 'text-info');
+    saveGoldenFinger();   // 金手指面板并行保存（快照未变时内部跳过）
     fetch(apiRouteUrl('wizard', 'action=save_doc'), {
       method: 'POST',
       headers: {'Content-Type':'application/json','X-CSRF-Token': window.CSRF_TOKEN||''},
@@ -392,6 +524,10 @@ $chatHistory = array_reverse($chatHistory);
 
   if (planningEl) planningEl.addEventListener('input', scheduleAutoSave);
   if (worldEl) worldEl.addEventListener('input', scheduleAutoSave);
+  // 金手指面板字段纳入自动保存
+  Object.keys(gfEls).forEach(function(k){
+    if (gfEls[k]) gfEls[k].addEventListener('input', scheduleAutoSave);
+  });
 
   // 每 30 秒兜底保存一次（防止用户长时间不动但有未保存）
   setInterval(function(){
@@ -412,7 +548,25 @@ $chatHistory = array_reverse($chatHistory);
             world_doc: worldEl ? worldEl.value : ''
           })
         });
-      } catch(_){}
+        // 金手指面板 keepalive 兜底（快照未变则后端幂等）
+        if (gfEls.name && gfSnapshot() !== lastGfSnap) {
+          fetch(apiRouteUrl('wizard', 'action=save_golden_finger'), {
+            method: 'POST',
+            keepalive: true,
+            headers: {'Content-Type':'application/json','X-CSRF-Token': window.CSRF_TOKEN||''},
+            body: JSON.stringify({
+              novel_id: novelId,
+              name: gfEls.name.value.trim(),
+              prev_name: lastGfName,
+              acquire_chapter: parseInt(gfEls.acquireCh && gfEls.acquireCh.value, 10) || 1,
+              acquire_scene: gfEls.acquireScene ? gfEls.acquireScene.value : '',
+              progression_lines: gfEls.progression ? gfEls.progression.value : '',
+              cost: gfEls.cost ? gfEls.cost.value : '',
+              limit: gfEls.limit ? gfEls.limit.value : ''
+            })
+          });
+        }
+      } catch(_) {}
     }
   });
 

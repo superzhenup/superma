@@ -8,12 +8,13 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
+require_once dirname(__DIR__) . '/includes/ChapterSynopsisPersistence.php';
 requireLoginApi();
 session_write_close();
 
@@ -38,10 +39,13 @@ $chapterIds = $input['chapter_ids'] ?? null;
 $force      = !empty($input['force']);
 
 // 审计 P0（2026-06-12）：归属校验 + 章节数量上限
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 if ($novelId > 0) checkNovelOwnership($novelId, $userId);
 if (is_array($chapterIds) && count($chapterIds) > 200) {
     sse('error', ['msg' => '单次最多 200 个章节']); sseDone(); exit;
+}
+if ($chapterIds !== null && !is_array($chapterIds)) {
+    sse('error', ['msg' => '章节列表格式无效']); sseDone(); exit;
 }
 
 $novel = DB::fetch('SELECT * FROM novels WHERE id=?', [$novelId]);
@@ -64,7 +68,8 @@ if ($chapterIds === null) {
     // 获取所有已大纲但未生成概要的章节
     $chapters = DB::fetchAll(
         'SELECT * FROM chapters
-         WHERE novel_id=? AND status IN ("outlined","writing","completed") AND synopsis_id IS NULL
+         WHERE novel_id=? AND status IN ("outlined","writing","completed")
+         AND (synopsis_id IS NULL OR NOT EXISTS (SELECT 1 FROM chapter_synopses s WHERE s.id=chapters.synopsis_id AND TRIM(COALESCE(s.synopsis, "")) <> ""))
          ORDER BY chapter_number ASC',
         [$novelId]
     );
@@ -76,8 +81,8 @@ if ($chapterIds === null) {
         exit;
     }
     // 审计修复（2026-07-19 H-04）：非 force 模式仅处理尚无概要的章节，与自动模式语义一致，
-    // 避免对已存在概要的章节重复生成；force 模式不过滤（下方 force 分支会先删除旧概要）。
-    $filterClause = $force ? '' : ' AND synopsis_id IS NULL';
+    // 空概要属于未完成；重新生成也保留旧概要直到新结果安全提交。
+    $filterClause = $force ? '' : ' AND (synopsis_id IS NULL OR NOT EXISTS (SELECT 1 FROM chapter_synopses s WHERE s.id=chapters.synopsis_id AND TRIM(COALESCE(s.synopsis, "")) <> ""))';
     $chapters = DB::fetchAll(
         'SELECT * FROM chapters WHERE novel_id=? AND id IN (' . implode(',', array_map('intval', $chapterIds)) . ')' . $filterClause . '
          ORDER BY chapter_number ASC',
@@ -91,18 +96,12 @@ if (empty($chapters)) {
     exit;
 }
 
-if ($force && $chapterIds !== null) {
-    foreach ($chapters as $ch) {
-        $existing = DB::fetch('SELECT id FROM chapter_synopses WHERE novel_id=? AND chapter_number=?', [$novelId, $ch['chapter_number']]);
-        if ($existing) {
-            DB::delete('chapter_synopses', 'id=?', [$existing['id']]);
-            DB::update('chapters', ['synopsis_id' => null], 'id=?', [$ch['id']]);
-        }
-    }
-}
-
+$persistence = new ChapterSynopsisPersistence(DB::connect(), $userId, $novelId);
 $totalChapters = count($chapters);
 $current = 0;
+$succeeded = 0;
+$failedChapters = [];
+$conflictedChapters = [];
 $totalPrompt = 0;
 $totalCompletion = 0;
 
@@ -116,7 +115,21 @@ foreach ($chapters as $ch) {
         'total'   => $totalChapters,
     ]);
     
-    $messages = buildChapterSynopsisPrompt($novel, $ch, $storyOutline);
+    try {
+        $snapshot = $persistence->capture((int)$ch['chapter_number'], $force);
+        $ch = $snapshot['chapter'];
+        $novel = array_replace($novel, $snapshot['novel']);
+        $messages = buildChapterSynopsisPrompt($novel, $ch, $snapshot['story']);
+    } catch (ChapterSynopsisSourceChangedException $sourceError) {
+        $conflictedChapters[] = (int)$ch['chapter_number'];
+        sse('conflict', ['chapter'=>(int)$ch['chapter_number'], 'msg'=>"第{$ch['chapter_number']}章来源已变化或无法读取，未替换现有概要"]);
+        continue;
+    } catch (Throwable $sourceError) {
+        $failedChapters[] = (int)$ch['chapter_number'];
+        error_log('generate_chapter_synopsis source read failed: ' . $sourceError->getMessage());
+        sse('error', ['chapter'=>(int)$ch['chapter_number'], 'msg'=>"第{$ch['chapter_number']}章来源读取失败，已保留原概要"]);
+        continue;
+    }
     $rawResponse = '';
     $usage = ['prompt_tokens' => 0, 'completion_tokens' => 0];
     $lastSynopsisHeartbeat = time();
@@ -157,7 +170,8 @@ foreach ($chapters as $ch) {
                 ]);
             }
         );
-    } catch (RuntimeException $e) {
+    } catch (Throwable $e) {
+        $failedChapters[] = (int)$ch['chapter_number'];
         sse('error', safe_sse_error_payload($e, "第{$ch['chapter_number']}章概要生成失败"));
         continue;
     }
@@ -165,48 +179,25 @@ foreach ($chapters as $ch) {
     $totalPrompt += $usage['prompt_tokens'];
     $totalCompletion += $usage['completion_tokens'];
 
-    // 解析JSON
-    $synopsis = extractChapterSynopsis($rawResponse);
-
-    if (empty($synopsis)) {
+    try {
+        $synData = ChapterSynopsisOutput::parse($rawResponse, (int)$ch['chapter_number']);
+    } catch (Throwable $validationError) {
+        $failedChapters[] = (int)$ch['chapter_number'];
         sse('error', [
-            'msg' => "第{$ch['chapter_number']}章概要解析失败，跳过",
-            'raw' => safe_substr($rawResponse, 0, 100),
+            'msg' => "第{$ch['chapter_number']}章概要内容或结构无效，已保留原概要",
         ]);
         continue;
     }
     
-    // 保存到数据库
-    // 审计修复（2026-07-19 H-中4）：先检查是否已存在概要，避免 INSERT 撞唯一键
-    // 导致 SSE 批量流程崩溃；非 force 模式下已存在则 UPDATE。
-    // 审计修复（2026-07-19 H-04 残留）：保存块包 try/catch，单章 DB 异常不再击穿整批 SSE 流。
+    // 发布前在同一短事务中复核来源；模型请求期间不持有锁也不清除旧稿。
     try {
-        $existingSyn = DB::fetch(
-            'SELECT id FROM chapter_synopses WHERE novel_id=? AND chapter_number=?',
-            [$novelId, $ch['chapter_number']]
-        );
-        $synData = [
-            'synopsis'         => $synopsis['synopsis'] ?? '',
-            'scene_breakdown'  => json_encode($synopsis['scene_breakdown'] ?? [], JSON_UNESCAPED_UNICODE),
-            'dialogue_beats'   => json_encode($synopsis['dialogue_beats'] ?? [], JSON_UNESCAPED_UNICODE),
-            'sensory_details'  => json_encode($synopsis['sensory_details'] ?? [], JSON_UNESCAPED_UNICODE),
-            'pacing'           => $synopsis['pacing'] ?? '中',
-            'cliffhanger'      => $synopsis['cliffhanger'] ?? '',
-            'foreshadowing'    => json_encode($synopsis['foreshadowing'] ?? [], JSON_UNESCAPED_UNICODE),
-            'callbacks'        => json_encode($synopsis['callbacks'] ?? [], JSON_UNESCAPED_UNICODE),
-        ];
-        if ($existingSyn) {
-            DB::update('chapter_synopses', $synData, 'id=?', [$existingSyn['id']]);
-            $synopsisId = (int)$existingSyn['id'];
-        } else {
-            $synData['novel_id'] = $novelId;
-            $synData['chapter_number'] = $ch['chapter_number'];
-            $synopsisId = DB::insert('chapter_synopses', $synData);
+        if (!$persistence->saveGenerated((int)$ch['chapter_number'], $synData)) {
+            $conflictedChapters[] = (int)$ch['chapter_number'];
+            sse('conflict', ['chapter'=>(int)$ch['chapter_number'], 'msg'=>"第{$ch['chapter_number']}章大纲或概要已被修改，已保留当前版本"]);
+            continue;
         }
-
-        // 更新章节关联
-        DB::update('chapters', ['synopsis_id' => $synopsisId], 'id=?', [$ch['id']]);
     } catch (Throwable $dbErr) {
+        $failedChapters[] = (int)$ch['chapter_number'];
         error_log('generate_chapter_synopsis 保存失败: chapter=' . $ch['chapter_number'] . ' - ' . $dbErr->getMessage());
         sse('error', [
             'msg' => "第{$ch['chapter_number']}章概要保存失败，跳过",
@@ -214,18 +205,30 @@ foreach ($chapters as $ch) {
         continue;
     }
 
+    $succeeded++;
     sse('chapter_done', [
         'msg'               => "第{$ch['chapter_number']}章概要已保存",
         'chapter'           => $ch['chapter_number'],
-        'synopsis_preview'  => safe_substr($synopsis['synopsis'] ?? '', 0, 60) . '...',
+        'synopsis_preview'  => safe_substr($synData['synopsis'], 0, 60) . '...',
     ]);
 }
 
-addLog($novelId, 'synopsis', "批量生成章节概要，共{$current}章");
+$failed = count($failedChapters);
+$conflicted = count($conflictedChapters);
+$resultStatus = $failed + $conflicted === 0 ? 'completed' : ($succeeded > 0 ? 'partial' : 'failed');
+$resultMessage = "章节概要处理结束：成功{$succeeded}章，失败{$failed}章，冲突{$conflicted}章";
+addLog($novelId, 'synopsis', $resultMessage);
 
 sse('complete', [
-    'msg'               => "章节概要生成完成！共{$current}章",
-    'total_chapters'    => $current,
+    'msg'               => $resultMessage,
+    'status'            => $resultStatus,
+    'total_chapters'    => $succeeded,
+    'attempted_chapters'=> $current,
+    'succeeded'         => $succeeded,
+    'failed'            => $failed,
+    'conflicted'        => $conflicted,
+    'failed_chapters'   => $failedChapters,
+    'conflicted_chapters'=> $conflictedChapters,
     'prompt_tokens'     => $totalPrompt,
     'completion_tokens' => $totalCompletion,
     'total_tokens'      => $totalPrompt + $totalCompletion,

@@ -151,7 +151,7 @@ class SceneAtmosphereBuilder
         }
 
         $selected = $available[array_rand($available)];
-        $this->recordAtmosphereUsage($selected);
+        $this->stashPendingHint($selected);
 
         return $selected;
     }
@@ -195,18 +195,83 @@ class SceneAtmosphereBuilder
         }
     }
 
-    private function recordAtmosphereUsage(string $hint): void
+    public static function pendingHintPath(int $novelId, int $chNum): string
     {
+        $dir = defined('CFG_PROGRESS_DIR') ? CFG_PROGRESS_DIR : sys_get_temp_dir();
+        return rtrim((string)$dir, '/\\') . DIRECTORY_SEPARATOR . "atmosphere_{$novelId}_{$chNum}.hint";
+    }
+
+    /**
+     * 写作前只暂存建议，不写入 memory_atoms。
+     * 正文落盘后再 commitPendingIfUsed：仅当正文实际用到该意象才进入冷却。
+     */
+    private function stashPendingHint(string $hint): void
+    {
+        $hint = trim($hint);
+        if ($hint === '' || $this->novelId <= 0 || $this->chNum <= 0) return;
+        try {
+            $path = self::pendingHintPath($this->novelId, $this->chNum);
+            $dir = dirname($path);
+            if (!is_dir($dir)) {
+                @mkdir($dir, 0755, true);
+            }
+            file_put_contents($path, $hint, LOCK_EX);
+        } catch (\Throwable $e) {
+            error_log('SceneAtmosphereBuilder stash pending hint failed: ' . $e->getMessage());
+        }
+    }
+
+    public static function commitPendingIfUsed(int $novelId, int $chNum, string $content, string $genre = ''): void
+    {
+        $path = self::pendingHintPath($novelId, $chNum);
+        $hint = is_file($path) ? trim((string)@file_get_contents($path)) : '';
+        if (is_file($path)) {
+            @unlink($path);
+        }
+        if ($hint === '' || $novelId <= 0 || $chNum <= 0) return;
+
+        // 审计修复（2026-08-17 P3）：原探测取 hint 前 8 字做 mb_strpos 精确匹配，模型
+        // 逐字复用概率≈0，氛围建议永远进不了冷却。氛围参考是意境指引，模型用自己的
+        // 语言描写，按关键意象词判定：按中文标点（，。、；：！？）与空格切分 hint，
+        // 过滤长度>=2 的片段取前 3 个，任一片段在正文中命中即视为已使用；
+        // 原 8 字前缀保留作为候选之一。
+        $candidates = [];
+        $prefix8 = mb_strlen($hint) >= 8 ? mb_substr($hint, 0, 8) : $hint;
+        if ($prefix8 !== '') $candidates[] = $prefix8;
+        $segments = preg_split('/[，。、；：！？\s]+/u', $hint, -1, PREG_SPLIT_NO_EMPTY);
+        if (is_array($segments)) {
+            foreach ($segments as $seg) {
+                if (mb_strlen($seg) >= 2) {
+                    $candidates[] = $seg;
+                    if (count($candidates) >= 4) break; // 前 3 个片段 + 8 字前缀
+                }
+            }
+        }
+        $used = false;
+        foreach ($candidates as $probe) {
+            if (mb_strpos($content, $probe) !== false) {
+                $used = true;
+                break;
+            }
+        }
+        if (!$used) return;
+
         try {
             DB::insert('memory_atoms', [
-                'novel_id'       => $this->novelId,
+                'novel_id'       => $novelId,
                 'atom_type'      => 'style_preference',
                 'content'        => $hint,
-                'source_chapter' => $this->chNum,
-                'confidence'     => 0.5,
-                'metadata'       => json_encode(['tone' => $this->detectTone(), 'genre' => $this->genre, 'is_atmosphere' => true], JSON_UNESCAPED_UNICODE),
+                'source_chapter' => $chNum,
+                'confidence'     => 0.7,
+                'metadata'       => json_encode([
+                    'genre' => $genre,
+                    'is_atmosphere' => true,
+                    'committed_after_write' => true,
+                ], JSON_UNESCAPED_UNICODE),
                 'created_at'     => date('Y-m-d H:i:s'),
             ]);
-        } catch (\Throwable $e) { error_log('SceneAtmosphereBuilder style hint insert failed: ' . $e->getMessage()); }
+        } catch (\Throwable $e) {
+            error_log('SceneAtmosphereBuilder commit pending hint failed: ' . $e->getMessage());
+        }
     }
 }

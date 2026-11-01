@@ -157,9 +157,20 @@ class StoryBible
                                 $report['errors'][] = "节点 {$category}/{$key} 已锁定，跳过重复创建";
                                 break;
                             }
-                            $updateData = ['last_updated_chapter' => $chapterNumber];
+                            // 审计修复 N4（2026-09-27）：只有实际变更内容/标题时
+                            // 才推进 last_updated_chapter。原实现无条件先行推进
+                            // 章号——AI 输出空 content/title 的 create 对已存在
+                            // 节点等价于空更新，节点却被"假装更新"到当前章，
+                            // 历史视图（getFromNodes 按 last_updated_chapter
+                            // < beforeChapter 过滤派生类节点）中该节点消失。
+                            $updateData = [];
                             if ($title !== '')   $updateData['node_title'] = $title;
                             if ($content !== '') $updateData['content_md'] = $content;
+                            if ($updateData === []) {
+                                $report['skipped']++;
+                                break;
+                            }
+                            $updateData['last_updated_chapter'] = $chapterNumber;
                             DB::update('bible_nodes', $updateData, 'id=?', [$existing['id']]);
                         } else {
                             if ($title === '') $title = $key;
@@ -191,9 +202,19 @@ class StoryBible
                             $report['errors'][] = "节点 {$category}/{$key} 已锁定，跳过更新";
                             break;
                         } else {
-                            $updateData = ['last_updated_chapter' => $chapterNumber];
+                            // 审计修复 N4（2026-09-27）：只有实际变更内容/标题时
+                            // 才推进 last_updated_chapter。原实现空 content/title
+                            // 的 update 仅推进章号——内容未变，节点被"假装更新"
+                            // 到当前章，历史视图按章号过滤后该节点从历史章圣经
+                            // 中消失。空更新改为跳过（不写库不推进章号）。
+                            $updateData = [];
                             if ($content !== '') $updateData['content_md'] = $content;
                             if ($title !== '')   $updateData['node_title'] = $title;
+                            if ($updateData === []) {
+                                $report['skipped']++;
+                                break;
+                            }
+                            $updateData['last_updated_chapter'] = $chapterNumber;
                             DB::update('bible_nodes', $updateData, 'id=?', [$existing['id']]);
                         }
                         $report['applied']++;
@@ -229,17 +250,20 @@ class StoryBible
      * 优先从 bible_nodes 聚合；无节点时降级读 novel_bible。
      * @return array{world_md:string,character_md:string,timeline_md:string,updated_chapter:int}|null
      */
-    public static function get(int $novelId): ?array
+    public static function get(int $novelId, ?int $beforeChapter = null, bool $strict = false): ?array
     {
         // 优先尝试从 bible_nodes 聚合
-        $fromNodes = self::getFromNodes($novelId);
+        $fromNodes = self::getFromNodes($novelId, $beforeChapter, $strict);
         if ($fromNodes !== null) return $fromNodes;
 
         // 降级：读旧表 novel_bible
         try {
-            self::ensureTable();
+            if (!$strict) self::ensureTable();
             $row = DB::fetch("SELECT world_md, character_md, timeline_md, updated_chapter FROM novel_bible WHERE novel_id=?", [$novelId]);
             if (!$row) return null;
+            // Legacy snapshots mix rules, possessions and current events. Without
+            // node provenance none of a future snapshot is safe historical data.
+            if ($beforeChapter !== null && (int)($row['updated_chapter'] ?? 0) >= $beforeChapter) return null;
             return [
                 'world_md'        => (string)($row['world_md'] ?? ''),
                 'character_md'    => (string)($row['character_md'] ?? ''),
@@ -247,25 +271,38 @@ class StoryBible
                 'updated_chapter' => (int)($row['updated_chapter'] ?? 0),
             ];
         } catch (\Throwable $e) {
+            if ($strict) throw $e;
             error_log('StoryBible::get ' . $e->getMessage());
             return null;
         }
+    }
+
+    /** Guard/readiness callers must distinguish unavailable data from no setting. */
+    public static function getStrict(int $novelId, ?int $beforeChapter = null): ?array
+    {
+        return self::get($novelId, $beforeChapter, true);
     }
 
     /**
      * 从 bible_nodes 聚合为旧三段格式
      * @return array|null 有节点时返回聚合结果，无节点返回 null
      */
-    private static function getFromNodes(int $novelId): ?array
+    private static function getFromNodes(int $novelId, ?int $beforeChapter = null, bool $strict = false): ?array
     {
-        self::ensureNodeTable();
+        if (!$strict) self::ensureNodeTable();
         try {
-            $nodes = DB::fetchAll(
-                "SELECT category, node_title, content_md FROM bible_nodes
-                 WHERE novel_id=? ORDER BY category, node_key ASC",
-                [$novelId]
-            );
-        } catch (\Throwable) {
+            $sql = "SELECT category, node_title, content_md FROM bible_nodes WHERE novel_id=?";
+            $params = [$novelId];
+            if ($beforeChapter !== null) {
+                // Rules of the setting are static; possessions, factions,
+                // character state and the timeline are chapter-derived facts.
+                $sql .= " AND (category IN ('world_rules','magic_system')
+                    OR last_updated_chapter IS NULL OR last_updated_chapter < ?)";
+                $params[] = $beforeChapter;
+            }
+            $nodes = DB::fetchAll($sql . ' ORDER BY category, node_key ASC', $params);
+        } catch (\Throwable $e) {
+            if ($strict) throw $e;
             return null;
         }
 
@@ -293,7 +330,10 @@ class StoryBible
                 [$novelId]
             );
             $maxChapter = (int)($row['max_ch'] ?? 0);
-        } catch (\Throwable) {}
+        } catch (\Throwable $e) {
+            if ($strict) throw $e;
+            error_log('StoryBible bible_nodes maxChapter fetch failed: ' . $e->getMessage());
+        }
 
         // 全空则视为无数据
         if (trim($sections['world_md']) === '' && trim($sections['character_md']) === '' && trim($sections['timeline_md']) === '') {
@@ -689,7 +729,7 @@ class StoryBible
                 [$novelId]
             );
             $nodeChapter = (int)($row['max_ch'] ?? 0);
-        } catch (\Throwable) {}
+        } catch (\Throwable $e) { error_log('StoryBible nodeChapter fetch failed: ' . $e->getMessage()); }
 
         $legacyChapter = 0;
         self::ensureTable();
@@ -711,7 +751,11 @@ class StoryBible
                  ON DUPLICATE KEY UPDATE updated_chapter=GREATEST(updated_chapter, VALUES(updated_chapter))",
                 [$novelId, $chNum]
             );
-        } catch (\Throwable) {}
+        } catch (\Throwable $e) {
+            // 审计修复 M10（2026-08-16）：写路径失败必须留痕——updated_chapter 不更新会导致
+            // 后续增量构建从错误的章节起点运行，静默吞掉后无人能定位原因。
+            error_log('StoryBible touchUpdatedChapter failed (novel=' . $novelId . ', ch=' . $chNum . '): ' . $e->getMessage());
+        }
     }
 
     /** 直接读旧表（不走 bible_nodes 聚合） */

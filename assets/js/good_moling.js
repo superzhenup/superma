@@ -222,8 +222,8 @@
     if (!a || !b) return 0;
     var aSub = a.length > 500 ? a.substring(0, 500) : a;
     var bSub = b.length > 500 ? b.substring(0, 500) : b;
-    var aWords = aSub.split(/[\s，。！？、；：""''（）\n]+/);
-    var bWords = bSub.split(/[\s，。！？、；：""''（）\n]+/);
+    var aWords = aSub.split(/[\s，。！？、；：“”‘’"'（）\n]+/);
+    var bWords = bSub.split(/[\s，。！？、；：“”‘’"'（）\n]+/);
     var bSet = {};
     for (var i = 0; i < bWords.length; i++) { if (bWords[i]) bSet[bWords[i]] = true; }
     var common = 0;
@@ -497,11 +497,13 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     }).then(function(d) {
-      if (!d.ok || !d.models) {
+      // jsonResponse 把载荷放在 data 下：{ok, data: {models}}
+      var models = d && d.ok && d.data ? d.data.models : null;
+      if (!Array.isArray(models)) {
         sel.innerHTML = '<option value="">加载失败</option>';
         return;
       }
-      populateModelSelect(d.models);
+      populateModelSelect(models);
     }).catch(function(e) {
       sel.innerHTML = '<option value="">加载失败</option>';
       console.error('loadModels error:', e);

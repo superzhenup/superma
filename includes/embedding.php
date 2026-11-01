@@ -241,7 +241,7 @@ class KnowledgeBase {
      */
     public function deleteCharacter(int $id): bool {
         DB::delete('novel_characters', 'id=? AND novel_id=?', [$id, $this->novelId]);
-        DB::delete('novel_embeddings', 'source_type=? AND source_id=?', ['character', $id]);
+        DB::delete('novel_embeddings', 'novel_id=? AND source_type=? AND source_id=?', [$this->novelId, 'character', $id]);
         return true;
     }
     
@@ -382,7 +382,7 @@ class KnowledgeBase {
 
     public function deleteWorldbuilding(int $id): bool {
         DB::delete('novel_worldbuilding', 'id=? AND novel_id=?', [$id, $this->novelId]);
-        DB::delete('novel_embeddings', 'source_type=? AND source_id=?', ['worldbuilding', $id]);
+        DB::delete('novel_embeddings', 'novel_id=? AND source_type=? AND source_id=?', [$this->novelId, 'worldbuilding', $id]);
         return true;
     }
     
@@ -512,7 +512,7 @@ class KnowledgeBase {
 
     public function deletePlot(int $id): bool {
         DB::delete('novel_plots', 'id=? AND novel_id=?', [$id, $this->novelId]);
-        DB::delete('novel_embeddings', 'source_type=? AND source_id=?', ['plot', $id]);
+        DB::delete('novel_embeddings', 'novel_id=? AND source_type=? AND source_id=?', [$this->novelId, 'plot', $id]);
         return true;
     }
     
@@ -642,7 +642,7 @@ class KnowledgeBase {
 
     public function deleteStyle(int $id): bool {
         DB::delete('novel_style', 'id=? AND novel_id=?', [$id, $this->novelId]);
-        DB::delete('novel_embeddings', 'source_type=? AND source_id=?', ['style', $id]);
+        DB::delete('novel_embeddings', 'novel_id=? AND source_type=? AND source_id=?', [$this->novelId, 'style', $id]);
         return true;
     }
     
@@ -836,22 +836,48 @@ class KnowledgeBase {
      * @return array 提取的知识条目统计
      */
     public function extractFromChapter(int $chapterNumber, string $content, ?int $chapterId = null): array {
+        try {
+            return $this->applyChapterExtraction(
+                $chapterNumber,
+                $content,
+                $chapterId,
+                $this->computeFromChapter($chapterNumber, $content, false),
+                false
+            );
+        } catch (\Throwable $error) {
+            if (self::isExtractionControlSignal($error)) throw $error;
+            error_log('extractFromChapter computation failed: ' . $error->getMessage());
+            return ['characters' => 0, 'worldbuilding' => 0, 'plots' => 0, 'styles' => 0];
+        }
+    }
+
+    /**
+     * Compute a candidate only. This method never publishes knowledge or embeddings.
+     * Provider/parse failures throw so a durable task cannot record false success.
+     */
+    public function computeFromChapter(int $chapterNumber, string $content, bool $strict = true): array {
+        if ($chapterNumber <= 0 || trim($content) === '') {
+            throw new InvalidArgumentException('Knowledge extraction requires a chapter and content.');
+        }
+        return $this->callAIForExtraction($this->buildExtractionPrompt($content, $chapterNumber), $strict);
+    }
+
+    /**
+     * Publish a previously computed candidate. The caller owns the revision fence,
+     * transaction and durable applied marker; failures must roll back that batch.
+     */
+    public function applyChapterExtraction(int $chapterNumber, string $content, ?int $chapterId, array $extracted, bool $strict = true): array {
         $stats = [
             'characters' => 0,
             'worldbuilding' => 0,
             'plots' => 0,
             'styles' => 0,
         ];
-        
-        // 构建提取提示词
-        $prompt = $this->buildExtractionPrompt($content, $chapterNumber);
-        
-        // 调用 AI 提取知识
-        $extracted = $this->callAIForExtraction($prompt);
-        
-        if (empty($extracted)) {
-            return $stats;
+        if (!$strict) {
+            if ($extracted === []) return $stats;
+            $extracted += ['characters' => [], 'worldbuilding' => [], 'plots' => [], 'styles' => []];
         }
+        $extracted = self::validateChapterExtraction($extracted);
         
         // 处理提取的角色
         if (!empty($extracted['characters'])) {
@@ -872,6 +898,7 @@ class KnowledgeBase {
                     $stats['characters']++;
                 } catch (\Throwable $e) {
                     error_log("extractFromChapter saveCharacter failed: " . $e->getMessage());
+                    if ($strict || self::isExtractionControlSignal($e)) throw $e;
                 }
             }
         }
@@ -889,6 +916,7 @@ class KnowledgeBase {
                     $stats['worldbuilding']++;
                 } catch (\Throwable $e) {
                     error_log("extractFromChapter saveWorldbuilding failed: " . $e->getMessage() . " category=" . ($wb['category'] ?? 'null'));
+                    if ($strict || self::isExtractionControlSignal($e)) throw $e;
                 }
             }
         }
@@ -908,6 +936,7 @@ class KnowledgeBase {
                     $stats['plots']++;
                 } catch (\Throwable $e) {
                     error_log("extractFromChapter savePlot failed: " . $e->getMessage() . " event_type=" . ($plot['event_type'] ?? 'null'));
+                    if ($strict || self::isExtractionControlSignal($e)) throw $e;
                 }
             }
         }
@@ -924,6 +953,7 @@ class KnowledgeBase {
                     $stats['styles']++;
                 } catch (\Throwable $e) {
                     error_log("extractFromChapter saveStyle failed: " . $e->getMessage() . " category=" . ($style['category'] ?? 'null'));
+                    if ($strict || self::isExtractionControlSignal($e)) throw $e;
                 }
             }
         }
@@ -938,19 +968,152 @@ class KnowledgeBase {
                 [$this->novelId, $chapterNumber]
             ) ?? 0);
         }
-        if ($chapterId > 0) {
-            $summary = mb_substr($content, 0, 500);
-            $this->storeEmbedding('chapter', $chapterId, $summary);
-        }
 
-        // v1.11.10: 章节数据完全入库后，统一批量补齐缺失的向量，消除单条实时 HTTP 超时累加
-        try {
-            $stats['embeddings_backfilled'] = $this->backfillEmbeddings();
-        } catch (\Throwable $e) {
-            error_log("extractFromChapter backfillEmbeddings failed: " . $e->getMessage());
+        // 审计修复（2026-08-02 P3）：Embedding 异步延迟生成。
+        // 后处理阶段跳过同步 embedding API 调用（角色/世界观/情节/风格/章节摘要），
+        // 改为在下一章语义检索前由 MemoryEngine::ensureEmbeddings() 触发批量补齐。
+        // 单章后处理省去 N 次 HTTP embedding 调用，显著降低延迟。
+        $embeddingAsync = function_exists('getSystemSetting')
+            ? (bool)getSystemSetting('ws_embedding_async', true, 'bool')
+            : false;
+
+        if ($embeddingAsync) {
+            // 异步模式：记录待补齐标记，不阻塞后处理
+            $stats['embeddings_deferred'] = true;
+            if ($chapterId > 0) {
+                // 章节摘要向量也延迟到 backfillPendingEmbeddings() 时生成
+                // 此处仅记录章节摘要文本，供后续补齐时取用
+                try {
+                    DB::execute(
+                        'INSERT INTO novel_embeddings (novel_id, source_type, source_id, content, embedding_blob, embedding_model)
+                         VALUES (?, ?, ?, ?, NULL, NULL)
+                         ON DUPLICATE KEY UPDATE content=VALUES(content), embedding_blob=NULL, embedding_model=NULL',
+                        [$this->novelId, 'chapter', $chapterId, mb_substr($content, 0, 500)]
+                    );
+                } catch (\Throwable $e) {
+                    error_log("extractFromChapter defer chapter embedding failed: " . $e->getMessage());
+                    if ($strict || self::isExtractionControlSignal($e)) throw $e;
+                }
+            }
+        } else {
+            // 同步模式（原行为）：立即生成章节摘要向量
+            if ($chapterId > 0) {
+                $summary = mb_substr($content, 0, 500);
+                $this->storeEmbedding('chapter', $chapterId, $summary);
+            }
+
+            // v1.11.10: 章节数据完全入库后，统一批量补齐缺失的向量，消除单条实时 HTTP 超时累加
+            try {
+                $stats['embeddings_backfilled'] = $this->backfillEmbeddings();
+            } catch (\Throwable $e) {
+                error_log("extractFromChapter backfillEmbeddings failed: " . $e->getMessage());
+                if ($strict || self::isExtractionControlSignal($e)) throw $e;
+            }
         }
 
         return $stats;
+    }
+
+    /**
+     * 审计修复（2026-08-02 P3）：异步延迟补齐 pending embeddings。
+     *
+     * 在异步模式下，extractFromChapter 只写入 content 不生成 embedding_blob。
+     * 本方法找出 embedding_blob IS NULL 的条目（含 chapter 摘要 + 角色等设定），
+     * 批量生成向量。由 MemoryEngine::ensureEmbeddings() 在语义检索前调用。
+     *
+     * @param int $batchLimit 单次最多补齐的条目数（防止首章检索时全量补齐耗时过长）
+     * @return int 实际补齐的条目数
+     */
+    public function backfillPendingEmbeddings(int $batchLimit = 20): int {
+        if (EmbeddingProvider::getConfig() === null) {
+            return 0;
+        }
+        if ($batchLimit <= 0) $batchLimit = 20;
+
+        $totalFilled = 0;
+
+        // 1. 补齐 chapter 摘要向量（embedding_blob IS NULL 但 content 已存的）
+        $pendingChapters = DB::fetchAll(
+            'SELECT source_id, content FROM novel_embeddings
+             WHERE novel_id=? AND source_type="chapter" AND embedding_blob IS NULL AND content IS NOT NULL
+             ORDER BY source_id ASC LIMIT ' . (int)$batchLimit,
+            [$this->novelId]
+        );
+        foreach ($pendingChapters as $pc) {
+            try {
+                $content = (string)$pc['content'];
+                if ($content === '') continue;
+                $result = EmbeddingProvider::embed($content);
+                if (!$result || empty($result['vec'])) continue;
+                $binary = Vector::pack($result['vec']);
+                $modelName = $result['model'] ?? '';
+                DB::query(
+                    'UPDATE novel_embeddings SET embedding_blob=?, embedding_model=? 
+                     WHERE novel_id=? AND source_type="chapter" AND source_id=? AND embedding_blob IS NULL',
+                    [$binary, $modelName, $this->novelId, (int)$pc['source_id']]
+                );
+                $totalFilled++;
+            } catch (\Throwable $e) {
+                error_log("backfillPendingEmbeddings chapter #{$pc['source_id']} failed: " . $e->getMessage());
+            }
+        }
+
+        // 2. 补齐设定类向量（角色/世界观/情节/风格 — 复用 backfillEmbeddings 但加 batch 限制）
+        // backfillEmbeddings() 找的是 novel_embeddings 完全缺失的行（LEFT JOIN IS NULL），
+        // 不受上面 chapter 行影响。为防止批量过大，用 batchLimit 限制单次处理量。
+        $remaining = $batchLimit - $totalFilled;
+        if ($remaining > 0) {
+            try {
+                $totalFilled += $this->backfillEmbeddingsBounded($remaining);
+            } catch (\Throwable $e) {
+                error_log("backfillPendingEmbeddings settings failed: " . $e->getMessage());
+            }
+        }
+
+        return $totalFilled;
+    }
+
+    /**
+     * backfillEmbeddings 的有界版本：每类最多处理 $perTypeLimit 条。
+     */
+    private function backfillEmbeddingsBounded(int $perTypeLimit): int {
+        if (EmbeddingProvider::getConfig() === null || $perTypeLimit <= 0) {
+            return 0;
+        }
+
+        $totalFilled = 0;
+        $sources = [
+            'character'     => ['table' => 'novel_characters',   'updater' => 'updateCharacterEmbedding'],
+            'worldbuilding' => ['table' => 'novel_worldbuilding','updater' => 'updateWorldbuildingEmbedding'],
+            'plot'          => ['table' => 'novel_plots',        'updater' => 'updatePlotEmbedding'],
+            'style'         => ['table' => 'novel_style',        'updater' => 'updateStyleEmbedding'],
+        ];
+
+        foreach ($sources as $sourceType => $info) {
+            if ($totalFilled >= $perTypeLimit) break;
+
+            $rows = DB::fetchAll(
+                "SELECT t.id FROM `{$info['table']}` t
+                 LEFT JOIN novel_embeddings e
+                   ON e.source_type = ? AND e.source_id = t.id AND e.novel_id = t.novel_id
+                 WHERE t.novel_id = ? AND e.id IS NULL
+                 LIMIT " . (int)$perTypeLimit,
+                [$sourceType, $this->novelId]
+            );
+            if (empty($rows)) continue;
+
+            foreach ($rows as $r) {
+                if ($totalFilled >= $perTypeLimit) break;
+                try {
+                    $this->{$info['updater']}((int)$r['id']);
+                    $totalFilled++;
+                } catch (\Throwable $e) {
+                    error_log("backfillEmbeddingsBounded {$sourceType} #{$r['id']} failed: " . $e->getMessage());
+                }
+            }
+        }
+
+        return $totalFilled;
     }
 
     /**
@@ -1052,31 +1215,52 @@ PROMPT;
      * 调用 AI 进行知识提取
      * 使用项目统一的 getAIClient()（默认模型），不再硬编码 qwen-plus
      */
-    private function callAIForExtraction(string $prompt): array {
-        try {
+    private function callAIForExtraction(string $prompt, bool $strict = true): array {
+        if (!function_exists('getAIClient')) {
             require_once __DIR__ . '/ai.php';
-            $ai = getAIClient(null);  // 用默认模型
+        }
+        $ai = getAIClient(null);  // Preserve the unified default-model route.
+        $raw = $ai->chat([
+            ['role' => 'system', 'content' => '你是一个小说创作助手，擅长提取和分析小说中的知识要素。'],
+            ['role' => 'user',   'content' => $prompt],
+        ], 'structured');
 
-            $raw = $ai->chat([
-                ['role' => 'system', 'content' => '你是一个小说创作助手，擅长提取和分析小说中的知识要素。'],
-                ['role' => 'user',   'content' => $prompt],
-            ], 'structured');
-
-            $content = trim($raw);
-            // 提取 JSON 部分（兼容 markdown 代码块包裹）
-            if (preg_match('/```(?:json)?\s*([\s\S]*?)```/i', $content, $m)) {
-                $content = trim($m[1]);
+        $content = trim($raw);
+        // 提取 JSON 部分（兼容 markdown 代码块包裹）
+        if (preg_match('/```(?:json)?\s*([\s\S]*?)```/i', $content, $m)) {
+            $content = trim($m[1]);
+        }
+        if (preg_match('/\{[\s\S]*\}/', $content, $matches)) {
+            $json = json_decode($matches[0], true);
+            if (is_array($json)) {
+                return $strict ? self::validateChapterExtraction($json) : $json;
             }
-            if (preg_match('/\{[\s\S]*\}/', $content, $matches)) {
-                $json = json_decode($matches[0], true);
-                if (is_array($json)) {
-                    return $json;
+        }
+
+        throw new UnexpectedValueException('Knowledge extraction did not return a valid candidate.');
+    }
+
+    /** Reject malformed successes before any business table can be touched. */
+    private static function validateChapterExtraction(array $extracted): array {
+        $result = [];
+        foreach (['characters' => 'name', 'worldbuilding' => 'name', 'plots' => 'title', 'styles' => 'name'] as $type => $identity) {
+            if (!array_key_exists($type, $extracted) || !is_array($extracted[$type])
+                || !array_is_list($extracted[$type])) {
+                throw new UnexpectedValueException('Knowledge extraction is missing a valid ' . $type . ' list.');
+            }
+            foreach ($extracted[$type] as $row) {
+                if (!is_array($row) || !is_string($row[$identity] ?? null) || trim($row[$identity]) === '') {
+                    throw new UnexpectedValueException('Knowledge extraction contains an invalid ' . $type . ' item.');
                 }
             }
-
-            return [];
-        } catch (\Throwable $e) {
-            return [];
+            $result[$type] = $extracted[$type];
         }
+        return $result;
+    }
+
+    private static function isExtractionControlSignal(\Throwable $error): bool {
+        return $error instanceof AIRequestCanceledException
+            || $error instanceof WriteEnginePostprocessLeaseLostException
+            || $error instanceof WorkflowRuntimeException;
     }
 }

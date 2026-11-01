@@ -97,13 +97,15 @@ class Schema
             // ========== 书籍分析表 ==========
             'book_analyses' => "CREATE TABLE IF NOT EXISTS `book_analyses` (
                 `id`          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `user_id`     INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '归属用户ID（0=待认领的旧记录）',
                 `title`       VARCHAR(200) NOT NULL DEFAULT '' COMMENT '书名',
                 `author`      VARCHAR(100) NOT NULL DEFAULT '' COMMENT '作者',
                 `genre`       VARCHAR(100) NOT NULL DEFAULT '' COMMENT '类型',
                 `content`     MEDIUMTEXT NOT NULL COMMENT '分析结果(Markdown)',
                 `source_text` MEDIUMTEXT DEFAULT NULL COMMENT '原始章节文本',
                 `created_at`  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                INDEX `idx_created` (`created_at`)
+                INDEX `idx_created` (`created_at`),
+                INDEX `idx_user` (`user_id`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='拆书分析表'",
 
             // ========== 核心业务表 ==========
@@ -118,6 +120,22 @@ class Schema
                 `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY `unique_arc` (`novel_id`, `arc_index`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+
+            // 审计功能（2026-08-16 P3-卷级摘要）：L2 远期再压缩层存储。
+            // 唯一键 (novel_id, volume_number) + 写入按 volume_number/chapter_from+to
+            // 双口径 DELETE→INSERT（吸取 arc_summaries 唯一键与查重口径不一致的教训）。
+            'volume_summaries' => "CREATE TABLE IF NOT EXISTS `volume_summaries` (
+                `id`             INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `novel_id`       INT UNSIGNED NOT NULL,
+                `volume_number`  INT UNSIGNED NOT NULL COMMENT '卷号从1起；无卷书为50章回退分组号',
+                `chapter_from`   INT UNSIGNED NOT NULL COMMENT '起始章节',
+                `chapter_to`     INT UNSIGNED NOT NULL COMMENT '结束章节',
+                `summary`        TEXT COMMENT '350-450字卷级故事线摘要',
+                `created_at`     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                `updated_at`     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY `uk_novel_volume` (`novel_id`, `volume_number`),
+                KEY `idx_novel_chto` (`novel_id`, `chapter_to`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='卷级摘要表'",
 
             'story_outlines' => "CREATE TABLE IF NOT EXISTS `story_outlines` (
                 `id`                    INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -223,7 +241,7 @@ class Schema
                 KEY `idx_deadline`         (`novel_id`, `deadline_chapter`),
                 KEY `idx_priority`         (`novel_id`, `priority`),
                 KEY `idx_embedding_null`   (`novel_id`, `embedding_updated_at`),
-                FULLTEXT KEY `ft_description` (`description`)
+                FULLTEXT KEY `ft_description` (`description`) WITH PARSER ngram
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='伏笔独立表'",
 
             'foreshadowing_mention_log' => "CREATE TABLE IF NOT EXISTS `foreshadowing_mention_log` (
@@ -284,7 +302,7 @@ class Schema
                 KEY `idx_novel_type`     (`novel_id`, `atom_type`),
                 KEY `idx_novel_chapter`  (`novel_id`, `source_chapter`),
                 KEY `idx_embedding_null` (`novel_id`, `embedding_updated_at`),
-                FULLTEXT KEY `ft_content` (`content`)
+                FULLTEXT KEY `ft_content` (`content`) WITH PARSER ngram
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='原子记忆表'",
 
             'novel_characters' => "CREATE TABLE IF NOT EXISTS `novel_characters` (
@@ -317,7 +335,7 @@ class Schema
             'novel_worldbuilding' => "CREATE TABLE IF NOT EXISTS `novel_worldbuilding` (
                 `id`                  INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                 `novel_id`            INT UNSIGNED NOT NULL,
-                `category`            ENUM('location','faction','rule','item','other') NOT NULL DEFAULT 'other' COMMENT '类别',
+                `category`            ENUM('location','faction','rule','item','golden_finger','other') NOT NULL DEFAULT 'other' COMMENT '类别',
                 `name`                VARCHAR(200) NOT NULL COMMENT '名称',
                 `description`         TEXT DEFAULT NULL COMMENT '描述',
                 `attributes`          JSON DEFAULT NULL COMMENT '扩展属性',
@@ -959,12 +977,127 @@ class Schema
                 `chapter_summary` TEXT COMMENT 'AI生成的章节摘要，供续写参考',
                 `used_tropes`     TEXT COMMENT '本章已用意象/场景(JSON)，近5章规避',
                 `retry_count`     TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '写作重试次数',
+                `claim_token`     VARCHAR(40) NOT NULL DEFAULT '' COMMENT '章节认领令牌(审计P0:防取消→重启竞态覆盖正文)',
+                `canonical_state` VARCHAR(16) NOT NULL DEFAULT 'none' COMMENT 'none|legacy|canonical',
+                `content_revision_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `canonicalized_at` DATETIME(6) DEFAULT NULL,
+                `write_policy_snapshot_json` JSON DEFAULT NULL,
+                `canonical_candidate_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
                 `created_at`      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 `updated_at`      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY `uk_novel_chapter` (`novel_id`, `chapter_number`),
+                UNIQUE KEY `uk_chapters_canonical_candidate` (`canonical_candidate_uid`),
                 KEY `idx_novel_status`  (`novel_id`, `status`),
-                KEY `idx_novel_status_chapter` (`novel_id`, `status`, `chapter_number`)
+                KEY `idx_novel_status_chapter` (`novel_id`, `status`, `chapter_number`),
+                KEY `idx_chapters_canonical_status` (`novel_id`, `canonical_state`, `status`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+
+            'chapter_candidates' => "CREATE TABLE IF NOT EXISTS `chapter_candidates` (
+                `id`                   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `candidate_uid`        CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `user_id`              INT UNSIGNED NOT NULL,
+                `novel_id`             INT UNSIGNED NOT NULL,
+                `chapter_id`           INT UNSIGNED NOT NULL,
+                `run_id`               BIGINT UNSIGNED DEFAULT NULL,
+                `source`               VARCHAR(16) NOT NULL COMMENT 'initial|rewrite',
+                `source_run_uid`       CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `source_task_id`       VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `parent_candidate_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `target_branch_uid`    CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `base_revision_uid`    CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `merge_source_revision_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `base_revision_hash`   CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `base_snapshot_json`   JSON DEFAULT NULL,
+                `draft_artifact_id`    BIGINT UNSIGNED DEFAULT NULL,
+                `inline_content`       LONGTEXT NOT NULL,
+                `content_hash`         CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `words`                INT UNSIGNED NOT NULL DEFAULT 0,
+                `lifecycle`            VARCHAR(24) NOT NULL DEFAULT 'draft' COMMENT 'M63: draft|quarantined|approved|committed|rejected|stale; legacy: evaluated|superseded',
+                `gate_state`           VARCHAR(24) NOT NULL DEFAULT 'pending' COMMENT 'pending|passed|quarantined|error',
+                `validation_artifact_id` BIGINT UNSIGNED DEFAULT NULL,
+                `validation_json`      JSON DEFAULT NULL,
+                `quarantine_reason`    TEXT NULL,
+                `policy_snapshot_json` JSON DEFAULT NULL,
+                `policy_snapshot_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `evaluated_at`         DATETIME(6) DEFAULT NULL,
+                `quarantined_at`       DATETIME(6) DEFAULT NULL,
+                `approved_at`          DATETIME(6) DEFAULT NULL,
+                `rejected_at`          DATETIME(6) DEFAULT NULL,
+                `stale_at`             DATETIME(6) DEFAULT NULL,
+                `committed_at`         DATETIME(6) DEFAULT NULL,
+                `created_at`           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `updated_at`           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_candidate_uid` (`candidate_uid`),
+                UNIQUE KEY `uk_candidate_run_content` (`run_id`, `content_hash`),
+                KEY `idx_candidate_chapter_content` (`chapter_id`, `content_hash`),
+                KEY `idx_candidate_chapter_lifecycle` (`chapter_id`, `lifecycle`, `created_at`),
+                KEY `idx_candidate_novel_lifecycle` (`novel_id`, `lifecycle`, `created_at`),
+                KEY `idx_candidate_source_task` (`source_task_id`),
+                KEY `idx_candidate_source_run` (`source_run_uid`),
+                KEY `idx_candidate_parent` (`parent_candidate_uid`),
+                KEY `idx_candidate_target_branch` (`target_branch_uid`, `chapter_id`, `created_at`),
+                KEY `idx_candidate_merge_source` (`merge_source_revision_uid`),
+                KEY `idx_candidate_draft_artifact` (`draft_artifact_id`),
+                KEY `idx_candidate_validation_artifact` (`validation_artifact_id`),
+                CONSTRAINT `fk_chapter_candidates_novel`
+                    FOREIGN KEY (`novel_id`) REFERENCES `novels` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_chapter_candidates_chapter`
+                    FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_chapter_candidates_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE SET NULL,
+                CONSTRAINT `fk_chapter_candidates_draft_artifact`
+                    FOREIGN KEY (`draft_artifact_id`) REFERENCES `generation_artifacts` (`id`) ON DELETE SET NULL,
+                CONSTRAINT `fk_chapter_candidates_validation_artifact`
+                    FOREIGN KEY (`validation_artifact_id`) REFERENCES `generation_artifacts` (`id`) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Pre-canon chapter candidates'",
+
+            'approval_requests' => "CREATE TABLE IF NOT EXISTS `approval_requests` (
+                `id`                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `approval_uid`        CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `user_id`             INT UNSIGNED NOT NULL,
+                `novel_id`            INT UNSIGNED NOT NULL,
+                `chapter_id`          INT UNSIGNED NOT NULL,
+                `run_id`              BIGINT UNSIGNED DEFAULT NULL,
+                `candidate_id`        BIGINT UNSIGNED NOT NULL,
+                `idempotency_key`     VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `action_type`         VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `risk_level`          VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `state`               VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'open' COMMENT 'open|approved|rejected|stale|canceled',
+                `base_revision_hash`  CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `policy_snapshot_json` JSON NOT NULL,
+                `policy_snapshot_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `summary_artifact_id` BIGINT UNSIGNED DEFAULT NULL,
+                `requested_by`        VARCHAR(120) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `decided_by`          VARCHAR(120) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `decision_reason`     VARCHAR(500) DEFAULT NULL,
+                `decision_idempotency_key` VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `decision_payload_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `expires_at`          DATETIME(6) DEFAULT NULL,
+                `created_at`          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `decided_at`          DATETIME(6) DEFAULT NULL,
+                `updated_at`          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                `open_slot`           TINYINT(1) GENERATED ALWAYS AS (IF(`state`='open', 1, NULL)) STORED,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_approval_uid` (`approval_uid`),
+                UNIQUE KEY `uk_approval_user_idempotency` (`user_id`, `idempotency_key`),
+                UNIQUE KEY `uk_approval_user_decision_idempotency` (`user_id`, `decision_idempotency_key`),
+                UNIQUE KEY `uk_approval_candidate_open` (`candidate_id`, `action_type`, `open_slot`),
+                KEY `idx_approval_candidate_state` (`candidate_id`, `state`, `created_at`),
+                KEY `idx_approval_run_state` (`run_id`, `state`, `created_at`),
+                KEY `idx_approval_expires` (`state`, `expires_at`),
+                KEY `idx_approval_summary_artifact` (`summary_artifact_id`),
+                CONSTRAINT `fk_approval_requests_novel`
+                    FOREIGN KEY (`novel_id`) REFERENCES `novels` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_approval_requests_chapter`
+                    FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_approval_requests_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE SET NULL,
+                CONSTRAINT `fk_approval_requests_candidate`
+                    FOREIGN KEY (`candidate_id`) REFERENCES `chapter_candidates` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_approval_requests_summary_artifact`
+                    FOREIGN KEY (`summary_artifact_id`) REFERENCES `generation_artifacts` (`id`) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Durable candidate approval decisions'",
 
             'writing_tasks' => "CREATE TABLE IF NOT EXISTS `writing_tasks` (
                 `id`                    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -978,9 +1111,15 @@ class Schema
                 `attempt`               SMALLINT UNSIGNED NOT NULL DEFAULT 0,
                 `lease_owner`           VARCHAR(120) DEFAULT NULL,
                 `lease_expires_at`      DATETIME NULL,
+                `lease_token`           CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `fence_generation`      BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 `cancel_requested`      TINYINT(1) NOT NULL DEFAULT 0,
                 `content_saved`         TINYINT(1) NOT NULL DEFAULT 0,
                 `chapter_revision_hash` CHAR(64) DEFAULT NULL,
+                `policy_snapshot_json`  JSON DEFAULT NULL,
+                `base_chapter_snapshot_json` JSON DEFAULT NULL,
+                `policy_snapshot_hash`  CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `accepted_candidate_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
                 `error_code`             VARCHAR(64) DEFAULT NULL,
                 `error_message`          VARCHAR(500) DEFAULT NULL,
                 `result_json`            JSON DEFAULT NULL,
@@ -991,6 +1130,7 @@ class Schema
                 UNIQUE KEY `uk_writing_task_id` (`task_id`),
                 KEY `idx_writing_task_novel_state` (`novel_id`, `state`),
                 KEY `idx_writing_task_lease` (`state`, `lease_expires_at`),
+                KEY `idx_writing_task_fence` (`task_id`, `lease_token`, `fence_generation`),
                 CONSTRAINT `fk_writing_tasks_novel`
                     FOREIGN KEY (`novel_id`) REFERENCES `novels` (`id`) ON DELETE CASCADE,
                 CONSTRAINT `fk_writing_tasks_chapter`
@@ -999,6 +1139,14 @@ class Schema
 
             'postprocess_jobs' => "CREATE TABLE IF NOT EXISTS `postprocess_jobs` (
                 `id`               BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `job_uid`          CHAR(32) CHARACTER SET ascii COLLATE ascii_bin
+                    GENERATED ALWAYS AS (LOWER(LEFT(SHA2(CONCAT(
+                        'postprocess_job_v2:',
+                        IF(`accepted_candidate_uid` IS NULL,
+                           CONCAT('legacy:', `chapter_id`, ':', `revision_hash`),
+                           CONCAT('candidate:', `accepted_candidate_uid`)),
+                        ':', `stage`
+                    ), 256), 32))) STORED COMMENT 'postprocess_job_v2',
                 `novel_id`         INT UNSIGNED NOT NULL,
                 `chapter_id`       INT UNSIGNED NOT NULL,
                 `revision_hash`    CHAR(64) NOT NULL,
@@ -1009,19 +1157,68 @@ class Schema
                 `available_at`     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 `lease_owner`      VARCHAR(120) DEFAULT NULL,
                 `lease_expires_at` DATETIME NULL,
+                `lease_token`      CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `fence_generation` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `policy_snapshot_json` JSON DEFAULT NULL,
+                `policy_snapshot_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `accepted_candidate_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `rewrite_allowed`  TINYINT(1) NOT NULL DEFAULT 0,
                 `last_error`       TEXT DEFAULT NULL,
                 `started_at`       DATETIME NULL,
                 `completed_at`     DATETIME NULL,
                 `created_at`       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 `updated_at`       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY `uk_postprocess_revision` (`chapter_id`, `revision_hash`, `stage`),
+                UNIQUE KEY `uk_postprocess_job_uid` (`job_uid`),
+                KEY `idx_postprocess_revision` (`chapter_id`, `revision_hash`, `stage`),
                 KEY `idx_postprocess_claim` (`state`, `available_at`, `lease_expires_at`),
                 KEY `idx_postprocess_novel` (`novel_id`, `state`),
+                KEY `idx_postprocess_fence` (`id`, `lease_token`, `fence_generation`),
                 CONSTRAINT `fk_postprocess_jobs_novel`
                     FOREIGN KEY (`novel_id`) REFERENCES `novels` (`id`) ON DELETE CASCADE,
                 CONSTRAINT `fk_postprocess_jobs_chapter`
-                    FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE CASCADE
+                    FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE RESTRICT
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='可重试章节后处理队列'",
+
+            'postprocess_subtasks' => "CREATE TABLE IF NOT EXISTS `postprocess_subtasks` (
+                `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `task_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `parent_job_id` BIGINT UNSIGNED NOT NULL,
+                `parent_job_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `novel_id` INT UNSIGNED NOT NULL,
+                `chapter_id` INT UNSIGNED NOT NULL,
+                `revision_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `accepted_candidate_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `parent_lease_owner` VARCHAR(120) NOT NULL,
+                `parent_lease_token` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `parent_fence_generation` BIGINT UNSIGNED NOT NULL,
+                `task_type` VARCHAR(32) NOT NULL,
+                `task_version` SMALLINT UNSIGNED NOT NULL DEFAULT 1,
+                `input_json` JSON NOT NULL,
+                `input_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `state` VARCHAR(24) NOT NULL DEFAULT 'queued',
+                `attempt` SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+                `max_attempts` SMALLINT UNSIGNED NOT NULL DEFAULT 3,
+                `available_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                `lease_owner` VARCHAR(120) DEFAULT NULL,
+                `lease_token` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `fence_generation` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `lease_expires_at` DATETIME NULL,
+                `result_json` JSON DEFAULT NULL,
+                `result_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `last_error` TEXT DEFAULT NULL,
+                `duration_ms` INT UNSIGNED NOT NULL DEFAULT 0,
+                `started_at` DATETIME NULL,
+                `completed_at` DATETIME NULL,
+                `applied_at` DATETIME NULL,
+                `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY `uk_postprocess_subtask_uid` (`task_uid`),
+                KEY `idx_postprocess_subtask_parent` (`parent_job_id`,`task_type`),
+                KEY `idx_postprocess_subtask_claim` (`state`,`available_at`,`lease_expires_at`),
+                KEY `idx_postprocess_subtask_recent` (`updated_at`,`state`),
+                CONSTRAINT `fk_postprocess_subtask_parent`
+                    FOREIGN KEY (`parent_job_id`) REFERENCES `postprocess_jobs` (`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Frozen pure postprocessing computations'",
 
             'chapter_projection_runs' => "CREATE TABLE IF NOT EXISTS `chapter_projection_runs` (
                 `id`            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -1040,6 +1237,558 @@ class Schema
                     FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='章节派生投影幂等记录'",
 
+            // ========== Harness M62：Run / Step / Attempt / Event / Artifact ==========
+            'generation_runs' => "CREATE TABLE IF NOT EXISTS `generation_runs` (
+                `id`                    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `run_uid`               CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `user_id`               INT UNSIGNED NOT NULL,
+                `novel_id`              INT UNSIGNED NOT NULL,
+                `chapter_id`            INT UNSIGNED DEFAULT NULL,
+                `queue`                 VARCHAR(32) NOT NULL DEFAULT 'writing',
+                `run_type`              VARCHAR(64) NOT NULL,
+                `workflow_name`         VARCHAR(64) NOT NULL,
+                `workflow_version`      VARCHAR(32) NOT NULL,
+                `authority_mode`        VARCHAR(16) NOT NULL DEFAULT 'shadow',
+                `state`                 VARCHAR(24) NOT NULL DEFAULT 'queued',
+                `current_step_key`      VARCHAR(64) DEFAULT NULL,
+                `progress`              TINYINT UNSIGNED NOT NULL DEFAULT 0,
+                `parent_run_id`         BIGINT UNSIGNED DEFAULT NULL,
+                `root_run_id`           BIGINT UNSIGNED DEFAULT NULL,
+                `idempotency_key`       VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `active_lock_key`       VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `attempt`               SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+                `max_attempts`          SMALLINT UNSIGNED NOT NULL DEFAULT 3,
+                `available_at`          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `next_event_no`         BIGINT UNSIGNED NOT NULL DEFAULT 1,
+                `event_stream_version`  INT UNSIGNED NOT NULL DEFAULT 1,
+                `input_hash`            CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `prompt_manifest_hash`  CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `context_snapshot_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `cancel_requested`      TINYINT(1) NOT NULL DEFAULT 0,
+                `deadline_at`           DATETIME(6) DEFAULT NULL,
+                `lease_owner`           VARCHAR(120) DEFAULT NULL,
+                `lease_token`           CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `fence_generation`      BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `lease_expires_at`      DATETIME(6) DEFAULT NULL,
+                `token_budget`          BIGINT UNSIGNED DEFAULT NULL,
+                `cost_budget`           DECIMAL(14,6) DEFAULT NULL,
+                `input_tokens`          BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `output_tokens`         BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `cost_total`            DECIMAL(14,6) NOT NULL DEFAULT 0,
+                `flag_snapshot_json`    JSON DEFAULT NULL,
+                `goal_json`             JSON DEFAULT NULL,
+                `result_json`           JSON DEFAULT NULL,
+                `error_code`            VARCHAR(64) DEFAULT NULL,
+                `error_message`         VARCHAR(500) DEFAULT NULL,
+                `started_at`            DATETIME(6) DEFAULT NULL,
+                `completed_at`          DATETIME(6) DEFAULT NULL,
+                `created_at`            DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `updated_at`            DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                UNIQUE KEY `uk_generation_run_uid` (`run_uid`),
+                UNIQUE KEY `uk_generation_run_idempotency` (`user_id`, `idempotency_key`),
+                UNIQUE KEY `uk_generation_run_active` (`novel_id`, `active_lock_key`),
+                KEY `idx_generation_run_claim` (`queue`, `state`, `available_at`, `lease_expires_at`),
+                KEY `idx_generation_run_chapter` (`chapter_id`, `created_at`),
+                KEY `idx_generation_run_parent` (`parent_run_id`),
+                KEY `idx_generation_run_root` (`root_run_id`),
+                KEY `idx_generation_run_fence` (`id`, `lease_token`, `fence_generation`),
+                CONSTRAINT `fk_generation_runs_novel`
+                    FOREIGN KEY (`novel_id`) REFERENCES `novels` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_generation_runs_chapter`
+                    FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE SET NULL,
+                CONSTRAINT `fk_generation_runs_parent`
+                    FOREIGN KEY (`parent_run_id`) REFERENCES `generation_runs` (`id`) ON DELETE SET NULL,
+                CONSTRAINT `fk_generation_runs_root`
+                    FOREIGN KEY (`root_run_id`) REFERENCES `generation_runs` (`id`) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Harness durable generation runs'",
+
+            'generation_steps' => "CREATE TABLE IF NOT EXISTS `generation_steps` (
+                `id`                 BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `run_id`             BIGINT UNSIGNED NOT NULL,
+                `step_key`           VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `iteration_no`       SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+                `ordinal`            SMALLINT UNSIGNED NOT NULL,
+                `step_type`          VARCHAR(64) NOT NULL,
+                `state`              VARCHAR(24) NOT NULL DEFAULT 'pending',
+                `progress`           TINYINT UNSIGNED NOT NULL DEFAULT 0,
+                `input_hash`         CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `output_hash`        CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `output_artifact_id` BIGINT UNSIGNED DEFAULT NULL,
+                `attempt`            SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+                `max_attempts`       SMALLINT UNSIGNED NOT NULL DEFAULT 3,
+                `retry_at`           DATETIME(6) DEFAULT NULL,
+                `lease_token`        CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `fence_generation`   BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `lease_expires_at`   DATETIME(6) DEFAULT NULL,
+                `policy_json`        JSON DEFAULT NULL,
+                `error_code`         VARCHAR(64) DEFAULT NULL,
+                `error_message`      VARCHAR(500) DEFAULT NULL,
+                `started_at`         DATETIME(6) DEFAULT NULL,
+                `completed_at`       DATETIME(6) DEFAULT NULL,
+                `created_at`         DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `updated_at`         DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                UNIQUE KEY `uk_generation_step_identity` (`run_id`, `step_key`, `iteration_no`),
+                KEY `idx_generation_step_state` (`run_id`, `state`, `ordinal`),
+                KEY `idx_generation_step_output_artifact` (`output_artifact_id`),
+                KEY `idx_generation_step_fence` (`id`, `lease_token`, `fence_generation`),
+                CONSTRAINT `fk_generation_steps_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Harness workflow steps'",
+
+            'generation_attempts' => "CREATE TABLE IF NOT EXISTS `generation_attempts` (
+                `id`                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `step_id`             BIGINT UNSIGNED NOT NULL,
+                `attempt_no`          SMALLINT UNSIGNED NOT NULL,
+                `state`               VARCHAR(24) NOT NULL DEFAULT 'running',
+                `provider`            VARCHAR(64) DEFAULT NULL,
+                `model`               VARCHAR(191) DEFAULT NULL,
+                `model_config_json`   JSON DEFAULT NULL,
+                `provider_request_id` VARCHAR(191) DEFAULT NULL,
+                `input_artifact_id`   BIGINT UNSIGNED DEFAULT NULL,
+                `output_artifact_id`  BIGINT UNSIGNED DEFAULT NULL,
+                `input_tokens`        BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `output_tokens`       BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `cache_tokens`        BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `cost`                DECIMAL(14,6) NOT NULL DEFAULT 0,
+                `latency_ms`          BIGINT UNSIGNED DEFAULT NULL,
+                `finish_reason`       VARCHAR(64) DEFAULT NULL,
+                `error_code`          VARCHAR(64) DEFAULT NULL,
+                `error_message`       VARCHAR(500) DEFAULT NULL,
+                `started_at`          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `completed_at`        DATETIME(6) DEFAULT NULL,
+                UNIQUE KEY `uk_generation_attempt_identity` (`step_id`, `attempt_no`),
+                KEY `idx_generation_attempt_input_artifact` (`input_artifact_id`),
+                KEY `idx_generation_attempt_output_artifact` (`output_artifact_id`),
+                CONSTRAINT `fk_generation_attempts_step`
+                    FOREIGN KEY (`step_id`) REFERENCES `generation_steps` (`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Harness model attempts'",
+
+            'generation_events' => "CREATE TABLE IF NOT EXISTS `generation_events` (
+                `id`                 BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `run_id`             BIGINT UNSIGNED NOT NULL,
+                `step_id`            BIGINT UNSIGNED DEFAULT NULL,
+                `attempt_id`         BIGINT UNSIGNED DEFAULT NULL,
+                `event_no`           BIGINT UNSIGNED NOT NULL,
+                `event_type`         VARCHAR(96) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `event_version`      SMALLINT UNSIGNED NOT NULL DEFAULT 1,
+                `severity`           VARCHAR(16) NOT NULL DEFAULT 'info',
+                `event_key`          VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `actor_type`         VARCHAR(32) DEFAULT NULL,
+                `actor_id`           VARCHAR(191) DEFAULT NULL,
+                `causation_event_id` BIGINT UNSIGNED DEFAULT NULL,
+                `client_visible`     TINYINT(1) NOT NULL DEFAULT 1,
+                `payload_json`       JSON DEFAULT NULL,
+                `payload_hash`       CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `created_at`         DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                UNIQUE KEY `uk_generation_event_sequence` (`run_id`, `event_no`),
+                UNIQUE KEY `uk_generation_event_key` (`run_id`, `event_key`),
+                KEY `idx_generation_event_cursor` (`run_id`, `id`),
+                KEY `idx_generation_event_step` (`step_id`, `id`),
+                KEY `idx_generation_event_attempt` (`attempt_id`, `id`),
+                KEY `idx_generation_event_causation` (`causation_event_id`),
+                CONSTRAINT `fk_generation_events_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_generation_events_step`
+                    FOREIGN KEY (`step_id`) REFERENCES `generation_steps` (`id`) ON DELETE SET NULL,
+                CONSTRAINT `fk_generation_events_attempt`
+                    FOREIGN KEY (`attempt_id`) REFERENCES `generation_attempts` (`id`) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Append-only Harness semantic events'",
+
+            'generation_event_id_allocator' => "CREATE TABLE IF NOT EXISTS `generation_event_id_allocator` (
+                `allocator_id` TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+                `next_id` BIGINT UNSIGNED NOT NULL,
+                `updated_at` DATETIME(6) NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+
+            'generation_event_segments' => "CREATE TABLE IF NOT EXISTS `generation_event_segments` (
+                `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                `run_id` BIGINT UNSIGNED NOT NULL,
+                `segment_no` INT UNSIGNED NOT NULL,
+                `first_event_no` BIGINT UNSIGNED NOT NULL,
+                `last_event_no` BIGINT UNSIGNED NOT NULL,
+                `event_count` INT UNSIGNED NOT NULL,
+                `storage_uri` VARCHAR(1000) NOT NULL,
+                `content_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `size_bytes` BIGINT UNSIGNED NOT NULL,
+                `format_version` INT UNSIGNED NOT NULL DEFAULT 1,
+                `created_at` DATETIME(6) NOT NULL,
+                UNIQUE KEY `uk_generation_event_segment_number` (`run_id`, `segment_no`),
+                UNIQUE KEY `uk_generation_event_segment_first` (`run_id`, `first_event_no`),
+                CONSTRAINT `fk_generation_event_segments_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+
+            'generation_event_checkpoints' => "CREATE TABLE IF NOT EXISTS `generation_event_checkpoints` (
+                `run_id` BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                `projector_version` INT UNSIGNED NOT NULL,
+                `contract_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `event_cursor` BIGINT UNSIGNED NOT NULL,
+                `stream_version` INT UNSIGNED NOT NULL,
+                `stream_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `state_json` JSON NOT NULL,
+                `state_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `created_at` DATETIME(6) NOT NULL,
+                CONSTRAINT `fk_generation_event_checkpoints_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+
+            'generation_poll_watermarks' => "CREATE TABLE IF NOT EXISTS `generation_poll_watermarks` (
+                `run_id` BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                `fence_generation` BIGINT UNSIGNED NOT NULL,
+                `artifact_revision` INT UNSIGNED NOT NULL DEFAULT 0,
+                `event_cursor` BIGINT UNSIGNED NOT NULL,
+                `progress` TINYINT UNSIGNED NOT NULL,
+                `content_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `updated_at` DATETIME(6) NOT NULL,
+                CONSTRAINT `fk_generation_poll_watermarks_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+
+            'generation_side_effect_operations' => "CREATE TABLE IF NOT EXISTS `generation_side_effect_operations` (
+                `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `operation_uid` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `run_id` BIGINT UNSIGNED NOT NULL,
+                `operation_key` VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `kind` VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `target` VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `request_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `fence_generation` BIGINT UNSIGNED NOT NULL,
+                `state` VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `result_json` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
+                `result_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `resolution_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `updated_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_side_effect_uid` (`operation_uid`),
+                UNIQUE KEY `uk_side_effect_operation` (`run_id`, `operation_key`),
+                KEY `idx_side_effect_pending` (`state`, `updated_at`, `run_id`),
+                CONSTRAINT `fk_side_effect_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+
+            'generation_artifacts' => "CREATE TABLE IF NOT EXISTS `generation_artifacts` (
+                `id`                     BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `artifact_uid`           CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `run_id`                 BIGINT UNSIGNED NOT NULL,
+                `step_id`                BIGINT UNSIGNED DEFAULT NULL,
+                `artifact_type`          VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `logical_key`            VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `revision_no`            INT UNSIGNED NOT NULL DEFAULT 1,
+                `content_hash`           CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `mime_type`              VARCHAR(127) NOT NULL,
+                `encoding`               VARCHAR(32) NOT NULL DEFAULT 'utf-8',
+                `storage_kind`           VARCHAR(16) NOT NULL DEFAULT 'inline',
+                `inline_text`            LONGTEXT DEFAULT NULL,
+                `inline_json`            JSON DEFAULT NULL,
+                `storage_uri`            VARCHAR(1000) DEFAULT NULL,
+                `size_bytes`             BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `sensitivity`            VARCHAR(24) NOT NULL DEFAULT 'internal',
+                `metadata_json`          JSON DEFAULT NULL,
+                `supersedes_artifact_id` BIGINT UNSIGNED DEFAULT NULL,
+                `retention_until`        DATETIME(6) DEFAULT NULL,
+                `created_at`             DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                UNIQUE KEY `uk_generation_artifact_uid` (`artifact_uid`),
+                UNIQUE KEY `uk_generation_artifact_revision` (`run_id`, `logical_key`, `revision_no`),
+                KEY `idx_generation_artifact_hash` (`content_hash`),
+                KEY `idx_generation_artifact_step` (`step_id`, `created_at`),
+                KEY `idx_generation_artifact_retention` (`retention_until`),
+                KEY `idx_generation_artifact_supersedes` (`supersedes_artifact_id`),
+                CONSTRAINT `fk_generation_artifacts_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_generation_artifacts_step`
+                    FOREIGN KEY (`step_id`) REFERENCES `generation_steps` (`id`) ON DELETE SET NULL,
+                CONSTRAINT `fk_generation_artifacts_supersedes`
+                    FOREIGN KEY (`supersedes_artifact_id`) REFERENCES `generation_artifacts` (`id`) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Content-addressed Harness artifacts'",
+
+            'chapter_commit_ledger' => "CREATE TABLE IF NOT EXISTS `chapter_commit_ledger` (
+                `id`                      BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `run_id`                  BIGINT UNSIGNED NOT NULL,
+                `chapter_id`              INT UNSIGNED NOT NULL,
+                `candidate_id`            BIGINT UNSIGNED DEFAULT NULL,
+                `draft_hash`              CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `previous_revision_hash`  CHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `committed_revision_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `legacy_revision_hash`    CHAR(64) CHARACTER SET ascii COLLATE ascii_bin
+                    GENERATED ALWAYS AS (IF(`candidate_id` IS NULL, `committed_revision_hash`, NULL)) STORED
+                    COMMENT 'm63_candidate_legacy_revision_v1',
+                `postprocess_job_id`       BIGINT UNSIGNED DEFAULT NULL,
+                `committed_at`             DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                UNIQUE KEY `uk_chapter_commit_run_draft` (`run_id`, `draft_hash`),
+                UNIQUE KEY `uk_chapter_commit_candidate` (`candidate_id`),
+                UNIQUE KEY `uk_chapter_commit_legacy_revision` (`chapter_id`, `legacy_revision_hash`),
+                KEY `idx_chapter_commit_revision` (`chapter_id`, `committed_revision_hash`),
+                KEY `idx_chapter_commit_job` (`postprocess_job_id`),
+                CONSTRAINT `fk_chapter_commit_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_chapter_commit_chapter`
+                    FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_chapter_commit_candidate`
+                    FOREIGN KEY (`candidate_id`) REFERENCES `chapter_candidates` (`id`) ON DELETE RESTRICT,
+                CONSTRAINT `fk_chapter_commit_job`
+                    FOREIGN KEY (`postprocess_job_id`) REFERENCES `postprocess_jobs` (`id`) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Exactly-once Canon commit ledger'",
+
+            // ========== Harness M64：unified durable Job Kernel ==========
+            'jobs' => "CREATE TABLE IF NOT EXISTS `jobs` (
+                `id`                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `job_uid`           CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `run_id`            BIGINT UNSIGNED DEFAULT NULL,
+                `step_id`           BIGINT UNSIGNED DEFAULT NULL,
+                `queue`             VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `job_type`          VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `user_id`           INT UNSIGNED NOT NULL,
+                `novel_id`          INT UNSIGNED NOT NULL,
+                `chapter_id`        INT UNSIGNED DEFAULT NULL,
+                `idempotency_key`   VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `state`             VARCHAR(24) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'queued',
+                `priority`          SMALLINT NOT NULL DEFAULT 0,
+                `progress`          TINYINT UNSIGNED NOT NULL DEFAULT 0,
+                `payload_json`      JSON NOT NULL,
+                `result_json`       JSON DEFAULT NULL,
+                `attempt`           SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+                `max_attempts`      SMALLINT UNSIGNED NOT NULL DEFAULT 3,
+                `available_at`      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `lease_owner`       VARCHAR(120) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `lease_token`       CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `fence_generation`  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `lease_expires_at`  DATETIME(6) DEFAULT NULL,
+                `cancel_requested`  TINYINT(1) NOT NULL DEFAULT 0,
+                `next_event_no`     BIGINT UNSIGNED NOT NULL DEFAULT 1,
+                `error_code`        VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `error_message`     VARCHAR(500) DEFAULT NULL,
+                `legacy_type`       VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `legacy_id`         BIGINT UNSIGNED DEFAULT NULL,
+                `started_at`        DATETIME(6) DEFAULT NULL,
+                `completed_at`      DATETIME(6) DEFAULT NULL,
+                `created_at`        DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `updated_at`        DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_job_uid` (`job_uid`),
+                UNIQUE KEY `uk_job_queue_idempotency` (`queue`, `idempotency_key`),
+                UNIQUE KEY `uk_job_legacy` (`legacy_type`, `legacy_id`),
+                KEY `idx_job_claim` (`queue`, `state`, `available_at`, `priority`, `id`),
+                KEY `idx_job_run` (`run_id`, `id`),
+                KEY `idx_job_step` (`step_id`, `id`),
+                KEY `idx_job_novel` (`novel_id`, `state`, `created_at`),
+                KEY `idx_job_chapter` (`chapter_id`, `created_at`),
+                KEY `idx_job_fence` (`id`, `lease_token`, `fence_generation`),
+                CONSTRAINT `fk_jobs_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE SET NULL,
+                CONSTRAINT `fk_jobs_step`
+                    FOREIGN KEY (`step_id`) REFERENCES `generation_steps` (`id`) ON DELETE SET NULL,
+                CONSTRAINT `fk_jobs_novel`
+                    FOREIGN KEY (`novel_id`) REFERENCES `novels` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_jobs_chapter`
+                    FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='M64 unified durable Job Kernel'",
+
+            'job_events' => "CREATE TABLE IF NOT EXISTS `job_events` (
+                `id`            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `job_id`        BIGINT UNSIGNED NOT NULL,
+                `event_no`      BIGINT UNSIGNED NOT NULL,
+                `event_type`    VARCHAR(96) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `event_version` SMALLINT UNSIGNED NOT NULL DEFAULT 1,
+                `event_key`     VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `actor_type`    VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `actor_id`      VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `payload_json`  JSON NOT NULL,
+                `payload_hash`  CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `created_at`    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_job_event_sequence` (`job_id`, `event_no`),
+                UNIQUE KEY `uk_job_event_key` (`job_id`, `event_key`),
+                KEY `idx_job_event_cursor` (`job_id`, `id`),
+                CONSTRAINT `fk_job_events_job`
+                    FOREIGN KEY (`job_id`) REFERENCES `jobs` (`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='M64 append-only Job lifecycle evidence'",
+
+            // ========== Harness M65：immutable Branch / Revision heads ==========
+            'story_branches' => "CREATE TABLE IF NOT EXISTS `story_branches` (
+                `id`                       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `branch_uid`               CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `user_id`                  INT UNSIGNED NOT NULL,
+                `novel_id`                 INT UNSIGNED NOT NULL,
+                `name`                     VARCHAR(100) NOT NULL,
+                `is_main`                  TINYINT(1) NOT NULL DEFAULT 0,
+                `state`                    VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'active',
+                `forked_from_branch_uid`   CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `forked_from_revision_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `main_slot` TINYINT(1) GENERATED ALWAYS AS (IF(`is_main`=1,1,NULL)) STORED,
+                `created_at`               DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `updated_at`               DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_story_branch_uid` (`branch_uid`),
+                UNIQUE KEY `uk_story_branch_name` (`user_id`, `novel_id`, `name`),
+                UNIQUE KEY `uk_story_branch_main` (`user_id`, `novel_id`, `main_slot`),
+                UNIQUE KEY `uk_story_branch_scope` (`user_id`, `novel_id`, `branch_uid`),
+                KEY `idx_story_branch_novel_state` (`novel_id`, `state`, `created_at`),
+                KEY `idx_story_branch_fork` (`forked_from_branch_uid`, `forked_from_revision_uid`),
+                CONSTRAINT `fk_story_branches_novel`
+                    FOREIGN KEY (`novel_id`) REFERENCES `novels` (`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='M65 owned story branches'",
+
+            // M66 keeps non-main Branch memory outside every legacy/main
+            // MemoryEngine table. The composite ownership FK is installed by
+            // the guarded M66 migration after older story_branches tables gain
+            // uk_story_branch_scope; until that succeeds schema v67 is never
+            // stamped and application admission remains fail-closed.
+            'branch_memory_records' => "CREATE TABLE IF NOT EXISTS `branch_memory_records` (
+                `id`                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `memory_uid`          CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `user_id`             INT UNSIGNED NOT NULL,
+                `novel_id`            INT UNSIGNED NOT NULL,
+                `branch_uid`          CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `memory_key`          VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                `record_type`         VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `payload_json`        JSON NOT NULL,
+                `payload_hash`        CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `source_revision_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `record_version`      BIGINT UNSIGNED NOT NULL DEFAULT 1,
+                `created_at`          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `updated_at`          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_branch_memory_uid` (`memory_uid`),
+                UNIQUE KEY `uk_branch_memory_scope_key` (`user_id`, `novel_id`, `branch_uid`, `memory_key`),
+                KEY `idx_branch_memory_type` (`user_id`, `novel_id`, `branch_uid`, `record_type`, `updated_at`),
+                KEY `idx_branch_memory_revision` (`source_revision_uid`),
+                CONSTRAINT `fk_branch_memory_revision`
+                    FOREIGN KEY (`source_revision_uid`) REFERENCES `chapter_revisions` (`revision_uid`) ON DELETE RESTRICT
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='M66 strictly scoped non-main Branch memory'",
+
+            'chapter_revisions' => "CREATE TABLE IF NOT EXISTS `chapter_revisions` (
+                `id`                        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `revision_uid`              CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `user_id`                   INT UNSIGNED NOT NULL,
+                `novel_id`                  INT UNSIGNED NOT NULL,
+                `chapter_id`                INT UNSIGNED NOT NULL,
+                `branch_uid`                CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `content`                   LONGTEXT NOT NULL,
+                `content_hash`              CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `parent_revision_uid`       CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `merge_source_revision_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `source_candidate_uid`      CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `created_at`                DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_chapter_revision_uid` (`revision_uid`),
+                KEY `idx_chapter_revision_branch` (`branch_uid`, `chapter_id`, `id`),
+                KEY `idx_chapter_revision_content` (`chapter_id`, `content_hash`),
+                KEY `idx_chapter_revision_parent` (`parent_revision_uid`),
+                KEY `idx_chapter_revision_merge` (`merge_source_revision_uid`),
+                KEY `idx_chapter_revision_candidate` (`source_candidate_uid`),
+                CONSTRAINT `fk_chapter_revisions_novel`
+                    FOREIGN KEY (`novel_id`) REFERENCES `novels` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_chapter_revisions_chapter`
+                    FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_chapter_revisions_branch`
+                    FOREIGN KEY (`branch_uid`) REFERENCES `story_branches` (`branch_uid`) ON DELETE RESTRICT,
+                CONSTRAINT `fk_chapter_revisions_candidate`
+                    FOREIGN KEY (`source_candidate_uid`) REFERENCES `chapter_candidates` (`candidate_uid`) ON DELETE RESTRICT
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='M65 immutable chapter revision bytes and lineage'",
+
+            'chapter_branch_heads' => "CREATE TABLE IF NOT EXISTS `chapter_branch_heads` (
+                `id`              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `branch_uid`      CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `chapter_id`      INT UNSIGNED NOT NULL,
+                `revision_uid`    CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `head_generation` BIGINT UNSIGNED NOT NULL DEFAULT 1,
+                `created_at`      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `updated_at`      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_chapter_branch_head` (`branch_uid`, `chapter_id`),
+                KEY `idx_chapter_branch_revision` (`revision_uid`),
+                KEY `idx_chapter_branch_chapter` (`chapter_id`, `updated_at`),
+                CONSTRAINT `fk_chapter_branch_heads_branch`
+                    FOREIGN KEY (`branch_uid`) REFERENCES `story_branches` (`branch_uid`) ON DELETE CASCADE,
+                CONSTRAINT `fk_chapter_branch_heads_chapter`
+                    FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='M65 CAS heads; revision pointer validated transactionally'",
+
+            'chapter_canonical_heads' => "CREATE TABLE IF NOT EXISTS `chapter_canonical_heads` (
+                `id`                   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `user_id`              INT UNSIGNED NOT NULL,
+                `novel_id`             INT UNSIGNED NOT NULL,
+                `chapter_id`           INT UNSIGNED NOT NULL,
+                `branch_uid`           CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `revision_uid`         CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `revision_hash`        CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `source_candidate_uid` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `head_generation`      BIGINT UNSIGNED NOT NULL DEFAULT 1,
+                `created_at`           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                `updated_at`           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_chapter_canonical_head` (`chapter_id`),
+                KEY `idx_chapter_canonical_novel` (`novel_id`, `updated_at`),
+                KEY `idx_chapter_canonical_revision` (`revision_uid`),
+                KEY `idx_chapter_canonical_candidate` (`source_candidate_uid`),
+                CONSTRAINT `fk_chapter_canonical_heads_novel`
+                    FOREIGN KEY (`novel_id`) REFERENCES `novels` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_chapter_canonical_heads_chapter`
+                    FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE CASCADE,
+                CONSTRAINT `fk_chapter_canonical_heads_branch`
+                    FOREIGN KEY (`branch_uid`) REFERENCES `story_branches` (`branch_uid`) ON DELETE RESTRICT
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='M65 canonical Revision compatibility head'",
+
+            'branch_merge_commit_ledger' => "CREATE TABLE IF NOT EXISTS `branch_merge_commit_ledger` (
+                `id`                             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `approval_id`                    BIGINT UNSIGNED NOT NULL,
+                `candidate_id`                   BIGINT UNSIGNED NOT NULL,
+                `chapter_id`                     INT UNSIGNED NOT NULL,
+                `branch_uid`                     CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `base_revision_uid`              CHAR(32) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+                `committed_revision_uid`         CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `committed_revision_hash`        CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `postprocess_job_id`              BIGINT UNSIGNED DEFAULT NULL,
+                `approval_decision_payload_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `committed_at`                   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_branch_merge_approval` (`approval_id`),
+                UNIQUE KEY `uk_branch_merge_candidate` (`candidate_id`),
+                UNIQUE KEY `uk_branch_merge_revision` (`committed_revision_uid`),
+                KEY `idx_branch_merge_history` (`branch_uid`, `chapter_id`, `committed_at`),
+                KEY `idx_branch_merge_base_revision` (`base_revision_uid`),
+                KEY `idx_branch_merge_postprocess` (`postprocess_job_id`),
+                CONSTRAINT `fk_branch_merge_approval`
+                    FOREIGN KEY (`approval_id`) REFERENCES `approval_requests` (`id`) ON DELETE RESTRICT,
+                CONSTRAINT `fk_branch_merge_candidate`
+                    FOREIGN KEY (`candidate_id`) REFERENCES `chapter_candidates` (`id`) ON DELETE RESTRICT,
+                CONSTRAINT `fk_branch_merge_chapter`
+                    FOREIGN KEY (`chapter_id`) REFERENCES `chapters` (`id`) ON DELETE RESTRICT,
+                CONSTRAINT `fk_branch_merge_branch`
+                    FOREIGN KEY (`branch_uid`) REFERENCES `story_branches` (`branch_uid`) ON DELETE RESTRICT,
+                CONSTRAINT `fk_branch_merge_base_revision`
+                    FOREIGN KEY (`base_revision_uid`) REFERENCES `chapter_revisions` (`revision_uid`) ON DELETE RESTRICT,
+                CONSTRAINT `fk_branch_merge_committed_revision`
+                    FOREIGN KEY (`committed_revision_uid`) REFERENCES `chapter_revisions` (`revision_uid`) ON DELETE RESTRICT,
+                CONSTRAINT `fk_branch_merge_postprocess`
+                    FOREIGN KEY (`postprocess_job_id`) REFERENCES `postprocess_jobs` (`id`) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='M65 exactly-once approved branch merge commits'",
+
+            // P7 retention ledger is intentionally retained after Event payload
+            // tiering; archive bytes must verify before this row is inserted.
+            'harness_retention_archives' => "CREATE TABLE IF NOT EXISTS `harness_retention_archives` (
+                `id`               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `archive_uid`      CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `run_id`           BIGINT UNSIGNED NOT NULL,
+                `snapshot_hash`    CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `content_hash`     CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                `storage_uri`      VARCHAR(1000) NOT NULL,
+                `size_bytes`       BIGINT UNSIGNED NOT NULL,
+                `event_count`      BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `artifact_count`   BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `first_event_no`   BIGINT UNSIGNED DEFAULT NULL,
+                `last_event_no`    BIGINT UNSIGNED DEFAULT NULL,
+                `completed_at`     DATETIME(6) NOT NULL,
+                `created_at`       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_harness_retention_archive_uid` (`archive_uid`),
+                UNIQUE KEY `uk_harness_retention_run` (`run_id`),
+                KEY `idx_harness_retention_completed` (`completed_at`, `id`),
+                CONSTRAINT `fk_harness_retention_run`
+                    FOREIGN KEY (`run_id`) REFERENCES `generation_runs` (`id`) ON DELETE RESTRICT
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Verified external Run/Event/Artifact archive ledger'",
+
             'writing_logs' => "CREATE TABLE IF NOT EXISTS `writing_logs` (
                 `id`         INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                 `novel_id`   INT UNSIGNED NOT NULL,
@@ -1054,16 +1803,19 @@ class Schema
             'volume_outlines' => "CREATE TABLE IF NOT EXISTS `volume_outlines` (
                 `id`              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                 `novel_id`        INT UNSIGNED NOT NULL,
-                `volume_number`   INT NOT NULL COMMENT '卷号，从1开始',
+                `volume_number`   INT DEFAULT NULL COMMENT '卷号，从1开始（与 volume_index 同值双写）',
+                `volume_index`    INT UNSIGNED DEFAULT NULL COMMENT '向导卷序号（与 volume_number 同值双写；NULL 时读方回退旧列）',
                 `title`           VARCHAR(200) NOT NULL COMMENT '卷标题',
                 `summary`         TEXT COMMENT '卷概要（300-500字）',
-                `theme`           VARCHAR(200) NOT NULL COMMENT '本卷主题',
-                `start_chapter`   INT NOT NULL COMMENT '起始章节号',
-                `end_chapter`     INT NOT NULL COMMENT '结束章节号',
+                `theme`           TEXT DEFAULT NULL COMMENT '本卷主题',
+                `start_chapter`   INT DEFAULT NULL COMMENT '起始章节号（与 chapter_from 同值双写）',
+                `end_chapter`     INT DEFAULT NULL COMMENT '结束章节号（与 chapter_to 同值双写）',
+                `chapter_from`    INT UNSIGNED DEFAULT NULL COMMENT '向导起始章（与 start_chapter 同值双写）',
+                `chapter_to`      INT UNSIGNED DEFAULT NULL COMMENT '向导结束章（与 end_chapter 同值双写）',
                 `key_events`      JSON COMMENT '本卷关键事件列表',
                 `character_focus` JSON COMMENT '本卷重点描写的人物',
-                `conflict`        VARCHAR(500) NOT NULL DEFAULT '' COMMENT '本卷核心冲突',
-                `resolution`      VARCHAR(500) NOT NULL DEFAULT '' COMMENT '本卷解决方式',
+                `conflict`        VARCHAR(500) DEFAULT '' COMMENT '本卷核心冲突',
+                `resolution`      VARCHAR(500) DEFAULT '' COMMENT '本卷解决方式',
                 `foreshadowing`               JSON COMMENT '本卷埋下的伏笔',
                 `volume_goals`                JSON COMMENT '本卷写作目标：主矛盾/人物弧/势力变化/需完成事项',
                 `must_resolve_foreshadowing`  JSON COMMENT '本卷必须回收的伏笔描述列表（强制执行）',
@@ -1189,6 +1941,20 @@ class Schema
                 KEY `idx_project` (`project_id`),
                 KEY `idx_episode` (`episode_id`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='漫剧异步任务队列'",
+
+            // ========== 登录限速表 ==========
+            // 审计修复（2026-08-02 H1-DB）：登录限速从文件锁迁移到数据库。
+            // Windows 下 flock() 在某些 PHP/NTFS 组合上不可靠（非阻塞锁
+            // 永远返回 false → 走无锁回退路径丢失计数），且并发请求易写冲突。
+            // DB 方案用 InnoDB 行锁 + 事务保证原子性，跨平台一致。
+            'login_throttle' => "CREATE TABLE IF NOT EXISTS `login_throttle` (
+                `ip_hash`       VARCHAR(64) NOT NULL COMMENT 'sha1(client_ip) — 不存原始 IP',
+                `attempts`      INT UNSIGNED NOT NULL DEFAULT 0,
+                `last_attempt`  INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '最近一次失败时间戳',
+                `lockout_until` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '锁定到期时间戳(0=未锁)',
+                `updated_at`    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (`ip_hash`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='登录限速（DB 持久化，替代文件锁）'",
         ];
     }
 
@@ -1228,6 +1994,11 @@ class Schema
             $state[$name] = 1;
             preg_match_all('/\bREFERENCES\s+`?([a-zA-Z0-9_]+)`?/i', $tables[$name], $matches);
             foreach (array_unique($matches[1] ?? []) as $dependency) {
+                // MySQL permits an inline self-referencing foreign key when
+                // the table is created. It is not an ordering dependency.
+                if ($dependency === $name) {
+                    continue;
+                }
                 if (isset($tables[$dependency])) {
                     $visit($dependency);
                 }

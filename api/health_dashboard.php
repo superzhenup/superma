@@ -12,7 +12,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  *   - 待回收伏笔
  *   - 系统健康分
  */
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
@@ -34,7 +34,7 @@ try {
         exit;
     }
 
-    $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    $userId = currentUserId();
     checkNovelOwnership($novelId, $userId);
 
     $data = [];

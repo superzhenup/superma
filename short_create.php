@@ -11,6 +11,10 @@ $models = DB::fetchAll('SELECT * FROM ai_models ORDER BY is_default DESC, id ASC
 
 pageHeader('新建短篇', 'shorts');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-short-create-submit-create-1', function (event, element) { return submitCreate(event); });
+</script>
+
 
 <style>
 .create-form { max-width: 720px; margin: 0 auto; }
@@ -33,7 +37,7 @@ pageHeader('新建短篇', 'shorts');
   <h5 class="mb-0 text-light fw-bold"><i class="bi bi-plus-circle me-2"></i>新建短篇小说</h5>
 </div>
 
-<form id="createForm" class="create-form" onsubmit="return submitCreate(event)">
+<form id="createForm" class="create-form" data-csp-submit="page-short-create-submit-create-1">
   <div class="row g-3">
     <div class="col-md-8">
       <label class="form-label">标题</label>
@@ -106,7 +110,7 @@ pageHeader('新建短篇', 'shorts');
 
 </div>
 
-<script>
+<script nonce="<?= cspNonce() ?>">
 function updatePerChapterHint() {
   const tw = parseInt(document.getElementById('targetWords').value) || 0;
   const cc = parseInt(document.getElementById('chapterCount').value) || 1;

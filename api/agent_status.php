@@ -12,7 +12,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 ob_start();
 ini_set('display_errors', '0');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
@@ -41,7 +41,7 @@ try {
                 throw new Exception('缺少 novel_id 参数');
             }
             // 审计修复 P2-6（2026-07-01）：补归属校验 + novel_id 限定，防止越权停用他人指令
-            $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+            $userId = currentUserId();
             checkNovelOwnership($novelId, $userId);
             require_once dirname(__DIR__) . '/includes/agents/AgentDirectives.php';
             $ok = AgentDirectives::deactivate($directiveId, $novelId);
@@ -57,7 +57,7 @@ try {
     }
 
     // 归属权校验
-    $userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+    $userId = currentUserId();
     checkNovelOwnership($novelId, $userId);
 
     // 验证小说存在

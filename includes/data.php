@@ -148,9 +148,11 @@ function updateChapter(int $chapterId, int $novelId, array $data, bool $backupVe
  * 备份条件：章节存在 + 内容非空 + 字数超过 CFG_CHAPTER_VERSION_MIN_WORDS（默认 100）
  * 自动保留最新 10 个版本（与 write_engine.php 一致）
  *
- * @param int $chapterId 章节ID
+ * @param int  $chapterId      章节ID
+ * @param bool $throwOnFailure Canon 晋升边界使用严格模式：只要存在旧正文，
+ *                             备份失败就向调用方抛出并由外层事务回滚。
  */
-function backupChapterVersion(int $chapterId): void {
+function backupChapterVersion(int $chapterId, bool $throwOnFailure = false): void {
     $pdo = DB::getPdo();
     $ownTx = !$pdo->inTransaction();
     static $savepointSequence = 0;
@@ -188,8 +190,9 @@ function backupChapterVersion(int $chapterId): void {
         $words = (int)($chapter['words'] ?? 0);
         $minWords = defined('CFG_CHAPTER_VERSION_MIN_WORDS') ? max(0, (int)CFG_CHAPTER_VERSION_MIN_WORDS) : 100;
 
-        // 内容为空或字数过少不备份（与 write_engine.php 的 $oldWords > 100 阈值一致）
-        if ($content === '' || $words <= $minWords) {
+        // 普通调用维持历史的最小字数阈值。Canon 严格提交只在旧正文为空时
+        // 跳过；即使旧稿很短，也必须保留其可恢复版本后才能覆盖。
+        if ($content === '' || (!$throwOnFailure && $words <= $minWords)) {
             if ($ownTx) {
                 $pdo->commit();
             } elseif ($savepoint !== null) {
@@ -229,7 +232,11 @@ function backupChapterVersion(int $chapterId): void {
         } catch (\Throwable $rollbackError) {
             error_log("backupChapterVersion({$chapterId}) 回滚失败: " . $rollbackError->getMessage());
         }
-        error_log("backupChapterVersion({$chapterId}) 失败: " . $e->getMessage());
+        $message = "backupChapterVersion({$chapterId}) 失败: " . $e->getMessage();
+        error_log($message);
+        if ($throwOnFailure) {
+            throw new \RuntimeException($message, 0, $e);
+        }
         return;
     }
 
@@ -312,6 +319,45 @@ function getNovelChapters(int $novelId, int $page = 0, int $pageSize = 0): array
         'SELECT id, novel_id, chapter_number, title, outline, hook, pacing, suspense, status, words, quality_score, synopsis_id, updated_at FROM chapters WHERE novel_id=? ORDER BY chapter_number ASC LIMIT ? OFFSET ?',
         [$novelId, $pageSize, $offset]
     );
+}
+
+/**
+ * 审计修复（2026-08-17 写作逻辑 B0）：批量读取质检失败章的原因摘要。
+ *
+ * saveChapter 质检警告时把原因写进 chapters.gate_results 的 hard_fail_reason 条目；
+ * 主界面章节列表据此展示「质检未过：原因」。completed 警告章与旧版 failed 章均可读取。
+ *
+ * @return array<int, string> chapter_id => 失败原因
+ */
+function getFailedChapterReasons(int $novelId, array $chapterIds): array {
+    if ($chapterIds === []) {
+        return [];
+    }
+    $map = [];
+    try {
+        $ph = implode(',', array_fill(0, count($chapterIds), '?'));
+        $rows = DB::fetchAll(
+            "SELECT id, gate_results FROM chapters WHERE novel_id=? AND id IN ($ph)",
+            array_merge([$novelId], $chapterIds)
+        );
+        foreach ($rows as $row) {
+            $gates = (is_string($row['gate_results']) && $row['gate_results'] !== '')
+                ? json_decode($row['gate_results'], true)
+                : null;
+            if (!is_array($gates)) {
+                continue;
+            }
+            foreach ($gates as $gate) {
+                if (is_array($gate) && !empty($gate['hard_fail_reason'])) {
+                    $map[(int)$row['id']] = (string)$gate['hard_fail_reason'];
+                    break;
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('getFailedChapterReasons failed: ' . $e->getMessage());
+    }
+    return $map;
 }
 
 /**
@@ -399,8 +445,11 @@ function addLog(int $novelId, string $action, string $message, ?int $chapterId =
     ]);
     // [v41] 1000章优化：原先每条日志都跑一次带子查询的 DELETE（postProcess 每章调用 30+ 次，
     // 1000 章即 3 万次无谓删除）。改为每约 25 条才裁剪一次，保留上限放宽到 220（200+缓冲）。
-    // 用插入 id 取模触发，确定性、无随机、与日志量自然挂钩。
-    if ($insertId > 0 && $insertId % 25 === 0) {
+    // 用插入 id 取模触发，确定性、与日志量自然挂钩。
+    // 审计修复（2026-08-17 P3）：id 是全表自增、多小说共享序列，单小说视角下
+    // id%25 的命中被其他小说的插入流稀释，冷门小说可能长期取模不中、日志膨胀。
+    // 保留原确定性触发，另加 1/50 随机兜底，保证每个小说都有机会被裁剪。
+    if (($insertId > 0 && $insertId % 25 === 0) || (mt_rand(1, 50) === 25)) {
         DB::execute(
             'DELETE FROM writing_logs WHERE novel_id=? AND id NOT IN (
                 SELECT id FROM (
@@ -614,7 +663,7 @@ function getPreviousSummary(int $novelId, int $currentChapterNumber, int $lookba
  * 获取前一章的尾部原文（$tailChars 字），用于微观衔接
  * 改进：如果前一章不存在或未完成，向前搜索最近的已完成章节
  */
-function getPreviousTail(int $novelId, int $currentChapterNumber, int $tailChars = 800): string {
+function getPreviousTail(int $novelId, int $currentChapterNumber, int $tailChars = 1000): string {
     if ($currentChapterNumber <= 1) return '';
     
     // 先尝试直接获取前一章
@@ -663,7 +712,7 @@ function getLayeredContext(int $novelId, int $chapterNumber): array {
     ));
 
     // L4：前章尾部原文
-    $tailContent = getPreviousTail($novelId, $chapterNumber, 600);
+    $tailContent = getPreviousTail($novelId, $chapterNumber, 1000);
 
     return [
         'arcs'          => $relevantArcs,
@@ -683,11 +732,13 @@ function getLayeredContext(int $novelId, int $chapterNumber): array {
  * 获取所有弧段摘要（按弧段编号正序），用于大纲/正文生成时注入全局记忆
  */
 function getArcSummaries(int $novelId): array {
-    return DB::fetchAll(
+    require_once __DIR__ . '/memory/NarrativeSummary.php';
+    $rows = DB::fetchAll(
         'SELECT arc_index, chapter_from, chapter_to, summary
          FROM arc_summaries WHERE novel_id=? ORDER BY arc_index ASC',
         [$novelId]
     );
+    return NarrativeSummary::filterCurrentRows($novelId, $rows, 'arc');
 }
 
 // ----------------------------------------------------------------

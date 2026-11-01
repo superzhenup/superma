@@ -8,7 +8,7 @@
 ob_start();
 ini_set('display_errors', '0');   // 不把错误直接输出到响应
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
@@ -17,6 +17,7 @@ require_once dirname(__DIR__) . '/includes/db.php';
 require_once dirname(__DIR__) . '/includes/ai.php';
 require_once dirname(__DIR__) . '/includes/functions.php';
 require_once dirname(__DIR__) . '/includes/ChapterMutationService.php';
+require_once dirname(__DIR__) . '/includes/NovelProjectionFence.php';
 require_once dirname(__DIR__) . '/includes/write_engine.php';
 require_once dirname(__DIR__) . '/includes/auth.php';
 requireLoginApi();
@@ -27,12 +28,17 @@ header('Content-Type: application/json; charset=utf-8');
 $input  = json_decode(file_get_contents('php://input'), true) ?? [];
 $action = $input['action'] ?? '';
 
+// A progress read must not hold the session while querying the database.
+if ($action === 'get_outline_progress' && session_status() === PHP_SESSION_ACTIVE) {
+    session_write_close();
+}
+
 // 多用户越权加固：在入口处统一校验小说和章节所有权
 // 审计 P0（2026-06-12）：原入口逻辑仅在请求顶层带 novel_id/chapter_id 时校验，
 // 但 save_chapter / save_chapter_outline / reset_chapter / delete_chapter 仅传 chapter_id，
 // 入口分支会被跳过，case 内只用 getChapter + DB::update 直接放行任意用户的章节。
 // 现强制：只要顶层任一字段非零即校验；后续 case 不得再覆盖。
-$userId    = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId    = currentUserId();
 $novelId   = (int)($input['novel_id'] ?? 0);
 $chapterId = (int)($input['chapter_id'] ?? 0);
 
@@ -54,17 +60,22 @@ try {
             $chapterId = (int)($input['chapter_id'] ?? 0);
             $title     = trim($input['title']   ?? '');
             $content   = trim($input['content'] ?? '');
+            $expectedHash = strtolower(trim((string)($input['expected_content_hash'] ?? '')));
             $ch        = getChapter($chapterId);
             if (!$ch) throw new RuntimeException('章节不存在');
             if ($ch['status'] === 'writing') {
                 jsonResponse(false, null, '章节正在写作中，无法保存', 'CHAPTER_WRITING');
             }
+            if ($expectedHash === '' || !preg_match('/^[a-f0-9]{64}$/D', $expectedHash)) {
+                jsonResponse(false, null, '缺少章节版本校验，请刷新后重试', 'CHAPTER_CONFLICT');
+            }
 
             $pdo = DB::connect();
-            $pdo->beginTransaction();
+            $projectionFence = NovelProjectionFence::acquire((int)$ch['novel_id'], 30);
             try {
+                $pdo->beginTransaction();
                 $words = countWords($content);
-                ChapterMutationService::mutateChapter($chapterId, (int)$ch['novel_id'], [
+                $mutation = ChapterMutationService::mutateChapter($chapterId, (int)$ch['novel_id'], [
                     'title'   => $title,
                     'content' => $content,
                     'words'   => $words,
@@ -75,16 +86,30 @@ try {
                 ], [
                     'backup_version' => true,
                     'prevent_writing' => true,
+                    'expected_content_hash' => $expectedHash,
                     'reason' => 'manual_save',
                 ]);
                 updateNovelStats($ch['novel_id']);
                 $pdo->commit();
-                jsonResponse(true, ['words' => $words], '保存成功');
+                NovelProjectionFence::release($projectionFence);
+                $projectionFence = null;
+                $repairQueued = !empty($mutation['postprocess_job_id']);
+                if ($repairQueued) {
+                    require_once dirname(__DIR__) . '/includes/tasks/PostprocessWorkerLauncher.php';
+                    PostprocessWorkerLauncher::launch(true);
+                }
+                jsonResponse(true, ['words' => $words, 'postprocess_queued' => $repairQueued],
+                    $repairQueued ? '保存成功，记忆重建已在后台执行' : '保存成功');
             } catch (ChapterMutationConflict $e) {
                 if ($pdo->inTransaction()) $pdo->rollBack();
+                if ($projectionFence !== null) NovelProjectionFence::release($projectionFence);
+                if (str_contains($e->getMessage(), '正文已被其他操作修改')) {
+                    jsonResponse(false, null, '章节正文已被其他操作修改，请刷新后重试', 'CHAPTER_CONFLICT');
+                }
                 jsonResponse(false, null, '章节正在写作中，无法保存', 'CHAPTER_WRITING');
             } catch (Throwable $e) {
                 if ($pdo->inTransaction()) $pdo->rollBack();
+                if ($projectionFence !== null) NovelProjectionFence::release($projectionFence);
                 throw $e;
             }
             break;
@@ -127,8 +152,9 @@ try {
             if (!$novel) throw new RuntimeException('小说不存在');
 
             $pdo = DB::getPdo();
-            $pdo->beginTransaction();
+            $projectionFence = NovelProjectionFence::acquire($novelId, 30);
             try {
+                $pdo->beginTransaction();
                 // 1. 先删子表：通过 card_id 关联 character_card_history
                 $cardIds = DB::fetchAll('SELECT id FROM character_cards WHERE novel_id=?', [$novelId]);
                 if ($cardIds) {
@@ -139,8 +165,9 @@ try {
 
                 // 2. 先删子表：通过 chapter_id 关联 chapter_versions
                 $chapterIds = DB::fetchAll('SELECT id FROM chapters WHERE novel_id=?', [$novelId]);
+                $ids = array_map(static fn (array $row): int => (int)$row['id'], $chapterIds);
+                ChapterMutationService::purgeNovelDeletionDependencies($novelId, $ids);
                 if ($chapterIds) {
-                    $ids = array_column($chapterIds, 'id');
                     $ph  = implode(',', array_fill(0, count($ids), '?'));
                     DB::execute("DELETE FROM chapter_versions WHERE chapter_id IN ($ph)", $ids);
                 }
@@ -152,6 +179,8 @@ try {
                 // 3. 批量删除所有含 novel_id 的关联表。派生表必须一并清理，
                 // 否则重复使用同一小说 ID 的缓存/记忆会读到幽灵数据。
                 $novelTables = [
+                    // Harness RESTRICT dependencies were removed transactionally
+                    // by purgeNovelDeletionDependencies() above.
                     'chapters',
                     'writing_logs',
                     'story_outlines',
@@ -196,9 +225,12 @@ try {
                 DB::delete('novels', 'id=?', [$novelId]);
 
                 $pdo->commit();
+                NovelProjectionFence::release($projectionFence);
+                $projectionFence = null;
                 jsonResponse(true, null, '删除成功');
-            } catch (Exception $e) {
-                $pdo->rollBack();
+            } catch (Throwable $e) {
+                if ($pdo->inTransaction()) $pdo->rollBack();
+                if ($projectionFence !== null) NovelProjectionFence::release($projectionFence);
                 throw $e;
             }
             break;
@@ -214,7 +246,9 @@ try {
                 if (!$modelExists) throw new RuntimeException('指定的模型不存在');
             }
             DB::update('novels', ['model_id' => $modelId], 'id=?', [$novelId]);
-            jsonResponse(true, null, '模型已更新');
+            // 审计修复 F04（2026-11-01）：回执带回实际保存的 model_id，前端据此确认切换，
+            // 不再以 toast 代替生效证据。
+            jsonResponse(true, ['model_id' => $modelId], '模型已更新');
             break;
 
         // -----------------------------------------------------------
@@ -225,8 +259,16 @@ try {
             if (!in_array($status, ['draft','writing','paused','completed'])) {
                 throw new RuntimeException('无效状态');
             }
+            // 2026-08-20：质检未过改为“仅提示”。启动自动写作时把旧版
+            // 已保存正文的 failed 质检章转为 completed，保留 gate_results 警告。
+            $promotedQualityWarnings = $status === 'writing'
+                ? WriteEngine::promoteQualityWarningChapters($novelId)
+                : 0;
             DB::update('novels', ['status' => $status], 'id=?', [$novelId]);
-            jsonResponse(true, ['status' => $status]);
+            jsonResponse(true, [
+                'status' => $status,
+                'promoted_quality_warnings' => $promotedQualityWarnings,
+            ]);
             break;
 
         // -----------------------------------------------------------
@@ -253,6 +295,7 @@ try {
                     throw new RuntimeException('每章字数必须在 500-20000 之间');
                 }
                 $updates['chapter_words'] = $chapterWords;
+                $updates['chapter_word_target'] = $chapterWords;
             }
 
             if (empty($updates)) {
@@ -297,13 +340,48 @@ try {
                     )
                     : null;
             }
-            $completedCount = DB::count('chapters', 'novel_id=? AND status="completed"', [$novelId]);
-            $outlinedCount  = DB::count('chapters', 'novel_id=? AND status IN ("outlined","writing","completed","skipped")', [$novelId]);
-            $skippedCount   = DB::count('chapters', 'novel_id=? AND status="skipped"', [$novelId]);
-            $failedCount    = DB::count('chapters', 'novel_id=? AND status="failed"', [$novelId]);
-            $unfinishedCount = DB::count('chapters', 'novel_id=? AND status<>"completed"', [$novelId]);
+            // 审计修复 H4（2026-08-16）：5 次独立 COUNT 合并为单条 GROUP BY。
+            // 本接口被自动写作进度/断线重连高频轮询，原实现每次请求对 chapters
+            // 表做 5 次范围扫描。派生逻辑与原 WHERE 语义逐条等价。
+            $statusRows = DB::fetchAll(
+                'SELECT status, COUNT(*) AS c FROM chapters WHERE novel_id=? GROUP BY status',
+                [$novelId]
+            );
+            $byStatus = [];
+            foreach ($statusRows as $sr) {
+                $byStatus[$sr['status']] = (int)$sr['c'];
+            }
+            $completedCount  = $byStatus['completed'] ?? 0;
+            $skippedCount    = $byStatus['skipped'] ?? 0;
+            $failedCount     = $byStatus['failed'] ?? 0;
+            $unfinishedCount = array_sum($byStatus) - $completedCount;
+            $outlinedCount   = 0;
+            foreach (['outlined', 'writing', 'completed', 'skipped'] as $st) {
+                $outlinedCount += $byStatus[$st] ?? 0;
+            }
             $autoWritableCount = WriteEngine::countAutomaticWritableChapters($novelId);
             $manualBackfillCount = WriteEngine::countManualBackfillChapters($novelId);
+            // 审计修复（2026-08-17 写作逻辑 B0）：自动写作被 failed 章堵住时，
+            // 返回堵住进度线的具体章节，前端提示用户去该章处理而不是笼统报未完成。
+            $blockedByFailed = null;
+            if ($mode === 'normal' && !$nextChapter && $unfinishedCount > 0) {
+                try {
+                    $frontier = WriteEngine::automaticChapterFrontier($novelId);
+                    $frontNext = DB::fetch(
+                        'SELECT id, chapter_number, status FROM chapters
+                         WHERE novel_id=? AND chapter_number>? ORDER BY chapter_number ASC LIMIT 1',
+                        [$novelId, $frontier]
+                    );
+                    if ($frontNext && (string)$frontNext['status'] === 'failed') {
+                        $blockedByFailed = [
+                            'id'            => (int)$frontNext['id'],
+                            'chapter_number' => (int)$frontNext['chapter_number'],
+                        ];
+                    }
+                } catch (Throwable $frontierError) {
+                    error_log('get_novel_status blocked_by_failed probe failed: ' . $frontierError->getMessage());
+                }
+            }
             jsonResponse(true, [
                 'status'          => $novel['status'],
                 'current_chapter' => $novel['current_chapter'],
@@ -318,6 +396,7 @@ try {
                 'next_chapter'    => $nextChapter,
                 'all_done'        => $unfinishedCount === 0,
                 'auto_blocked'    => $mode === 'normal' && !$nextChapter && $unfinishedCount > 0,
+                'blocked_by_failed' => $blockedByFailed,
                 'manual_mode'     => $mode === 'catchup',
             ]);
             break;
@@ -341,22 +420,42 @@ try {
             $chapterId = (int)($input['chapter_id'] ?? 0);
             $ch = getChapter($chapterId);
             if (!$ch) throw new RuntimeException('章节不存在');
-            if ($ch['status'] === 'writing') {
-                jsonResponse(false, null, '章节正在写作中，无法重置', 'CHAPTER_WRITING');
+            $resetNovelId = (int)$ch['novel_id'];
+            $wasWriting = ($ch['status'] ?? '') === 'writing';
+
+            // 章节列表「取消」走此接口。写作中必须先发取消信号，再清空正文：
+            // 否则后台 writer 会继续烧 token，且 prevent_writing 会把请求打成失败。
+            if ($wasWriting) {
+                require_once dirname(__DIR__) . '/includes/tasks/WritingTaskRepository.php';
+                DB::query(
+                    'UPDATE novels SET cancel_flag = 1, status = "paused", daemon_write = 0 WHERE id = ?',
+                    [$resetNovelId]
+                );
+                WritingTaskRepository::requestCancel($resetNovelId);
+                if (defined('CFG_PROGRESS_DIR')) {
+                    @mkdir(CFG_PROGRESS_DIR, 0755, true);
+                }
+                file_put_contents(WriteEngine::cancelFlagPath($resetNovelId), (string)time(), LOCK_EX);
             }
 
-            ChapterMutationService::mutateChapter($chapterId, (int)$ch['novel_id'], [
-                'content' => '',
-                'words'   => 0,
-                'status'  => 'outlined',
-            ], [
-                'backup_version' => true,
-                'prevent_writing' => true,
-                'force_content_invalidation' => true,
-                'reason' => 'reset_chapter',
-            ]);
-            updateNovelStats($ch['novel_id']);
-            jsonResponse(true, null, '章节已重置');
+            // 审计整改 C1：重置绑定上面读到的状态，与锁内的当前状态不一致就不动正文。
+            try {
+                ChapterMutationService::resetChapter($chapterId, $resetNovelId, (string)($ch['status'] ?? ''));
+            } catch (ChapterMutationConflict $e) {
+                $nowStatus = (string)(getChapter($chapterId)['status'] ?? '');
+                if ($wasWriting) {
+                    $msg = $nowStatus === 'completed'
+                        ? '本章在取消前已经写完，正文已保留；写作已停止。如需重写请再次重置'
+                        : '本章状态已变化，未重置（写作已停止），请刷新后重试';
+                } else {
+                    $msg = $nowStatus === 'writing'
+                        ? '本章刚开始写作，未重置；请先取消写作再重置'
+                        : '本章状态已变化，未重置，请刷新后重试';
+                }
+                jsonResponse(false, null, $msg, 'CHAPTER_CONFLICT');
+            }
+            updateNovelStats($resetNovelId);
+            jsonResponse(true, null, $wasWriting ? '已取消写作并重置章节' : '章节已重置');
             break;
 
         // -----------------------------------------------------------
@@ -401,23 +500,24 @@ try {
             $novel   = getNovel($novelId);
             if (!$novel) throw new RuntimeException('小说不存在');
 
-            // 审计修复 P-2（2026-06-22）：短时缓存（5 秒），减少断线重连时的 DB 压力。
-            // 前端 generateOutline 在网络抖动时会频繁重连，每次都查询 chapters 表两次。
-            // 5 秒缓存足够覆盖重连间隔，且不会让用户感知到进度延迟。
-            static $progressCache = [];
-            $cacheKey = $novelId;
-            if (isset($progressCache[$cacheKey]) && (time() - $progressCache[$cacheKey]['ts']) < 5) {
-                jsonResponse(true, $progressCache[$cacheKey]['data']);
-                break;
-            }
-
-            $outlinedCount = DB::count('chapters', 'novel_id=? AND status != "pending"', [$novelId]);
-            // 查询最大已大纲章节号，用于断线续接
-            $lastRow = DB::fetch(
-                'SELECT MAX(chapter_number) AS max_ch FROM chapters WHERE novel_id=? AND status != "pending"',
-                [$novelId]
+            require_once dirname(__DIR__) . '/includes/ChapterOutlineProgress.php';
+            $rangeStart = array_key_exists('start_chapter', $input) ? (int)$input['start_chapter'] : null;
+            $rangeEnd = array_key_exists('end_chapter', $input) ? (int)$input['end_chapter'] : null;
+            // MAX(chapter_number) alone can skip missing chapters; status alone
+            // also counts writing/completed rows that never received an outline.
+            $progressData = ChapterOutlineProgress::read(
+                DB::getPdo(), $novelId, (int)$novel['target_chapters'], $rangeStart, $rangeEnd
             );
-            $lastOutlined = (int)($lastRow['max_ch'] ?? 0);
+
+            // Inspect only the authenticated novel's same request. This does not
+            // launch workers or infer process death from elapsed time/heartbeat.
+            require_once dirname(__DIR__) . '/includes/ChapterOutlineRequestStore.php';
+            $requestId = $input['request_id'] ?? null;
+            if ($requestId !== null && (!is_string($requestId) || !preg_match('/\A[a-f0-9]{12}\z/D', $requestId))) {
+                throw new InvalidArgumentException('章节细纲追踪号无效');
+            }
+            $progressData['request'] = (new ChapterOutlineRequestStore())->snapshot($userId, $novelId, $requestId);
+            header('Cache-Control: no-store');
 
             // 检测当前使用的模型是否支持 1M 上下文
             $is1MModel = false;
@@ -430,14 +530,10 @@ try {
                 // 忽略
             }
 
-            $progressData = [
-                'outlined'     => $outlinedCount,
-                'total'        => (int)$novel['target_chapters'],
-                'last_outlined' => $lastOutlined,
+            $progressData += [
                 'is_1m_model'  => $is1MModel,
                 'model_name'   => $modelName,
             ];
-            $progressCache[$cacheKey] = ['ts' => time(), 'data' => $progressData];
             jsonResponse(true, $progressData);
             break;
 
@@ -480,8 +576,9 @@ try {
 
             // 事务包裹：保存大纲 + 备份版本 + 重置状态，三步原子执行
             $pdo = DB::getPdo();
-            $pdo->beginTransaction();
+            $projectionFence = NovelProjectionFence::acquire((int)$ch['novel_id'], 30);
             try {
+                $pdo->beginTransaction();
                 ChapterMutationService::mutateChapter($chapterId, (int)$ch['novel_id'], [
                     'outline'    => $outline,
                     'hook'       => $hook,
@@ -498,6 +595,8 @@ try {
                 ]);
 
                 $pdo->commit();
+                NovelProjectionFence::release($projectionFence);
+                $projectionFence = null;
                 addLog($ch['novel_id'], 'regenerate', "第{$ch['chapter_number']}章大纲更新并重置（原子操作）");
                 jsonResponse(true, [
                     'chapter_id'   => $chapterId,
@@ -505,7 +604,8 @@ try {
                     'should_write' => true,
                 ], '大纲已保存，章节已重置');
             } catch (Throwable $e) {
-                $pdo->rollBack();
+                if ($pdo->inTransaction()) $pdo->rollBack();
+                if ($projectionFence !== null) NovelProjectionFence::release($projectionFence);
                 throw $e;
             }
             break;
@@ -517,16 +617,18 @@ try {
             if (!$novel) throw new RuntimeException('小说不存在');
 
             $pdo = DB::getPdo();
-            $pdo->beginTransaction();
+            $projectionFence = NovelProjectionFence::acquire($novelId, 30);
             try {
+                $pdo->beginTransaction();
                 // 统一清理所有可按章节定位的正文派生数据；人物设定、卷/全书大纲等
                 // 用户策划数据仍由下方显式列表决定是否清除。
                 ChapterMutationService::invalidateNovelFromChapter($novelId, 1, 'clear_all_chapters');
 
                 // 1. 删除 chapter_versions（子表，通过 chapter_id 关联）
                 $chapterIds = DB::fetchAll('SELECT id FROM chapters WHERE novel_id=?', [$novelId]);
+                $ids = array_map(static fn (array $row): int => (int)$row['id'], $chapterIds);
+                ChapterMutationService::purgeChapterDeletionDependencies($novelId, $ids, true);
                 if ($chapterIds) {
-                    $ids = array_column($chapterIds, 'id');
                     $ph  = implode(',', array_fill(0, count($ids), '?'));
                     DB::execute("DELETE FROM chapter_versions WHERE chapter_id IN ($ph)", $ids);
                 }
@@ -545,6 +647,8 @@ try {
 
                 // 3. 批量删除正文、规划及所有由正文产生的投影数据。
                 $novelTables = [
+                    // Harness RESTRICT dependencies were removed transactionally
+                    // by purgeChapterDeletionDependencies() above.
                     'chapters',
                     'chapter_synopses',
                     'writing_logs',
@@ -592,11 +696,14 @@ try {
 
                 // 清除章节列表 / 章节数 / 小说信息缓存，否则页面 reload 后
                 // getNovelChapters() 仍读取 5 分钟内的旧缓存，章节列表不会清空
+                NovelProjectionFence::release($projectionFence);
+                $projectionFence = null;
                 clearNovelCache($novelId);
 
                 jsonResponse(true, ['novel_id' => $novelId], '已清空所有章节');
-            } catch (Exception $e) {
-                $pdo->rollBack();
+            } catch (Throwable $e) {
+                if ($pdo->inTransaction()) $pdo->rollBack();
+                if ($projectionFence !== null) NovelProjectionFence::release($projectionFence);
                 error_log('actions clearChapters: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
                 throw new RuntimeException('清空失败，请稍后重试');
             }
@@ -640,15 +747,19 @@ try {
             if (!$novel) throw new RuntimeException('小说不存在');
             if ($count < 1 || $count > 200) throw new RuntimeException('章节数量需在 1-200 之间');
 
-            $maxCh = (int)(DB::fetch(
-                'SELECT COALESCE(MAX(chapter_number), 0) AS m FROM chapters WHERE novel_id=?',
-                [$novelId]
-            )['m'] ?? 0);
-
             if ($mode === 'empty') {
+                // 审计修复（2026-10-31 B4）：MAX(chapter_number) 原在事务外读取，
+                // 并发双击会各自算出同一批章节号，第二批整批撞 uk_novel_chapter
+                // 回滚并丢掉全部新增。改走 save_chapter 同款投影 fence + 事务内
+                // 读 MAX：小说级互斥下编号分配与既定锁序（章节→小说）一致。
                 $pdo = DB::getPdo();
-                $pdo->beginTransaction();
+                $projectionFence = NovelProjectionFence::acquire($novelId, 30);
                 try {
+                    $pdo->beginTransaction();
+                    $maxCh = (int)(DB::fetch(
+                        'SELECT COALESCE(MAX(chapter_number), 0) AS m FROM chapters WHERE novel_id=?',
+                        [$novelId]
+                    )['m'] ?? 0);
                     $stmt = $pdo->prepare(
                         'INSERT INTO chapters (novel_id, chapter_number, title, status) VALUES (?, ?, ?, ?)'
                     );
@@ -657,6 +768,8 @@ try {
                         $stmt->execute([$novelId, $startNum + $i, '', 'outlined']);
                     }
                     $pdo->commit();
+                    NovelProjectionFence::release($projectionFence);
+                    $projectionFence = null;
                     updateNovelStats($novelId);
                     $endNum = $startNum + $count - 1;
                     jsonResponse(true, [
@@ -664,12 +777,18 @@ try {
                         'start_chapter' => $startNum,
                         'end_chapter'   => $endNum,
                     ], "已添加 {$count} 个空章节（第{$startNum}-{$endNum}章）");
-                } catch (Exception $e) {
-                    $pdo->rollBack();
+                } catch (Throwable $e) {
+                    if ($pdo->inTransaction()) $pdo->rollBack();
+                    if ($projectionFence !== null) NovelProjectionFence::release($projectionFence);
                     error_log('actions addChapters: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
                     throw new RuntimeException('添加失败，请稍后重试');
                 }
             } else {
+                // outline 模式为只读响应，不写库、无唯一键冲突面，无需 fence
+                $maxCh = (int)(DB::fetch(
+                    'SELECT COALESCE(MAX(chapter_number), 0) AS m FROM chapters WHERE novel_id=?',
+                    [$novelId]
+                )['m'] ?? 0);
                 jsonResponse(true, [
                     'added'       => 0,
                     'mode'        => 'outline',
@@ -949,7 +1068,8 @@ function _actionsSafeBusinessMessage(string $msg): string
     }
 
     // 仅允许：中文、字母、数字、空格、常用中文/英文标点、下划线
-    if (preg_match('/^[\p{Han}\p{L}\p{N}\s\.,;:!?，。；：！？、（）()\[\]【】_\-—~·…""\'"]+$/u', $msg)) {
+    // 中文弯引号 “”‘’ 曾被损坏成英文引号，含弯引号的正常提示会被替换成通用错误。
+    if (preg_match('/^[\p{Han}\p{L}\p{N}\s\.,;:!?，。；：！？、（）()\[\]【】_\-—~·…“”‘’"\']+$/u', $msg)) {
         return $msg;
     }
     return '操作失败，请稍后重试';

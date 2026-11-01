@@ -15,6 +15,18 @@ function h(?string $s): string {
 }
 
 /**
+ * 重写/精炼用精简铁律（审计修复 2026-08-09 R11-3）
+ * 主写作链铁律在 ChapterPromptBuilder；重写链路此前缺失导致钩子/禁词被剥掉。
+ */
+function rewriteIronRulesSnippet(bool $isFinalChapter = false): string
+{
+    if ($isFinalChapter) {
+        return "铁律（最终章）：圆满收束、主题回响，不设新悬念钩子；禁止AI套话与直述情绪词；用可见微表情/肢体/生理反应表达情绪；保持人物状态一致。";
+    }
+    return "铁律：章末须有可追读钩子；禁止AI套话与直述情绪词；用可见微表情/肢体/生理反应表达情绪；保持人物状态与禁词约束一致。";
+}
+
+/**
  * 转义 SQL LIKE 通配符（%, _, \）
  * 审计修复 P3（2026-07-12）：防止用户输入的 %/_ 被当作通配符
  *
@@ -27,6 +39,66 @@ function h(?string $s): string {
  */
 function escapeLikeWildcards(string $s): string {
     return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $s);
+}
+
+/**
+ * 生成统一的下载响应 Content-Disposition 值（审计 2026-10-31 T3，RFC 6266/5987）。
+ *
+ * 输出双文件名，现代浏览器取 UTF-8 名，旧浏览器回退 ASCII 兜底名：
+ *   attachment; filename="<ASCII 兜底名>"; filename*=UTF-8''<rawurlencode(UTF-8 名)>
+ *
+ * 清洗规则（防响应头注入 / Windows 非法文件名字符）：
+ *   - 去控制字符（\x00-\x1F、\x7F，含 \r \n）；
+ *   - 去双引号与非法字符 / \ : * ? " < > | ；
+ *   - 扩展名 = 最后一个点之后的部分，主名清洗后为空（含只有扩展名的
+ *     输入，如 ".txt"）时主名回退 download；
+ *   - 超长按字符截断（主名 ≤120 字符、扩展名 ≤16 字符），扩展名保留；
+ *   - ASCII 兜底名把非 ASCII 字符替换为 _；连续 ≥2 个 [_ 空白] 合并为
+ *     单个 _（普通 ASCII 名中的单个空格保留）；首尾 trim 空格与 _；
+ *   - 兜底名清洗后为空（含空名 / 纯非法字符输入）回退 download。
+ *
+ * @param string $filename 完整文件名（含扩展名），如 书名_章节概要_Ymd_His.json
+ * @return string Content-Disposition 头的值（调用方自行拼接头名）
+ */
+function contentDispositionAttachment(string $filename): string
+{
+    // 去控制字符（含 \r \n，防响应头注入）
+    $filename = preg_replace('/[\x00-\x1F\x7F]/u', '', trim($filename)) ?? '';
+    // 去双引号与 Windows/HTTP 非法字符
+    $filename = preg_replace('/[\/\\\:\*\?"\<\>\|]/u', '', $filename) ?? '';
+
+    // 分离扩展名（= 最后一个点之后的部分，不论点在何位置）；
+    // 主名随后若为空（如 ".txt"），下方统一回退 download。
+    $ext = '';
+    $dot = strrpos($filename, '.');
+    if ($dot !== false) {
+        $ext = substr($filename, $dot);
+        $filename = substr($filename, 0, $dot);
+    }
+    // 超长按字符截断（UTF-8 安全），扩展名保留但同样收敛
+    if (mb_strlen($filename, 'UTF-8') > 120) {
+        $filename = mb_substr($filename, 0, 120, 'UTF-8');
+    }
+    if (mb_strlen($ext, 'UTF-8') > 16) {
+        $ext = mb_substr($ext, 0, 16, 'UTF-8');
+    }
+
+    // ASCII 兜底名：非可打印 ASCII 白名单字符替换为 _；连续 ≥2 个
+    // [_ 空白] 合并为单个 _（"书名 卷" 的 "____ ___" 收敛为 "_"，
+    // "My Novel" 的单个空格保留）；首尾同时 trim 空格与 _。
+    $ascii = preg_replace('/[^A-Za-z0-9._\- ]/u', '_', $filename) ?? '';
+    $ascii = preg_replace('/[_ ][_ ]+/', '_', $ascii) ?? '';
+    $ascii = trim($ascii, '_ ');
+    if ($ascii === '') {
+        $ascii = 'download';
+    }
+    // UTF-8 主名清洗后为空同样回退 download（如空名 / 纯非法字符 / 只有扩展名）
+    if ($filename === '') {
+        $filename = 'download';
+    }
+
+    return 'attachment; filename="' . $ascii . $ext . '"; filename*=UTF-8\'\''
+        . rawurlencode($filename . $ext);
 }
 
 /**
@@ -111,10 +183,33 @@ function truncateToWordLimit(string $content, int $maxWords): string
     if ($maxWords <= 0) return '';
     if (countWords($content) <= $maxWords) return $content;
 
-    // v1.5.3 修复：searchEnd 严格限制在 maxWords，与 Prompt 铁律一致
-    // 不允许超字，在 maxWords 以内寻找最佳截断点
-    $searchEnd = $maxWords;  // 严格限制，不再 * 1.05
-    $searchStart = (int)($maxWords * 0.85);  // 从 85% 处开始寻找边界
+    // 审计修复（2026-08-09 R9-3）：按 countWords 量纲截断，禁止把 maxWords 当字符下标。
+    // 二分找「字数 ≤ maxWords」的最大字符边界，再在 85%–100% 字数窗口内寻段落/句末。
+    $charLen = mb_strlen($content);
+    $lo = 0;
+    $hi = $charLen;
+    while ($lo < $hi) {
+        $mid = intdiv($lo + $hi + 1, 2);
+        if (countWords(mb_substr($content, 0, $mid)) <= $maxWords) {
+            $lo = $mid;
+        } else {
+            $hi = $mid - 1;
+        }
+    }
+    $searchEnd = $lo;
+
+    $targetStartWords = max(1, (int)($maxWords * 0.85));
+    $lo = 0;
+    $hi = $searchEnd;
+    while ($lo < $hi) {
+        $mid = intdiv($lo + $hi + 1, 2);
+        if (countWords(mb_substr($content, 0, $mid)) <= $targetStartWords) {
+            $lo = $mid;
+        } else {
+            $hi = $mid - 1;
+        }
+    }
+    $searchStart = $lo;
 
     $sub = mb_substr($content, 0, $searchEnd);
 
@@ -142,48 +237,21 @@ function truncateToWordLimit(string $content, int $maxWords): string
             return mb_substr($content, 0, $pos + mb_strlen($marker));
         }
     }
-    // 实在找不到边界，硬截（严格限制在 maxWords）
-    return mb_substr($content, 0, $maxWords);
+    // 实在找不到边界，硬截到字数边界
+    return mb_substr($content, 0, $searchEnd);
 }
 
 /**
- * 超字截断但尽量保留章末钩子段（审计优化 2026-07-20）。
- *
- * 策略：从原文尾部抽出约 12% 字数的收束/钩子片段，主体在剩余额度内截断，
- * 再拼回尾部——避免「章末必须有钩子」却被硬切掉。
+ * @deprecated Narrative must be regenerated or preserved intact when overlong.
+ * Joining a prefix to the ending deletes causal events. Kept as a guarded
+ * compatibility entry point so an old caller cannot silently corrupt a draft.
  */
 function truncateToWordLimitPreservingHook(string $content, int $maxWords): string
 {
-    if ($maxWords <= 0) return '';
-    if (countWords($content) <= $maxWords) return $content;
-
-    // 过短章节没有「钩子预算」空间，退回普通截断
-    if ($maxWords < 500) {
-        return truncateToWordLimit($content, $maxWords);
+    if ($maxWords <= 0 || countWords($content) > $maxWords) {
+        throw new LengthException('不能通过首尾拼接裁剪小说正文；请重新生成或保留完整稿。');
     }
-
-    $hookBudget = min(480, max(180, (int)round($maxWords * 0.12)));
-    [$bodySource, $tail] = extractTrailingHookParts($content, $hookBudget);
-    $tailWords = countWords($tail);
-
-    // 尾部太短或抽不出独立尾段 → 普通截断
-    if ($tailWords < 40 || $bodySource === '' || $tail === '') {
-        return truncateToWordLimit($content, $maxWords);
-    }
-
-    $bodyMax = max(100, $maxWords - $tailWords);
-    $body = truncateToWordLimit($bodySource, $bodyMax);
-    $joined = rtrim($body) . "\n\n" . ltrim($tail);
-
-    // 安全阀：拼合后仍超则再缩主体
-    if (countWords($joined) > $maxWords) {
-        $body = truncateToWordLimit($bodySource, max(80, $maxWords - countWords($tail)));
-        $joined = rtrim($body) . "\n\n" . ltrim($tail);
-    }
-    if (countWords($joined) > $maxWords) {
-        return truncateToWordLimit($content, $maxWords);
-    }
-    return $joined;
+    return $content;
 }
 
 /**
@@ -200,15 +268,18 @@ function extractTrailingHookParts(string $content, int $hookBudget): array
     $paras = preg_split('/\n\s*\n/u', $content) ?: [$content];
     $paras = array_values(array_filter(array_map('trim', $paras), fn($p) => $p !== ''));
     if (count($paras) < 2) {
-        $len = mb_strlen($content);
-        if ($len <= $hookBudget) {
+        // 审计修复（2026-08-09 R8-7）：单段路径按 countWords 预算抽尾，禁止 mb_strlen 当字数
+        $totalWords = countWords($content);
+        if ($totalWords <= $hookBudget) {
             return ['', $content];
         }
-        $start = max(0, $len - $hookBudget);
+        $len = mb_strlen($content);
+        $approxRatio = $hookBudget / max(1, $totalWords);
+        $start = max(0, (int)($len * (1 - min(0.5, $approxRatio * 1.2))));
         $chunk = mb_substr($content, $start);
         foreach (['。', '！', '？', '」', '』'] as $punct) {
             $pos = mb_strpos($chunk, $punct);
-            if ($pos !== false && $pos < (int)($hookBudget * 0.35)) {
+            if ($pos !== false && $pos < (int)(mb_strlen($chunk) * 0.35)) {
                 $start += $pos + 1;
                 break;
             }
@@ -243,6 +314,28 @@ function extractTrailingHookParts(string $content, int $hookBudget): array
 }
 
 /**
+ * 剥离推理模型/网关内联在正文里的 <think>/<thinking> 推理内容。
+ *
+ * 审计修复 P2-1（2026-10-18）：原逻辑只内联在 stripSegmentMarkers（初写链路），
+ * 润色/压缩/质量改写/选段润色直接保存模型输出，推理文字进入正文并计入字数。
+ * 抽为公共函数供所有"AI 正文落盘/回填编辑器"路径共用；stripSegmentMarkers
+ * 调用本函数，初写链路行为逐字节不变（崩溃恢复依赖同一清洗结果比对哈希）。
+ */
+function stripInlineReasoning(string $content): string
+{
+    $content = preg_replace('/<(think|thinking)\b[^>]*>.*?<\/\1\s*>/isu', '', $content) ?? $content;
+    if (preg_match('/<\/(think|thinking)\s*>/iu', $content, $m, PREG_OFFSET_CAPTURE)) {
+        // 只有闭合标签：开标签被网关吞掉，闭合标签之前都是推理内容
+        $content = substr($content, $m[0][1] + strlen($m[0][0]));
+    }
+    if (preg_match('/<(think|thinking)\b[^>]*>/iu', $content, $m, PREG_OFFSET_CAPTURE)) {
+        // 未闭合的开标签：其后全是推理内容（输出被截断）
+        $content = substr($content, 0, $m[0][1]);
+    }
+    return $content;
+}
+
+/**
  * 过滤AI模型误生成的段落标记
  * 移除正文中的"铺垫段""发展段""高潮段""钩子段"等结构化标注
  * @param string $content 原始内容
@@ -250,15 +343,32 @@ function extractTrailingHookParts(string $content, int $hookBudget): array
  */
 function stripSegmentMarkers(string $content): string
 {
+    // 推理模型的 <think>/<thinking> 内容不得进入正文或计入字数
+    $content = stripInlineReasoning($content);
+
+    // 首行若是模型自加的章节标题（如"第十二章 风起"/"## 第12章"），剥离；标题不计入正文
+    $content = ltrim($content);
+    if (preg_match('/^([^\n]*)\n/u', $content, $m)) {
+        $firstLine = trim($m[1]);
+        if (mb_strlen($firstLine) <= 40
+            && preg_match('/^(#{1,6}\s*)?\**\s*第[一二三四五六七八九十百千万零〇\d]+章[^\n。，！？；…]{0,30}?\**$/u', $firstLine)
+            && trim(substr($content, strlen($m[0]))) !== '') {
+            $content = substr($content, strlen($m[0]));
+        }
+    }
+
     // 模式1：**(铺垫段:约XXX字，xxx)**
     // 模式2：**发展段(约XXX字)**
     // 模式3：**高潮段:约XXX字**
     // 模式4：单独的**铺垫段** / **高潮段** 等
     $patterns = [
         // 带字数描述的完整标记：**铺垫段:约600字，对话密集)**
-        '/\*{1,2}\s*(铺垫段|发展段|高潮段|钩子段|收尾段)[：:]\s*约?\d+\s*字[^\)]*\)?\*{1,2}/iu',
-        // 带括号的标记：**发展段(约600字)**
-        '/\*{1,2}\s*(铺垫段|发展段|高潮段|钩子段|收尾段)\s*\(约?\d+\s*字[^\)]*\)\*{1,2}/iu',
+        // 审计修复 P0-2（2026-08-08）：中段描述字符类排除 * 与换行。
+        // 旧 [^\)]* 贪婪且可跨行：当正文中存在多个标记（如 **铺垫段:约600字**…**发展段:约800字**），
+        // 匹配会从首个标记一路吞到全文最后一对 ** 才闭合，把中间真实正文一并删除。
+        '/\*{1,2}\s*(铺垫段|发展段|高潮段|钩子段|收尾段)[：:]\s*约?\d+\s*字[^\)\）\*\r\n]*[\)）]?\*{1,2}/iu',
+        // 带括号的标记：**发展段(约600字)**（同上修复：中段不可跨 * 或换行）
+        '/\*{1,2}\s*(铺垫段|发展段|高潮段|钩子段|收尾段)\s*[\(（]约?\d+\s*字[^\)\）\*\r\n]*[\)）]\*{1,2}/iu',
         // 仅段落名称标记：**铺垫段**、**发展段** 等
         '/\*{1,2}\s*(铺垫段|发展段|高潮段|钩子段|收尾段)\s*\*{1,2}/iu',
         // 无星号的纯标记行：铺垫段:约600字
@@ -363,7 +473,9 @@ function jsonResponse(bool $ok, $data = null, string $msg = '', string $errorCod
         $payload['data'] = $data;
         if ($msg !== '') $payload['msg'] = $msg;
     } else {
-        $payload['error'] = $msg ?: '未知错误';
+        $err = $msg !== '' ? $msg : '未知错误';
+        $payload['error'] = $err;
+        $payload['msg'] = $err;
         if ($errorCode !== '') $payload['code'] = $errorCode;
         if ($data !== null) $payload['data'] = $data;
     }
@@ -376,9 +488,12 @@ function jsonResponse(bool $ok, $data = null, string $msg = '', string $errorCod
  * 当前为单用户系统风险有限，但提供基础防护层以备多用户扩展。
  *
  * @param string $text 用户原始输入（小说标题、角色名、设定等）
+ * @param int $maxLength 截断上限（审计修复 M2，2026-09-27：默认 2000 保持
+ *                       原行为；章节大纲等长规划字段传更大值——2000 截断会
+ *                       切掉长大纲尾部的关键情节点）
  * @return string 消毒后的文本
  */
-function sanitizeForPrompt(string $text): string {
+function sanitizeForPrompt(string $text, int $maxLength = 2000): string {
     // 移除常见的越狱/注入前缀
     $patterns = [
         '/\bignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|directives?|prompts?|rules?)\b/i',
@@ -396,9 +511,10 @@ function sanitizeForPrompt(string $text): string {
 
     $cleaned = preg_replace($patterns, '[已过滤]', $text);
 
-    // 长度截断保护（单字段最长 2000 字符）
-    if (mb_strlen($cleaned) > 2000) {
-        $cleaned = mb_substr($cleaned, 0, 2000);
+    // 长度截断保护
+    $maxLength = max(1, $maxLength);
+    if (mb_strlen($cleaned) > $maxLength) {
+        $cleaned = mb_substr($cleaned, 0, $maxLength);
     }
 
     return $cleaned;
@@ -419,14 +535,61 @@ function sanitizeForPrompt(string $text): string {
  */
 
 /**
+ * 加载管理员凭证（审计 2026-08-13 #3）。
+ *
+ * 优先从 storage/admin_credentials.json 读取（web 不可达，受 deny-all .htaccess 保护），
+ * 回退到 config.php 中的 ADMIN_USER/ADMIN_PASS 常量（向后兼容旧安装）。
+ *
+ * 返回 ['user' => string, 'pass_hash' => string]；未配置时两个字段为空字符串。
+ * 结果在请求内静态缓存，避免重复读文件。
+ */
+function loadAdminCredentials(): array {
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+
+    $user     = '';
+    $passHash = '';
+
+    // 优先：json 凭证文件（storage/ 受 deny-all .htaccess 保护，web 不可达）
+    $base     = defined('BASE_PATH') ? BASE_PATH : dirname(__DIR__);
+    $credFile = $base . '/storage/admin_credentials.json';
+    if (is_file($credFile)) {
+        $json = @file_get_contents($credFile);
+        if ($json !== false) {
+            $data = json_decode($json, true);
+            if (is_array($data) && isset($data['user'], $data['pass_hash']) && is_string($data['user']) && is_string($data['pass_hash'])) {
+                $user     = $data['user'];
+                $passHash = $data['pass_hash'];
+            }
+        }
+    }
+
+    // 回退：config.php 常量（向后兼容旧安装）
+    if ($user === '' && defined('ADMIN_USER') && ADMIN_USER !== '') {
+        $user = (string)ADMIN_USER;
+    }
+    if ($passHash === '' && defined('ADMIN_PASS') && ADMIN_PASS !== '') {
+        $passHash = (string)ADMIN_PASS;
+    }
+
+    return $cached = ['user' => $user, 'pass_hash' => $passHash];
+}
+
+/**
  * 取 HMAC secret —— 优先 ADMIN_PASS（已哈希且非空），回退到一个基于 BASE_PATH 的
  * 静态盐（首次安装时 ADMIN_PASS 可能为空字符串）。getSystemSetting('ws_task_secret', '')
  * 允许管理员显式设置更强的密钥。
+ *
+ * 审计 2026-08-13 #3：改用 loadAdminCredentials() 统一读取凭证，
+ * 兼容 json 凭证文件与 config.php 常量两种存储方式。
  */
 function _taskIdSecret(): string {
     $cfg = getSystemSetting('ws_task_secret', '');
     if ($cfg !== '' && strlen($cfg) >= 16) return $cfg;
-    if (defined('ADMIN_PASS') && ADMIN_PASS !== '' && strlen(ADMIN_PASS) >= 50) return ADMIN_PASS;
+    $cred = loadAdminCredentials();
+    if ($cred['pass_hash'] !== '' && strlen($cred['pass_hash']) >= 50) return $cred['pass_hash'];
     // 兜底：用 BASE_PATH + 一个常量盐做基础保护（非生产场景）
     $salt = 'ai_novel_task_secret_2026';
     return hash('sha256', (defined('BASE_PATH') ? BASE_PATH : __DIR__) . '|' . $salt);
@@ -445,18 +608,10 @@ function generateBoundTaskId(int $userId, int $novelId): string {
     return 'w' . $nonce . substr($sig, 0, 16);  // 总长 25 字符：w + 8 + 16
 }
 
-/** 校验 task_id 是否属于给定 user（用恒定时间比较） */
-function verifyTaskIdOwnership(string $taskId, int $userId, int $novelId): bool {
-    // task_id 必须是 w + 24hex
-    if (!preg_match('/^w[0-9a-f]{24}$/', $taskId)) return false;
-    $expected = taskIdSignature($taskId, $userId, $novelId);
-    // 进度文件中存的是完整 64 字符签名（用于整体签名校验）
-    // 这里我们重新计算 16hex 后缀进行比对
-    $noncePart = substr($taskId, 1, 8);
-    $sigPart   = substr($taskId, 9, 16);
-    $recalc    = hash_hmac('sha256', $userId . '|' . $novelId . '|' . 'w' . $noncePart, _taskIdSecret());
-    return hash_equals(substr($recalc, 0, 16), $sigPart);
-}
+// 审计修复 L4（2026-08-16）：删除 verifyTaskIdOwnership() 死函数——全项目无任何调用方，
+// 且其内部按"16hex 截断比对"的语义与 generateBoundTaskId/taskIdSignature 的实际签名
+// 口径不一致，属半成品代码；若未来被误用（如 write_poll 改调它）会引入校验歧义。
+// 实际校验逻辑见 write_poll.php（taskIdSignature 全串 hash_equals 比对）。
 
 /**
  * 审计修复 H-3（2026-06-17）：AI 错误信息脱敏。
@@ -488,6 +643,157 @@ function sanitizeAiErrorMessage(string $errMsg): string {
 }
 
 // ================================================================
+// SSRF 防护（API 端点校验）— 审计修复 M1（2026-08-16）
+//
+// 单一真理源：settings.php（保存时校验）与 includes/ai.php（请求时校验 +
+// CURLOPT_RESOLVE 固定）共用本组函数，防止两处校验逻辑漂移。
+//
+// 修复的三个缺口（原 settings.php isSafeApiUrl）：
+//   1. gethostbyname 只查 A 记录 → 仅有 AAAA 记录的内网 IPv6 域名被放行
+//   2. DNS 解析失败时 return true 放行 → 改为 fail-closed 拒绝
+//   3. 保存时校验、请求时 cURL 独立重解析 → DNS rebinding TOCTOU，
+//      由请求侧校验 + CURLOPT_RESOLVE 固定解析结果封堵
+// ================================================================
+
+/** 规范化 URL host：小写、去 [] 包裹、去尾部点号 */
+if (!function_exists('normalizeApiUrlHost')) {
+function normalizeApiUrlHost(string $host): string {
+    $host = strtolower(trim($host));
+    if (str_starts_with($host, '[') && str_ends_with($host, ']')) {
+        $host = substr($host, 1, -1);
+    }
+    return rtrim($host, '.');
+}
+}
+
+/** 本机回环放行名单（内置 Ollama 预设依赖；仅此三值，不含 .localhost 子域） */
+if (!function_exists('apiUrlHostIsLocal')) {
+function apiUrlHostIsLocal(string $host): bool {
+    $h = normalizeApiUrlHost($host);
+    return $h === 'localhost' || $h === '127.0.0.1' || $h === '::1';
+}
+}
+
+/** IPv6 二进制串（inet_pton 产物，16 字节）是否为不允许连接的地址 */
+if (!function_exists('ipv6BinIsDisallowedForApi')) {
+function ipv6BinIsDisallowedForApi(string $ip): bool {
+    if (strlen($ip) !== 16) return false;
+    // ::（未指定）/ ::1（loopback）
+    if ($ip === str_repeat("\0", 16)) return true;
+    if ($ip === str_repeat("\0", 15) . "\1") return true;
+    $first  = ord($ip[0]);
+    $second = ord($ip[1]);
+    if (($first & 0xFE) === 0xFC) return true;                       // fc00::/7 ULA
+    if ($first === 0xFE && ($second & 0xC0) === 0x80) return true;   // fe80::/10 link-local
+    if ($first === 0xFF) return true;                                // ff00::/8 multicast
+    // IPv4-mapped ::ffff:a.b.c.d → 按内嵌 IPv4 复检私网段
+    $mappedPrefix = str_repeat("\0", 10) . "\xff\xff";
+    if (substr($ip, 0, 12) === $mappedPrefix) {
+        $mappedLong = unpack('N', substr($ip, 12))[1];
+        if (($mappedLong & 0xFF000000) === 0x7F000000) return true;  // 127/8
+        if (($mappedLong & 0xFF000000) === 0x0A000000) return true;  // 10/8
+        if (($mappedLong & 0xFFFF0000) === 0xC0A80000) return true;  // 192.168/16
+        if (($mappedLong & 0xFFF00000) === 0xAC100000) return true;  // 172.16/12
+        if (($mappedLong & 0xFFFF0000) === 0xA9FE0000) return true;  // 169.254/16
+    }
+    return false;
+}
+}
+
+/** IP 字符串（v4/v6）是否为不允许连接的地址（私网/回环/链路本地/保留段） */
+if (!function_exists('ipIsDisallowedForApi')) {
+function ipIsDisallowedForApi(string $ip): bool {
+    $bin = @inet_pton($ip);
+    if ($bin === false) return true; // 无法解析的地址一律拒绝（fail-closed）
+    if (strlen($bin) === 16) return ipv6BinIsDisallowedForApi($bin);
+    if (strlen($bin) !== 4) return true;
+    $ipLong = unpack('N', $bin)[1];
+    if (($ipLong & 0xFF000000) === 0x00000000) return true;  // 0.0.0.0/8 "this network"（多数系统连接 0.0.0.0 等价回环，拒绝）
+    if (($ipLong & 0xFF000000) === 0x0A000000) return true;  // 10/8 私网
+    if (($ipLong & 0xFFC00000) === 0x64400000) return true;  // 100.64/10 CGN
+    if (($ipLong & 0xFF000000) === 0x7F000000) return true;  // 127/8 回环（127.0.0.1 已在放行名单单独处理）
+    if (($ipLong & 0xFFFF0000) === 0xA9FE0000) return true;  // 169.254/16 链路本地
+    if (($ipLong & 0xFFF00000) === 0xAC100000) return true;  // 172.16/12 私网
+    if (($ipLong & 0xFFFFFF00) === 0xC0000000) return true;  // 192.0.0/24 IETF 保留
+    if (($ipLong & 0xFFFFFF00) === 0xC0000200) return true;  // 192.0.2/24 TEST-NET-1
+    if (($ipLong & 0xFFFF0000) === 0xC0A80000) return true;  // 192.168/16 私网
+    if (($ipLong & 0xFFFE0000) === 0xC6120000) return true;  // 198.18/15 基准测试
+    if (($ipLong & 0xFFFFFF00) === 0xC6336400) return true;  // 198.51.100/24 TEST-NET-2
+    if (($ipLong & 0xFFFFFF00) === 0xCB007100) return true;  // 203.0.113/24 TEST-NET-3
+    if (($ipLong & 0xF0000000) === 0xE0000000) return true;  // 224/4 组播
+    if (($ipLong & 0xF0000000) === 0xF0000000) return true;  // 240/4 保留
+    return false;
+}
+}
+
+/**
+ * 校验 API 端点 URL 的 host 是否只解析到公网地址，返回 CURLOPT_RESOLVE 条目。
+ *
+ * - 回环名单（localhost/127.0.0.1/::1）：直接放行，返回 []（无需固定解析）
+ * - 域名：dns_get_record 同时取 A + AAAA，逐条校验；全部公网才通过。
+ *   解析失败回退 gethostbyname（仅 A）；再失败抛异常（fail-closed，不放行）。
+ * - IP 直填：直接校验。
+ *
+ * @return string[] CURLOPT_RESOLVE 条目（"host:port:ip"），回环时为空数组
+ * @throws RuntimeException 解析失败或命中不允许地址
+ */
+if (!function_exists('assertPublicApiEndpointResolve')) {
+function assertPublicApiEndpointResolve(string $url): array {
+    $parsed = parse_url($url);
+    $host = normalizeApiUrlHost((string)($parsed['host'] ?? ''));
+    if ($host === '') {
+        throw new RuntimeException('API 地址缺少有效主机名');
+    }
+    $port = (int)($parsed['port'] ?? ('https' === strtolower((string)($parsed['scheme'] ?? '')) ? 443 : 80));
+
+    if (apiUrlHostIsLocal($host)) {
+        return [];
+    }
+
+    // IP 直填（v4/v6）
+    $bin = @inet_pton($host);
+    if ($bin !== false) {
+        if (ipIsDisallowedForApi($host)) {
+            throw new RuntimeException('不允许连接内网或保留地址');
+        }
+        return [];
+    }
+
+    // 域名：A + AAAA 全量校验
+    $records = @dns_get_record($host, DNS_A + DNS_AAAA);
+    $ips = [];
+    if (is_array($records)) {
+        foreach ($records as $record) {
+            $ip = $record['ip'] ?? $record['ipv6'] ?? '';
+            if ($ip !== '') $ips[] = $ip;
+        }
+    }
+    if (!$ips) {
+        // 回退：dns_get_record 不可用/无记录时用 gethostbyname（仅 A 记录）
+        $resolved = @gethostbyname($host);
+        if ($resolved !== false && $resolved !== '' && $resolved !== $host && filter_var($resolved, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            $ips[] = $resolved;
+        }
+    }
+    if (!$ips) {
+        // 审计修复 M1：解析失败不再放行（原实现 return true），
+        // 防止"保存后把 DNS 改指向内网"以及笔误域名静默通过校验。
+        throw new RuntimeException('无法解析 API 地址域名（' . $host . '），请检查网络或 DNS 配置');
+    }
+
+    $resolve = [];
+    foreach (array_unique($ips) as $ip) {
+        if (ipIsDisallowedForApi($ip)) {
+            throw new RuntimeException('API 域名解析到内网/保留地址，已拒绝连接');
+        }
+        $curlIp = str_contains($ip, ':') ? '[' . $ip . ']' : $ip;
+        $resolve[] = "{$host}:{$port}:{$curlIp}";
+    }
+    return $resolve;
+}
+}
+
+// ================================================================
 // SSE 辅助（Server-Sent Events）
 // ================================================================
 
@@ -511,6 +817,14 @@ class SseChannel {
     private array $messages = [];
     private int $lastHeartbeat = 0;
     private int $heartbeatInterval = 10;
+    /** 审计修复（2026-08-30 M-6）：.content 拆分是否已完成首次迁移。 */
+    protected bool $_contentSplitReady = false;
+    /** 审计修复（2026-08-30 M-6）：JSON 元数据节流时间戳。 */
+    protected float $_contentLastFlush = 0.0;
+    /** 审计修复（2026-08-30，审计 L-8 收口）：messages 批量节流计数（原动态属性）。 */
+    protected int $_msgBatchCount = 0;
+    /** 审计修复（2026-08-30，审计 L-8 收口）：messages 上次 flush 时间（原动态属性）。 */
+    protected float $_msgLastFlush = 0.0;
 
     public function __construct(?string $taskId = null, ?string $progressFile = null, int $heartbeatInterval = 10) {
         $this->taskId = $taskId;
@@ -520,13 +834,37 @@ class SseChannel {
         $this->heartbeatInterval = $heartbeatInterval;
     }
 
+    /** 审计修复 E1（2026-09-27）：子类覆写 modifyProgress 做任务归属校验所需。 */
+    protected function sseTaskId(): ?string {
+        return $this->taskId;
+    }
+
+    /** 审计修复 E1（2026-09-27）：同上。 */
+    protected function sseProgressFile(): ?string {
+        return $this->progressFile;
+    }
+
     public function chunk(string $text): void {
         $this->heartbeat();
         if ($this->isAsync) {
-            // 审计修复 P2-10（2026-07-12）：消除 read-modify-write 竞态
-            // 旧实现先 readProgress()（LOCK_SH）再 appendProgress()（LOCK_EX），
-            // 两次锁之间其他进程的写入会被本次 stale read 覆盖。
-            // 改为在单个 LOCK_EX 内完成读-拼-写。
+            // 审计修复（2026-08-30 M-6）：正文改为追加独立 .content 文件（每 token O(1)），
+            // JSON 主文件（体积恒定小）只做节流后的元数据更新。原实现在单个
+            // LOCK_EX 内完成读-拼-写（P2-10 修复了竞态但未解决 IO 放大）：每 token
+            // 全量重写整个进度 JSON，且 content 字段随正文线性增长——6000 字章节
+            // ≈ 数千次数十 KB 的全量重写，累计 IO O(n²)，磁盘满时直接写作失败。
+            // 读取端（write_poll.php）已兼容 _content_split：优先读 .content，回退 JSON。
+            if ($this->appendChunkToFile($text)) {
+                $elapsed = microtime(true) - ($this->_contentLastFlush ?? 0);
+                if ($elapsed < 2) return;
+                $this->_contentLastFlush = microtime(true);
+                $this->modifyProgress(function (array $progress): array {
+                    $progress['status'] = 'writing';
+                    $progress['_content_split'] = true;
+                    return $progress;
+                });
+                return;
+            }
+            // 回退：.content 追加不可用（IO 故障）时保持旧全量路径，内容不丢。
             $this->modifyProgress(function (array $progress) use ($text): array {
                 $progress['content'] = ($progress['content'] ?? '') . $text;
                 $progress['status']  = 'writing';
@@ -535,6 +873,89 @@ class SseChannel {
         } else {
             echo 'data: ' . json_encode(['chunk' => $text], JSON_UNESCAPED_UNICODE) . "\n\n";
             $this->flush();
+        }
+    }
+
+    /**
+     * 审计修复（2026-08-30 M-6）：把流式正文追加到独立 .content 文件。
+     *
+     * 首次调用时做一次性迁移：把 JSON 内嵌的旧 content 写入 .content 并清空
+     * JSON 字段、置位 _content_split（锁序 JSON→.content 与 worker 的
+     * flushChunkBuffer / msg 的 reset_content 分支保持一致，不会反序死锁）。
+     * msg 的 reset_content 分支会清空 .content，此后本方法继续纯追加。
+     *
+     * IO 故障必须抛错，不能把失败 chunk 写进轮询端会忽略的 JSON.content。
+     * @return bool true=正文已完整持久化；false=未配置异步进度文件
+     */
+    protected function appendChunkToFile(string $text): bool
+    {
+        if ($this->progressFile === null) return false;
+        $contentFile = $this->progressFile . '.content';
+        if (!$this->_contentSplitReady) {
+            $migrationOk = false;
+            $this->modifyProgress(function (array $progress) use ($contentFile, $text, &$migrationOk): array {
+                $legacy = (string)($progress['content'] ?? '');
+                $wasSplit = !empty($progress['_content_split']);
+                // Until the split marker is published, JSON is authoritative.
+                // Overwrite an uncommitted sidecar instead of duplicating it.
+                self::writeStreamingContentFile($contentFile, ($wasSplit ? '' : $legacy) . $text, $wasSplit);
+                $progress['content'] = '';
+                $progress['_content_split'] = true;
+                $progress['status'] = 'writing';
+                $migrationOk = true;
+                return $progress;
+            });
+            if (!$migrationOk) {
+                throw new RuntimeException('Unable to publish streaming content progress.');
+            }
+            $this->_contentSplitReady = true;
+            return true;
+        }
+        self::writeStreamingContentFile($contentFile, $text, true);
+        return true;
+    }
+
+    private static function writeStreamingContentFile(string $path, string $text, bool $append): void
+    {
+        $fp = false;
+        $locked = false;
+        $start = null;
+        try {
+            $fp = @fopen($path, 'c+b');
+            if ($fp === false || !flock($fp, LOCK_EX)) {
+                throw new RuntimeException('Unable to lock streaming content file.');
+            }
+            $locked = true;
+            if ($append) {
+                if (fseek($fp, 0, SEEK_END) !== 0 || ($start = ftell($fp)) === false) {
+                    throw new RuntimeException('Unable to seek streaming content file.');
+                }
+            } elseif (!ftruncate($fp, 0) || fseek($fp, 0) !== 0) {
+                throw new RuntimeException('Unable to initialize streaming content file.');
+            }
+            $offset = 0;
+            $length = strlen($text);
+            while ($offset < $length) {
+                $written = fwrite($fp, substr($text, $offset));
+                if ($written === false || $written === 0) {
+                    throw new RuntimeException('Unable to write complete streaming content.');
+                }
+                $offset += $written;
+            }
+            if (!fflush($fp)) {
+                throw new RuntimeException('Unable to flush streaming content file.');
+            }
+        } catch (Throwable $exception) {
+            // Never leave half a chunk available for a retry to append twice.
+            if ($locked && $append && is_int($start)) {
+                try { ftruncate($fp, $start); fflush($fp); } catch (Throwable) {}
+            }
+            throw new RuntimeException('Unable to persist streaming content.', 0, $exception);
+        } finally {
+            if (is_resource($fp)) {
+                if ($locked) flock($fp, LOCK_UN);
+                fclose($fp);
+            }
         }
     }
 
@@ -646,26 +1067,54 @@ class SseChannel {
     /**
      * 在单个 LOCK_EX 内执行读-改-写，消除 read-modify-write 竞态
      * 审计修复 P2-10（2026-07-12）
+     * 审计修复（2026-08-30 M-6）：private → protected，WriteSseChannel 等子类
+     * 复用 .content 拆分机制时需要同一加锁读-改-写原语。
      *
      * @param callable $modifier 接收当前 progress 数组，返回更新后的数组
      */
-    private function modifyProgress(callable $modifier): void {
+    protected function modifyProgress(callable $modifier): void {
         if (!$this->progressFile || !file_exists($this->progressFile)) return;
-        $fp = fopen($this->progressFile, 'r+');
-        if (!$fp) return;
-        flock($fp, LOCK_EX);
+        $fp = false;
+        $locked = false;
         try {
+            $fp = @fopen($this->progressFile, 'r+');
+            if ($fp === false || !flock($fp, LOCK_EX)) {
+                throw new RuntimeException('Unable to lock streaming content progress.');
+            }
+            $locked = true;
             $data     = stream_get_contents($fp);
+            if ($data === false) {
+                throw new RuntimeException('Unable to read streaming content progress.');
+            }
             $progress = json_decode($data, true) ?: [];
             $updated  = $modifier($progress);
             if (!is_array($updated)) $updated = [];
             $updated['updated_at'] = time();
-            fseek($fp, 0);
-            ftruncate($fp, 0);
-            fwrite($fp, json_encode($updated, JSON_UNESCAPED_UNICODE));
+            // Serialize before truncating so malformed metadata cannot destroy
+            // the current authoritative source or publish a false split marker.
+            $encoded = json_encode($updated, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+            if (fseek($fp, 0) !== 0 || !ftruncate($fp, 0)) {
+                throw new RuntimeException('Unable to initialize streaming content progress.');
+            }
+            $offset = 0;
+            $length = strlen($encoded);
+            while ($offset < $length) {
+                $written = fwrite($fp, substr($encoded, $offset));
+                if ($written === false || $written === 0) {
+                    throw new RuntimeException('Unable to write complete streaming content progress.');
+                }
+                $offset += $written;
+            }
+            if (!fflush($fp)) {
+                throw new RuntimeException('Unable to flush streaming content progress.');
+            }
+        } catch (Throwable $exception) {
+            throw new RuntimeException('Unable to persist streaming content progress.', 0, $exception);
         } finally {
-            flock($fp, LOCK_UN);
-            fclose($fp);
+            if (is_resource($fp)) {
+                if ($locked) flock($fp, LOCK_UN);
+                fclose($fp);
+            }
         }
     }
 }

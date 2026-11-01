@@ -7,25 +7,21 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
 
 header('Content-Type: application/json; charset=utf-8');
 
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
 require_once dirname(__DIR__) . '/includes/auth.php';
 requireLoginApi();
 
-// 加载配置文件
-$configFile = dirname(__DIR__) . '/config_optimize.php';
-if (file_exists($configFile)) {
-    require_once $configFile;
-}
-
-// 获取配置
-$mode = defined('OPTIMIZE_OUTLINE_MODE') ? OPTIMIZE_OUTLINE_MODE : 'ajax';
-$batchSize = defined('OPTIMIZE_BATCH_SIZE') ? OPTIMIZE_BATCH_SIZE : 10;
-$ajaxDelay = defined('AJAX_BATCH_DELAY') ? AJAX_BATCH_DELAY : 500;
-$heartbeatInterval = defined('SSE_HEARTBEAT_INTERVAL') ? SSE_HEARTBEAT_INTERVAL : 10;
-$heartbeatTimeout = defined('SSE_HEARTBEAT_TIMEOUT') ? SSE_HEARTBEAT_TIMEOUT : 300;
+// 获取配置：直接读取 includes/config_constants.php 的 CFG_* 常量（config.php 已加载）。
+// 审计 T5（2026-10-31）：原 config_optimize.php 只是把这些常量再 define 一遍、外加
+// 3 个零调用函数，已删除；返回字段、取值来源与缺省值均保持不变。
+$mode = defined('CFG_OPTIMIZE_MODE') ? CFG_OPTIMIZE_MODE : 'ajax';
+$batchSize = defined('CFG_OPTIMIZE_BATCH') ? CFG_OPTIMIZE_BATCH : 10;
+$ajaxDelay = defined('CFG_OPTIMIZE_AJAX_DELAY') ? CFG_OPTIMIZE_AJAX_DELAY : 500;
+$heartbeatInterval = defined('CFG_SSE_HEARTBEAT') ? CFG_SSE_HEARTBEAT : 10;
+$heartbeatTimeout = defined('CFG_PROGRESS_STALE') ? CFG_PROGRESS_STALE : 300;
 
 echo json_encode([
     'mode' => $mode,

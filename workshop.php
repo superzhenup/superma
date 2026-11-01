@@ -16,6 +16,23 @@ $models = DB::fetchAll('SELECT * FROM ai_models ORDER BY is_default DESC, id ASC
 
 pageHeader('创意工坊', 'workshop');
 ?>
+<script nonce="<?= cspNonce() ?>">
+AppEvents.register('page-workshop-reset-form-1', function (event, element) { resetForm(); });
+AppEvents.register('page-workshop-generate-idea-2', function (event, element) { generateIdea(); });
+AppEvents.register('page-workshop-regenerate-result-3', function (event, element) { regenerateResult(); });
+AppEvents.register('page-workshop-create-novel-4', function (event, element) { createNovel(); });
+AppEvents.register('page-workshop-regenerate-section-5', function (event, element) { regenerateSection('protagonist_info'); });
+AppEvents.register('page-workshop-open-rewrite-modal-6', function (event, element) { openRewriteModal('protagonist_info'); });
+AppEvents.register('page-workshop-regenerate-section-7', function (event, element) { regenerateSection('world_settings'); });
+AppEvents.register('page-workshop-open-rewrite-modal-8', function (event, element) { openRewriteModal('world_settings'); });
+AppEvents.register('page-workshop-regenerate-section-9', function (event, element) { regenerateSection('plot_settings'); });
+AppEvents.register('page-workshop-open-rewrite-modal-10', function (event, element) { openRewriteModal('plot_settings'); });
+AppEvents.register('page-workshop-regenerate-section-11', function (event, element) { regenerateSection('extra_settings'); });
+AppEvents.register('page-workshop-open-rewrite-modal-12', function (event, element) { openRewriteModal('extra_settings'); });
+AppEvents.register('page-workshop-confirm-create-novel-13', function (event, element) { confirmCreateNovel(); });
+AppEvents.register('page-workshop-confirm-rewrite-14', function (event, element) { confirmRewrite(); });
+</script>
+
 
 <!-- 创意工坊主界面 -->
 <div class="workshop-container">
@@ -172,10 +189,10 @@ pageHeader('创意工坊', 'workshop');
 
                 <!-- 生成按钮 -->
                 <div class="d-flex gap-2 justify-content-end mt-4">
-                    <button type="button" class="btn btn-outline-secondary" onclick="resetForm()">
+                    <button type="button" class="btn btn-outline-secondary" data-csp-click="page-workshop-reset-form-1">
                         <i class="bi bi-arrow-counterclockwise me-1"></i>重置
                     </button>
-                    <button type="button" class="btn btn-primary" id="generate-btn" onclick="generateIdea()">
+                    <button type="button" class="btn btn-primary" id="generate-btn" data-csp-click="page-workshop-generate-idea-2">
                         <i class="bi bi-magic me-1"></i>一键生成
                     </button>
                 </div>
@@ -189,10 +206,10 @@ pageHeader('创意工坊', 'workshop');
             <div class="page-card-header d-flex justify-content-between align-items-center">
                 <span><i class="bi bi-journal-text me-2"></i>生成结果</span>
                 <div class="btn-group btn-group-sm" id="result-actions" style="display:none">
-                    <button type="button" class="btn btn-outline-primary" onclick="regenerateResult()">
+                    <button type="button" class="btn btn-outline-primary" data-csp-click="page-workshop-regenerate-result-3">
                         <i class="bi bi-arrow-repeat me-1"></i>重新生成
                     </button>
-                    <button type="button" class="btn btn-success" onclick="createNovel()">
+                    <button type="button" class="btn btn-success" data-csp-click="page-workshop-create-novel-4">
                         <i class="bi bi-plus-circle me-1"></i>新建小说
                     </button>
                 </div>
@@ -247,10 +264,10 @@ pageHeader('创意工坊', 'workshop');
                             <div class="d-flex justify-content-between align-items-center">
                                 <label class="form-label small text-muted mb-0">主角信息</label>
                                 <div class="section-actions">
-                                    <button type="button" class="btn btn-outline-secondary btn-xs" onclick="regenerateSection('protagonist_info')" title="重新生成">
+                                    <button type="button" class="btn btn-outline-secondary btn-xs" data-csp-click="page-workshop-regenerate-section-5" title="重新生成">
                                         <i class="bi bi-arrow-repeat"></i> 重新生成
                                     </button>
-                                    <button type="button" class="btn btn-outline-primary btn-xs" onclick="openRewriteModal('protagonist_info')" title="输入意见改写">
+                                    <button type="button" class="btn btn-outline-primary btn-xs" data-csp-click="page-workshop-open-rewrite-modal-6" title="输入意见改写">
                                         <i class="bi bi-pencil"></i> 意见改写
                                     </button>
                                 </div>
@@ -266,10 +283,10 @@ pageHeader('创意工坊', 'workshop');
                                 <i class="bi bi-globe me-1"></i>世界观设定
                             </div>
                             <div class="section-actions">
-                                <button type="button" class="btn btn-outline-secondary btn-xs" onclick="regenerateSection('world_settings')" title="重新生成">
+                                <button type="button" class="btn btn-outline-secondary btn-xs" data-csp-click="page-workshop-regenerate-section-7" title="重新生成">
                                     <i class="bi bi-arrow-repeat"></i> 重新生成
                                 </button>
-                                <button type="button" class="btn btn-outline-primary btn-xs" onclick="openRewriteModal('world_settings')" title="输入意见改写">
+                                <button type="button" class="btn btn-outline-primary btn-xs" data-csp-click="page-workshop-open-rewrite-modal-8" title="输入意见改写">
                                     <i class="bi bi-pencil"></i> 意见改写
                                 </button>
                             </div>
@@ -284,10 +301,10 @@ pageHeader('创意工坊', 'workshop');
                                 <i class="bi bi-signpost-2 me-1"></i>情节设定
                             </div>
                             <div class="section-actions">
-                                <button type="button" class="btn btn-outline-secondary btn-xs" onclick="regenerateSection('plot_settings')" title="重新生成">
+                                <button type="button" class="btn btn-outline-secondary btn-xs" data-csp-click="page-workshop-regenerate-section-9" title="重新生成">
                                     <i class="bi bi-arrow-repeat"></i> 重新生成
                                 </button>
-                                <button type="button" class="btn btn-outline-primary btn-xs" onclick="openRewriteModal('plot_settings')" title="输入意见改写">
+                                <button type="button" class="btn btn-outline-primary btn-xs" data-csp-click="page-workshop-open-rewrite-modal-10" title="输入意见改写">
                                     <i class="bi bi-pencil"></i> 意见改写
                                 </button>
                             </div>
@@ -302,10 +319,10 @@ pageHeader('创意工坊', 'workshop');
                                 <i class="bi bi-gear me-1"></i>额外设定
                             </div>
                             <div class="section-actions">
-                                <button type="button" class="btn btn-outline-secondary btn-xs" onclick="regenerateSection('extra_settings')" title="重新生成">
+                                <button type="button" class="btn btn-outline-secondary btn-xs" data-csp-click="page-workshop-regenerate-section-11" title="重新生成">
                                     <i class="bi bi-arrow-repeat"></i> 重新生成
                                 </button>
-                                <button type="button" class="btn btn-outline-primary btn-xs" onclick="openRewriteModal('extra_settings')" title="输入意见改写">
+                                <button type="button" class="btn btn-outline-primary btn-xs" data-csp-click="page-workshop-open-rewrite-modal-12" title="输入意见改写">
                                     <i class="bi bi-pencil"></i> 意见改写
                                 </button>
                             </div>
@@ -356,7 +373,7 @@ pageHeader('创意工坊', 'workshop');
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-                <button type="button" class="btn btn-primary" onclick="confirmCreateNovel()">
+                <button type="button" class="btn btn-primary" data-csp-click="page-workshop-confirm-create-novel-13">
                     <i class="bi bi-check-circle me-1"></i>确认创建
                 </button>
             </div>
@@ -380,7 +397,7 @@ pageHeader('创意工坊', 'workshop');
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-                <button type="button" class="btn btn-primary" id="rewrite-confirm-btn" onclick="confirmRewrite()">
+                <button type="button" class="btn btn-primary" id="rewrite-confirm-btn" data-csp-click="page-workshop-confirm-rewrite-14">
                     <i class="bi bi-magic me-1"></i>开始改写
                 </button>
             </div>

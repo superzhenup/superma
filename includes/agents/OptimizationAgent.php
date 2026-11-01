@@ -16,6 +16,7 @@
 defined('APP_LOADED') or die('Direct access denied.');
 
 require_once __DIR__ . '/BaseAgent.php';
+require_once __DIR__ . '/../config_center.php';
 
 class OptimizationAgent extends BaseAgent
 {
@@ -173,12 +174,14 @@ class OptimizationAgent extends BaseAgent
         $templates = [
             'write_speed' => [
                 'actions' => [
+                    ['name' => 'tune_prompt_cache', 'improvement' => 0.10, 'cost' => 'low'],
                     ['name' => 'smart_truncation', 'improvement' => 0.15, 'cost' => 'low'],
                 ],
             ],
             'token_usage' => [
                 'actions' => [
                     ['name' => 'compress_context', 'improvement' => 0.30, 'cost' => 'medium'],
+                    ['name' => 'tune_prompt_cache', 'improvement' => 0.10, 'cost' => 'low'],
                     ['name' => 'smart_truncation', 'improvement' => 0.20, 'cost' => 'low'],
                 ],
             ],
@@ -219,8 +222,14 @@ class OptimizationAgent extends BaseAgent
         });
         
         // 选择ROI最高且风险可接受的方案
+        // 审计修复（2026-08-17 P3）修复1：ROI 死逻辑。write_speed 类数学上限 =
+        // improvement 0.10 × (1-risk 0.7) × (1+效果奖金≤0.3) = 0.091，恒低于原 0.1
+        // 过滤线；overall_quality 类 0.15 × 0.6 = 0.09（无奖金时）同样被过滤——
+        // 性能/质量优化永不执行。阈值降至 0.05：低于 write_speed 无奖金基线 0.07
+        // 与 overall_quality 基线 0.09，仅过滤强负反馈（奖金≤-0.3）的方案；
+        // risk < 0.5 保持不变，不改 improvement/risk 定义。
         return array_filter($proposals, function($p) {
-            return $p['roi'] > 0.1 && $p['risk'] < 0.5;
+            return $p['roi'] > 0.05 && $p['risk'] < 0.5;
         });
     }
     
@@ -255,9 +264,64 @@ class OptimizationAgent extends BaseAgent
         try {
             switch ($action['name']) {
                 case 'compress_context':
-                    $this->logAction($this->novelId, $action['name'], 'success');
-                    $this->writeDirective('optimization', '本章上下文精简：前情提要控制在300字以内，去除重复的角色描述和世界观说明，只保留与本章情节直接相关的核心信息。如果上下文接近超限，优先裁剪"近章大纲"和"故事线回顾"的长度。');
-                    return ['action' => $action['name'], 'status' => 'success', 'message' => '已注入上下文精简指令'];
+                    // 审计修复（2026-08-09 R8-6）：原指令让写作模型「裁剪近章大纲」——模型改不了 builder。
+                    // 改为真压缩记忆预算 + 可执行的正文侧指令（勿复述已知设定）。
+                    // R10-9：地板对齐 write_engine 的 2000；已在地板则跳过，避免假成功抬预算。
+                    $curBudget = (int)ConfigCenter::getNovel($this->novelId, 'ws_memory_token_budget', 20000, 'int');
+                    $floor = 2000;
+                    if ($curBudget <= $floor) {
+                        $this->logAction($this->novelId, $action['name'], 'skipped', [
+                            'old_budget' => $curBudget,
+                            'reason' => 'already_at_floor',
+                        ]);
+                        return ['action' => $action['name'], 'status' => 'skipped', 'message' => "记忆预算已达下限{$floor}，跳过压缩"];
+                    }
+                    $newBudget = max($floor, (int)round($curBudget * 0.75));
+                    if ($newBudget >= $curBudget) {
+                        $newBudget = max($floor, $curBudget - 1);
+                    }
+                    ConfigCenter::setNovel($this->novelId, 'ws_memory_token_budget', $newBudget, 'int');
+                    $this->logAction($this->novelId, $action['name'], 'success', [
+                        'old_budget' => $curBudget,
+                        'new_budget' => $newBudget,
+                    ]);
+                    $this->writeDirective('optimization',
+                        "记忆上下文已收紧（预算{$curBudget}→{$newBudget}）。正文侧：默默遵守人物/世界观约束，勿把设定复述进正文；用动作与对话推进，省略重复铺垫。"
+                    );
+                    return ['action' => $action['name'], 'status' => 'success', 'message' => "记忆预算{$curBudget}→{$newBudget}并注入精简指令"];
+
+                case 'tune_prompt_cache':
+                case 'enable_parallel_write':
+                    // 章节并行写入会打乱记忆/伏笔顺序，不落地。
+                    // 同目标（降本/加速）改为小说级 Prompt/L1 缓存 TTL。
+                    // 审计修复（2026-08-17 P3）修复2：幂等短路。原每次执行都重写 TTL=3600
+                    // 并记 success（假成功刷日志）。照搬 compress_context 的 already_at_floor
+                    // 模式：TTL 已达目标值则跳过，不再写库。
+                    $ttl = 3600;
+                    $currentTtl = (int)ConfigCenter::getNovel($this->novelId, 'ws_prompt_cache_ttl', 0, 'int');
+                    if ($currentTtl >= $ttl) {
+                        $this->logAction($this->novelId, $action['name'], 'skipped', [
+                            'current_ttl' => $currentTtl,
+                            'reason' => 'already_configured',
+                        ]);
+                        return ['action' => $action['name'], 'status' => 'skipped', 'message' => "Prompt 缓存 TTL 已配置为 {$currentTtl}s（≥{$ttl}），跳过重复配置"];
+                    }
+                    if (!ConfigCenter::setNovel($this->novelId, 'ws_prompt_cache_ttl', $ttl, 'int')) {
+                        throw new RuntimeException('Prompt 缓存 TTL 保存失败');
+                    }
+                    // 审计修复（2026-08-17 P3）修复2：删除 setNovel(..., 'ws_enable_parallel_write', 0)
+                    // 死配置行——全项目无任何读取方（grep 仅本处出现），写库纯属噪声。
+                    $this->logAction($this->novelId, $action['name'], 'success', [
+                        'ws_prompt_cache_ttl' => $ttl,
+                    ]);
+                    $this->writeDirective('optimization',
+                        "已启用小说级 Prompt 缓存（{$ttl}秒），减少重复拉取全书设定。章节仍按顺序写作，避免记忆错位。"
+                    );
+                    return [
+                        'action' => $action['name'],
+                        'status' => 'success',
+                        'message' => "Prompt 缓存 TTL={$ttl}s（章节保持串行）",
+                    ];
 
                 case 'smart_truncation':
                     $this->logAction($this->novelId, $action['name'], 'success');
@@ -307,8 +371,8 @@ class OptimizationAgent extends BaseAgent
                  FROM chapters 
                  WHERE novel_id = ? AND status = "completed" 
                    AND duration_ms > 0
-                   AND chapter_number >= GREATEST(1, (SELECT MAX(chapter_number) - 20 FROM chapters WHERE novel_id = ? AND status = "completed"))',
-                [$this->novelId, $this->novelId]
+                   AND chapter_number >= ? AND chapter_number < ?',
+                [$this->novelId, max(1, ($this->currentChapterNumber ?: PHP_INT_MAX) - 20), $this->currentChapterNumber ?: PHP_INT_MAX]
             );
             
             $avgTime = (float)($stats['avg_time'] ?? 0);
@@ -331,9 +395,9 @@ class OptimizationAgent extends BaseAgent
         try {
             $recent = DB::fetchAll(
                 'SELECT quality_score FROM chapters 
-                 WHERE novel_id = ? AND quality_score IS NOT NULL 
+                 WHERE novel_id = ? AND quality_score IS NOT NULL AND status = "completed" AND chapter_number < ?
                  ORDER BY chapter_number DESC LIMIT 10',
-                [$this->novelId]
+                [$this->novelId, $this->currentChapterNumber ?: PHP_INT_MAX]
             );
             
             if (count($recent) < 2) {
@@ -368,11 +432,11 @@ class OptimizationAgent extends BaseAgent
                 'SELECT SUM(tokens_used) as total_tokens, COUNT(*) as chapter_count
                  FROM (
                      SELECT tokens_used FROM chapters
-                     WHERE novel_id = ? AND status = "completed"
+                     WHERE novel_id = ? AND status = "completed" AND chapter_number < ?
                      ORDER BY chapter_number DESC
                      LIMIT 50
                  ) recent',
-                [$this->novelId]
+                [$this->novelId, $this->currentChapterNumber ?: PHP_INT_MAX]
             );
             
             $totalTokens = (int)($stats['total_tokens'] ?? 0);
@@ -445,7 +509,7 @@ class OptimizationAgent extends BaseAgent
     {
         try {
             require_once __DIR__ . '/AgentDirectives.php';
-            $stats = AgentDirectives::getOutcomeStats($this->novelId);
+            $stats = AgentDirectives::getOutcomeStats($this->novelId, $this->currentChapterNumber ?: PHP_INT_MAX);
             
             $byType = [];
             foreach ($stats['by_type'] as $row) {
@@ -493,10 +557,10 @@ class OptimizationAgent extends BaseAgent
                      SELECT o.quality_change, o.evaluated_at
                      FROM agent_directive_outcomes o
                      JOIN agent_directives d ON o.directive_id = d.id
-                     WHERE o.novel_id = ? AND d.type = ?
-                     ORDER BY o.evaluated_at DESC LIMIT 20
+                     WHERE o.novel_id = ? AND d.type = ? AND o.chapter_number < ?
+                     ORDER BY o.chapter_number DESC LIMIT 20
                  ) sub',
-                [$this->novelId, $dbType]
+                [$this->novelId, $dbType, $this->currentChapterNumber ?: PHP_INT_MAX]
             );
             
             if (empty($stats) || !$stats['avg_change']) return 0;

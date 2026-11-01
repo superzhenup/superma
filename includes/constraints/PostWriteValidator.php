@@ -17,43 +17,201 @@
 
 defined('APP_LOADED') or die('Direct access denied.');
 
+require_once __DIR__ . '/../quality/WritePolicySnapshot.php';
+require_once __DIR__ . '/../quality/DialogueText.php';
+
+final class PostWritePolicyReplayException extends RuntimeException
+{
+}
+
 class PostWriteValidator
 {
+    /** @var list<string> */
+    private const LEGACY_COMPAT_BANNED_WORDS = ['绝境', '反杀', '真相', '背水', '逆袭'];
+    private const LEGACY_COMPAT_MAX_BANNED_WORD_USAGE = 15;
+    private const LEGACY_COMPAT_MAX_SAME_CONFLICT = 1;
+    private const LEGACY_COMPAT_MAX_COINCIDENCES = 5;
+
     private int    $novelId;
     private array  $chapter;
     private string $content;
     private int    $targetWords;
+    private int    $hardMinWords;
+    private int    $minWords;
+    private int    $maxWords;
+    private bool   $constraintEnabled;
+    /** @var list<string> */
+    private array  $bannedWords;
+    private int    $maxBannedWordUsage;
+    private int    $maxSameConflict;
+    private int    $maxCoincidences;
+    private bool   $frozenPolicy = false;
+    /** @var array{level:string,dimension:string,issue_type:string,issue_desc:string,auto_fixed:bool}|null */
+    private ?array $policyAdvisory = null;
     private ?ConstraintStateDB $stateDB = null;
 
     /** @var array 校验结果累积 */
     private array $issues = [];
 
-    public function __construct(int $novelId, array $chapter, string $content, int $targetWords)
-    {
+    public function __construct(
+        int $novelId,
+        array $chapter,
+        string $content,
+        int $targetWords,
+        ?WritePolicySnapshot $policySnapshot = null
+    ) {
         $this->novelId     = $novelId;
         $this->chapter     = $chapter;
         $this->content     = $content;
+
+        if ($policySnapshot === null) {
+            $this->configureLegacyLivePolicy($targetWords);
+            return;
+        }
+
+        $this->configureFrozenPolicy($policySnapshot, $targetWords);
+    }
+
+    /**
+     * Backward-compatible path for callers not yet wired to a policy snapshot.
+     * All live reads are resolved once here; validation methods consume only
+     * the resulting properties.
+     */
+    private function configureLegacyLivePolicy(int $targetWords): void
+    {
         $this->targetWords = $targetWords;
+        $this->constraintEnabled = ConstraintConfig::isEnabled();
+        $this->bannedWords = array_values(ConstraintConfig::bannedWords());
+        $this->maxBannedWordUsage = ConstraintConfig::maxBannedWordUsage();
+        $this->maxSameConflict = ConstraintConfig::maxSameConflict();
+        $this->maxCoincidences = max(0, ConstraintConfig::maxCoincidences());
+
+        $range = calculateDynamicTolerance($targetWords, $this->novelId);
+        $this->minWords = (int)$range['min'];
+        $this->maxWords = (int)$range['max'];
+        $this->hardMinWords = $targetWords > 0
+            ? max(100, (int)floor($targetWords * 0.3))
+            : 0;
+    }
+
+    private function configureFrozenPolicy(WritePolicySnapshot $policy, int $legacyTargetWords): void
+    {
+        $this->frozenPolicy = true;
+        $this->targetWords = $policy->targetWords();
+        $this->hardMinWords = $policy->hardMinWords();
+        $this->minWords = $policy->minWords();
+        $this->maxWords = $policy->maxWords();
+
+        if ($legacyTargetWords !== $this->targetWords) {
+            throw new InvalidArgumentException(
+                'PostWriteValidator targetWords must match the frozen policy target_words.'
+            );
+        }
+
+        if ($policy->version() === WritePolicySnapshot::SCHEMA_V1) {
+            if ($policy->canonPolicy() === WritePolicySnapshot::CANON_POLICY_STRICT) {
+                throw new PostWritePolicyReplayException(
+                    'A strict write-policy-v1 snapshot has no frozen constraint profile and cannot be replayed.'
+                );
+            }
+            $this->applyLegacyCompatibilityProfile();
+            $this->policyAdvisory = self::advisoryIssue(
+                'legacy_policy_snapshot_compat',
+                'Constraint validation used the fixed write-policy-v1 compatibility profile; live settings were ignored.'
+            );
+            return;
+        }
+
+        if ($policy->constraintRuleVersion() !== WritePolicySnapshot::CONSTRAINT_RULE_POST_WRITE_V1) {
+            throw new PostWritePolicyReplayException(
+                'The frozen constraint rule version is unsupported by PostWriteValidator.'
+            );
+        }
+
+        $enabled = $policy->constraintEnabled();
+        $bannedWords = $policy->constraintBannedWords();
+        $maxBannedWordUsage = $policy->constraintMaxBannedWordUsage();
+        $maxSameConflict = $policy->constraintMaxSameConflict();
+        $maxCoincidences = $policy->constraintMaxCoincidences();
+        if ($enabled === null
+            || $bannedWords === null
+            || $maxBannedWordUsage === null
+            || $maxSameConflict === null
+            || $maxCoincidences === null) {
+            throw new PostWritePolicyReplayException(
+                'The write-policy-v2 constraint profile is structurally incomplete.'
+            );
+        }
+        if (!$policy->constraintProfileComplete()) {
+            if ($policy->canonPolicy() === WritePolicySnapshot::CANON_POLICY_STRICT) {
+                throw new PostWritePolicyReplayException(
+                    'A strict write-policy-v2 snapshot has an incomplete constraint profile and cannot be replayed.'
+                );
+            }
+            $this->policyAdvisory = self::advisoryIssue(
+                'constraint_profile_incomplete',
+                'Constraint validation replayed frozen fallback values from an incomplete profile; live settings were ignored.'
+            );
+        }
+
+        $this->constraintEnabled = $enabled;
+        $this->bannedWords = $bannedWords;
+        $this->maxBannedWordUsage = $maxBannedWordUsage;
+        $this->maxSameConflict = $maxSameConflict;
+        $this->maxCoincidences = $maxCoincidences;
+    }
+
+    private function applyLegacyCompatibilityProfile(): void
+    {
+        $this->constraintEnabled = true;
+        $this->bannedWords = self::LEGACY_COMPAT_BANNED_WORDS;
+        $this->maxBannedWordUsage = self::LEGACY_COMPAT_MAX_BANNED_WORD_USAGE;
+        $this->maxSameConflict = self::LEGACY_COMPAT_MAX_SAME_CONFLICT;
+        $this->maxCoincidences = self::LEGACY_COMPAT_MAX_COINCIDENCES;
+    }
+
+    /** @return array{level:string,dimension:string,issue_type:string,issue_desc:string,auto_fixed:bool} */
+    private static function advisoryIssue(string $type, string $description): array
+    {
+        return [
+            'level' => 'P2',
+            'dimension' => 'structure',
+            'issue_type' => $type,
+            'issue_desc' => $description,
+            'auto_fixed' => false,
+        ];
     }
 
     /**
      * 执行全部校验
      * @param bool $forceRun 强制执行（用于人工审核场景，忽略框架启用状态）
+     * @param ?bool $recordViolations null preserves legacy logging for old
+     *     callers and suppresses logging for frozen/replay evaluation.
      * @return array{has_p0: bool, has_p1: bool, p0_issues: array, p1_issues: array, p2_issues: array, all_issues: array}
      */
-    public function run(bool $forceRun = false): array
+    public function run(bool $forceRun = false, ?bool $recordViolations = null): array
     {
-        $isEnabled = ConstraintConfig::isEnabled();
+        $this->issues = [];
+        $this->stateDB = null;
+        if ($this->policyAdvisory !== null) {
+            $this->issues[] = $this->policyAdvisory;
+        }
+        $recordViolations ??= !$this->frozenPolicy;
+        $isEnabled = $this->constraintEnabled;
 
         if (!$isEnabled && !$forceRun) {
-            return $this->emptyResult();
+            return $this->issues === []
+                ? $this->emptyResult()
+                : $this->buildResult($recordViolations);
         }
 
         try {
             $this->stateDB = new ConstraintStateDB($this->novelId);
         } catch (\Throwable $e) {
             if (!$forceRun) {
-                return $this->emptyResult();
+                return $this->issues === []
+                    ? $this->emptyResult()
+                    : $this->buildResult($recordViolations);
             }
             $this->stateDB = null;
         }
@@ -61,14 +219,14 @@ class PostWriteValidator
         $this->checkStructure();
 
         if (!$isEnabled) {
-            return $this->buildResult();
+            return $this->buildResult($recordViolations);
         }
 
         $this->checkLanguage();
         $this->checkPlotBasics();
         $this->checkBreathingRhythm();
 
-        return $this->buildResult();
+        return $this->buildResult($recordViolations);
     }
 
     // ============================================================
@@ -88,10 +246,9 @@ class PostWriteValidator
      */
     private function checkWordCount(): void
     {
-        $words     = countWords($this->content);
-        $tolResult = calculateDynamicTolerance($this->targetWords);
-        $minOk     = $tolResult['min'];
-        $maxOk     = $tolResult['max'];
+        $words = countWords($this->content);
+        $minOk = $this->minWords;
+        $maxOk = $this->maxWords;
 
         if ($words < $minOk) {
             $deviation = $this->targetWords > 0
@@ -99,9 +256,7 @@ class PostWriteValidator
                 : 0;
             // 严格模式以前永远收不到 P0。低于目标 30% 通常是断流/截断稿，
             // 属于不可作为完整章节落盘的客观失败，而不是风格偏好。
-            $criticalFloor = $this->targetWords > 0
-                ? max(100, (int)floor($this->targetWords * 0.3))
-                : 0;
+            $criticalFloor = $this->hardMinWords;
             if ($criticalFloor > 0 && $words < $criticalFloor) {
                 $severity = 'P0';
                 $type = 'chapter_incomplete';
@@ -139,7 +294,7 @@ class PostWriteValidator
     private function checkTitleBlacklist(): void
     {
         $title  = $this->chapter['title'] ?? '';
-        $banned = ConstraintConfig::bannedWords();
+        $banned = $this->bannedWords;
 
         // 正常落盘路径下，TitleSanitizer 已在校验前自动改写标题，此处不会再命中。
         // 残留命中（自定义禁用词无法安全改写 / forceRun 人工审核旧章）一律记 P1 提示——
@@ -167,6 +322,7 @@ class PostWriteValidator
     {
         $this->checkRepeatedPatterns();
         $this->checkDirectEmotion();
+        $this->checkBannedWordBody();
     }
 
     /**
@@ -181,7 +337,7 @@ class PostWriteValidator
 
         // v1.11.9: 过滤语气词与特殊标点，提取纯净的句尾实词指纹，降低误报
         $fingerprints = [];
-        $stopWordsPattern = '/[了呢吧啊吗呀嘛哈哒的啦]|[。！？，…“”""\'\']/u';
+        $stopWordsPattern = '/[了呢吧啊吗呀嘛哈哒的啦]|[。！？，…“”‘’"\']/u';
         foreach ($sentences as $s) {
             $s = trim($s);
             if (mb_strlen($s) < 3) continue;
@@ -246,11 +402,11 @@ class PostWriteValidator
                     if (isset($matchedOffsets[$offset])) continue; // 已计过
                     // 往前探测约 12 字节 (3-4 个中文字符) 判断是否有"不/没/非/并无/毫不"等词
                     $prefixStart = max(0, $offset - 12);
-                    // 审计修复（2026-07-19 H-中5）：substr 按字节截取，/u 正则需多字节安全
-                    $prefix = mb_substr($this->content, 0, 0); // placeholder
-                    $prefix = function_exists('mb_substr')
-                        ? mb_substr($this->content, $prefixStart, ($offset - $prefixStart), 'UTF-8')
-                        : substr($this->content, $prefixStart, $offset - $prefixStart);
+                    // P2-1 修复（2026-08-09）：PREG_OFFSET_CAPTURE 返回的是字节偏移，
+                    // substr 也按字节截取，二者维度一致。原代码误用 mb_substr（按字符偏移），
+                    // 在多字节 UTF-8 内容上会切到错误位置，使否定前缀豁免失效；
+                    // 另有 `$prefix = mb_substr($this->content, 0, 0);` 死代码一并移除。
+                    $prefix = substr($this->content, $prefixStart, $offset - $prefixStart);
                     if (preg_match('/(不|没|非|未|并无|毫不|绝不)/u', $prefix)) {
                         $matchedOffsets[$offset] = true; // 否定，标记已处理
                         continue; // 否定表达，不计入违规计数
@@ -273,6 +429,31 @@ class PostWriteValidator
         }
     }
 
+    /**
+     * P1: 单章禁用词出现次数超过 cf_max_banned_word_usage
+     */
+    private function checkBannedWordBody(): void
+    {
+        $banned = $this->bannedWords;
+        if (empty($banned)) return;
+        $max = $this->maxBannedWordUsage;
+        $total = 0;
+        $hits = [];
+        foreach ($banned as $word) {
+            $cnt = mb_substr_count($this->content, $word);
+            if ($cnt > 0) {
+                $total += $cnt;
+                $hits[] = "{$word}×{$cnt}";
+            }
+        }
+        if ($total > $max) {
+            $this->addIssue(
+                'P1', 'language', 'banned_word_overuse',
+                "本章禁用词出现{$total}次（上限{$max}）：" . implode('、', array_slice($hits, 0, 5))
+            );
+        }
+    }
+
     // ============================================================
     //  情节基础约束（Phase 1 轻量版）
     // ============================================================
@@ -281,6 +462,7 @@ class PostWriteValidator
     {
         $this->checkCoincidenceKeywords();
         $this->checkExhaustedSceneTemplates();
+        $this->checkRepeatedConflictType();
     }
 
     /**
@@ -295,7 +477,7 @@ class PostWriteValidator
         }
 
         if ($count >= 3) {
-            $maxCoincidences = ConstraintConfig::maxCoincidences();
+            $maxCoincidences = $this->maxCoincidences;
             $this->addIssue(
                 'P2', 'plot', 'excessive_coincidence',
                 "本章巧合类描写{$count}次（全书上限{$maxCoincidences}次），可能导致情节可信度下降"
@@ -326,6 +508,32 @@ class PostWriteValidator
         }
     }
 
+    /**
+     * P2: 连续多章同一冲突类型超过 cf_max_same_conflict
+     */
+    private function checkRepeatedConflictType(): void
+    {
+        if (!$this->stateDB) return;
+        $limit = $this->maxSameConflict;
+        $history = $this->stateDB->getConflictHistory($limit + 1);
+        if (count($history) < $limit + 1) return;
+
+        $types = [];
+        foreach ($history as $h) {
+            $t = is_array($h) ? trim((string)($h['type'] ?? '')) : trim((string)$h);
+            if ($t !== '' && $t !== 'mixed') $types[] = $t;
+        }
+        if (count($types) < $limit + 1) return;
+        $first = $types[0];
+        for ($i = 1; $i <= $limit; $i++) {
+            if (($types[$i] ?? '') !== $first) return;
+        }
+        $this->addIssue(
+            'P2', 'plot', 'repeated_conflict_type',
+            "近" . ($limit + 1) . "章冲突类型均为「{$first}」（连续上限{$limit}章）"
+        );
+    }
+
     // ============================================================
     //  段落级呼吸节奏检测 (v1.10.3)
     // ============================================================
@@ -336,9 +544,9 @@ class PostWriteValidator
      * 检测维度：
      * 1. 短段比例 > 60% → 太碎
      * 2. 长段比例 > 30% → 太闷
-     * 3. 场景切换 > 8 → 太杂乱
-     * 4. 对话密度 > 70% → 缺描写
-     * 5. 对话密度 < 10% → 缺互动
+     * 3. 对话密度 > 70% → 缺描写
+     * 4. 对话密度 < 10% → 缺互动
+     * 引号、括号和短段只能说明排版，不能证明场景切换。
      */
     private function checkBreathingRhythm(): void
     {
@@ -348,28 +556,18 @@ class PostWriteValidator
         $totalParagraphs = count($paragraphs);
         $shortCount = 0;
         $longCount = 0;
-        $totalLen = 0;
-        $sceneChanges = 0;
         $dialogueChars = 0;
-        $totalChars = mb_strlen($this->content);
+        $totalChars = DialogueText::visibleLength($this->content);
 
-        foreach ($paragraphs as $i => $para) {
+        foreach ($paragraphs as $para) {
+            $para = preg_replace('/^\s+|\s+$/u', '', $para) ?? $para;
             $len = mb_strlen($para);
-            $totalLen += $len;
 
             if ($len < 50) $shortCount++;
             if ($len > 500) $longCount++;
 
-            if ($i > 0 && mb_strlen($para) > 10) {
-                $firstChar = mb_substr($para, 0, 1);
-                if (preg_match('/[「『""\'\'""（（]/u', $firstChar)) {
-                    // 段落以引号开头可能是场景切换
-                }
-            }
-
-            preg_match_all('/[「『""\'\'""].*?[」』""\'\'""]/u', $para, $dm);
-            foreach ($dm[0] as $d) {
-                $dialogueChars += mb_strlen($d);
+            foreach (DialogueText::passages($para) as $d) {
+                $dialogueChars += DialogueText::visibleLength($d);
             }
         }
 
@@ -424,7 +622,7 @@ class PostWriteValidator
         ];
     }
 
-    private function buildResult(): array
+    private function buildResult(bool $recordViolations): array
     {
         $p0 = []; $p1 = []; $p2 = [];
         foreach ($this->issues as $issue) {
@@ -436,7 +634,7 @@ class PostWriteValidator
         }
 
         // 写入 constraint_logs
-        if ($this->stateDB && !empty($this->issues)) {
+        if ($recordViolations && $this->stateDB && !empty($this->issues)) {
             $chNum = (int)($this->chapter['chapter_number'] ?? 0);
             $chId  = isset($this->chapter['id']) ? (int)$this->chapter['id'] : null;
             foreach ($this->issues as $issue) {

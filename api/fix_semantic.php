@@ -8,7 +8,7 @@ if (!defined('API_VIA_ROUTER')) { http_response_code(403); exit; }
  * GET  /api/fix_semantic.php?novel_id=1&dry_run=1   — 只看不动
  * POST /api/fix_semantic.php {"novel_id":1}         — 执行修复
  */
-define('APP_LOADED', true);
+defined('APP_LOADED') or define('APP_LOADED', true);
 require_once dirname(__DIR__) . '/config.php';
 require_once dirname(__DIR__) . '/includes/error_handler.php';
 registerApiErrorHandlers();
@@ -45,7 +45,7 @@ if (!$novelId) {
     exit;
 }
 
-$userId = (int)($_SESSION['user_id'] ?? $_SESSION['uid'] ?? 0);
+$userId = currentUserId();
 checkNovelOwnership($novelId, $userId);
 
 $result = ['novel_id' => $novelId, 'dry_run' => $dryRun, 'actions' => []];
