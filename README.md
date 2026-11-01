@@ -1,4 +1,4 @@
-# ✦ Super Ma Agents v1.8.0 — AI 智能小说创作辅助系统（平台）
+# ✦ Super Ma Agents v1.8.5 — AI 智能小说创作辅助系统（平台）
 ## UI预览
 <img width="1921" height="906" alt="局部截取_20260427_204024" src="https://github.com/user-attachments/assets/5951459d-bada-4d90-b443-1ad7127c53e1" />
 <p> <p>
@@ -506,6 +506,14 @@ location ^~ /bin/ { deny all; }
 ---
 
 ## 更新日志
+
+
+
+### v1.8.5（2026-11-1）
+
+**功能更新**
+
+- **修复所有已知问题**：修复所有已知问题，提升写作稳定性
 
 
 ### v1.8（2026-07-26）
